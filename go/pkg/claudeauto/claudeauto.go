@@ -249,7 +249,7 @@ type Router struct {
 	server        *http.Server
 	ln            net.Listener
 	port          int
-	mainSlots     chan struct{}
+	sched         *scheduler
 	maxMainActive int
 	mainActive    atomic.Int64
 	mainQueued    atomic.Int64
@@ -274,7 +274,7 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	reviewerProxy.ErrorHandler = proxyError
 	router := &Router{maxMainActive: maxMainActive}
 	if maxMainActive > 0 {
-		router.mainSlots = make(chan struct{}, maxMainActive)
+		router.sched = newScheduler(maxMainActive)
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -335,14 +335,13 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 // waits behind coding work.
 func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil.ReverseProxy, route string, body []byte) {
 	start := time.Now()
+	conversation := conversationKey(body)
 	var queue time.Duration
-	if route == routeMain && r != nil && r.mainSlots != nil {
+	if route == routeMain && r != nil && r.sched != nil {
 		r.mainQueued.Add(1)
-		select {
-		case r.mainSlots <- struct{}{}:
-			r.mainQueued.Add(-1)
-		case <-req.Context().Done():
-			r.mainQueued.Add(-1)
+		admitted := r.sched.acquire(req.Context(), conversation, laneOf(body))
+		r.mainQueued.Add(-1)
+		if !admitted {
 			r.record(route, body, start, time.Since(start), nil)
 			return
 		}
@@ -350,7 +349,7 @@ func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil
 		r.mainActive.Add(1)
 		defer func() {
 			r.mainActive.Add(-1)
-			<-r.mainSlots
+			r.sched.release(conversation)
 		}()
 	}
 	metered := &meteredWriter{ResponseWriter: w, start: start}
