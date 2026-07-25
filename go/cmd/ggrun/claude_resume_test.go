@@ -1,8 +1,10 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/raketenkater/ggrun/pkg/claudesession"
 )
@@ -191,4 +193,27 @@ func TestParseLaunchArgsRejectsResumeWithoutAValue(t *testing.T) {
 	if _, err := parseLaunchArgs([]string{"model.gguf", "--claude-resume"}); err == nil {
 		t.Fatal("--claude-resume without a value was accepted")
 	}
+}
+
+// Ctrl+C reaches the whole foreground process group while Claude Code holds the
+// terminal. ggrun must absorb it rather than die, or it orphans the backend and
+// never records the session.
+func TestHoldInterruptForClaudeAbsorbsSIGINT(t *testing.T) {
+	release := holdInterruptForClaude()
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := proc.Signal(os.Interrupt); err != nil {
+			t.Fatalf("signal: %v", err)
+		}
+	}
+	// Reaching here at all means the default action did not terminate us.
+	time.Sleep(50 * time.Millisecond)
+	release()
+
+	// Release must stop delivery so the normal shutdown handler can own SIGINT
+	// again once Claude Code has exited.
+	release()
 }

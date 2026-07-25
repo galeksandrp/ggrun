@@ -2564,6 +2564,11 @@ func cmdLaunch(args []string) {
 		if code := runClaudeCodeClient(clientHost, claudeClientPort, serverArgs, clientArgs, sessionSpec); code >= 0 {
 			progressStop()
 			healthCancel()
+			// Record on exit as well as on launch: the workflow run ID is
+			// assigned inside Claude Code, so only now is the resume handle
+			// complete.
+			refreshClaudeSessionRecord(cfg.CacheDir, sessionSpec, req.ModelPath, req.Backend,
+				req.Port, claudeStripResumeArgs(req.OriginalArgs), serverArgs)
 			// The terminal was handed to `claude`, so a mid-session backend
 			// crash isn't something this process can retry live — but it can
 			// still be recorded before Stop(), so the NEXT `--claude-code`
@@ -3813,6 +3818,8 @@ func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string, 
 	if prompt := claudeResumePrompt(spec); prompt != "" && spec.Resume {
 		args = append(args, prompt)
 	}
+	releaseInterrupt := holdInterruptForClaude()
+	defer releaseInterrupt()
 	cmd := exec.Command(claudePath, args...)
 	cmd.Env = claudeCodeEnv(host, port, serverArgs)
 	cmd.Stdin = os.Stdin

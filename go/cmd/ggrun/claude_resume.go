@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/raketenkater/ggrun/pkg/claudesession"
 	"github.com/raketenkater/ggrun/pkg/config"
@@ -194,6 +196,75 @@ func claudeResumePrompt(spec *claudeSessionSpec) string {
 	b.WriteString(" Do not change the script or args: agents whose prompt and options are unchanged replay from cache," +
 		" and any edit re-runs everything after the first changed call.")
 	return b.String()
+}
+
+// holdInterruptForClaude keeps Ctrl+C from killing ggrun while Claude Code owns
+// the terminal.
+//
+// The client runs in the foreground, so Ctrl+C reaches the whole process group.
+// Claude Code handles it itself -- the first interrupt cancels its current turn
+// rather than ending the session -- but ggrun installs no handler until after
+// the client returns, so the default action would terminate ggrun mid-session,
+// orphan the backend and skip the session record that makes the run resumable.
+//
+// signal.Notify is used rather than signal.Ignore on purpose: an ignored
+// disposition survives exec and would leave Claude Code unable to see Ctrl+C at
+// all, whereas a caught signal is reset to default in the child.
+func holdInterruptForClaude() func() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-sigCh:
+				// Absorbed: the interrupt belongs to Claude Code.
+			case <-done:
+				return
+			}
+		}
+	}()
+	// Idempotent: the caller defers this and may also release it explicitly on
+	// an early return, and a second close would panic.
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			signal.Stop(sigCh)
+			close(done)
+		})
+	}
+}
+
+// refreshClaudeSessionRecord re-records the session once Claude Code exits, so
+// a workflow started during the session is part of the resume handle. The run
+// ID is assigned inside Claude Code and cannot be known at launch.
+func refreshClaudeSessionRecord(cacheDir string, spec *claudeSessionSpec, modelPath, backend string, port int, launchArgs, serverArgs []string) {
+	if spec == nil || spec.ID == "" || cacheDir == "" {
+		return
+	}
+	workDir, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	if wf, cached := claudesession.LatestRun(claudeProjectsDir(), workDir, spec.ID); wf != nil {
+		spec.Workflow, spec.Cached = wf, cached
+		fmt.Printf("[claude-code] Session %s recorded: workflow %s has %d completed agents cached. "+
+			"Resume with: ggrun claude resume\n", spec.ID, wf.RunID, cached)
+	}
+	// Recording on exit also repairs a launch-time record that could not be
+	// written, so a resumable session is not lost to a transient error.
+	if spec.Resume {
+		// A resumed session keeps its original recorded shape; only the
+		// workflow pointer is refreshed above.
+		if rec, err := claudesession.Load(cacheDir, spec.ID); err == nil {
+			rec.Workflow = spec.Workflow
+			if saveErr := claudesession.Save(cacheDir, rec); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "[claude-code] could not update session record: %v\n", saveErr)
+			}
+			return
+		}
+	}
+	recordClaudeSession(cacheDir, spec, modelPath, backend, port, launchArgs, serverArgs)
 }
 
 // claudeStripResumeArgs removes resume flags from a recorded launch so
