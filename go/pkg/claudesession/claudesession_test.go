@@ -3,6 +3,7 @@ package claudesession
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -229,5 +230,112 @@ func TestJournalPathAndCachedAgents(t *testing.T) {
 	// Two results and three starts: only the finished agents replay.
 	if got := CachedAgents(path); got != 2 {
 		t.Errorf("CachedAgents = %d, want 2", got)
+	}
+}
+
+// Resume must reproduce the placement that ran, not re-derive one. A recomputed
+// placement is not merely different: on this project a reboot moved
+// --n-cpu-moe from a proven 24 to 23, and the first request aborted with a CUDA
+// out-of-memory inside the compute pool.
+func TestPlacementArgsPinsTheProvenLayout(t *testing.T) {
+	rec := Record{ServerArgs: []string{
+		"-m", "model.gguf", "--ctx-size", "1048576",
+		"--n-cpu-moe", "24", "--tensor-split", "1.00,0.00,0.00",
+		"-ot", "blk\\.(1|2)\\.ffn=CUDA0", "--split-mode", "layer",
+		"--parallel", "4",
+	}}
+	got := rec.PlacementArgs()
+	want := []string{
+		"--n-cpu-moe", "24",
+		"-ot", "blk\\.(1|2)\\.ffn=CUDA0",
+		"--tensor-split", "1.00,0.00,0.00",
+		"--split-mode", "layer",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Errorf("PlacementArgs() = %v, want %v", got, want)
+	}
+	// Settings that are not placement must not be dragged along; the launch
+	// flags already carry them.
+	for _, unwanted := range []string{"--ctx-size", "--parallel", "-m"} {
+		for _, arg := range got {
+			if arg == unwanted {
+				t.Errorf("PlacementArgs() included non-placement flag %q", unwanted)
+			}
+		}
+	}
+}
+
+func TestPlacementArgsEmptyWhenNothingRecorded(t *testing.T) {
+	if got := (Record{}).PlacementArgs(); got != nil {
+		t.Errorf("PlacementArgs() = %v, want nil", got)
+	}
+	if got := (Record{ServerArgs: []string{"--ctx-size", "65536"}}).PlacementArgs(); len(got) != 0 {
+		t.Errorf("PlacementArgs() = %v, want empty when no placement was recorded", got)
+	}
+}
+
+// Appending a placement cannot override it: llama.cpp accumulates -ot rules
+// instead of letting a later flag win, so the first attempt shipped two rule
+// sets and reproduced the identical out-of-memory abort.
+func TestApplyPlacementReplacesRatherThanAppends(t *testing.T) {
+	computed := []string{
+		"-m", "model.gguf", "--ctx-size", "1048576",
+		"--n-cpu-moe", "23",
+		"-ot", "blk\\.(1|2|3|4|5|6|7|8|9|10)\\.ffn=CUDA0",
+		"--tensor-split", "0.50,0.25,0.25", "--split-mode", "layer",
+		"--parallel", "4",
+	}
+	recorded := Record{ServerArgs: []string{
+		"--n-cpu-moe", "24",
+		"-ot", "blk\\.(1|2|3|4|5|6|7|8|9)\\.ffn=CUDA0",
+		"--tensor-split", "1.00,0.00,0.00", "--split-mode", "layer",
+	}}
+	got := ApplyPlacement(computed, recorded.PlacementArgs())
+
+	// Each placement flag must appear exactly once, carrying the recorded value.
+	for _, key := range []string{"--n-cpu-moe", "-ot", "--tensor-split", "--split-mode"} {
+		n := 0
+		for i, a := range got {
+			if a == key {
+				n++
+				if i+1 >= len(got) {
+					t.Fatalf("%s has no value", key)
+				}
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s appears %d times, want exactly 1", key, n)
+		}
+	}
+	if v := valueOf(got, "--n-cpu-moe"); v != "24" {
+		t.Errorf("--n-cpu-moe = %q, want the recorded 24", v)
+	}
+	if v := valueOf(got, "--tensor-split"); v != "1.00,0.00,0.00" {
+		t.Errorf("--tensor-split = %q, want the recorded value", v)
+	}
+	if v := valueOf(got, "-ot"); strings.Contains(v, "|10") {
+		t.Errorf("-ot kept the computed 10-layer map: %q", v)
+	}
+	// Non-placement arguments must survive untouched.
+	for _, key := range []string{"-m", "--ctx-size", "--parallel"} {
+		if valueOf(got, key) == "" {
+			t.Errorf("ApplyPlacement dropped %s", key)
+		}
+	}
+}
+
+func valueOf(args []string, key string) string {
+	for i, a := range args {
+		if a == key && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func TestApplyPlacementIsANoOpWithoutARecord(t *testing.T) {
+	computed := []string{"--n-cpu-moe", "23", "--ctx-size", "65536"}
+	if got := ApplyPlacement(computed, nil); strings.Join(got, " ") != strings.Join(computed, " ") {
+		t.Errorf("ApplyPlacement changed args with no recorded placement: %v", got)
 	}
 }

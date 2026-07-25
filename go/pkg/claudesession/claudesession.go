@@ -208,6 +208,64 @@ func ShapeOf(serverArgs []string) map[string]string {
 	return shape
 }
 
+// placementKeys are the settings that describe where the model was actually
+// put, as opposed to what was asked for. ggrun recomputes these on every
+// launch from live VRAM measurements, so a recorded session cannot be
+// reproduced by replaying its launch flags alone.
+var placementKeys = []string{"--n-cpu-moe", "-ot", "--tensor-split", "--split-mode"}
+
+// PlacementArgs returns the recorded placement as pass-through flags.
+//
+// A resume must reproduce the placement that ran, not re-derive one. Recomputed
+// placement is not merely different: it can be worse. On this project a reboot
+// moved --n-cpu-moe from a proven 24 to 23, putting one more expert layer on a
+// GPU that then had about 1.1 GiB free; the model loaded and passed health, and
+// the first real request aborted with a CUDA out-of-memory inside the compute
+// pool. Replaying the recorded placement avoids relitigating a decision that
+// was already validated by three days of serving.
+func (r Record) PlacementArgs() []string {
+	if len(r.ServerArgs) == 0 {
+		return nil
+	}
+	var out []string
+	for _, key := range placementKeys {
+		for i := 0; i < len(r.ServerArgs)-1; i++ {
+			if r.ServerArgs[i] == key {
+				out = append(out, key, r.ServerArgs[i+1])
+				break
+			}
+		}
+	}
+	return out
+}
+
+// ApplyPlacement replaces the computed placement in serverArgs with the
+// recorded one.
+//
+// Appending is not enough. llama.cpp accumulates -ot rules rather than letting
+// a later flag win, so appending a second rule set leaves the computed
+// assignment in force and changes nothing: the first attempt at this shipped
+// two -ot sets, two --n-cpu-moe values and two --tensor-split values, and
+// reproduced the identical out-of-memory abort.
+func ApplyPlacement(serverArgs, placement []string) []string {
+	if len(placement) == 0 {
+		return serverArgs
+	}
+	drop := map[string]bool{}
+	for _, key := range placementKeys {
+		drop[key] = true
+	}
+	out := make([]string, 0, len(serverArgs)+len(placement))
+	for i := 0; i < len(serverArgs); i++ {
+		if drop[serverArgs[i]] {
+			i++ // skip the value too
+			continue
+		}
+		out = append(out, serverArgs[i])
+	}
+	return append(out, placement...)
+}
+
 // Mismatch describes one setting that differs between a recorded session and a
 // proposed relaunch.
 type Mismatch struct {

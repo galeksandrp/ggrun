@@ -154,6 +154,37 @@ func claudeLaunchSession(cfg *config.Config, req *launchRequest, serverArgs []st
 	return spec, nil
 }
 
+// applyRecordedPlacement substitutes a resumed session's proven placement into
+// the freshly computed backend arguments.
+//
+// Placement is derived from live VRAM measurements, so it drifts between
+// launches, and a drifted placement is not merely different -- it can be worse.
+// A reboot moved --n-cpu-moe from a proven 24 to 23 on this project, putting
+// one more expert layer on a GPU that then had about 1.1 GiB free; the model
+// loaded, passed its health check, and aborted with a CUDA out-of-memory in the
+// compute pool on the very first request.
+func applyRecordedPlacement(cfg *config.Config, req *launchRequest, serverArgs []string) []string {
+	if req == nil || req.ClaudeResume == "" || cfg == nil {
+		return serverArgs
+	}
+	workDir, err := os.Getwd()
+	if err != nil {
+		return serverArgs
+	}
+	rec, err := resolveClaudeResume(cfg.CacheDir, workDir, req.ClaudeResume)
+	if err != nil {
+		return serverArgs
+	}
+	placement := rec.PlacementArgs()
+	if len(placement) == 0 {
+		return serverArgs
+	}
+	applied := claudesession.ApplyPlacement(serverArgs, placement)
+	fmt.Printf("[claude-code] Reusing the recorded placement from session %s (%s %s).\n",
+		rec.SessionID, placement[0], placement[1])
+	return applied
+}
+
 // claudeSessionArgs prepends the session flags to the client invocation.
 //
 // A resume must reuse the original session ID. --fork-session mints a new one,

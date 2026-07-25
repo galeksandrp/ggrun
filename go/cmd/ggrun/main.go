@@ -2403,6 +2403,11 @@ func cmdLaunch(args []string) {
 	if serverArgs == nil || strategy != preRecoveryStrategy {
 		serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
 	}
+	// A resume must run the placement that was proven, not one re-derived from
+	// the current VRAM reading. Substituting it here, before the backend
+	// starts, is the only point where the computed assignment can be replaced
+	// rather than merely appended to.
+	serverArgs = applyRecordedPlacement(cfg, req, serverArgs)
 	fmt.Printf("[launch] %s\n", formatCommand(serverArgs))
 	if memMax := backendMemoryMaxMB(req, caps); memMax > 0 {
 		fmt.Printf("[launch] backend memory scope: MemoryMax=%d MiB\n", memMax)
