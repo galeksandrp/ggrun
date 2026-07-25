@@ -174,6 +174,14 @@ Sources: `db3f32cc/1`, `db3f32cc/2`, `db3f32cc/3`, user request 2026-07-12.
   loaded, generated, and shut down cleanly; restricted-GPU preflight now reports
   the renumbered CUDA device's real 12 GiB capacity rather than physical GPU0's 24.
 
+- [ ] **Post-baseline MTP path matrix:** only after the V4, HY3, M3 and 27B
+  context, mmap/no-mmap, prefill/decode and single-/multi-GPU baselines are
+  complete, run `ggrun spec-test` for every model/backend pair that advertises a
+  compatible MTP path. Compare target-only versus MTP with the same workload and
+  record correctness, accepted length, TTFT, prefill/decode speed, wall time and
+  peak RAM/VRAM. Record unsupported combinations as not applicable rather than
+  forcing speculation.
+
 - [ ] **Ship a small local AI-doc advisor with ggrun:** package a compact model
   plus a signed, versioned knowledge bundle covering llama.cpp/fork flags, GGUF
   architectures, artifact provenance, known backend failures and ggrun's test
