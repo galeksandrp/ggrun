@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/raketenkater/ggrun/pkg/backends"
+	"github.com/raketenkater/ggrun/pkg/claudesession"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/gguf"
@@ -121,6 +122,12 @@ type Model struct {
 	choiceCursor  int
 	choiceApply   func(*Model, string)
 	choiceReturn  Screen
+
+	// Resumable Claude Code session for the working directory, discovered when
+	// the pre-launch screen is opened.
+	resumeSession string
+	resumeRun     string
+	resumeCached  int
 
 	// Launch request (set when user chooses to launch)
 	launchRequest *LaunchRequest
@@ -553,6 +560,7 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 			m.aitune = false
 		}
 	case "launch":
+		m.loadResumableSession()
 		m.screen = ScreenPrelaunch
 	case "dryrun":
 		m.message = fmt.Sprintf("Dry run: %s", strings.Join(m.buildArgs(), " "))
@@ -648,6 +656,7 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "x", "X":
 		m.claudeCode = !m.claudeCode
 	case "l", "L":
+		m.loadResumableSession()
 		m.screen = ScreenPrelaunch
 	case "d", "D":
 		m.message = fmt.Sprintf("Dry run: %s", strings.Join(m.buildArgs(), " "))
@@ -1008,12 +1017,65 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "enter":
 			m.launchRequest = m.buildLaunchRequest()
 			return m, tea.Quit
+		case "r", "R":
+			// Resume only makes sense in Claude Code mode with a recorded
+			// session; otherwise fall through to no-op rather than launching
+			// something the footer did not offer.
+			if m.claudeCode && m.resumeSession != "" {
+				req := m.buildLaunchRequest()
+				if req != nil {
+					req.ResumeSession = m.resumeSession
+					m.launchRequest = req
+					return m, tea.Quit
+				}
+			}
+			return m, nil
 		case "esc":
 			m.screen = ScreenModelConfig
 			return m, nil
 		}
 	}
 	return m, nil
+}
+
+// loadResumableSession looks for a Claude Code session recorded from this
+// working directory, so the pre-launch screen can offer to continue it instead
+// of starting a conversation and workflow from zero.
+func (m *Model) loadResumableSession() {
+	m.resumeSession, m.resumeRun, m.resumeCached = "", "", 0
+	workDir, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	rec, err := claudesession.Latest(m.cacheDir, workDir)
+	if err != nil {
+		return
+	}
+	m.resumeSession = rec.SessionID
+	if wf, cached := claudesession.LatestRun(claudeProjectsDir(), rec.WorkDir, rec.SessionID); wf != nil {
+		m.resumeRun, m.resumeCached = wf.RunID, cached
+	}
+}
+
+// claudeProjectsDir mirrors the CLI's lookup of Claude Code's project state.
+func claudeProjectsDir() string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, "projects")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "projects")
+}
+
+// shortSessionID keeps the pre-launch line readable; the full ID is only needed
+// by the resume itself.
+func shortSessionID(id string) string {
+	if len(id) <= 13 {
+		return id
+	}
+	return id[:13] + "…"
 }
 
 func (m Model) viewPrelaunch() string {
@@ -1051,9 +1113,19 @@ func (m Model) viewPrelaunch() string {
 	if m.tunePath != "" {
 		b.WriteString(fmt.Sprintf("  Tuned config:   %s\n", filepath.Base(m.tunePath)))
 	}
+	if m.claudeCode && m.resumeSession != "" {
+		b.WriteString(fmt.Sprintf("  Resumable:      session %s\n", shortSessionID(m.resumeSession)))
+		if m.resumeRun != "" {
+			b.WriteString(fmt.Sprintf("                  workflow %s, %d agents cached\n", m.resumeRun, m.resumeCached))
+		}
+	}
 	b.WriteString("\n")
 	b.WriteString(highlightStyle.Render("  [Enter] Confirm and launch"))
 	b.WriteString("\n")
+	if m.claudeCode && m.resumeSession != "" {
+		b.WriteString(highlightStyle.Render("  [r] Resume that session and its workflow"))
+		b.WriteString("\n")
+	}
 	b.WriteString("  [Esc] Back to config\n")
 	return b.String()
 }
@@ -2156,6 +2228,7 @@ type LaunchRequest struct {
 	Benchmark     bool
 	ClaudeCode    bool
 	ClaudeProfile string
+	ResumeSession string // reopen this recorded Claude Code session
 }
 
 func (req *LaunchRequest) LaunchArgs() []string {
@@ -2201,6 +2274,11 @@ func (req *LaunchRequest) LaunchArgs() []string {
 		args = append(args, "--claude-code")
 		if req.ClaudeProfile != "" {
 			args = append(args, "--claude-profile", req.ClaudeProfile)
+		}
+		// Resume goes through the same launch argv as the CLI, so the TUI and
+		// the command line share one implementation.
+		if req.ResumeSession != "" {
+			args = append(args, "--claude-resume", req.ResumeSession)
 		}
 	}
 	return args

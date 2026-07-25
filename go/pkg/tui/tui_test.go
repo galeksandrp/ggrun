@@ -537,3 +537,34 @@ func TestPerModelParallelEntryRejectsInvalidValue(t *testing.T) {
 		t.Fatalf("invalid parallel changed launch settings: value=%q explicit=%v message=%q", m.parallel, m.parallelSet, m.message)
 	}
 }
+
+func TestLaunchArgsEmitsClaudeResume(t *testing.T) {
+	req := &LaunchRequest{
+		ModelPath: "model.gguf", Port: 8081, CtxFlag: "fit",
+		ClaudeCode: true, ResumeSession: "072e63a1-819a-4682-a742-559695c3cd76",
+	}
+	args := strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(args, "--claude-resume 072e63a1-819a-4682-a742-559695c3cd76") {
+		t.Errorf("resume flag missing from launch args: %s", args)
+	}
+	// The TUI and the CLI must reach the same launch path.
+	if !strings.Contains(args, "--claude-code") {
+		t.Errorf("resume emitted without claude-code mode: %s", args)
+	}
+}
+
+func TestLaunchArgsOmitsResumeWhenNotResuming(t *testing.T) {
+	req := &LaunchRequest{ModelPath: "model.gguf", CtxFlag: "fit", ClaudeCode: true}
+	if args := strings.Join(req.LaunchArgs(), " "); strings.Contains(args, "--claude-resume") {
+		t.Errorf("fresh launch emitted a resume flag: %s", args)
+	}
+}
+
+func TestShortSessionIDKeepsPrelaunchReadable(t *testing.T) {
+	if got := shortSessionID("072e63a1-819a-4682-a742-559695c3cd76"); got != "072e63a1-819a…" {
+		t.Errorf("shortSessionID = %q", got)
+	}
+	if got := shortSessionID("short"); got != "short" {
+		t.Errorf("short id was truncated: %q", got)
+	}
+}

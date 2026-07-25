@@ -98,6 +98,8 @@ func main() {
 		cmdRecommend(args[1:])
 	case "models":
 		cmdModels(args[1:])
+	case "claude":
+		cmdClaude(args[1:])
 	case "gui", "tui":
 		cmdGUI()
 	case "config":
@@ -139,6 +141,8 @@ Commands:
   backend [list|add|register|remove]  Manage custom llama.cpp backends and
                        optionally route a model architecture to one
   update, --update     Update ggrun and backends
+  claude [list|resume] List recorded Claude Code sessions, or relaunch the recorded
+                       backend shape and resume one (default: newest in this directory)
   gui, tui             Interactive TUI (model picker, settings, launch)
 
 Launch flags:
@@ -159,6 +163,9 @@ Launch flags:
   -vision              Enable vision (auto-detect mmproj)
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
+  --claude-resume str  Reopen a recorded Claude Code session (id or "latest") and resume
+                       its interrupted workflow from the cached journal
+  --claude-resume-force  Resume even though the backend shape changed (unsafe)
   --calibrate str      First-launch placement calibration: auto|on|off (default auto;
                        measures alternative placements once per model/hardware/workload)
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
@@ -167,7 +174,7 @@ Launch flags:
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "memory-probe", "kv-probe", "record-longctx-validation", "download", "tune", "spec-test", "recommend", "models", "gui", "tui", "config", "backend", "backends", "update", "--update":
+	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "memory-probe", "kv-probe", "record-longctx-validation", "download", "tune", "spec-test", "recommend", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
 		return true
 	default:
 		return false
@@ -492,10 +499,13 @@ type launchRequest struct {
 	UBatchSizeSet        bool
 	Benchmark            bool
 	ClaudeCode           bool
-	ClaudeProfile        string // agent-interactive avoids the automatic parallel-4 floor
-	Calibrate            string // "auto" (default: calibrate unproven small models), "on" (force), "off"
-	EmitServerArgvJSON   bool   // dry-run machine interface for reproducible benchmark harnesses
-	SpecDraftMax         int    // internal spec-test ceiling; not a public launch override
+	ClaudeProfile        string   // agent-interactive avoids the automatic parallel-4 floor
+	ClaudeResume         string   // session id or "latest": reopen a recorded Claude session
+	ClaudeResumeForce    bool     // accept a resume whose backend shape no longer matches
+	OriginalArgs         []string // launch argv as given, so a resume can reproduce it exactly
+	Calibrate            string   // "auto" (default: calibrate unproven small models), "on" (force), "off"
+	EmitServerArgvJSON   bool     // dry-run machine interface for reproducible benchmark harnesses
+	SpecDraftMax         int      // internal spec-test ceiling; not a public launch override
 	ExtraArgs            []string
 	// ReviewerReservation holds the Claude Auto reviewer's placement companion
 	// for the whole launch. placementOptionsFromRequest attaches it to every
@@ -515,6 +525,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
 	backendExplicit := configuredBackendExplicit(cfg.Backend)
+	originalArgs := append([]string(nil), args...)
 	req := &launchRequest{
 		Port:            cfg.Port,
 		CtxFlag:         cfg.CtxValue(),
@@ -531,6 +542,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		RAMLimitPercent: cfg.RAMLimitPercent,
 		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
 		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
+		OriginalArgs:    originalArgs,
 	}
 	if req.Port == 0 {
 		req.Port = 8081
@@ -678,6 +690,9 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				}
 				req.ClaudeProfile = profile
 				continue
+			case "--claude-resume":
+				req.ClaudeResume, req.ClaudeCode = val, true
+				continue
 			}
 		}
 		next := func() (string, error) {
@@ -774,6 +789,15 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			req.VisionAuto = true
 		case "--claude-code":
 			req.ClaudeCode = true
+		case "--claude-resume":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			// Resuming a Claude session is only meaningful in Claude Code mode.
+			req.ClaudeResume, req.ClaudeCode = v, true
+		case "--claude-resume-force":
+			req.ClaudeResumeForce = true
 		case "--claude-profile":
 			v, err := next()
 			if err != nil {
@@ -2528,7 +2552,16 @@ func cmdLaunch(args []string) {
 		} else {
 			fmt.Println("[claude-code] Live request progress enabled in the terminal title (existing Claude status line preserved).")
 		}
-		if code := runClaudeCodeClient(clientHost, claudeClientPort, serverArgs, clientArgs); code >= 0 {
+		sessionSpec, sessionErr := claudeLaunchSession(cfg, req, serverArgs)
+		if sessionErr != nil {
+			progressStop()
+			healthCancel()
+			_ = p.Stop()
+			claudeAuto.stop()
+			fmt.Fprintf(os.Stderr, "Error: %v\n", sessionErr)
+			os.Exit(1)
+		}
+		if code := runClaudeCodeClient(clientHost, claudeClientPort, serverArgs, clientArgs, sessionSpec); code >= 0 {
 			progressStop()
 			healthCancel()
 			// The terminal was handed to `claude`, so a mid-session backend
@@ -3735,7 +3768,7 @@ func claudeCodeShiftableContext(model *placement.ModelProfile, strategy *placeme
 // runClaudeCodeClient launches Claude Code in the foreground wired to the local
 // server, inheriting the terminal. It returns claude's exit code, or -1 if the
 // `claude` CLI isn't installed (so the caller can fall back to the recipe).
-func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string) int {
+func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string, spec *claudeSessionSpec) int {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return -1
@@ -3766,6 +3799,19 @@ func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string) 
 		fmt.Println("[claude-code] Online research enabled through DuckDuckGo MCP (search + fetch_content).")
 	} else {
 		fmt.Println("[claude-code] WebSearch disabled (Anthropic-only); install uvx or add a search MCP for web research.")
+	}
+	sessionArgs, err := claudeSessionArgs(spec, extraArgs, args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[claude-code] %v\n", err)
+		return 2
+	}
+	args = sessionArgs
+	if summary := describeClaudeResume(spec); summary != "" {
+		fmt.Println(summary)
+	}
+	// The resume instruction goes last so it becomes Claude's opening turn.
+	if prompt := claudeResumePrompt(spec); prompt != "" && spec.Resume {
+		args = append(args, prompt)
 	}
 	cmd := exec.Command(claudePath, args...)
 	cmd.Env = claudeCodeEnv(host, port, serverArgs)

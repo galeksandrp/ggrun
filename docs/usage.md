@@ -198,6 +198,37 @@ claude --permission-mode auto --disallowedTools WebSearch
 All five inference tiers point at `local` on purpose, so foreground and background
 model calls cannot leave for `api.anthropic.com`.
 
+### Resuming a session and its workflow
+
+A long local workflow does not have to be restarted from zero when you stop the
+backend. ggrun assigns each `--claude-code` launch its own Claude Code session ID
+and records it with the exact backend shape that produced it:
+
+```bash
+ggrun claude list             # recorded sessions for this directory
+ggrun claude resume           # relaunch the recorded shape, reopen the newest session
+ggrun claude resume <id>      # or a specific one
+```
+
+In the TUI, the pre-launch screen shows a resumable session when one exists and
+offers **[r] Resume that session and its workflow**.
+
+Resume relaunches the recorded backend, reopens the conversation, and asks Claude
+Code to continue the interrupted workflow run from its journal. Agents that had
+finished replay from cache without a model call; agents still running when the
+session stopped re-run. The summary printed before launch states how many agents
+are actually recoverable.
+
+Two deliberate restrictions:
+
+- **The backend shape must match.** If the context, KV type, placement or batch
+  settings changed since the session was recorded, ggrun refuses and names the
+  differing setting. Reusing a conversation under different settings does not
+  fail at runtime; it reinterprets state built under the old ones. Use
+  `--claude-resume-force` only if you accept that.
+- **`--fork-session` is refused with a resume.** Forking mints a new session ID,
+  which moves the workflow journal path and silently discards every cached agent.
+
 - **Thinking is on** — a normal launch never passes `--reasoning off` (measurement-only:
   benchmark and the deterministic core `spec-test` matrix).
 - **Context fits the slot.** `--parallel` splits `--ctx-size` across sequence slots,
