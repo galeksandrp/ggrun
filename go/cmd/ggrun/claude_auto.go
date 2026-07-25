@@ -371,7 +371,17 @@ func claudeReviewerLog(cfg *config.Config, port int) (io.Writer, io.Closer) {
 	return f, f
 }
 
-func (r *claudeAutoRuntime) startRouter(mainHost string, mainPort int, supportsVision bool, maxMainActive int) error {
+// claudeRouterMetricsPath keeps one launch's per-request evidence next to that
+// launch's reviewer log.
+func claudeRouterMetricsPath(cfg *config.Config, port int) string {
+	dir := os.TempDir()
+	if cfg != nil && cfg.LogDir != "" {
+		dir = cfg.LogDir
+	}
+	return filepath.Join(dir, fmt.Sprintf("ggrun-claude-requests-%d.jsonl", port))
+}
+
+func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mainPort int, supportsVision bool, maxMainActive int) error {
 	if r == nil {
 		return nil
 	}
@@ -394,6 +404,14 @@ func (r *claudeAutoRuntime) startRouter(mainHost string, mainPort int, supportsV
 		return err
 	}
 	r.router = router
+	// Recording is evidence, not a dependency: a metrics failure must not stop
+	// the user's launch.
+	metricsPath := claudeRouterMetricsPath(cfg, router.Port())
+	if err := router.EnableMetrics(metricsPath); err != nil {
+		fmt.Fprintf(os.Stderr, "[claude-code] per-request metrics disabled: %v\n", err)
+	} else {
+		fmt.Printf("[claude-code] per-request metrics -> %s\n", metricsPath)
+	}
 	if r.reviewerPort > 0 {
 		fmt.Printf("[claude-code] Auto router ready on %s (coding -> main model, safety -> local reviewer)\n", router.URL())
 	} else {

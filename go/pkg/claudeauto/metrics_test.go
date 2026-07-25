@@ -1,0 +1,345 @@
+package claudeauto
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// sseBody is the shape Claude Code actually receives: input counts arrive in
+// message_start and the output count grows across message_delta events.
+const sseBody = `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":61000,"cache_read_input_tokens":24000,"cache_creation_input_tokens":1200,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":57}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"output_tokens":211}}
+
+`
+
+func newTestRouter(t *testing.T, backend string, maxMainActive int) (*Router, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "requests.jsonl")
+	router, err := StartRouter(backend, backend, true, maxMainActive)
+	if err != nil {
+		t.Fatalf("StartRouter: %v", err)
+	}
+	t.Cleanup(func() { _ = router.Close() })
+	if err := router.EnableMetrics(path); err != nil {
+		t.Fatalf("EnableMetrics: %v", err)
+	}
+	return router, path
+}
+
+func readRecords(t *testing.T, path string) []RequestRecord {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open metrics: %v", err)
+	}
+	defer f.Close()
+	var out []RequestRecord
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for scanner.Scan() {
+		var rec RequestRecord
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			t.Fatalf("decode record %q: %v", scanner.Text(), err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// waitForRecords polls because a record is written after the proxy finishes,
+// which is strictly after the client has seen the last byte.
+func waitForRecords(t *testing.T, path string, want int) []RequestRecord {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var records []RequestRecord
+	for time.Now().Before(deadline) {
+		if records = readRecords(t, path); len(records) >= want {
+			return records
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("want %d records, got %d", want, len(records))
+	return nil
+}
+
+// postErr sends one routed request and drains the response, so the proxy has
+// finished before the caller inspects metrics. It returns an error rather than
+// failing the test so it is also safe to call from a goroutine.
+func postErr(router *Router, body string) error {
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	_, err = io.Copy(io.Discard, resp.Body)
+	return err
+}
+
+func post(t *testing.T, router *Router, body string) {
+	t.Helper()
+	if err := postErr(router, body); err != nil {
+		t.Fatalf("post: %v", err)
+	}
+}
+
+func TestRouterRecordsStreamingUsageAndTiming(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("backend writer is not a Flusher")
+		}
+		for _, chunk := range strings.SplitAfter(sseBody, "\n\n") {
+			_, _ = w.Write([]byte(chunk))
+			if ok {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer backend.Close()
+
+	router, path := newTestRouter(t, backend.URL, 1)
+	post(t, router, `{"model":"local","stream":true,"system":"coding agent","messages":[{"role":"user","content":"hi"}]}`)
+
+	rec := waitForRecords(t, path, 1)[0]
+	if rec.Route != routeMain {
+		t.Errorf("route = %q, want %q", rec.Route, routeMain)
+	}
+	if !rec.Stream {
+		t.Error("stream request not recorded as streaming")
+	}
+	if rec.Aborted {
+		t.Error("completed request recorded as aborted")
+	}
+	if rec.Status != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Status)
+	}
+	if rec.Usage.InputTokens != 61000 {
+		t.Errorf("input tokens = %d, want 61000", rec.Usage.InputTokens)
+	}
+	// The cache keys must not be swallowed by the shorter "input_tokens" match.
+	if rec.Usage.CacheReadTokens != 24000 {
+		t.Errorf("cache read tokens = %d, want 24000", rec.Usage.CacheReadTokens)
+	}
+	if rec.Usage.CacheCreationTokens != 1200 {
+		t.Errorf("cache creation tokens = %d, want 1200", rec.Usage.CacheCreationTokens)
+	}
+	// The final message_delta wins, not the placeholder in message_start.
+	if rec.Usage.OutputTokens != 211 {
+		t.Errorf("output tokens = %d, want 211", rec.Usage.OutputTokens)
+	}
+	if rec.Usage.PromptTokens() != 62200 {
+		t.Errorf("prompt tokens = %d, want 62200", rec.Usage.PromptTokens())
+	}
+	if rec.Conversation == "" {
+		t.Error("conversation key not recorded")
+	}
+	if rec.ResponseBytes == 0 {
+		t.Error("response bytes not recorded")
+	}
+}
+
+// The metered writer wraps the proxy's ResponseWriter. If it failed to forward
+// Flush, every SSE token would buffer until the response ended and Claude Code
+// would look frozen, so assert the client sees a chunk while the backend is
+// still writing.
+func TestRouterForwardsFlushWhileStreaming(t *testing.T) {
+	seen := make(chan struct{})
+	finish := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\ndata: {}\n\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-seen:
+		case <-time.After(3 * time.Second):
+			t.Error("client never received the flushed chunk")
+		}
+		_, _ = w.Write([]byte(`data: {"usage":{"output_tokens":5}}` + "\n\n"))
+		close(finish)
+	}))
+	defer backend.Close()
+
+	router, _ := newTestRouter(t, backend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"local","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+
+	buf := make([]byte, 16)
+	if _, err := resp.Body.Read(buf); err != nil {
+		t.Fatalf("read first chunk: %v", err)
+	}
+	close(seen)
+	select {
+	case <-finish:
+	case <-time.After(3 * time.Second):
+		t.Fatal("backend did not finish streaming")
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+}
+
+func TestRouterRecordsQueueWaitSeparatelyFromPrefill(t *testing.T) {
+	release := make(chan struct{})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":10,"output_tokens":2}}`))
+	}))
+	defer backend.Close()
+
+	// One admission slot, so the second request must wait for the first.
+	router, path := newTestRouter(t, backend.URL, 1)
+	body := `{"model":"local","messages":[{"role":"user","content":"hi"}]}`
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { done <- postErr(router, body) }()
+	}
+	time.Sleep(120 * time.Millisecond)
+	close(release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("post: %v", err)
+		}
+	}
+
+	records := waitForRecords(t, path, 2)
+	var queued int
+	for _, rec := range records {
+		if rec.QueueMS > 0 {
+			queued++
+		}
+		// Queue wait must never be counted as backend prefill.
+		if rec.PrefillMS() > rec.TTFBMS {
+			t.Errorf("prefill %dms exceeds ttfb %dms", rec.PrefillMS(), rec.TTFBMS)
+		}
+	}
+	if queued == 0 {
+		t.Error("no request recorded a queue wait despite a saturated admission limit")
+	}
+}
+
+func TestRouterRecordsReviewerRouteWithoutAdmissionControl(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":25000,"output_tokens":3}}`))
+	}))
+	defer backend.Close()
+
+	router, path := newTestRouter(t, backend.URL, 1)
+	body := `{"model":"local","system":[{"type":"text","text":"` + ClassifierMarker + ` Review it."}],` +
+		`"messages":[{"role":"user","content":"rm -rf /"}]}`
+	post(t, router, body)
+
+	records := waitForRecords(t, path, 1)
+	if records[0].Route != routeReviewer {
+		t.Errorf("route = %q, want %q", records[0].Route, routeReviewer)
+	}
+	// Safety must not consume a main admission slot.
+	if records[0].QueueMS != 0 {
+		t.Errorf("reviewer queued %dms, want 0", records[0].QueueMS)
+	}
+	if records[0].Usage.InputTokens != 25000 {
+		t.Errorf("input tokens = %d, want 25000", records[0].Usage.InputTokens)
+	}
+}
+
+func TestMetricsSummaryAppearsOnRouterEndpoint(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":100,"output_tokens":20}}`))
+	}))
+	defer backend.Close()
+
+	router, _ := newTestRouter(t, backend.URL, 2)
+	post(t, router, `{"model":"local","messages":[{"role":"user","content":"hi"}]}`)
+
+	statusResp, err := http.Get(router.URL() + "/ggrun/router")
+	if err != nil {
+		t.Fatalf("get status: %v", err)
+	}
+	defer statusResp.Body.Close()
+	var status struct {
+		Limit   int64          `json:"limit"`
+		Metrics map[string]any `json:"metrics"`
+	}
+	if err := json.NewDecoder(statusResp.Body).Decode(&status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status.Limit != 2 {
+		t.Errorf("limit = %d, want 2", status.Limit)
+	}
+	if status.Metrics == nil {
+		t.Fatal("metrics summary missing from /ggrun/router")
+	}
+	if got, ok := status.Metrics["requests"].(float64); !ok || got != 1 {
+		t.Errorf("requests = %v, want 1", status.Metrics["requests"])
+	}
+	if got, ok := status.Metrics["prompt_tokens"].(float64); !ok || got != 100 {
+		t.Errorf("prompt_tokens = %v, want 100", status.Metrics["prompt_tokens"])
+	}
+}
+
+func TestRouterWithoutMetricsStaysSilent(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer backend.Close()
+
+	router, err := StartRouter(backend.URL, backend.URL, true, 1)
+	if err != nil {
+		t.Fatalf("StartRouter: %v", err)
+	}
+	defer router.Close()
+	post(t, router, `{"model":"local","messages":[{"role":"user","content":"hi"}]}`)
+	if summary := router.MetricsSummary(); summary != nil {
+		t.Errorf("summary = %v, want nil when recording is disabled", summary)
+	}
+}
+
+func TestScanUsageAcrossChunkBoundary(t *testing.T) {
+	full := `{"usage":{"input_tokens":123456,"cache_read_input_tokens":789,"output_tokens":42}}`
+	for split := 1; split < len(full); split++ {
+		w := &meteredWriter{start: time.Now()}
+		w.scan([]byte(full[:split]))
+		w.scan([]byte(full[split:]))
+		if w.usage.InputTokens != 123456 {
+			t.Fatalf("split %d: input tokens = %d, want 123456", split, w.usage.InputTokens)
+		}
+		if w.usage.CacheReadTokens != 789 {
+			t.Fatalf("split %d: cache read tokens = %d, want 789", split, w.usage.CacheReadTokens)
+		}
+		if w.usage.OutputTokens != 42 {
+			t.Fatalf("split %d: output tokens = %d, want 42", split, w.usage.OutputTokens)
+		}
+	}
+}
+
+func TestConversationKeyIsStablePerAgentAndDistinctAcrossAgents(t *testing.T) {
+	first := []byte(`{"system":"agent A","messages":[{"role":"user","content":"start"}]}`)
+	later := []byte(`{"system":"agent A","messages":[{"role":"user","content":"start"},{"role":"assistant","content":"ok"}]}`)
+	other := []byte(`{"system":"agent B","messages":[{"role":"user","content":"start"}]}`)
+	if conversationKey(first) != conversationKey(later) {
+		t.Error("conversation key changed across turns of the same agent")
+	}
+	if conversationKey(first) == conversationKey(other) {
+		t.Error("different agents share a conversation key")
+	}
+	if got := conversationKey([]byte(`{"metadata":{"user_id":"agent-7"}}`)); got != "agent-7" {
+		t.Errorf("explicit user_id = %q, want agent-7", got)
+	}
+}

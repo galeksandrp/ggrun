@@ -40,6 +40,10 @@ const (
 
 	maxRoutedRequestBytes = 16 << 20
 
+	// Route labels recorded per request.
+	routeMain     = "main"
+	routeReviewer = "reviewer"
+
 	textOnlyImagePlaceholder = "[Image omitted by ggrun: this local model was launched without an mmproj. Use a text extraction/OCR tool or relaunch with --vision.]"
 )
 
@@ -249,6 +253,7 @@ type Router struct {
 	maxMainActive int
 	mainActive    atomic.Int64
 	mainQueued    atomic.Int64
+	metrics       *metricsSink
 }
 
 // StartRouter starts the local request router on an automatically selected
@@ -275,11 +280,15 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/ggrun/router" {
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]int64{
+			status := map[string]any{
 				"active": router.mainActive.Load(),
 				"queued": router.mainQueued.Load(),
 				"limit":  int64(router.maxMainActive),
-			})
+			}
+			if summary := router.MetricsSummary(); summary != nil {
+				status["metrics"] = summary
+			}
+			_ = json.NewEncoder(w).Encode(status)
 			return
 		}
 		if r.URL.Path != "/v1/messages" {
@@ -303,10 +312,10 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 			r.ContentLength = int64(len(body))
 		}
 		if IsClassifierRequest(body) {
-			reviewerProxy.ServeHTTP(w, r)
+			router.serve(w, r, reviewerProxy, routeReviewer, body)
 			return
 		}
-		router.serveMain(w, r, mainProxy)
+		router.serve(w, r, mainProxy, routeMain, body)
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -321,25 +330,58 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	return router, nil
 }
 
-func (r *Router) serveMain(w http.ResponseWriter, req *http.Request, proxy *httputil.ReverseProxy) {
-	if r == nil || r.mainSlots == nil {
-		proxy.ServeHTTP(w, req)
+// serve proxies one routed request and records its timing. Only the main route
+// is admission-controlled: the reviewer lane stays free so a safety review never
+// waits behind coding work.
+func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil.ReverseProxy, route string, body []byte) {
+	start := time.Now()
+	var queue time.Duration
+	if route == routeMain && r != nil && r.mainSlots != nil {
+		r.mainQueued.Add(1)
+		select {
+		case r.mainSlots <- struct{}{}:
+			r.mainQueued.Add(-1)
+		case <-req.Context().Done():
+			r.mainQueued.Add(-1)
+			r.record(route, body, start, time.Since(start), nil)
+			return
+		}
+		queue = time.Since(start)
+		r.mainActive.Add(1)
+		defer func() {
+			r.mainActive.Add(-1)
+			<-r.mainSlots
+		}()
+	}
+	metered := &meteredWriter{ResponseWriter: w, start: start}
+	proxy.ServeHTTP(metered, req)
+	r.record(route, body, start, queue, metered)
+}
+
+// record stores one request's timing. A nil metered writer means the caller gave
+// up while queued, which is exactly the starvation case worth counting.
+func (r *Router) record(route string, body []byte, start time.Time, queue time.Duration, metered *meteredWriter) {
+	if r == nil || r.metrics == nil {
 		return
 	}
-	r.mainQueued.Add(1)
-	select {
-	case r.mainSlots <- struct{}{}:
-		r.mainQueued.Add(-1)
-	case <-req.Context().Done():
-		r.mainQueued.Add(-1)
-		return
+	rec := RequestRecord{
+		Time:         start.UTC().Format(time.RFC3339Nano),
+		Route:        route,
+		Conversation: conversationKey(body),
+		Stream:       isStreamRequest(body),
+		QueueMS:      queue.Milliseconds(),
+		TotalMS:      time.Since(start).Milliseconds(),
+		RequestBytes: int64(len(body)),
+		Aborted:      true,
 	}
-	r.mainActive.Add(1)
-	defer func() {
-		r.mainActive.Add(-1)
-		<-r.mainSlots
-	}()
-	proxy.ServeHTTP(w, req)
+	if metered != nil {
+		rec.Status = metered.status
+		rec.ResponseBytes = metered.written
+		rec.Usage = metered.usage
+		rec.TTFBMS = metered.ttfb.Milliseconds()
+		rec.Aborted = metered.status == 0 && metered.written == 0
+	}
+	r.metrics.record(rec)
 }
 
 // sanitizeTextOnlyImages replaces only Anthropic message image blocks. It
@@ -424,5 +466,9 @@ func (r *Router) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return r.server.Shutdown(ctx)
+	err := r.server.Shutdown(ctx)
+	if closeErr := r.metrics.close(); err == nil {
+		err = closeErr
+	}
+	return err
 }

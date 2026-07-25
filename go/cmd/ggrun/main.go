@@ -2465,7 +2465,7 @@ func cmdLaunch(args []string) {
 	}
 	claudeClientPort := req.Port
 	if claudeAuto != nil {
-		if err := claudeAuto.startRouter(req.Host, req.Port, hasArg(serverArgs, "--mmproj"), claudeMainMaxActive(req, strategy)); err != nil {
+		if err := claudeAuto.startRouter(cfg, req.Host, req.Port, hasArg(serverArgs, "--mmproj"), claudeMainMaxActive(req, strategy)); err != nil {
 			_ = p.Stop()
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error starting Claude Auto router: %v\n", err)
