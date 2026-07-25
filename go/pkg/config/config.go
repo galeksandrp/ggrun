@@ -149,28 +149,45 @@ func defaultSources() map[string]string {
 	return sources
 }
 
-// Path returns the canonical config file path. It resolves the app home via
-// backends.AppHome() so the config file lives alongside backends.json
-// (AppHome()/.config/) instead of diverging to a separate $HOME/.config/ggrun
-// location.
+// Path returns the canonical config file path. A self-contained ggrun install
+// keeps its config beside backends.json in AppHome()/.config/ rather than in
+// $HOME/.config/ggrun.
+//
+// AppHome() strips a trailing bin directory from the executable's path, so a
+// normal OS install at ~/.local/bin/ggrun resolves to an "app home" of
+// ~/.local. Claiming that as the config location hid the user's real
+// $HOME/.config/ggrun/config: settings appeared to save, and the next launch
+// silently used built-in defaults, including the wrong model directory. Worse,
+// a repo-local ./ggrun is not in a bin directory and did fall through to $HOME,
+// so two builds of the same version disagreed about where settings lived.
+//
+// An app home is therefore only honoured when it actually holds ggrun state.
+// A binary that merely lives in a bin directory does not get to claim one.
 func Path() string {
 	if p := os.Getenv("LLM_CONFIG"); p != "" {
 		return p
 	}
-	home := backends.AppHome()
-	isGenericHome := home == os.Getenv("HOME")
-	if !isGenericHome {
-		if f := filepath.Join(home, ".config", "config"); fileExists(f) {
-			return f
+	userHome := os.Getenv("HOME")
+	if home := backends.AppHome(); home != "" && home != userHome {
+		for _, f := range []string{
+			filepath.Join(home, ".config", "config"),
+			filepath.Join(home, "config", "config"),
+			filepath.Join(home, ".config", "ggrun", "config"),
+		} {
+			if fileExists(f) {
+				return f
+			}
 		}
-		if f := filepath.Join(home, "config", "config"); fileExists(f) {
-			return f
+		// No config there yet: only create one if this really is a ggrun
+		// install tree, evidenced by its backend manifest.
+		if fileExists(filepath.Join(home, ".config", "backends.json")) {
+			return filepath.Join(home, ".config", "ggrun", "config")
 		}
 	}
-	if f := filepath.Join(home, ".config", "ggrun", "config"); fileExists(f) {
-		return f
+	if userHome == "" {
+		userHome = "."
 	}
-	return filepath.Join(home, ".config", "ggrun", "config")
+	return filepath.Join(userHome, ".config", "ggrun", "config")
 }
 
 // Load reads the config file and env vars, returning a merged config.

@@ -230,3 +230,70 @@ func TestBudgetParserRejectsMalformedValues(t *testing.T) {
 		t.Fatalf("ParseBudgetMBStrict(2G) = %d, %v; want 2048, nil", got, err)
 	}
 }
+
+// A binary installed at ~/.local/bin/ggrun makes AppHome() resolve to ~/.local.
+// Treating that as an app home hid the user's real $HOME/.config/ggrun/config:
+// saved settings silently reverted to defaults on the next launch.
+func TestPathIgnoresABinDirectoryThatIsNotAGgrunInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LLM_CONFIG", "")
+	// Pretend the executable lives in <home>/.local/bin, so AppHome() reports
+	// <home>/.local -- a directory holding no ggrun state at all.
+	t.Setenv("LLM_APP_HOME", filepath.Join(home, ".local"))
+
+	want := filepath.Join(home, ".config", "ggrun", "config")
+	if got := Path(); got != want {
+		t.Errorf("Path() = %q, want the user's own config at %q", got, want)
+	}
+}
+
+// An existing $HOME config must win over an app home that has none, so an
+// install location change never orphans settings that are already on disk.
+func TestPathPrefersAnExistingUserConfigOverAnEmptyAppHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LLM_CONFIG", "")
+	t.Setenv("LLM_APP_HOME", filepath.Join(home, ".local"))
+
+	userCfg := filepath.Join(home, ".config", "ggrun", "config")
+	if err := os.MkdirAll(filepath.Dir(userCfg), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(userCfg, []byte("LLM_MODEL_DIR=\"/models\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := Path(); got != userCfg {
+		t.Errorf("Path() = %q, want the existing user config %q", got, userCfg)
+	}
+}
+
+// A genuine self-contained install keeps its config beside backends.json.
+func TestPathHonoursARealAppHome(t *testing.T) {
+	home := t.TempDir()
+	appHome := filepath.Join(home, "ggrun-productions")
+	t.Setenv("HOME", home)
+	t.Setenv("LLM_CONFIG", "")
+	t.Setenv("LLM_APP_HOME", appHome)
+
+	if err := os.MkdirAll(filepath.Join(appHome, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := filepath.Join(appHome, ".config", "backends.json")
+	if err := os.WriteFile(manifest, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(appHome, ".config", "ggrun", "config")
+	if got := Path(); got != want {
+		t.Errorf("Path() = %q, want the install-local config %q", got, want)
+	}
+}
+
+// LLM_CONFIG stays an absolute override.
+func TestPathRespectsExplicitOverride(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LLM_CONFIG", "/tmp/explicit-ggrun.conf")
+	if got := Path(); got != "/tmp/explicit-ggrun.conf" {
+		t.Errorf("Path() = %q, want the explicit override", got)
+	}
+}
