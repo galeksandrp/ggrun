@@ -3,6 +3,7 @@ package backends
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -114,5 +115,152 @@ func TestHY3RecipePatchAppliesAndRevertsCleanly(t *testing.T) {
 	}
 	if string(restored) != original {
 		t.Fatalf("patch revert changed source:\n%s", restored)
+	}
+}
+
+// The installer's default target is ~/.local/bin, whose parent holds no ggrun
+// state. Claiming it as an app home made a second copy of ggrun report no
+// models and no backends while the real install sat untouched.
+func TestAppHomeFromExeIgnoresAStatelessBinParent(t *testing.T) {
+	root := t.TempDir()
+	stateless := filepath.Join(root, ".local")
+	if err := os.MkdirAll(filepath.Join(stateless, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := AppHomeFromExe(filepath.Join(stateless, "bin", "ggrun")); got != "" {
+		t.Errorf("AppHomeFromExe claimed a stateless bin parent: %q", got)
+	}
+}
+
+// A real self-contained install must still be recognised from its own binary,
+// with no environment variable set.
+func TestAppHomeFromExeAcceptsARealInstall(t *testing.T) {
+	install := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(install, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, ".config", "backends.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, binDir := range []string{".bin", "bin"} {
+		exe := filepath.Join(install, binDir, "ggrun")
+		if got := AppHomeFromExe(exe); got != install {
+			t.Errorf("AppHomeFromExe(%s) = %q, want %q", binDir, got, install)
+		}
+	}
+}
+
+// Anything outside a bin directory says nothing about the app home.
+func TestAppHomeFromExeIgnoresUnrelatedLocations(t *testing.T) {
+	if got := AppHomeFromExe("/home/mik/ggrun-project/ggrun/ggrun"); got != "" {
+		t.Errorf("AppHomeFromExe = %q, want empty for a repo-local binary", got)
+	}
+	if got := AppHomeFromExe(""); got != "" {
+		t.Errorf("AppHomeFromExe(\"\") = %q, want empty", got)
+	}
+}
+
+func TestHasStateRecognisesRealInstallsOnly(t *testing.T) {
+	dir := t.TempDir()
+	if HasState(dir) {
+		t.Error("empty directory reported as an app home")
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if HasState(dir) {
+		t.Error("bare .config directory reported as an app home")
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".config", "backends.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !HasState(dir) {
+		t.Error("a directory holding backends.json is an app home")
+	}
+}
+
+// Discovery is what saves a user whose shell no longer exports LLM_APP_HOME.
+func TestDiscoverAppHomeFindsANestedInstall(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	install := filepath.Join(home, "my-project", "ggrun-productions")
+	if err := os.MkdirAll(filepath.Join(install, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, ".config", "backends.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := DiscoverAppHome(); got != install {
+		t.Errorf("DiscoverAppHome() = %q, want %q", got, install)
+	}
+}
+
+func TestDiscoverAppHomePrefersTheConventionalLayout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, dir := range []string{
+		filepath.Join(home, "ggrun-productions"),
+		filepath.Join(home, "elsewhere", "ggrun-productions"),
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, ".config"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".config", "backends.json"), []byte("[]"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := DiscoverAppHome(); got != filepath.Join(home, "ggrun-productions") {
+		t.Errorf("DiscoverAppHome() = %q, want the conventional ~/ggrun-productions", got)
+	}
+}
+
+func TestDiscoverAppHomeReturnsEmptyWhenNoInstallExists(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "unrelated", "stuff"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := DiscoverAppHome(); got != "" {
+		t.Errorf("DiscoverAppHome() = %q, want empty", got)
+	}
+}
+
+// A recorded pointer must survive the install being deleted without sending
+// every later lookup to a dead path.
+func TestPointerIsIgnoredWhenTheRecordedInstallIsGone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("LLM_APP_HOME", "")
+	install := filepath.Join(home, "gone")
+	if err := os.MkdirAll(filepath.Join(install, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, ".config", "backends.json"), []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	RecordAppHome(install)
+	if got := AppHome(); got != install {
+		t.Fatalf("AppHome() = %q, want the recorded %q", got, install)
+	}
+	if err := os.RemoveAll(install); err != nil {
+		t.Fatal(err)
+	}
+	if got := AppHome(); got == install {
+		t.Error("AppHome() still points at a deleted install")
+	}
+}
+
+func TestScanIsBounded(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for i := 0; i < 60; i++ {
+		if err := os.MkdirAll(filepath.Join(home, "d"+strconv.Itoa(i), "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No install anywhere: must terminate and report nothing rather than walk
+	// the tree indefinitely.
+	if got := DiscoverAppHome(); got != "" {
+		t.Errorf("DiscoverAppHome() = %q, want empty", got)
 	}
 }

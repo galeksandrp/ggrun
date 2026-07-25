@@ -174,18 +174,207 @@ func gitApply(srcDir string, patch []byte, reverse, check bool) error {
 	return nil
 }
 
-// AppHome resolves the ggrun app home (holds .bin, .src, .config): LLM_APP_HOME
-// wins, else the parent of the .bin/bin dir the running binary lives in.
+// PointerFile records the app home for binaries that cannot derive it. The
+// installer's default target is ~/.local/bin, whose parent ~/.local holds no
+// ggrun state, so a second copy of ggrun installed there would otherwise see no
+// models and no registered backends while the real install sat untouched
+// elsewhere. Silently falling back to defaults is worse than any error: it
+// looks like the install lost its configuration.
+const PointerFile = "apphome"
+
+// HasState reports whether dir is a real ggrun app home rather than a directory
+// that merely happens to contain the binary.
+func HasState(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	for _, marker := range []string{
+		filepath.Join(dir, ".config", "backends.json"),
+		filepath.Join(dir, ".config", "config"),
+		filepath.Join(dir, ".config", "ggrun", "config"),
+	} {
+		if st, err := os.Stat(marker); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+// pointerPath is where the app home pointer lives, always under the user's own
+// config directory so every binary can find it regardless of install location.
+func pointerPath() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "ggrun", PointerFile)
+}
+
+// RecordAppHome saves the app home so any other ggrun binary resolves the same
+// install. Best effort: failing to write it only costs discoverability.
+func RecordAppHome(dir string) {
+	p := pointerPath()
+	if p == "" || dir == "" || dir == os.Getenv("HOME") || !HasState(dir) {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte(dir+"\n"), 0o644)
+}
+
+// pointedAppHome returns the recorded app home if it still holds ggrun state.
+func pointedAppHome() string {
+	p := pointerPath()
+	if p == "" {
+		return ""
+	}
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(string(body))
+	if HasState(dir) {
+		return dir
+	}
+	return ""
+}
+
+// maxDiscoveryDirs bounds the search so startup cost stays predictable on a
+// home directory with many entries.
+const maxDiscoveryDirs = 400
+
+// AppHomeFromExe derives the app home from the running binary's location, or
+// returns "" when that location says nothing about it.
+//
+// The parent of a .bin/bin directory is only an app home if it actually holds
+// ggrun state. The installer's default target is ~/.local/bin, and treating
+// ~/.local as an app home made a second copy of ggrun report no models and no
+// registered backends while the real install sat untouched elsewhere.
+//
+// Split out from AppHome so it is testable: os.Executable() inside a test
+// returns the test binary, which can never exercise this path.
+func AppHomeFromExe(exe string) string {
+	if exe == "" {
+		return ""
+	}
+	exeDir := filepath.Dir(exe)
+	switch filepath.Base(exeDir) {
+	case ".bin", "bin":
+		if parent := filepath.Dir(exeDir); HasState(parent) {
+			return parent
+		}
+	}
+	return ""
+}
+
+// DiscoverAppHome looks for a ggrun install tree when nothing else identifies
+// one. It checks the user's home directory and one level below it, which covers
+// both ~/ggrun-productions and the common ~/<project>/ggrun-productions layout,
+// and stops at the first directory holding real ggrun state.
+//
+// This is what keeps a fresh shell, a second install, or a machine that lost an
+// exported LLM_APP_HOME from presenting an empty ggrun with no models and no
+// registered backends.
+func DiscoverAppHome() string {
+	home := os.Getenv("HOME")
+	if home == "" {
+		return ""
+	}
+	// Named layouts first: cheap, and correct in the overwhelming majority of
+	// installs.
+	for _, name := range []string{"ggrun-productions", ".ggrun", filepath.Join(".local", "share", "ggrun")} {
+		if dir := filepath.Join(home, name); HasState(dir) {
+			return dir
+		}
+	}
+	// Then the home directory, then the usual places an install can be moved
+	// to, including mounted volumes. The budget is shared across every root so
+	// total work stays bounded no matter how many roots exist.
+	budget := maxDiscoveryDirs
+	roots := append([]string{home}, systemSearchRoots()...)
+	for _, root := range roots {
+		if dir := scanForState(root, 2, &budget); dir != "" {
+			return dir
+		}
+	}
+	return ""
+}
+
+// systemSearchRoots are the non-home locations an install may have been moved
+// to. Deliberately a short list rather than a whole-filesystem walk: an
+// unbounded scan would be slow on every startup and could wander into network
+// or removable mounts.
+func systemSearchRoots() []string {
+	return []string{"/opt", "/srv", "/mnt", "/media", "/usr/local/share"}
+}
+
+// scanForState looks for a ggrun app home under root, up to depth levels deep,
+// consuming from a shared budget.
+func scanForState(root string, depth int, budget *int) string {
+	if depth <= 0 || *budget <= 0 {
+		return ""
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+	var subdirs []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		// Skip dot directories: ggrun's own state lives in a .config inside a
+		// normal directory, never in a hidden top-level one, and descending
+		// into caches and VCS metadata wastes the budget.
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		if *budget--; *budget <= 0 {
+			return ""
+		}
+		dir := filepath.Join(root, name)
+		if HasState(dir) {
+			return dir
+		}
+		subdirs = append(subdirs, dir)
+	}
+	for _, dir := range subdirs {
+		if found := scanForState(dir, depth-1, budget); found != "" {
+			return found
+		}
+	}
+	return ""
+}
+
+// AppHome resolves the ggrun app home (holds .bin, .src, .config).
+//
+// Order: LLM_APP_HOME, then the parent of the .bin/bin directory the running
+// binary lives in but only when that parent actually holds ggrun state, then
+// the recorded pointer, then a bounded search of the home directory.
+//
+// A binary sitting in a plain install directory such as ~/.local/bin -- the
+// installer's own default -- does not get to claim an app home. Before this
+// ordering it did, which made a second copy of ggrun report no models and no
+// backends while the real install sat untouched, indistinguishable from a lost
+// configuration.
 func AppHome() string {
 	if h := os.Getenv("LLM_APP_HOME"); h != "" {
 		return h
 	}
 	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		switch filepath.Base(exeDir) {
-		case ".bin", "bin":
-			return filepath.Dir(exeDir)
+		if home := AppHomeFromExe(exe); home != "" {
+			return home
 		}
+	}
+	if p := pointedAppHome(); p != "" {
+		return p
+	}
+	if d := DiscoverAppHome(); d != "" {
+		// Remember it so the next run skips the search entirely.
+		RecordAppHome(d)
+		return d
 	}
 	if h := os.Getenv("HOME"); h != "" {
 		return h
