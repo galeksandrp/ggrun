@@ -217,3 +217,28 @@ func TestHoldInterruptForClaudeAbsorbsSIGINT(t *testing.T) {
 	// again once Claude Code has exited.
 	release()
 }
+
+// The shape guard fires whenever placement recomputes, which happens routinely
+// after a reboot. Without a way to pass the override through the convenience
+// command, a refused resume had no recovery path.
+func TestClaudeResumeSubcommandParsesForceAndTarget(t *testing.T) {
+	for _, tc := range []struct {
+		args       []string
+		wantTarget string
+		wantForce  bool
+	}{
+		{nil, "", false},
+		{[]string{"latest"}, "latest", false},
+		{[]string{"--force"}, "", true},
+		{[]string{"-f"}, "", true},
+		{[]string{"latest", "--force"}, "latest", true},
+		{[]string{"--force", "072e63a1-819a-4682-a742-559695c3cd76"}, "072e63a1-819a-4682-a742-559695c3cd76", true},
+		{[]string{"--claude-resume-force"}, "", true},
+	} {
+		target, force := parseClaudeResumeArgs(tc.args)
+		if target != tc.wantTarget || force != tc.wantForce {
+			t.Errorf("parseClaudeResumeArgs(%v) = (%q,%v), want (%q,%v)",
+				tc.args, target, force, tc.wantTarget, tc.wantForce)
+		}
+	}
+}

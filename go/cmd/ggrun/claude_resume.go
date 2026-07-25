@@ -295,15 +295,31 @@ func cmdClaude(args []string) {
 	case "list", "ls", "sessions":
 		cmdClaudeList()
 	case "resume", "continue":
-		target := ""
-		if len(args) > 0 {
-			target = args[0]
-		}
-		cmdClaudeResume(target)
+		target, force := parseClaudeResumeArgs(args)
+		cmdClaudeResume(target, force)
 	default:
-		fmt.Fprintln(os.Stderr, "Usage: ggrun claude [list | resume [session-id|latest]]")
+		fmt.Fprintln(os.Stderr, "Usage: ggrun claude [list | resume [session-id|latest] [--force]]")
 		os.Exit(2)
 	}
+}
+
+// parseClaudeResumeArgs splits `ggrun claude resume` arguments into the target
+// session and the shape-override flag. The override matters because placement
+// legitimately recomputes between launches -- a reboot alone can move an expert
+// layer -- so a refused resume must have a recovery path that does not require
+// reconstructing the long-form launch command by hand.
+func parseClaudeResumeArgs(args []string) (target string, force bool) {
+	for _, arg := range args {
+		switch arg {
+		case "--force", "-f", "--claude-resume-force":
+			force = true
+		default:
+			if target == "" {
+				target = arg
+			}
+		}
+	}
+	return target, force
 }
 
 func cmdClaudeList() {
@@ -338,7 +354,7 @@ func cmdClaudeList() {
 // session. It replays the recorded launch argv rather than re-deriving flags,
 // because a placement or KV default that changed since would silently
 // reinterpret the cached conversation.
-func cmdClaudeResume(target string) {
+func cmdClaudeResume(target string, force bool) {
 	cfg := loadConfigOrExit()
 	workDir, err := os.Getwd()
 	if err != nil {
@@ -363,7 +379,11 @@ func cmdClaudeResume(target string) {
 		}
 		launchArgs = []string{rec.ModelPath, "--claude-code"}
 	}
-	cmdLaunch(append(launchArgs, "--claude-resume", rec.SessionID))
+	launchArgs = append(launchArgs, "--claude-resume", rec.SessionID)
+	if force {
+		launchArgs = append(launchArgs, "--claude-resume-force")
+	}
+	cmdLaunch(launchArgs)
 }
 
 // describeClaudeResume reports what a resume will actually recover, so the cost
