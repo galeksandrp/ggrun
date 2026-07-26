@@ -624,22 +624,24 @@ func findSpecializedCandidate(target *ModelProfile, modelDir string, opts Option
 	if target == nil || modelDir == "" {
 		return ""
 	}
-	entries, err := os.ReadDir(modelDir)
-	if err != nil {
-		return ""
-	}
+	// Search subdirectories too. ggrun's own downloader stores each model in a
+	// per-repository directory, and `ggrun models list` presents that layout,
+	// so a flat scan of modelDir could never see a companion that ggrun itself
+	// had placed there. Every locally downloaded MTP/DFlash/EAGLE drafter was
+	// therefore invisible: speculation reported "no compatible drafter" and
+	// fell through to a download attempt for a file already on disk.
+	paths := specCandidateFiles(modelDir)
 	type candidate struct {
 		path string
 		size int64
 		rank int
 	}
 	var matches []candidate
-	for _, entry := range entries {
-		name := strings.ToLower(entry.Name())
-		if entry.IsDir() || !strings.HasSuffix(name, ".gguf") || !draftFilenameLooksRelevantForKind(name, kind) {
+	for _, path := range paths {
+		name := strings.ToLower(filepath.Base(path))
+		if !draftFilenameLooksRelevantForKind(name, kind) {
 			continue
 		}
-		path := filepath.Join(modelDir, entry.Name())
 		if path == target.Path {
 			continue
 		}
@@ -648,14 +650,14 @@ func findSpecializedCandidate(target *ModelProfile, modelDir string, opts Option
 			continue
 		}
 		if err := verifyKnownLocalSpecArtifact(path, target, kind); err != nil {
-			fmt.Fprintf(os.Stderr, "[spec] rejecting pinned companion %s: %v\n", entry.Name(), err)
+			fmt.Fprintf(os.Stderr, "[spec] rejecting pinned companion %s: %v\n", filepath.Base(path), err)
 			continue
 		}
 		if _, err := validateSpecCandidate(path, target, opts.BackendTag, kind); err != nil {
 			continue
 		}
 		if err := validateSpecCandidateBackend(path, opts); err != nil {
-			fmt.Fprintf(os.Stderr, "[spec] rejecting local %s companion %s: selected backend cannot load it: %v\n", strings.ToUpper(kind), entry.Name(), err)
+			fmt.Fprintf(os.Stderr, "[spec] rejecting local %s companion %s: selected backend cannot load it: %v\n", strings.ToUpper(kind), filepath.Base(path), err)
 			continue
 		}
 		matches = append(matches, candidate{path: path, size: fi.Size(), rank: draftCandidateRank(path, kind)})
@@ -670,6 +672,52 @@ func findSpecializedCandidate(target *ModelProfile, modelDir string, opts Option
 		return matches[i].size < matches[j].size
 	})
 	return matches[0].path
+}
+
+// specCandidateFiles lists .gguf files in modelDir and one level of
+// subdirectories, which is how ggrun lays models out on disk. Depth is bounded
+// deliberately: a model directory can hold hundreds of gigabytes, and a full
+// walk would stat every shard of every model on every launch.
+func specCandidateFiles(modelDir string) []string {
+	var out []string
+	entries, err := os.ReadDir(modelDir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() {
+			if strings.HasSuffix(strings.ToLower(name), ".gguf") {
+				out = append(out, filepath.Join(modelDir, name))
+			}
+			continue
+		}
+		sub := filepath.Join(modelDir, name)
+		children, err := os.ReadDir(sub)
+		if err != nil {
+			continue
+		}
+		for _, child := range children {
+			if child.IsDir() {
+				// One more level: quantisation subdirectories such as
+				// <repo>/UD-Q4_K_XL/ are common.
+				deeper, err := os.ReadDir(filepath.Join(sub, child.Name()))
+				if err != nil {
+					continue
+				}
+				for _, leaf := range deeper {
+					if !leaf.IsDir() && strings.HasSuffix(strings.ToLower(leaf.Name()), ".gguf") {
+						out = append(out, filepath.Join(sub, child.Name(), leaf.Name()))
+					}
+				}
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(child.Name()), ".gguf") {
+				out = append(out, filepath.Join(sub, child.Name()))
+			}
+		}
+	}
+	return out
 }
 
 func backendSupportsMTP(backendTag string) bool {
@@ -1038,10 +1086,30 @@ func specializedArchitectureCompatibleForBackend(target *ModelProfile, kind, can
 		}
 		return reviewedSpecializedArchitecturePair(kind, targetArch, candidateArch, backendTag)
 	case "dflash":
+		// A DFlash speculator is a different architecture from its target by
+		// design, and publishers do not encode the target in the name:
+		// poolside ships Laguna's companion as general.architecture "dflash",
+		// not "laguna-dflash". Requiring the target's name as a prefix
+		// therefore rejected the only DFlash drafter that exists for this
+		// target, with the drafter sitting in the model directory.
+		//
+		// A name was never the proof in any case. The caller enforces the
+		// substantive identity immediately after this check -- embedding
+		// length, vocab size and tokenizer hash (or model plus pre) must all
+		// match -- so a companion built for a different target still cannot be
+		// accepted.
 		if !strings.Contains(candidateArch, "dflash") {
 			return false
 		}
-		return targetArch == "" || targetArch == "unknown" || candidateArch == targetArch || strings.HasPrefix(candidateArch, targetArch+"-")
+		if candidateArch == "dflash" {
+			// Names no family at all; identity is proven dimensionally.
+			return true
+		}
+		// But a companion whose architecture does name a family must name this
+		// one, so a Qwen speculator can never be paired with a DeepSeek target
+		// on the strength of the shared "dflash" substring alone.
+		return targetArch == "" || targetArch == "unknown" ||
+			candidateArch == targetArch || strings.HasPrefix(candidateArch, targetArch+"-")
 	default:
 		return true
 	}
