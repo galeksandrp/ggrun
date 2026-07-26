@@ -967,7 +967,7 @@ func TestComputeDeepSeekV4SplitOwnerStaysExpertFreeAfterStartupProbe(t *testing.
 	// A measurement for another parallel shape is deliberately not evidence for
 	// this foreground/P1 launch.
 	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 4,
-		map[int]int{0: 2048, 1: 128, 2: 128}, nil, 0); err != nil {
+		map[int]int{0: 2048, 1: 128, 2: 128}, nil, nil, 0); err != nil {
 		t.Fatalf("write mismatched probe: %v", err)
 	}
 	wrongShape, err := Compute(caps, model, opts)
@@ -981,7 +981,7 @@ func TestComputeDeepSeekV4SplitOwnerStaysExpertFreeAfterStartupProbe(t *testing.
 	// Even an exact startup probe does not remove the gate: it measures loading,
 	// not a 60k-token request with the final runtime graph shape.
 	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1,
-		map[int]int{0: 2048, 1: 128, 2: 128}, nil, 0); err != nil {
+		map[int]int{0: 2048, 1: 128, 2: 128}, nil, nil, 0); err != nil {
 		t.Fatalf("write exact probe: %v", err)
 	}
 	stillConservative, err := Compute(caps, model, opts)
@@ -1063,7 +1063,7 @@ func TestComputeHybridMoEProtectsEverySplitOwner(t *testing.T) {
 	}
 
 	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1,
-		map[int]int{0: 1024, 1: 1024}, nil, 0); err != nil {
+		map[int]int{0: 1024, 1: 1024}, nil, nil, 0); err != nil {
 		t.Fatalf("write startup probe: %v", err)
 	}
 	strategy, err = Compute(caps, model, opts)
@@ -1175,7 +1175,7 @@ func TestMaximizeMoEGPUFitByUBatchRescuesZeroExpertPlacement(t *testing.T) {
 		64:  {0: 2470, 1: 2793, 2: 2797},
 	}
 	for ub, byGPU := range measured {
-		if err := writeProbeCacheForModel(cacheDir, model, 1048576, ub, "high", "gpu", "llama", gpus, 4, byGPU, nil, 0); err != nil {
+		if err := writeProbeCacheForModel(cacheDir, model, 1048576, ub, "high", "gpu", "llama", gpus, 4, byGPU, nil, nil, 0); err != nil {
 			t.Fatalf("seed probe cache ubatch=%d: %v", ub, err)
 		}
 	}
@@ -1345,7 +1345,7 @@ func TestMaximizeMoEGPUFitByUBatchRescuesExcludedGPU(t *testing.T) {
 		64:  {0: 2500, 1: 1300, 2: 500},
 	}
 	for ub, byGPU := range measured {
-		if err := writeProbeCacheForModel(cacheDir, model, 262144, ub, "high", "gpu", "llama", gpus, 4, byGPU, nil, 0); err != nil {
+		if err := writeProbeCacheForModel(cacheDir, model, 262144, ub, "high", "gpu", "llama", gpus, 4, byGPU, nil, nil, 0); err != nil {
 			t.Fatalf("seed probe cache ubatch=%d: %v", ub, err)
 		}
 	}

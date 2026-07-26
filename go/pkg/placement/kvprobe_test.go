@@ -149,7 +149,7 @@ func TestLoadProbeCacheDropsLegacyStartupOOMDoubleCount(t *testing.T) {
 	// Schema-2 growth is known to come from a post-health crash and must remain,
 	// even in the unlikely event its measured size equals the compute buffer.
 	if err := writeProbeCacheForModel(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1,
-		map[int]int{2: 8616}, map[int]int{2: 8616}, 0); err != nil {
+		map[int]int{2: 8616}, map[int]int{2: 8616}, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	got = loadProbeCache(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1)
@@ -274,10 +274,10 @@ func TestProbeCacheRoundTripRuntimeKey(t *testing.T) {
 	if wrongPlacement := loadProbeCache(dir, model, 1048576, 512, "mid", "cpu", "llama", gpus, 1); wrongPlacement != nil {
 		t.Fatalf("probe must not cross KV placement: %#v", wrongPlacement)
 	}
-	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "mid", "gpu", "llama", gpus, 1, 2, 1000); err != nil {
+	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "mid", "gpu", "llama", gpus, 1, 2, 1000, false); err != nil {
 		t.Fatalf("record runtime growth: %v", err)
 	}
-	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "mid", "gpu", "llama", gpus, 1, 2, 900); err != nil {
+	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "mid", "gpu", "llama", gpus, 1, 2, 900, false); err != nil {
 		t.Fatalf("record lower runtime growth: %v", err)
 	}
 	got = loadProbeCache(dir, model, 1048576, 512, "mid", "gpu", "llama", gpus, 1)
@@ -295,11 +295,11 @@ func TestProbeCacheSeparatesParallelSlotCounts(t *testing.T) {
 	gpus := []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", Driver: "580"}}
 
 	if err := writeProbeCacheForModel(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1,
-		map[int]int{0: 8000}, map[int]int{0: 500}, 0); err != nil {
+		map[int]int{0: 8000}, map[int]int{0: 500}, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeProbeCacheForModel(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 4,
-		map[int]int{0: 12000}, map[int]int{0: 900}, 0); err != nil {
+		map[int]int{0: 12000}, map[int]int{0: 900}, nil, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -358,5 +358,95 @@ func TestSetCtxSizeArg(t *testing.T) {
 	got = setCtxSizeArg([]string{"-m", "x"}, 8192)
 	if got[len(got)-2] != "--ctx-size" || got[len(got)-1] != "8192" {
 		t.Fatalf("ctx not appended: %v", got)
+	}
+}
+
+// A CUDA VMM failure carries no allocation size, so ggrun falls back to a flat
+// fraction of the card. Two aborts on a 24 GiB card compounded that guess to
+// 4914 MiB -- 3.6 expert layers withheld permanently -- and one of the aborts
+// was a malformed launch that proved nothing about capacity.
+func TestEstimatedRuntimeGrowthDoesNotAccumulate(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "/models/big-moe.gguf", Basename: "big-moe.gguf", TotalSizeMB: 70000}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}
+
+	for i := 0; i < 3; i++ {
+		if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4, 0, 2457, true); err != nil {
+			t.Fatalf("record estimate %d: %v", i, err)
+		}
+	}
+	got := RuntimeGraphGrowthByGPU(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4)
+	if got[0] != 2457 {
+		t.Errorf("three identical estimates gave %d MiB, want 2457 (no accumulation)", got[0])
+	}
+}
+
+// A measurement is better evidence than a fraction of the card, even when it is
+// smaller. Backing off is safe: a CUDA out-of-memory aborts the backend, which
+// ggrun derates and restarts, rather than taking the host down.
+func TestMeasuredRuntimeGrowthReplacesAnEstimate(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "/models/big-moe.gguf", Basename: "big-moe.gguf", TotalSizeMB: 70000}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}
+
+	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4, 0, 2457, true); err != nil {
+		t.Fatal(err)
+	}
+	// A real allocation size, smaller than the guess.
+	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4, 0, 900, false); err != nil {
+		t.Fatal(err)
+	}
+	if got := RuntimeGraphGrowthByGPU(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4); got[0] != 900 {
+		t.Errorf("measurement did not replace the estimate: got %d MiB, want 900", got[0])
+	}
+	// And a later guess must not raise a value that was actually observed.
+	if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4, 0, 2457, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := RuntimeGraphGrowthByGPU(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4); got[0] != 900 {
+		t.Errorf("an estimate overwrote a measurement: got %d MiB, want 900", got[0])
+	}
+}
+
+// Measured values still accumulate by maximum: a larger observed allocation is
+// strictly better evidence than a smaller one.
+func TestMeasuredRuntimeGrowthKeepsTheLargestObservation(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "/models/big-moe.gguf", Basename: "big-moe.gguf", TotalSizeMB: 70000}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}
+	for _, mb := range []int{1000, 1800, 900} {
+		if err := RecordRuntimeGraphGrowthFromOOM(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4, 0, mb, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := RuntimeGraphGrowthByGPU(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4); got[0] != 1800 {
+		t.Errorf("measured growth = %d MiB, want the largest observation 1800", got[0])
+	}
+}
+
+// Nothing else shrinks learned growth, so a scope taxed by a crash that no
+// longer reproduces needs a way back.
+func TestClearRuntimeGraphGrowthKeepsComputeBuffers(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "/models/big-moe.gguf", Basename: "big-moe.gguf", TotalSizeMB: 70000}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}
+
+	if err := writeProbeCacheForModel(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4,
+		map[int]int{0: 6117}, map[int]int{0: 4914}, map[int]bool{0: true}, 128); err != nil {
+		t.Fatal(err)
+	}
+	if err := ClearRuntimeGraphGrowth(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	pc := loadProbeCache(dir, model, 1048576, 512, "q4_0", "cpu", "llama", gpus, 4)
+	if pc == nil {
+		t.Fatal("probe cache removed entirely; only learned growth should be cleared")
+	}
+	if len(pc.RuntimeGraphGrowthByGPU) != 0 {
+		t.Errorf("growth not cleared: %#v", pc.RuntimeGraphGrowthByGPU)
+	}
+	// The expensive measurements must survive.
+	if pc.ComputeBufByGPU[0] != 6117 || pc.KVPerLayerMB != 128 {
+		t.Errorf("clear discarded measured buffers: %#v", pc)
 	}
 }

@@ -87,6 +87,8 @@ func main() {
 		cmdMemoryProbe(args[1:])
 	case "kv-probe":
 		cmdKVProbe(args[1:])
+	case "probe-reset":
+		cmdProbeReset(args[1:])
 	case "record-longctx-validation":
 		cmdRecordLongContextValidation(args[1:])
 	case "download":
@@ -125,6 +127,8 @@ Commands:
   detect               Detect hardware capabilities
   probe                Check free GPU/RAM memory
   memory-probe <model> Measure a contained backend memory plan and stop (--json supported)
+  probe-reset <model>  Clear learned runtime-VRAM reserve for a launch shape so it
+                       is re-derived; measured compute/KV probes are kept
   kv-probe <model>     Measure real KV cache size (2 short launches) and cache it,
                        so context sizing is exact for compressed-attention models
   record-longctx-validation <model> --prompt-tokens N
@@ -175,7 +179,7 @@ Launch flags:
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "memory-probe", "kv-probe", "record-longctx-validation", "download", "tune", "spec-test", "recommend", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
+	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "record-longctx-validation", "download", "tune", "spec-test", "recommend", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
 		return true
 	default:
 		return false
@@ -2179,7 +2183,7 @@ func recordRuntimeOOMLog(req *launchRequest, cfg *config.Config, model *placemen
 	if !ok {
 		return 0, 0, false, false, false, nil
 	}
-	if err = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, reserveMB); err != nil {
+	if err = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, reserveMB, estimated); err != nil {
 		return device, reserveMB, estimated, false, true, err
 	}
 	changed = reserveMB > prior[device]
@@ -2636,7 +2640,7 @@ func cmdLaunch(args []string) {
 		}
 
 		runtimeOOMRetries++
-		_ = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, allocMB)
+		_ = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, allocMB, estimated)
 		if estimated {
 			fmt.Fprintf(os.Stderr, "[launch] server crashed after health check: CUDA VMM OOM on device %d omitted its allocation size — reserving %d MiB, re-planning and relaunching (attempt %d/%d)...\n",
 				device, allocMB, runtimeOOMRetries, maxRuntimeOOMRetries)

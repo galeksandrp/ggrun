@@ -4045,14 +4045,18 @@ func RecordMeasuredComputeBuffers(cacheDir string, model *ModelProfile, ctxSize,
 	}
 	pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel)
 	growth := map[int]int{}
+	estimatedByGPU := map[int]bool{}
 	kvPerLayerMB := 0
 	if pc != nil {
 		for k, v := range pc.RuntimeGraphGrowthByGPU {
 			growth[k] = v
 		}
+		for k, v := range pc.RuntimeGraphGrowthEstimatedByGPU {
+			estimatedByGPU[k] = v
+		}
 		kvPerLayerMB = pc.KVPerLayerMB
 	}
-	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, growth, kvPerLayerMB)
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, growth, estimatedByGPU, kvPerLayerMB)
 }
 
 // RunPostLaunchModelProbe records measured compute-buffer data for the exact
@@ -4184,11 +4188,30 @@ func longContextValidationPath(cacheDir string, model *ModelProfile, ctxSize, ub
 	return filepath.Join(cacheDir, "validations", md5Hash12(key)+".longctx")
 }
 
-// RecordRuntimeGraphGrowth stores exact per-device runtime graph growth for the
-// current runtime signature. The values must come from measurement: VRAM delta
-// after a canary or an exact cudaMalloc allocation request parsed from backend
-// logs. It intentionally never adds static margins.
+// RecordRuntimeGraphGrowth stores per-device runtime graph growth for the
+// current runtime signature.
+//
+// A measured value is an exact cudaMalloc request parsed from the backend log,
+// or a VRAM delta after a canary. Those accumulate by maximum, because a larger
+// observed allocation is strictly better evidence than a smaller one.
+//
+// An estimated value is a fallback used when a CUDA VMM failure carries no
+// allocation size: a flat fraction of the card, which is a guess about the
+// hardware rather than an observation of it. Estimates must not accumulate. Two
+// aborts on a 24 GiB card previously compounded to 4914 MiB -- 3.6 expert
+// layers withheld permanently -- and one of those aborts was a malformed launch
+// that proved nothing about capacity. A second guess is not twice the evidence.
+//
+// A measurement always supersedes an estimate, whatever their sizes: a real
+// allocation size is better evidence than a fraction of the card even when it
+// is smaller. Backing off is safe here because a CUDA out-of-memory aborts the
+// backend process, which ggrun's recovery derates and restarts; it does not
+// take the host down.
 func RecordRuntimeGraphGrowth(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, growthByGPU map[int]int) error {
+	return recordRuntimeGraphGrowth(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, growthByGPU, false)
+}
+
+func recordRuntimeGraphGrowth(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, growthByGPU map[int]int, estimated bool) error {
 	if model == nil || ctxSize <= 0 || ubatch <= 0 || len(growthByGPU) == 0 {
 		return nil
 	}
@@ -4196,6 +4219,7 @@ func RecordRuntimeGraphGrowth(cacheDir string, model *ModelProfile, ctxSize, uba
 	computeByGPU := map[int]int{}
 	kvPerLayerMB := 0
 	mergedGrowth := map[int]int{}
+	mergedEstimated := map[int]bool{}
 	if pc != nil {
 		for k, v := range pc.ComputeBufByGPU {
 			computeByGPU[k] = v
@@ -4203,24 +4227,60 @@ func RecordRuntimeGraphGrowth(cacheDir string, model *ModelProfile, ctxSize, uba
 		for k, v := range pc.RuntimeGraphGrowthByGPU {
 			mergedGrowth[k] = v
 		}
+		for k, v := range pc.RuntimeGraphGrowthEstimatedByGPU {
+			mergedEstimated[k] = v
+		}
 		kvPerLayerMB = pc.KVPerLayerMB
 	}
 	for idx, v := range growthByGPU {
-		if v > mergedGrowth[idx] {
+		prior, had := mergedGrowth[idx]
+		priorEstimated := mergedEstimated[idx]
+		switch {
+		case !had:
+			// Nothing known yet: take it, remembering how it was obtained.
 			mergedGrowth[idx] = v
+			mergedEstimated[idx] = estimated
+		case !estimated && priorEstimated:
+			// Measurement replaces a guess outright, even downwards.
+			mergedGrowth[idx] = v
+			mergedEstimated[idx] = false
+		case estimated && !priorEstimated:
+			// A guess must not raise a value that was actually observed.
+		default:
+			// Same kind of evidence on both sides: keep the larger. For
+			// estimates this caps them rather than summing, which is what made
+			// repeated aborts compound.
+			if v > prior {
+				mergedGrowth[idx] = v
+			}
 		}
 	}
-	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, mergedGrowth, kvPerLayerMB)
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, mergedGrowth, mergedEstimated, kvPerLayerMB)
 }
 
 // RecordRuntimeGraphGrowthFromOOM records a runtime graph allocation observed in
-// a cudaMalloc OOM line. allocMB is already the backend-requested size, so using
-// it as growth is measured accounting, not a reserve margin.
-func RecordRuntimeGraphGrowthFromOOM(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel, device, allocMB int) error {
+// a cudaMalloc OOM line. When estimated is false, allocMB is the size the
+// backend actually asked for, which is measured accounting rather than a
+// margin. When it is true the backend gave no size and allocMB is a fallback
+// fraction of the card, which is stored as such so a later measurement can
+// replace it.
+func RecordRuntimeGraphGrowthFromOOM(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel, device, allocMB int, estimated bool) error {
 	if device < 0 || allocMB <= 0 {
 		return nil
 	}
-	return RecordRuntimeGraphGrowth(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, map[int]int{device: allocMB})
+	return recordRuntimeGraphGrowth(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, map[int]int{device: allocMB}, estimated)
+}
+
+// ClearRuntimeGraphGrowth removes learned growth for one runtime signature so it
+// can be derived again. Nothing else shrinks these values, so a scope taxed by a
+// crash that no longer reproduces has no other way back.
+func ClearRuntimeGraphGrowth(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int) error {
+	pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel)
+	if pc == nil {
+		return nil
+	}
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
+		pc.ComputeBufByGPU, map[int]int{}, map[int]bool{}, pc.KVPerLayerMB)
 }
 
 // RunPostLaunchModelProbeVRAMDelta writes per-GPU compute-buffer probe cache from
@@ -4354,12 +4414,14 @@ func RunPostLaunchModelProbeVRAMDelta(
 	// Preserve any runtime-growth history from a previous OOM so the probe
 	// cache does not silently erase it (audit cross-check #3).
 	var mergedGrowth map[int]int
+	var mergedEstimated map[int]bool
 	if existing != nil {
 		mergedGrowth = existing.RuntimeGraphGrowthByGPU
+		mergedEstimated = existing.RuntimeGraphGrowthEstimatedByGPU
 	}
 
 	if err := writeProbeCacheForModel(cacheDir, model, strategy.ContextSize, strategy.UBatchSize,
-		strategy.KVQuality, strategy.KVPlacement, backendTag, gpus, strategy.Parallel, computeByGPU, mergedGrowth, 0); err == nil {
+		strategy.KVQuality, strategy.KVPlacement, backendTag, gpus, strategy.Parallel, computeByGPU, mergedGrowth, mergedEstimated, 0); err == nil {
 		indices := make([]int, 0, len(computeByGPU))
 		for idx := range computeByGPU {
 			indices = append(indices, idx)
@@ -4384,7 +4446,7 @@ func RunPostLaunchModelProbe(cacheDir string, model *ModelProfile, ctxSize, ubat
 	if len(computeByGPU) == 0 && kvPerLayerMB <= 0 {
 		return false
 	}
-	if err := writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, nil, kvPerLayerMB); err == nil {
+	if err := writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, nil, nil, kvPerLayerMB); err == nil {
 		if len(computeByGPU) == 0 {
 			return true
 		}
@@ -4599,7 +4661,11 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 		return nil
 	}
 	content := string(data)
-	pc := &probeCache{ComputeBufByGPU: map[int]int{}, RuntimeGraphGrowthByGPU: map[int]int{}}
+	pc := &probeCache{
+		ComputeBufByGPU:                  map[int]int{},
+		RuntimeGraphGrowthByGPU:          map[int]int{},
+		RuntimeGraphGrowthEstimatedByGPU: map[int]bool{},
+	}
 	schemaVersion := 1
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
@@ -4628,6 +4694,11 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			v, valErr := strconv.Atoi(val)
 			if idxErr == nil && valErr == nil && idx >= 0 && v >= 0 {
 				pc.ComputeBufByGPU[idx] = v
+			}
+		case strings.HasPrefix(k, "PROBED_RUNTIME_GRAPH_GROWTH_ESTIMATED_CUDA"):
+			idxRaw := strings.TrimPrefix(k, "PROBED_RUNTIME_GRAPH_GROWTH_ESTIMATED_CUDA")
+			if idx, err := strconv.Atoi(idxRaw); err == nil && idx >= 0 {
+				pc.RuntimeGraphGrowthEstimatedByGPU[idx] = val == "1" || strings.EqualFold(val, "true")
 			}
 		case strings.HasPrefix(k, "PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(k, "PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA")
@@ -4744,13 +4815,25 @@ type systemProbe struct {
 }
 
 type probeCache struct {
-	ComputeBufMB            int
-	ComputeBufByGPU         map[int]int
+	ComputeBufMB    int
+	ComputeBufByGPU map[int]int
+	// RuntimeGraphGrowthByGPU is VRAM a real request needed beyond the
+	// load-time graph reserve, keyed by GPU index.
 	RuntimeGraphGrowthByGPU map[int]int
-	KVPerLayerMB            int
+	// RuntimeGraphGrowthEstimatedByGPU marks entries that were guessed rather
+	// than read from the backend.
+	//
+	// A CUDA VMM out-of-memory line carries no allocation size, so ggrun falls
+	// back to a flat fraction of the card. Storing that indistinguishably from
+	// a measured size meant a guess could never be corrected, and repeated
+	// crashes compounded it: on a 24 GiB card two aborts accumulated 4914 MiB,
+	// which is 3.6 expert layers withheld permanently. One of those aborts was
+	// a malformed launch that proved nothing about capacity.
+	RuntimeGraphGrowthEstimatedByGPU map[int]bool
+	KVPerLayerMB                     int
 }
 
-const probeCacheSchema = 2
+const probeCacheSchema = 3
 
 // probeParallelKey preserves the legacy serial key (0) for normal --parallel 1
 // launches while isolating multi-slot graph measurements such as Claude Code's
@@ -4804,10 +4887,10 @@ func WriteProbeCache(cacheDir, modelName string, computeBufMB, kvPerLayerMB int)
 // per-model/runtime cache consumed by placement. computeByGPU is keyed by CUDA
 // device index as emitted in the backend log.
 func WriteProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, computeByGPU map[int]int, kvPerLayerMB int) error {
-	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, 0, computeByGPU, nil, kvPerLayerMB)
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, 0, computeByGPU, nil, nil, kvPerLayerMB)
 }
 
-func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, kvPerLayerMB int) error {
+func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, estimatedByGPU map[int]bool, kvPerLayerMB int) error {
 	parallelKey := probeParallelKey(parallel)
 	path := probeCachePath(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallelKey)
 	if path == "" {
@@ -4824,6 +4907,12 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	for idx, v := range computeByGPU {
 		mergedCompute[idx] = v
 	}
+	// A nil growth map means "leave what is already recorded alone", which is
+	// how the compute-buffer-only writers preserve it. A non-nil map is
+	// authoritative: its caller has already applied the estimate-versus-
+	// measurement rules, and re-merging by maximum here would silently undo a
+	// deliberate downward correction or a clear.
+	authoritativeGrowth := runtimeGrowthByGPU != nil
 	mergedGrowth := map[int]int{}
 	for idx, v := range runtimeGrowthByGPU {
 		mergedGrowth[idx] = v
@@ -4834,9 +4923,12 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 				mergedCompute[idx] = v
 			}
 		}
-		for idx, v := range existing.RuntimeGraphGrowthByGPU {
-			if v > mergedGrowth[idx] {
+		if !authoritativeGrowth {
+			for idx, v := range existing.RuntimeGraphGrowthByGPU {
 				mergedGrowth[idx] = v
+			}
+			if estimatedByGPU == nil {
+				estimatedByGPU = existing.RuntimeGraphGrowthEstimatedByGPU
 			}
 		}
 		if kvPerLayerMB <= 0 {
@@ -4875,6 +4967,9 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	for _, idx := range growthIndices {
 		if mergedGrowth[idx] > 0 {
 			fmt.Fprintf(&b, "PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA%d=%d\n", idx, mergedGrowth[idx])
+			if estimatedByGPU[idx] {
+				fmt.Fprintf(&b, "PROBED_RUNTIME_GRAPH_GROWTH_ESTIMATED_CUDA%d=1\n", idx)
+			}
 		}
 	}
 	if kvPerLayerMB > 0 {
