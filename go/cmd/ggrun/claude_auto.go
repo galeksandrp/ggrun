@@ -404,6 +404,11 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 		return err
 	}
 	r.router = router
+	// Point Claude Code's cheap tiers at the companion backend when one is
+	// actually running. With no separate companion the alias must stay unset,
+	// so cheap-tier work continues to the main model rather than into a lane
+	// that loops back to the same server.
+	router.SetCompanion("local", r.reviewerPort > 0)
 	// Recording is evidence, not a dependency: a metrics failure must not stop
 	// the user's launch.
 	metricsPath := claudeRouterMetricsPath(cfg, router.Port())

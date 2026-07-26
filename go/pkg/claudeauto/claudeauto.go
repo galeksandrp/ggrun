@@ -246,14 +246,33 @@ func IsClassifierRequest(body []byte) bool {
 // Router exposes a loopback-only endpoint and sends classifier requests to the
 // reviewer while transparently streaming all normal traffic to the main model.
 type Router struct {
-	server        *http.Server
-	ln            net.Listener
-	port          int
-	sched         *scheduler
-	maxMainActive int
-	mainActive    atomic.Int64
-	mainQueued    atomic.Int64
-	metrics       *metricsSink
+	server         *http.Server
+	ln             net.Listener
+	port           int
+	sched          *scheduler
+	maxMainActive  int
+	companionAlias string
+	hasCompanion   bool
+	mainActive     atomic.Int64
+	mainQueued     atomic.Int64
+	metrics        *metricsSink
+}
+
+// SetCompanion enables the cheap-tier lane. alias is the model name the
+// companion backend was launched with; hasSeparateBackend must be false when
+// the companion URL is the main model, so cheap-tier work is not routed into a
+// lane that leads back to the same server.
+func (r *Router) SetCompanion(alias string, hasSeparateBackend bool) {
+	if r == nil {
+		return
+	}
+	r.companionAlias = strings.TrimSpace(alias)
+	r.hasCompanion = hasSeparateBackend
+}
+
+// utilityEnabled reports whether cheap-tier requests have somewhere to go.
+func (r *Router) utilityEnabled() bool {
+	return r != nil && r.hasCompanion
 }
 
 // StartRouter starts the local request router on an automatically selected
@@ -313,6 +332,17 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 		}
 		if IsClassifierRequest(body) {
 			router.serve(w, r, reviewerProxy, routeReviewer, body)
+			return
+		}
+		// Claude Code's cheap tiers address the utility alias. Send that work
+		// to the companion backend instead of the main model, rewriting the
+		// model field to the alias the companion was launched with so it does
+		// not need to know ggrun's routing labels.
+		if router.utilityEnabled() && IsUtilityRequest(body) {
+			body = utilityBody(body, router.companionAlias)
+			r.Body = io.NopCloser(bodyReader(body))
+			r.ContentLength = int64(len(body))
+			router.serve(w, r, reviewerProxy, routeUtility, body)
 			return
 		}
 		router.serve(w, r, mainProxy, routeMain, body)

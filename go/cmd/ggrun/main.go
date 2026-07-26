@@ -23,6 +23,7 @@ import (
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/benchmark"
+	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/daemon"
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -3484,8 +3485,11 @@ func claudeCodeEnv(host string, port int, serverArgs []string) []string {
 		fmt.Sprintf("ANTHROPIC_BASE_URL=http://%s:%d", clientHost, port),
 		"ANTHROPIC_AUTH_TOKEN=ggrun",
 		"ANTHROPIC_MODEL=local",
-		"ANTHROPIC_SMALL_FAST_MODEL=local",
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=local",
+		// The cheap tiers address the utility alias. ggrun's router resolves it
+		// to the companion backend when one is running and falls back to the
+		// main model otherwise, so nothing can reach the vendor API either way.
+		"ANTHROPIC_SMALL_FAST_MODEL="+claudeauto.UtilityAlias,
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+claudeauto.UtilityAlias,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL=local",
 		"ANTHROPIC_DEFAULT_OPUS_MODEL=local",
 		// xhigh is Claude Code's recommended balance for coding and agentic work.
