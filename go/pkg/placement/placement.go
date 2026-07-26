@@ -3223,30 +3223,22 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 	// always overwrites this with a real, headroom-based value (0 included).
 	maxCheckpoints := -1
 
-	// Multi-GPU CRAM
+	// The prompt cache lives in host RAM, not VRAM: server_prompt_cache copies
+	// slot state out through llama_state_seq_get_data into host buffers and
+	// caps itself in MiB. Sizing it from VRAM headroom therefore disabled it
+	// exactly when it is most valuable -- a model large enough to fill VRAM is
+	// also the one whose re-prefill costs the most. On a 3-GPU host serving a
+	// 68 GiB MoE this produced `-cram 0`, which in turn disabled
+	// --cache-idle-slots, so an agent evicted from a slot lost its whole
+	// prefix instead of parking it in the ~99 GiB of free RAM.
+	//
+	// The host-RAM budget computed above is correct for every strategy, so the
+	// multi-GPU case only adds a checkpoint policy on top of it.
 	if numGPUs > 1 && s.Type != CPUOnly {
-		// TOTAL_VRAM_MB = sum of FREE VRAM
-		totalFreeVRAM := 0
-		for _, g := range caps.GPUs {
-			totalFreeVRAM += g.VRAMFreeMB()
-		}
-		modelOnGPUMB := totalSizeMB * vramOverheadPercent / 100
-		if modelOnGPUMB > totalFreeVRAM {
-			modelOnGPUMB = totalFreeVRAM
-		}
-		vramHeadroom := totalFreeVRAM - modelOnGPUMB - kvTotalMB - computePerGPUMB*numGPUs
-		if vramHeadroom < 0 {
-			vramHeadroom = 0
-		}
-		cacheRAMMB := vramHeadroom / 2
-		if cacheRAMMB > 4096 {
-			cacheRAMMB = 4096
-		}
-		if cacheRAMMB < 256 {
-			cacheRAMMB = 0
+		if cram < minCramMB {
 			maxCheckpoints = 0
 		} else {
-			maxCheckpoints = cacheRAMMB / 200
+			maxCheckpoints = cram / 200
 			if maxCheckpoints < 2 {
 				maxCheckpoints = 2
 			}
@@ -3254,7 +3246,6 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 				maxCheckpoints = 16
 			}
 		}
-		cram = cacheRAMMB
 	}
 
 	// A zero checkpoint policy makes every append-only agent turn re-evaluate the

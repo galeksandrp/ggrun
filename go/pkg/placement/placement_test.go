@@ -1210,9 +1210,14 @@ func TestMaximizeMoEGPUFitByUBatchRescuesZeroExpertPlacement(t *testing.T) {
 // TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint is the end-to-end
 // version of the bounded hybrid policy: runs the real
 // Compute() -> computeCRAM -> Args() pipeline against the exact hardware and
-// model shape used for 128GB DeepSeek-V4. VRAM is too tight for host prompt
-// CRAM, but the machine has ample host headroom for one recurrent-state
-// checkpoint. The default of 32 remains forbidden.
+// model shape used for 128GB DeepSeek-V4.
+//
+// This test previously asserted `-cram 0`, on the reasoning that VRAM was too
+// tight for the prompt cache. That was wrong: the prompt cache is held in host
+// RAM, and this fixture keeps roughly 37 GiB free after the weights load. The
+// old expectation disabled caching precisely on the models whose re-prefill
+// costs the most. The bounded-checkpoint property the test is named for is
+// unchanged -- one recurrent checkpoint, never the backend default of 32.
 func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
@@ -1253,8 +1258,12 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compute failed: %v", err)
 	}
-	if strat.CRAM != 0 {
-		t.Fatalf("expected computeCRAM to disable the prompt cache under tight VRAM, got CRAM=%d", strat.CRAM)
+	// The prompt cache is host RAM, so a VRAM-saturated model still gets one.
+	if strat.CRAM < minCramMB {
+		t.Fatalf("expected a host-RAM prompt cache, got CRAM=%d", strat.CRAM)
+	}
+	if strat.CRAM > 37623/10+1 {
+		t.Fatalf("prompt cache %d MiB exceeds the host RAM budget after load", strat.CRAM)
 	}
 	if strat.MaxCheckpoints != 1 {
 		t.Fatalf("expected one bounded recurrent checkpoint, got MaxCheckpoints=%d", strat.MaxCheckpoints)
@@ -1266,8 +1275,8 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 		t.Fatalf("expected x1 GPU to still receive full expert pins, got OT %s", strat.OTString)
 	}
 	args := strat.Args("/models/test.gguf", 8081)
-	if !hasAdjacentArgPlacement(args, "-cram", "0") {
-		t.Fatalf("expected explicit '-cram 0' in emitted args, got %v", args)
+	if hasAdjacentArgPlacement(args, "-cram", "0") {
+		t.Fatalf("prompt cache disabled despite ample host RAM, got %v", args)
 	}
 	if !hasAdjacentArgPlacement(args, "--ctx-checkpoints", "1") {
 		t.Fatalf("expected explicit '--ctx-checkpoints 1' in emitted args, got %v", args)
@@ -3375,5 +3384,68 @@ func TestNormalizeKVType(t *testing.T) {
 	}
 	if _, err := NormalizeKVType("q6_k"); err == nil {
 		t.Fatal("unsupported cache type must be rejected before placement")
+	}
+}
+
+// TestPromptCacheSizedFromHostRAMNotVRAM pins the distinction that broke
+// caching on this project's own hardware: --cache-ram is a host-RAM prompt
+// cache (server_prompt_cache copies slot state out via
+// llama_state_seq_get_data into host buffers), but it was sized from VRAM
+// headroom. A model large enough to saturate VRAM therefore got -cram 0, which
+// also disabled --cache-idle-slots, so an agent evicted from a slot lost its
+// entire prefix instead of parking it in tens of GiB of idle RAM.
+func TestPromptCacheSizedFromHostRAMNotVRAM(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		// VRAM is fully committed to weights; host RAM is nearly empty.
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 120000},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "big-moe.gguf", Basename: "big-moe.gguf",
+		SizeBytes: 73000000000, TotalSizeMB: 70000,
+		NumLayers: 32, IsMoE: true, NumExperts: 128, ExpertUsedCount: 8,
+		ExpertFF: 2048, ExpertBytes: 68000000000, NonExpertBytes: 4000000000,
+		ModelArch: "qwen3moe", ContextSize: 262144, CTXTrain: 262144,
+	}
+	cram, _ := computeCRAM(caps, model, &Strategy{Type: MoEOffload, Parallel: 4}, 70000, 8000)
+
+	if cram < minCramMB {
+		t.Fatalf("prompt cache disabled (%d MiB) despite ~99 GiB of host RAM free after load", cram)
+	}
+	// It must still be a fraction of host RAM, not unbounded.
+	ramAfterLoad := 120000 - (70000 - caps.TotalVRAM())
+	if cram > ramAfterLoad/10+1 {
+		t.Errorf("prompt cache %d MiB exceeds one tenth of the %d MiB host budget", cram, ramAfterLoad)
+	}
+}
+
+// A genuinely RAM-starved host must still disable the cache rather than push
+// the machine into swap.
+func TestPromptCacheStaysDisabledWhenHostRAMIsExhausted(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+		},
+		RAM: detect.RAMInfo{TotalMB: 64000, FreeMB: 40000},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "huge.gguf", Basename: "huge.gguf",
+		SizeBytes: 84000000000, TotalSizeMB: 80000,
+		NumLayers: 32, IsMoE: true, NumExperts: 128, ExpertUsedCount: 8,
+		ExpertFF: 2048, ExpertBytes: 78000000000, NonExpertBytes: 2000000000,
+		ModelArch: "qwen3moe", ContextSize: 65536, CTXTrain: 65536,
+	}
+	// 80 GiB model, 36 GiB VRAM: ~44 GiB must live in 40 GiB of RAM, leaving
+	// nothing for a cache.
+	cram, _ := computeCRAM(caps, model, &Strategy{Type: MoEOffload, Parallel: 4}, 80000, 4000)
+	if cram != 0 {
+		t.Errorf("expected the prompt cache disabled on a RAM-starved host, got %d MiB", cram)
 	}
 }
