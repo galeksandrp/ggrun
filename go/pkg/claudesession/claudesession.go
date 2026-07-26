@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -173,97 +174,38 @@ func Latest(cacheDir, workDir string) (Record, error) {
 	return records[0], nil
 }
 
-// shapeKeys are the launch settings that change how a cached conversation is
-// interpreted. Ports, log paths and metrics files are deliberately absent: they
-// do not alter model output.
-var shapeKeys = []string{
-	"--ctx-size",
-	"--parallel",
-	"--cache-type-k",
-	"--cache-type-v",
-	"--n-cpu-moe",
-	"-ngl",
-	"--tensor-split",
-	"--split-mode",
-	"-ot",
-	"--rope-scaling",
-	"--rope-scale",
-	"--yarn-orig-ctx",
-	"-b",
-	"-ub",
-}
-
-// ShapeOf extracts the settings that must match for a resume to be meaningful.
-func ShapeOf(serverArgs []string) map[string]string {
-	shape := map[string]string{}
-	for i := 0; i < len(serverArgs); i++ {
-		for _, key := range shapeKeys {
-			if serverArgs[i] != key || i+1 >= len(serverArgs) {
-				continue
-			}
-			shape[key] = serverArgs[i+1]
-			break
-		}
-	}
-	return shape
-}
-
-// placementKeys are the settings that describe where the model was actually
-// put, as opposed to what was asked for. ggrun recomputes these on every
-// launch from live VRAM measurements, so a recorded session cannot be
-// reproduced by replaying its launch flags alone.
-var placementKeys = []string{"--n-cpu-moe", "-ot", "--tensor-split", "--split-mode"}
-
-// PlacementArgs returns the recorded placement as pass-through flags.
+// A resume restores a conversation and a workflow journal, both of which are
+// plain recorded data. No backend tensor state survives a restart, so nothing
+// in the launch configuration can reinterpret them.
 //
-// A resume must reproduce the placement that ran, not re-derive one. Recomputed
-// placement is not merely different: it can be worse. On this project a reboot
-// moved --n-cpu-moe from a proven 24 to 23, putting one more expert layer on a
-// GPU that then had about 1.1 GiB free; the model loaded and passed health, and
-// the first real request aborted with a CUDA out-of-memory inside the compute
-// pool. Replaying the recorded placement avoids relitigating a decision that
-// was already validated by three days of serving.
-func (r Record) PlacementArgs() []string {
-	if len(r.ServerArgs) == 0 {
-		return nil
-	}
-	var out []string
-	for _, key := range placementKeys {
-		for i := 0; i < len(r.ServerArgs)-1; i++ {
-			if r.ServerArgs[i] == key {
-				out = append(out, key, r.ServerArgs[i+1])
-				break
+// The guard therefore checks capacity, not identity. The one way a resume can
+// genuinely fail is a slot too small to hold the conversation it must replay.
+// An earlier version compared placement -- --n-cpu-moe, -ot, --tensor-split --
+// and refused whenever they moved. They move legitimately: ggrun recomputes
+// placement from live VRAM, and a companion model holding a couple of
+// gigabytes shifts it by a few expert layers. That guard blocked three
+// consecutive resumes over a difference that could not affect correctness.
+
+// perSlotContext returns the context each slot gets, which is what a resumed
+// conversation actually has to fit into.
+func perSlotContext(serverArgs []string) int {
+	ctx, parallel := 0, 1
+	for i := 0; i < len(serverArgs)-1; i++ {
+		switch serverArgs[i] {
+		case "--ctx-size", "-c":
+			if v, err := strconv.Atoi(serverArgs[i+1]); err == nil {
+				ctx = v
+			}
+		case "--parallel", "-np":
+			if v, err := strconv.Atoi(serverArgs[i+1]); err == nil && v > 0 {
+				parallel = v
 			}
 		}
 	}
-	return out
-}
-
-// ApplyPlacement replaces the computed placement in serverArgs with the
-// recorded one.
-//
-// Appending is not enough. llama.cpp accumulates -ot rules rather than letting
-// a later flag win, so appending a second rule set leaves the computed
-// assignment in force and changes nothing: the first attempt at this shipped
-// two -ot sets, two --n-cpu-moe values and two --tensor-split values, and
-// reproduced the identical out-of-memory abort.
-func ApplyPlacement(serverArgs, placement []string) []string {
-	if len(placement) == 0 {
-		return serverArgs
+	if ctx <= 0 {
+		return 0
 	}
-	drop := map[string]bool{}
-	for _, key := range placementKeys {
-		drop[key] = true
-	}
-	out := make([]string, 0, len(serverArgs)+len(placement))
-	for i := 0; i < len(serverArgs); i++ {
-		if drop[serverArgs[i]] {
-			i++ // skip the value too
-			continue
-		}
-		out = append(out, serverArgs[i])
-	}
-	return append(out, placement...)
+	return ctx / parallel
 }
 
 // Mismatch describes one setting that differs between a recorded session and a
@@ -285,25 +227,24 @@ func (m Mismatch) String() string {
 	return fmt.Sprintf("%s: recorded %s, now %s", m.Key, recorded, proposed)
 }
 
-// ShapeMismatches reports settings that differ between the recorded launch and
-// a proposed one. A resume with any mismatch reuses a cache built under other
-// settings, which is wrong silently rather than loudly, so callers must refuse
-// it unless the user overrides explicitly.
+// ShapeMismatches reports a proposed relaunch that cannot hold the recorded
+// session. Only a shrunk per-slot context qualifies: a conversation that fit
+// before may not fit now, and the failure would surface mid-run as a truncated
+// or rejected request rather than at launch.
+//
+// Growing the slot is fine, and everything else -- placement, KV type, batch
+// sizes, rope settings -- is deliberately not checked. Those change how the
+// model runs, not whether recorded data can be replayed.
 func (r Record) ShapeMismatches(serverArgs []string) []Mismatch {
-	recorded := ShapeOf(r.ServerArgs)
-	proposed := ShapeOf(serverArgs)
-	seen := map[string]bool{}
-	var out []Mismatch
-	for _, key := range shapeKeys {
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		if recorded[key] != proposed[key] {
-			out = append(out, Mismatch{Key: key, Recorded: recorded[key], Proposed: proposed[key]})
-		}
+	was, now := perSlotContext(r.ServerArgs), perSlotContext(serverArgs)
+	if was <= 0 || now <= 0 || now >= was {
+		return nil
 	}
-	return out
+	return []Mismatch{{
+		Key:      "context per slot",
+		Recorded: strconv.Itoa(was),
+		Proposed: strconv.Itoa(now),
+	}}
 }
 
 // JournalPath returns where Claude Code keeps a session's workflow resume

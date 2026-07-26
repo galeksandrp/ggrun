@@ -61,20 +61,36 @@ func TestClaudeSessionArgsYieldsToAUserSuppliedSession(t *testing.T) {
 	}
 }
 
-func TestClaudeResumeSpecRefusesAChangedBackendShape(t *testing.T) {
+// The only resume that must be refused is one whose slot cannot hold the
+// recorded conversation. Placement, KV type and batch sizes move legitimately
+// between launches and are deliberately not checked.
+func TestClaudeResumeSpecRefusesAShrunkSlot(t *testing.T) {
 	rec := claudesession.Record{
 		SessionID:  "072e63a1-819a-4682-a742-559695c3cd76",
-		ServerArgs: []string{"--ctx-size", "1048576", "--cache-type-k", "q4_0"},
+		ServerArgs: []string{"--ctx-size", "1048576", "--parallel", "4", "--n-cpu-moe", "24"},
 	}
-	changed := []string{"--ctx-size", "524288", "--cache-type-k", "q4_0"}
+	// Half the context, same slot count: each slot shrinks 262144 -> 131072.
+	changed := []string{"--ctx-size", "524288", "--parallel", "4", "--n-cpu-moe", "27"}
 
 	if _, err := claudeResumeSpec(rec, changed, false); err == nil {
-		t.Fatal("resume accepted a changed context size")
-	} else if !strings.Contains(err.Error(), "--ctx-size") {
-		t.Errorf("error does not name the changed setting: %v", err)
+		t.Fatal("resume accepted a slot too small for the recorded session")
+	} else if !strings.Contains(err.Error(), "262144") {
+		t.Errorf("error does not state the recorded slot size: %v", err)
 	}
 
-	// The override exists so the user can accept the risk deliberately.
+	// Placement drift alone must not block a resume: ggrun recomputes it from
+	// live VRAM and a companion model shifts it by a few expert layers.
+	placementOnly := []string{"--ctx-size", "1048576", "--parallel", "4", "--n-cpu-moe", "27"}
+	if _, err := claudeResumeSpec(rec, placementOnly, false); err != nil {
+		t.Errorf("placement drift blocked a resume: %v", err)
+	}
+	// A larger slot is fine.
+	bigger := []string{"--ctx-size", "2097152", "--parallel", "4"}
+	if _, err := claudeResumeSpec(rec, bigger, false); err != nil {
+		t.Errorf("a larger slot was refused: %v", err)
+	}
+
+	// The override exists so the user can truncate deliberately.
 	spec, err := claudeResumeSpec(rec, changed, true)
 	if err != nil {
 		t.Fatalf("forced resume rejected: %v", err)
@@ -85,7 +101,7 @@ func TestClaudeResumeSpecRefusesAChangedBackendShape(t *testing.T) {
 }
 
 func TestClaudeResumeSpecAcceptsAnIdenticalShape(t *testing.T) {
-	args := []string{"--ctx-size", "1048576", "--parallel", "4", "--cache-type-k", "q4_0"}
+	args := []string{"--ctx-size", "1048576", "--parallel", "4"}
 	rec := claudesession.Record{SessionID: "072e63a1-819a-4682-a742-559695c3cd76", ServerArgs: args}
 	spec, err := claudeResumeSpec(rec, args, false)
 	if err != nil {

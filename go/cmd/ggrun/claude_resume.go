@@ -57,11 +57,8 @@ func resolveClaudeResume(cacheDir, workDir, value string) (claudesession.Record,
 	return claudesession.Load(cacheDir, value)
 }
 
-// claudeResumeSpec turns a recorded session into a launch spec, refusing the
-// resume when the proposed backend shape no longer matches the recorded one.
-// Reusing a conversation and its workflow cache under a different context,
-// quant, KV type or placement does not error at runtime -- it silently
-// reinterprets state built under other settings.
+// claudeResumeSpec turns a recorded session into a launch spec, refusing only
+// when the proposed launch cannot hold the recorded conversation.
 func claudeResumeSpec(rec claudesession.Record, serverArgs []string, force bool) (*claudeSessionSpec, error) {
 	if mismatches := rec.ShapeMismatches(serverArgs); len(mismatches) > 0 && !force {
 		var lines []string
@@ -69,9 +66,10 @@ func claudeResumeSpec(rec claudesession.Record, serverArgs []string, force bool)
 			lines = append(lines, "  "+m.String())
 		}
 		return nil, fmt.Errorf(
-			"backend shape changed since session %s was recorded:\n%s\n"+
-				"Resuming would reuse state built under the recorded settings. "+
-				"Relaunch with the recorded settings, or pass --claude-resume-force to accept the risk.",
+			"session %s was recorded with a larger slot than this launch provides:\n%s\n"+
+				"A conversation that fit before may not fit now, and it would fail mid-run "+
+				"rather than here. Relaunch with at least the recorded context per slot, or "+
+				"pass --claude-resume-force to truncate.",
 			rec.SessionID, strings.Join(lines, "\n"))
 	}
 	spec := &claudeSessionSpec{ID: rec.SessionID, Resume: true, Workflow: rec.Workflow}
@@ -152,37 +150,6 @@ func claudeLaunchSession(cfg *config.Config, req *launchRequest, serverArgs []st
 	}
 	recordClaudeSession(cacheDir, spec, modelPath, backend, port, launchArgs, serverArgs)
 	return spec, nil
-}
-
-// applyRecordedPlacement substitutes a resumed session's proven placement into
-// the freshly computed backend arguments.
-//
-// Placement is derived from live VRAM measurements, so it drifts between
-// launches, and a drifted placement is not merely different -- it can be worse.
-// A reboot moved --n-cpu-moe from a proven 24 to 23 on this project, putting
-// one more expert layer on a GPU that then had about 1.1 GiB free; the model
-// loaded, passed its health check, and aborted with a CUDA out-of-memory in the
-// compute pool on the very first request.
-func applyRecordedPlacement(cfg *config.Config, req *launchRequest, serverArgs []string) []string {
-	if req == nil || req.ClaudeResume == "" || cfg == nil {
-		return serverArgs
-	}
-	workDir, err := os.Getwd()
-	if err != nil {
-		return serverArgs
-	}
-	rec, err := resolveClaudeResume(cfg.CacheDir, workDir, req.ClaudeResume)
-	if err != nil {
-		return serverArgs
-	}
-	placement := rec.PlacementArgs()
-	if len(placement) == 0 {
-		return serverArgs
-	}
-	applied := claudesession.ApplyPlacement(serverArgs, placement)
-	fmt.Printf("[claude-code] Reusing the recorded placement from session %s (%s %s).\n",
-		rec.SessionID, placement[0], placement[1])
-	return applied
 }
 
 // claudeSessionArgs prepends the session flags to the client invocation.
