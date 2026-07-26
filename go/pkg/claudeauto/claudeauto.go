@@ -22,8 +22,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/raketenkater/ggrun/pkg/backendmetrics"
 )
 
 const (
@@ -253,6 +256,13 @@ type Router struct {
 	maxMainActive  int
 	companionAlias string
 	hasCompanion   bool
+	mainBaseURL    string
+	ubatch         int
+	backendMu      sync.Mutex
+	backend        map[string]any
+	pollOnce       sync.Once
+	pollStop       chan struct{}
+	stopPollOnce   sync.Once
 	mainActive     atomic.Int64
 	mainQueued     atomic.Int64
 	metrics        *metricsSink
@@ -291,7 +301,7 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	reviewerProxy := httputil.NewSingleHostReverseProxy(reviewerURL)
 	mainProxy.ErrorHandler = proxyError
 	reviewerProxy.ErrorHandler = proxyError
-	router := &Router{maxMainActive: maxMainActive}
+	router := &Router{maxMainActive: maxMainActive, mainBaseURL: strings.TrimRight(mainBaseURL, "/")}
 	if maxMainActive > 0 {
 		router.sched = newScheduler(maxMainActive)
 	}
@@ -306,6 +316,12 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 			}
 			if summary := router.MetricsSummary(); summary != nil {
 				status["metrics"] = summary
+			}
+			// Served from the last polled snapshot, never fetched inline: the
+			// status endpoint must not add load to a backend that is already
+			// saturated, and must not block on it either.
+			if backend, ok := router.BackendSnapshot(); ok {
+				status["backend"] = backend
 			}
 			_ = json.NewEncoder(w).Encode(status)
 			return
@@ -495,9 +511,99 @@ func (r *Router) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if r.pollStop != nil {
+		r.stopPollOnce.Do(func() { close(r.pollStop) })
+	}
 	err := r.server.Shutdown(ctx)
 	if closeErr := r.metrics.close(); err == nil {
 		err = closeErr
 	}
 	return err
+}
+
+// StartBackendPolling samples the model server's own timing counters on a
+// timer and caches the result.
+//
+// The backend's counters are the authority for throughput: router timings
+// measure whole HTTP requests, and a cancelled call or a client that stops
+// reading keeps one open long after the model has finished with it. ggrun
+// derived 0.26 tok/s that way while the backend reported 4.13 for the same
+// traffic.
+//
+// Polling is deliberately decoupled from the status endpoint. A status line
+// refreshing once a second must not translate into a request per second
+// against a saturated backend, and must never block on one.
+func (r *Router) StartBackendPolling(interval time.Duration) {
+	if r == nil || r.mainBaseURL == "" || interval <= 0 {
+		return
+	}
+	r.pollOnce.Do(func() {
+		r.pollStop = make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				r.refreshBackendSnapshot()
+				select {
+				case <-ticker.C:
+				case <-r.pollStop:
+					return
+				}
+			}
+		}()
+	})
+}
+
+func (r *Router) refreshBackendSnapshot() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	m, err := backendmetrics.Fetch(ctx, nil, r.mainBaseURL)
+	if err != nil || !m.Available() {
+		return
+	}
+	snap := map[string]any{
+		"prompt_tokens_per_s": m.PromptTokensPerSecond(),
+		"decode_tokens_per_s": m.DecodeTokensPerSecond(),
+		"prompt_tokens":       m.PromptTokens,
+		"predicted_tokens":    m.PredictedTokens,
+		"decode_calls":        m.DecodeCalls,
+		"busy_slots_per_call": m.BusySlotsPerCall,
+	}
+	if pc, ok := backendmetrics.PassCostFrom(m, r.ubatch); ok {
+		snap["pass_cost"] = map[string]any{
+			"fixed_ms":    pc.FixedMS,
+			"marginal_ms": pc.MarginalMS,
+			"fixed_share": pc.FixedShare(),
+			"ubatch":      pc.UBatch,
+			"projected_tokens_per_s": map[string]float64{
+				"1": pc.ProjectedTokensPerSecond(1),
+				"4": pc.ProjectedTokensPerSecond(4),
+				"8": pc.ProjectedTokensPerSecond(8),
+			},
+		}
+	}
+	r.backendMu.Lock()
+	r.backend = snap
+	r.backendMu.Unlock()
+}
+
+// BackendSnapshot returns the most recent polled backend metrics.
+func (r *Router) BackendSnapshot() (map[string]any, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.backendMu.Lock()
+	defer r.backendMu.Unlock()
+	if r.backend == nil {
+		return nil, false
+	}
+	return r.backend, true
+}
+
+// SetUBatch records the micro-batch the backend was launched with, which the
+// pass-cost decomposition needs to know how many tokens a prefill pass carried.
+func (r *Router) SetUBatch(n int) {
+	if r != nil && n > 0 {
+		r.ubatch = n
+	}
 }

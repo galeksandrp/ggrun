@@ -381,7 +381,7 @@ func claudeRouterMetricsPath(cfg *config.Config, port int) string {
 	return filepath.Join(dir, fmt.Sprintf("ggrun-claude-requests-%d.jsonl", port))
 }
 
-func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mainPort int, supportsVision bool, maxMainActive int) error {
+func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mainPort int, supportsVision bool, maxMainActive int, serverArgs []string) error {
 	if r == nil {
 		return nil
 	}
@@ -409,6 +409,13 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	// so cheap-tier work continues to the main model rather than into a lane
 	// that loops back to the same server.
 	router.SetCompanion("local", r.reviewerPort > 0)
+	// The pass-cost decomposition needs to know how many tokens a prefill pass
+	// carried, which is the micro-batch the backend was launched with.
+	router.SetUBatch(argIntValue(serverArgs, "-ub", "--ubatch-size"))
+	// Poll the backend's own counters so /ggrun/router can report measured
+	// throughput rather than request wall-clock. Five seconds is well below any
+	// human-visible status refresh and negligible load on the backend.
+	router.StartBackendPolling(5 * time.Second)
 	// Recording is evidence, not a dependency: a metrics failure must not stop
 	// the user's launch.
 	metricsPath := claudeRouterMetricsPath(cfg, router.Port())

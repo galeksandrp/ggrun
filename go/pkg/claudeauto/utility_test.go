@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestIsUtilityRequestMatchesOnlyTheAlias(t *testing.T) {
@@ -136,5 +138,80 @@ func TestClassifierStillWinsOverUtility(t *testing.T) {
 	body := `{"model":"` + UtilityAlias + `","system":[{"type":"text","text":"` + ClassifierMarker + `"}],"messages":[]}`
 	if !IsClassifierRequest([]byte(body)) {
 		t.Fatal("classifier marker not detected when the cheap alias is also set")
+	}
+}
+
+// The status endpoint must never fetch inline. A status line refreshing once a
+// second would otherwise become a request per second against a backend that is
+// already saturated, and would block on it.
+func TestStatusEndpointDoesNotTouchTheBackend(t *testing.T) {
+	var hits int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		_, _ = w.Write([]byte("llamacpp:prompt_seconds_total 1\n"))
+	}))
+	defer backend.Close()
+
+	router, err := StartRouter(backend.URL, backend.URL, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	// Polling is not started, so nothing should reach the backend.
+	for i := 0; i < 5; i++ {
+		resp, err := http.Get(router.URL() + "/ggrun/router")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if n := atomic.LoadInt32(&hits); n != 0 {
+		t.Errorf("status polling made %d backend requests, want 0", n)
+	}
+}
+
+func TestBackendSnapshotAppearsOncePolled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(
+			"llamacpp:prompt_tokens_total 249473\n" +
+				"llamacpp:prompt_seconds_total 1850.65\n" +
+				"llamacpp:tokens_predicted_total 348\n" +
+				"llamacpp:tokens_predicted_seconds_total 84.304\n"))
+	}))
+	defer backend.Close()
+
+	router, err := StartRouter(backend.URL, backend.URL, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	if _, ok := router.BackendSnapshot(); ok {
+		t.Error("snapshot available before polling started")
+	}
+	router.SetUBatch(512)
+	router.StartBackendPolling(50 * time.Millisecond)
+
+	deadline := time.Now().Add(3 * time.Second)
+	var snap map[string]any
+	for time.Now().Before(deadline) {
+		if s, ok := router.BackendSnapshot(); ok {
+			snap = s
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snap == nil {
+		t.Fatal("no backend snapshot after polling")
+	}
+	// The backend's measured decode rate, not one derived from request timing.
+	if got, _ := snap["decode_tokens_per_s"].(float64); got < 4.0 || got > 4.3 {
+		t.Errorf("decode_tokens_per_s = %v, want ~4.13", got)
+	}
+	pc, ok := snap["pass_cost"].(map[string]any)
+	if !ok {
+		t.Fatal("pass_cost missing from the snapshot")
+	}
+	if share, _ := pc["fixed_share"].(float64); share < 0.90 {
+		t.Errorf("fixed_share = %v, want >0.90 for this fixture", share)
 	}
 }
