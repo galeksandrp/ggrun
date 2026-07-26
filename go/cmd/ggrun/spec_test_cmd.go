@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,21 +43,68 @@ func cmdSpecTest(args []string) {
 	}
 }
 
-// runSpecTest benchmarks the stable target-only placement and the exact MTP
-// placement at ceilings 1-4. Auto never consumes a result unless this command
-// proves correctness, repeated stability, end-to-end speed, and the requested
-// parallel/long-context workload for the exact artifact/backend/hardware scope.
+// specTestMode names the speculative path under test.
+//
+// This command was written around MTP and hardcoded it throughout, so the only
+// harness able to prove a speculative win could not evaluate DFlash, EAGLE-3 or
+// a plain draft model. On a mixture-of-experts model served from system RAM
+// that is the wrong thing to be unable to measure: a forward pass costs nearly
+// the same whether it carries one token or many, which makes speculation the
+// largest available lever and the one most in need of proof.
+type specTestMode struct {
+	Flag  string              // --spec value
+	Label string              // human-readable, used in every message
+	Draft placement.DraftType // draft type the plan must actually select
+}
+
+var specTestModes = map[string]specTestMode{
+	"mtp":    {Flag: "mtp", Label: "MTP", Draft: placement.DraftMTP},
+	"dflash": {Flag: "dflash", Label: "DFlash", Draft: placement.DraftDFlash},
+	"eagle3": {Flag: "eagle3", Label: "EAGLE-3", Draft: placement.DraftEagle3},
+	"draft":  {Flag: "draft", Label: "draft model", Draft: placement.DraftModel},
+}
+
+// resolveSpecTestMode picks the path to test. MTP remains the default so an
+// existing invocation keeps its meaning.
+func resolveSpecTestMode(requested string) (specTestMode, error) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" || requested == "auto" || requested == "off" {
+		requested = "mtp"
+	}
+	mode, ok := specTestModes[requested]
+	if !ok {
+		names := make([]string, 0, len(specTestModes))
+		for name := range specTestModes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return specTestMode{}, fmt.Errorf(
+			"spec-test cannot evaluate --spec %q; supported: %s", requested, strings.Join(names, ", "))
+	}
+	return mode, nil
+}
+
+// runSpecTest benchmarks the stable target-only placement against the exact
+// speculative placement at ceilings 1-4. Auto never consumes a result unless
+// this command proves correctness, repeated stability, end-to-end speed, and
+// the requested parallel/long-context workload for the exact
+// artifact/backend/hardware scope.
 func runSpecTest(args []string) error {
 	req, err := parseLaunchArgs(args)
 	if err != nil {
 		return err
 	}
 	if req.ModelPath == "" {
-		return fmt.Errorf("usage: ggrun spec-test <model.gguf> [--rounds 2] [--ctx 1048576] [--parallel 4]")
+		return fmt.Errorf("usage: ggrun spec-test <model.gguf> [--spec mtp|dflash|eagle3|draft] [--rounds 2] [--ctx 1048576] [--parallel 4]")
 	}
 	if err := guardPortFree(req.Port, "spec-test"); err != nil {
 		return err
 	}
+	mode, err := resolveSpecTestMode(req.SpecMode)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[spec-test] evaluating %s against a target-only baseline\n", mode.Label)
 
 	cfg, loadErr := config.Load()
 	if loadErr != nil {
@@ -107,7 +155,7 @@ func runSpecTest(args []string) error {
 	fmt.Println("[spec-test] deterministic matrix: reasoning off")
 	baselineReq := testReq
 	baselineReq.SpecMode = "off"
-	baseline, baselineStrategy, err := runSpecConfiguration(&baselineReq, cfg, caps, model, be, rounds, 0)
+	baseline, baselineStrategy, err := runSpecConfiguration(&baselineReq, cfg, caps, model, be, rounds, 0, mode)
 	if err != nil {
 		report.Configurations = append(report.Configurations, baseline)
 		reportPath, saveErr := saveSpecTestReport(cfg.CacheDir, report)
@@ -126,25 +174,25 @@ func runSpecTest(args []string) error {
 	bestStableIndex := -1
 	bestStableWallGain := -1e9
 	for ceiling := 1; ceiling <= 4; ceiling++ {
-		mtpReq := testReq
-		mtpReq.SpecMode = "mtp"
-		mtpReq.SpecDraftMax = ceiling
-		result, strategy, runErr := runSpecConfiguration(&mtpReq, cfg, caps, model, be, rounds, ceiling)
+		specReq := testReq
+		specReq.SpecMode = mode.Flag
+		specReq.SpecDraftMax = ceiling
+		result, strategy, runErr := runSpecConfiguration(&specReq, cfg, caps, model, be, rounds, ceiling, mode)
 		if runErr != nil {
 			result.Skipped = true
 			result.SkipReason = runErr.Error()
-			fmt.Printf("[spec-test] MTP ceiling %d skipped: %v\n", ceiling, runErr)
+			fmt.Printf("[spec-test] %s ceiling %d skipped: %v\n", mode.Label, ceiling, runErr)
 		} else if strategy.ContextSize != baselineStrategy.ContextSize || strategy.Parallel != baselineStrategy.Parallel {
 			result.Skipped = true
-			result.SkipReason = "MTP changed context or parallelism relative to baseline"
-			fmt.Printf("[spec-test] MTP ceiling %d rejected: %s\n", ceiling, result.SkipReason)
+			result.SkipReason = mode.Label + " changed context or parallelism relative to baseline"
+			fmt.Printf("[spec-test] %s ceiling %d rejected: %s\n", mode.Label, ceiling, result.SkipReason)
 		} else {
 			decodeGain := percentGain(result.Result.MedianGenerateTPS, baseline.Result.MedianGenerateTPS)
 			wallGain := inversePercentGain(result.Result.MeanWallSeconds, baseline.Result.MeanWallSeconds)
 			promptRegression := percentRegression(result.Result.MedianPromptTPS, baseline.Result.MedianPromptTPS)
 			lengthDelta := absolutePercentDelta(result.Result.MeanGenerated, baseline.Result.MeanGenerated)
-			fmt.Printf("[spec-test] MTP ceiling %d: %.2f tok/s (%+.2f%%), %.2fs wall (%+.2f%%), accept %.1f%%\n",
-				ceiling, result.Result.MedianGenerateTPS, decodeGain, result.Result.MeanWallSeconds, wallGain, result.Result.DraftAcceptRate*100)
+			fmt.Printf("[spec-test] %s ceiling %d: %.2f tok/s (%+.2f%%), %.2fs wall (%+.2f%%), accept %.1f%%\n",
+				mode.Label, ceiling, result.Result.MedianGenerateTPS, decodeGain, result.Result.MeanWallSeconds, wallGain, result.Result.DraftAcceptRate*100)
 			if result.Result.CorrectnessPassed && result.Result.StabilityPassed {
 				if wallGain > bestStableWallGain {
 					bestStableIndex = len(report.Configurations)
@@ -170,14 +218,14 @@ func runSpecTest(args []string) error {
 		bestIndex = bestStableIndex
 	}
 	if bestIndex < 0 {
-		return fmt.Errorf("no MTP ceiling completed correctness and stability checks; Auto remains off")
+		return fmt.Errorf("no %s ceiling completed correctness and stability checks; Auto remains off", mode.Label)
 	}
 
 	best := report.Configurations[bestIndex]
 	opts := placementOptionsFromRequest(&testReq, model, be, cfg.CacheDir)
 	opts.ContextSize = best.Context
 	opts.Parallel = best.Parallel
-	scope := placement.NewSpecProfileScope(model, caps, opts, "mtp", best.DraftPath)
+	scope := placement.NewSpecProfileScope(model, caps, opts, mode.Flag, best.DraftPath)
 	decodeGain := percentGain(best.Result.MedianGenerateTPS, baseline.Result.MedianGenerateTPS)
 	wallGain := inversePercentGain(best.Result.MeanWallSeconds, baseline.Result.MeanWallSeconds)
 	promptRegression := percentRegression(best.Result.MedianPromptTPS, baseline.Result.MedianPromptTPS)
@@ -197,7 +245,7 @@ func runSpecTest(args []string) error {
 	if ok, reason := profile.AutoEligible(); !ok {
 		fmt.Printf("[spec-test] profile saved but Auto remains off: %s\n", reason)
 	} else {
-		fmt.Printf("[spec-test] verified MTP ceiling %d; Auto is enabled for this exact runtime scope\n", best.DraftMax)
+		fmt.Printf("[spec-test] verified %s ceiling %d; Auto is enabled for this exact runtime scope\n", mode.Label, best.DraftMax)
 	}
 	fmt.Printf("[spec-test] profile: %s\n", profilePath)
 	return nil
@@ -224,10 +272,10 @@ func specFailureSummary(result specbench.Result) string {
 	return strings.Join(failures, "; ")
 }
 
-func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.Capabilities, model *placement.ModelProfile, be *backendInfo, rounds, ceiling int) (specTestConfiguration, *placement.Strategy, error) {
+func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.Capabilities, model *placement.ModelProfile, be *backendInfo, rounds, ceiling int, mode specTestMode) (specTestConfiguration, *placement.Strategy, error) {
 	name := "baseline"
 	if ceiling > 0 {
-		name = fmt.Sprintf("mtp-%d", ceiling)
+		name = fmt.Sprintf("%s-%d", mode.Flag, ceiling)
 	}
 	opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
 	strategy, err := placement.Compute(caps, model, opts)
@@ -235,8 +283,8 @@ func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.C
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, nil, err
 	}
 	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
-	if ceiling > 0 && (strategy.Draft == nil || strategy.Draft.Type != placement.DraftMTP) {
-		return specTestConfiguration{Name: name, DraftMax: ceiling}, strategy, fmt.Errorf("no compatible MTP path for selected backend")
+	if ceiling > 0 && (strategy.Draft == nil || strategy.Draft.Type != mode.Draft) {
+		return specTestConfiguration{Name: name, DraftMax: ceiling}, strategy, fmt.Errorf("no compatible %s path for selected backend", mode.Label)
 	}
 	serverArgs := buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
 	fmt.Printf("[spec-test] loading %s: %s\n", name, formatCommand(serverArgs))
@@ -245,8 +293,8 @@ func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.C
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, finalStrategy, err
 	}
 	defer p.Stop()
-	if ceiling > 0 && (finalStrategy.Draft == nil || finalStrategy.Draft.Type != placement.DraftMTP || finalStrategy.Draft.DraftMax != ceiling) {
-		return specTestConfiguration{Name: name, DraftMax: ceiling}, finalStrategy, fmt.Errorf("startup safety re-plan disabled or changed MTP")
+	if ceiling > 0 && (finalStrategy.Draft == nil || finalStrategy.Draft.Type != mode.Draft || finalStrategy.Draft.DraftMax != ceiling) {
+		return specTestConfiguration{Name: name, DraftMax: ceiling}, finalStrategy, fmt.Errorf("startup safety re-plan disabled or changed %s", mode.Label)
 	}
 	parallel := finalStrategy.Parallel
 	if parallel < 1 {
