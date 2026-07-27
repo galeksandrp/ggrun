@@ -273,3 +273,46 @@ func TestClaudeReviewerReservationSkipsNonClaudeAndCPU(t *testing.T) {
 		t.Fatal("GPU-less host must not reserve GPU VRAM for the reviewer")
 	}
 }
+
+// A reviewer left running by a previous ggrun is already inside the VRAM the
+// hardware scan reports as used. Adding the full reservation on top charges one
+// process twice: measured here as 2096 MiB resident plus a 2600 MiB reservation,
+// ~4.7 GB withheld for a 2.1 GB helper. On the 12 GB card that seat is on, and
+// at 1371 MiB per expert layer, it cost two layers -- the card took 4 where an
+// unoccupied one took 6.
+func TestReviewerReservationIsNotChargedTwice(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 0, VRAMTotalMB: 24564, BandwidthMBps: 15754},
+		{Index: 1, VRAMTotalMB: 12288, BandwidthMBps: 985},
+	}}
+	req := &launchRequest{ClaudeCode: true}
+	restore := residentReviewerVRAM
+	defer func() { residentReviewerVRAM = restore }()
+
+	// Nothing resident: the full bound is reserved.
+	residentReviewerVRAM = func() int { return 0 }
+	got := claudeReviewerReservation(req, caps, "")
+	if got == nil || got.VRAMMB != claudeReviewerReservationVRAMMB {
+		t.Fatalf("with no reviewer running, reservation = %+v, want %d MiB", got, claudeReviewerReservationVRAMMB)
+	}
+
+	// A stored measurement supersedes the constant.
+	dir := t.TempDir()
+	if err := placement.RecordCompanionVRAM(dir, claudeReviewerCompanionName, 2096); err != nil {
+		t.Fatal(err)
+	}
+	if got := claudeReviewerReservation(req, caps, dir); got == nil || got.VRAMMB != 2096 {
+		t.Errorf("measured reservation = %+v, want 2096 MiB", got)
+	}
+
+	// A leftover reviewer already occupies that VRAM, so nothing more is owed.
+	residentReviewerVRAM = func() int { return 2096 }
+	if got := claudeReviewerReservation(req, caps, dir); got != nil {
+		t.Errorf("reservation = %+v, want none: the seat is already occupied", got)
+	}
+	// A partially covered seat reserves only the difference.
+	residentReviewerVRAM = func() int { return 1500 }
+	if got := claudeReviewerReservation(req, caps, dir); got == nil || got.VRAMMB != 596 {
+		t.Errorf("reservation = %+v, want the uncovered 596 MiB", got)
+	}
+}

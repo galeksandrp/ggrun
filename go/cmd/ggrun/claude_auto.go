@@ -83,6 +83,23 @@ func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, ca
 			vramMB = measured
 		}
 	}
+	// A reviewer left behind by a previous ggrun is already counted in the VRAM
+	// nvidia-smi reports as used, so reserving the full amount on top charges one
+	// process twice. Measured on this project: 2096 MiB resident from the old run
+	// plus a 2600 MiB reservation, ~4.7 GB withheld for a 2.1 GB helper, which
+	// cost the 3060 two expert layers -- it took 4 where an unoccupied card took
+	// 6. Subtracting what is already resident is safe because the reviewer is
+	// started before the main model loads, so the seat is occupied continuously
+	// whether the old process or the new one holds it.
+	if resident := residentReviewerVRAM(); resident > 0 {
+		vramMB -= resident
+		if vramMB < 0 {
+			vramMB = 0
+		}
+	}
+	if vramMB <= 0 {
+		return nil
+	}
 	return &placement.CompanionReservation{
 		Name:          claudeReviewerCompanionName,
 		VRAMMB:        vramMB,
@@ -112,6 +129,42 @@ func recordReviewerVRAM(cfg *config.Config, p *server.Process) {
 			usedMB, claudeReviewerReservationVRAMMB-usedMB, claudeReviewerReservationVRAMMB)
 	}
 }
+
+// residentReviewerVRAMMB sums the VRAM held by reviewer processes that are
+// already running, so a reservation is not added on top of memory the hardware
+// scan has already reported as in use.
+//
+// Matching is on the reviewer's own model directory, which no other process
+// loads, rather than on a PID ggrun does not own: the leftover belongs to a
+// previous launch that has not finished exiting.
+// residentReviewerVRAM is indirected so tests can describe a host without
+// depending on whatever happens to be running on the machine.
+var residentReviewerVRAM = residentReviewerVRAMMB
+
+func residentReviewerVRAMMB() int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	total := 0
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
+		if err != nil || !strings.Contains(string(raw), claudeReviewerModelDirMarker) {
+			continue
+		}
+		total += placement.QueryVRAMUsedByPID(pid)
+	}
+	return total
+}
+
+// claudeReviewerModelDirMarker is the directory EnsureReviewerModel downloads
+// into. It identifies a reviewer process without depending on the model file
+// name, which changes when the reviewer model is upgraded.
+const claudeReviewerModelDirMarker = "claude-reviewer"
 
 // startClaudeAutoReviewer launches the pinned Auto reviewer on the seat the
 // placement planner returned in companionPlacements. When the planner ran, its
