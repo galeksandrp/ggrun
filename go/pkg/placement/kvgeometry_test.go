@@ -125,3 +125,56 @@ func TestExpertOnlyComputeReserveTrustsAnUnambiguousMeasurement(t *testing.T) {
 		t.Errorf("only %d MiB reclaimed; the floor withheld 925", freed)
 	}
 }
+
+// A context checkpoint is only useful if one sits at or before the point a
+// later turn resumes from. The backend builds each checkpoint 2*n_swa wide and
+// rejects any whose pos_max overshoots the resume point, so spacing decides
+// whether the mechanism can work at all.
+//
+// Measured on a 16k prompt at llama.cpp's 8192 default: a 92% prefix match was
+// found, the only two checkpoints were [14728,15751] and [15240,16263], the
+// resume point was ~14906, and both were rejected for overshooting -- one by
+// just 845 tokens. All 164,358 prompt tokens were re-processed.
+func TestCheckpointSpacingTilesTheContext(t *testing.T) {
+	swa := &ModelProfile{SlidingWindow: 512}
+	// The backend built the SWA cache at exactly this depth on this project:
+	// "creating SWA KV cache, size = 1024 cells" with n_swa 512 and -ub 512,
+	// and every checkpoint spanned pos_max-pos_min = 1023.
+	if got, want := checkpointMinStep(swa, 512), 1024; got != want {
+		t.Errorf("spacing at ub=512 = %d, want the cache depth %d", got, want)
+	}
+	// Not 2*n_swa: that coincided only because the window equalled the ubatch.
+	if got, want := checkpointMinStep(swa, 256), 768; got != want {
+		t.Errorf("spacing at ub=256 = %d, want n_swa+n_ubatch = %d; 2*n_swa would be a third too coarse", got, want)
+	}
+	if got := checkpointMinStep(swa, 512); got > 8192 {
+		t.Errorf("spacing %d is no better than llama.cpp's default", got)
+	}
+
+	// Replay the failing case. With contiguous spacing a checkpoint must land
+	// at or before the resume point rather than straddling it.
+	const resume, width = 14906, 1024
+	step := checkpointMinStep(swa, 512)
+	best := -1
+	for posMin := 0; posMin+width <= resume; posMin += step {
+		best = posMin
+	}
+	if best < 0 {
+		t.Fatal("no checkpoint lands before the resume point")
+	}
+	if posMax := best + width - 1; posMax > resume {
+		t.Errorf("checkpoint [%d,%d] still overshoots %d", best, posMax, resume)
+	}
+	if skipped := float64(best) / resume; skipped < 0.8 {
+		t.Errorf("resuming at %d skips only %.0f%% of the prefill", best, skipped*100)
+	}
+
+	// A model without a sliding window keeps llama.cpp's default: the depth is
+	// not derived this way there.
+	if got := checkpointMinStep(&ModelProfile{}, 512); got != 0 {
+		t.Errorf("non-SWA model got spacing %d, want the backend default", got)
+	}
+	if got := checkpointMinStep(nil, 512); got != 0 {
+		t.Errorf("nil model got spacing %d", got)
+	}
+}

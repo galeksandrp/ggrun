@@ -124,14 +124,17 @@ type Strategy struct {
 	// MeasuredPromptCacheEntryMB is what one saved conversation occupied, taken
 	// from the backend rather than derived. It is preferred over the per-token
 	// cost because it needs no assumption about how long a typical turn is.
-	MeasuredPromptCacheEntryMB float64      `json:"measured_prompt_cache_entry_mb,omitempty"`
-	MaxCheckpoints             int          `json:"max_checkpoints,omitempty"`
-	UseCUDAGraphs              bool         `json:"use_cuda_graphs,omitempty"`
-	Host                       string       `json:"host,omitempty"`        // listen address
-	HasSSM                     bool         `json:"has_ssm,omitempty"`     // SSM/Mamba hybrid flag
-	Draft                      *DraftConfig `json:"draft,omitempty"`       // speculative decoding config
-	MMProjPath                 string       `json:"mmproj_path,omitempty"` // vision projector GGUF
-	MMProjSizeMB               int          `json:"-"`                     // mmproj VRAM on primary GPU
+	MeasuredPromptCacheEntryMB float64 `json:"measured_prompt_cache_entry_mb,omitempty"`
+	MaxCheckpoints             int     `json:"max_checkpoints,omitempty"`
+	// CheckpointMinStep is the token spacing between context checkpoints. It
+	// decides whether one can sit at the point a later turn resumes from.
+	CheckpointMinStep int          `json:"checkpoint_min_step,omitempty"`
+	UseCUDAGraphs     bool         `json:"use_cuda_graphs,omitempty"`
+	Host              string       `json:"host,omitempty"`        // listen address
+	HasSSM            bool         `json:"has_ssm,omitempty"`     // SSM/Mamba hybrid flag
+	Draft             *DraftConfig `json:"draft,omitempty"`       // speculative decoding config
+	MMProjPath        string       `json:"mmproj_path,omitempty"` // vision projector GGUF
+	MMProjSizeMB      int          `json:"-"`                     // mmproj VRAM on primary GPU
 	// CompanionPlacements records where each Options.Companions reservation was
 	// placed: GPU index, or -1 for CPU. Runtime-only; the launcher starts the
 	// helper on the device the planner chose.
@@ -235,6 +238,54 @@ type GPULedgerEntry struct {
 	// attention, norms or KV.
 	ExpertOnly bool `json:"expert_only,omitempty"`
 }
+
+// checkpointMinStep is the token spacing between context checkpoints.
+//
+// A checkpoint covers the SWA cache's own depth, which llama.cpp builds as
+// n_swa + n_ubatch padded to 256:
+//
+//	size_swa = GGML_PAD(min(size_base, hparams.n_swa + n_ubatch), 256)
+//
+// and the checkpoint search rejects any candidate whose pos_max overshoots the
+// point a later turn resumes from. Spacing wider than that depth leaves gaps a
+// resume point can fall into, and llama.cpp's 8192 default is far wider.
+//
+// Measured on a 16k prompt at the default: a 92% prefix match was found, the
+// only two checkpoints were [14728,15751] and [15240,16263], the resume point
+// was ~14906, and both were rejected for overshooting -- one by 845 tokens.
+// All 164,358 prompt tokens were re-processed.
+//
+// Deriving the spacing from the depth makes consecutive checkpoints contiguous.
+// Note this is not 2*n_swa: that matched only because this project runs
+// -ub 512 with a 512 window, and would be a third too coarse at -ub 256.
+//
+// Returns 0 when the model has no sliding window, leaving llama.cpp's default
+// in place -- without SWA the checkpoint depth is not derived this way.
+func checkpointMinStep(model *ModelProfile, ubatch int) int {
+	if model == nil || model.SlidingWindow <= 0 {
+		return 0
+	}
+	if ubatch <= 0 {
+		// llama.cpp's own default physical batch.
+		ubatch = 512
+	}
+	step := model.SlidingWindow + ubatch
+	// The backend pads the cache to a 256-cell boundary; match it so the
+	// spacing cannot be marginally wider than the depth it is tiling.
+	if rem := step % 256; rem != 0 {
+		step -= rem
+	}
+	if step < checkpointMinStepFloor {
+		step = checkpointMinStepFloor
+	}
+	return step
+}
+
+// checkpointMinStepFloor keeps a tiny sliding window from producing a
+// checkpoint every few hundred tokens: each one costs real host memory (20.257
+// MiB measured on this project) and --ctx-checkpoints caps how many survive, so
+// spacing far below the depth buys nothing but eviction churn.
+const checkpointMinStepFloor = 512
 
 // CompanionReservation reserves VRAM on one GPU for a co-launched helper model
 // (e.g. the Claude Auto safety reviewer) inside the same placement ledger as the
@@ -826,6 +877,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			// checkpoint policy from the early cache-hit return.
 			LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
 			s.CRAM, s.MaxCheckpoints = computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
+			s.CheckpointMinStep = checkpointMinStep(model, s.UBatchSize)
 			if opts.CacheRAMMB > 0 {
 				s.CRAM = opts.CacheRAMMB
 			}
@@ -887,6 +939,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 	s.CRAM = cram
 	s.MaxCheckpoints = maxCheckpoints
+	s.CheckpointMinStep = checkpointMinStep(model, s.UBatchSize)
 
 	// Default host
 	if s.Host == "" {
@@ -3895,6 +3948,24 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 	args = append(args, "-cram", fmt.Sprintf("%d", s.CRAM))
 	if s.MaxCheckpoints >= 0 {
 		args = append(args, "--ctx-checkpoints", fmt.Sprintf("%d", s.MaxCheckpoints))
+		// Spacing decides whether a checkpoint can ever sit at the point a
+		// later turn resumes from, and llama.cpp's 8192 default is too coarse
+		// for an agent workload.
+		//
+		// A checkpoint spans 2*n_swa tokens, and the search rejects any whose
+		// pos_max overshoots the resume point. Measured here on a 16k prompt
+		// with the default spacing: a 92% prefix match was found, the only two
+		// checkpoints were [14728,15751] and [15240,16263], the resume point
+		// was ~14906, and both were rejected for overshooting it by as little
+		// as 845 tokens. Every one of 164,358 prompt tokens was re-processed.
+		//
+		// Spacing equal to the checkpoint's own width tiles the context without
+		// gaps, so no resume point can fall between two of them. It is derived
+		// from the model rather than chosen: the width is what the backend
+		// already uses.
+		if step := s.CheckpointMinStep; step > 0 {
+			args = append(args, "--checkpoint-min-step", fmt.Sprintf("%d", step))
+		}
 	}
 
 	// ik_llama.cpp fork specific flags
