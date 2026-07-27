@@ -106,6 +106,11 @@ type Strategy struct {
 	ThreadsBatch             int    `json:"threads_batch"` // batch threads (logical cores)
 	Parallel                 int    `json:"parallel,omitempty"`
 	CRAM                     int    `json:"cram,omitempty"` // prompt cache MB
+	// VRAMLedger explains, per GPU, how the expert placement was arrived at.
+	// Every question of the form "why is that card not full?" has been answered
+	// by reverse-engineering this arithmetic from the emitted -ot string and
+	// nvidia-smi; printing it turns an afternoon into one line.
+	VRAMLedger []GPULedgerEntry `json:"vram_ledger,omitempty"`
 	// SWAFull records that this launch gives sliding-window layers the full
 	// context. It belongs on the strategy rather than only on the request
 	// because it changes the KV size every later stage prices, not just the
@@ -207,6 +212,28 @@ type ModelProfile struct {
 	LeadingDense              int                   `json:"leading_dense,omitempty"`
 	LeadingDenseInferred      bool                  `json:"leading_dense_inferred,omitempty"`
 	NextNPredictLayers        int                   `json:"nextn_predict_layers,omitempty"`
+}
+
+// GPULedgerEntry is one card's expert-placement arithmetic.
+type GPULedgerEntry struct {
+	GPU int `json:"gpu"`
+	// FreeMB is what the hardware scan reported, already net of any companion
+	// reservation seated on this card.
+	FreeMB int `json:"free_mb"`
+	// FixedMB is everything charged before experts: CUDA overhead, the compute
+	// buffer (or its floor), measured runtime graph growth, and on a split owner
+	// the attention and norm weights plus its KV share.
+	FixedMB int `json:"fixed_mb"`
+	// RoomMB is FreeMB minus FixedMB: the budget experts were packed into.
+	RoomMB int `json:"room_mb"`
+	// ExpertLayers is how many whole layers fit in RoomMB.
+	ExpertLayers int `json:"expert_layers"`
+	// StrandedMB is what RoomMB could not spend, because an expert layer is
+	// indivisible. It is the honest answer to "why is that card not full?".
+	StrandedMB int `json:"stranded_mb"`
+	// ExpertOnly marks a card that carries pinned expert tensors but no
+	// attention, norms or KV.
+	ExpertOnly bool `json:"expert_only,omitempty"`
 }
 
 // CompanionReservation reserves VRAM on one GPU for a co-launched helper model
@@ -1457,7 +1484,15 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	expertOnlyFixedPerGPU := make([]int, numGPUs)
 	for i, g := range caps.GPUs {
 		computeBufMB := firstLaunchComputeBufMBForGPUParallelAtContext(model, s.UBatchSize, s.Parallel, s.ContextSize, i, gpuOrder)
-		expertOnlyComputeMB := expertOnlyComputeReserveMB(computeBufMB)
+		measuredThisGPU := 0
+		if pc != nil {
+			measuredThisGPU = pc.ComputeBufByGPU[g.Index]
+		}
+		aggregate := computeBufMB
+		if pc != nil && pc.ComputeBufMB > aggregate {
+			aggregate = pc.ComputeBufMB
+		}
+		expertOnlyComputeMB := expertOnlyComputeReserveMB(aggregate, measuredThisGPU)
 		if opts.RequireMeasuredBuffers {
 			computeBufMB = 0
 			expertOnlyComputeMB = 0
@@ -1932,6 +1967,41 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 
 	// Build -ot string. Always include the exps=CPU catch-all so expert
 	// tensors never follow the backend's default layer split by accident.
+	// Record the arithmetic before it is thrown away. Stranded VRAM is not a
+	// defect on its own -- an expert layer is indivisible, so a card will always
+	// end with less than one layer unspent -- but stranded space larger than a
+	// layer means something reserved it, and that is worth being able to see.
+	s.VRAMLedger = s.VRAMLedger[:0]
+	for _, gi := range gpuOrder {
+		if gi < 0 || gi >= len(caps.GPUs) {
+			continue
+		}
+		spent := 0
+		for i := 0; i < layersPerGPU[gi] && i < len(layerCosts); i++ {
+			spent += layerCosts[i].whole()
+		}
+		if layersPerGPU[gi] > 0 && expertPerLayerMB > 0 {
+			spent = layersPerGPU[gi] * expertPerLayerMB
+		}
+		stranded := roomMBPer[gi] - spent
+		if stranded < 0 {
+			stranded = 0
+		}
+		fixed := fixedPerGPU[gi]
+		if expertOnlyGPU[gi] {
+			fixed = expertOnlyFixedPerGPU[gi]
+		}
+		s.VRAMLedger = append(s.VRAMLedger, GPULedgerEntry{
+			GPU:          caps.GPUs[gi].Index,
+			FreeMB:       caps.GPUs[gi].VRAMFreeMB(),
+			FixedMB:      fixed,
+			RoomMB:       roomMBPer[gi],
+			ExpertLayers: layersPerGPU[gi],
+			StrandedMB:   stranded,
+			ExpertOnly:   expertOnlyGPU[gi],
+		})
+	}
+
 	otString := buildOTStringWithSubPins(layersPerGPU, subPins, caps.GPUs, gpuOrder, moeStartLayer, opts.BackendTag)
 	if otString != "" {
 		s.OTString = otString
@@ -3012,9 +3082,51 @@ func expertOnlySlowGPUs(gpus []detect.GPU, splitFixedPerGPU, expertOnlyFixedPerG
 // layers at all. Cap at the compute floor: it is a conservative reserve for
 // the small expert-projection graph, and the preflight gate catches any real
 // overflow before the load.
-func expertOnlyComputeReserveMB(splitOwnerComputeMB int) int {
-	return computeFloorMB
+// expertOnlyComputeReserveMB sizes the compute buffer for a GPU that carries
+// pinned expert tensors but no attention, norms or KV.
+//
+// It used to return a flat computeFloorMB, which is a fixed margin in a planner
+// whose whole premise is that reserved VRAM must be measured. On this project
+// the measurement was 99 MiB against a 1024 MiB floor -- 925 MiB withheld, 67%
+// of an expert layer, and always on the smallest card, because that is where
+// the reviewer is seated and where a withheld layer costs the most.
+//
+// The reason the per-GPU measurement was distrusted is real and documented: a
+// GPU that was expert-only when measured may be a split owner on the next plan,
+// and 99 MiB would then be catastrophically short. But the magnitude settles
+// that question by itself. A split owner's buffer is orders of magnitude larger
+// -- measured 4267 MiB against 99 on the same launch -- so a per-GPU value that
+// small could only have come from a run where that GPU was already expert-only.
+//
+// Accept it under that test, with headroom, and fall back to the floor whenever
+// the measurement is absent or large enough to be ambiguous.
+func expertOnlyComputeReserveMB(splitOwnerComputeMB, measuredThisGPUMB int) int {
+	if measuredThisGPUMB <= 0 || splitOwnerComputeMB <= 0 {
+		return computeFloorMB
+	}
+	// Ambiguous: not obviously smaller than a split owner's buffer, so it may
+	// have been measured while this GPU owned a split.
+	if measuredThisGPUMB*expertOnlyComputeRoleRatio > splitOwnerComputeMB {
+		return computeFloorMB
+	}
+	reserve := measuredThisGPUMB * expertOnlyComputeHeadroomNum / expertOnlyComputeHeadroomDen
+	if reserve > computeFloorMB {
+		return computeFloorMB
+	}
+	return reserve
 }
+
+const (
+	// expertOnlyComputeRoleRatio is how much smaller than the split owner's
+	// buffer a per-GPU measurement must be before it is accepted as proof that
+	// the GPU was expert-only when measured. 4267 against 99 is a factor of 43;
+	// requiring 8 leaves a wide margin for a smaller model.
+	expertOnlyComputeRoleRatio = 8
+	// Headroom on an accepted measurement, since a later plan can pin a few more
+	// expert layers to the same card than the measured one did.
+	expertOnlyComputeHeadroomNum = 3
+	expertOnlyComputeHeadroomDen = 2
+)
 
 // RequiresConservativeSplitOwnerProtection identifies the MoE-hybrid
 // architectures whose regular split owners can grow a deferred graph after

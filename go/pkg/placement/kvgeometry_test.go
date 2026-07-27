@@ -88,3 +88,40 @@ func TestKVGeometryRoundTripsThroughTheCacheFile(t *testing.T) {
 		t.Errorf("--swa-full priced at %d MiB against %d without: the rate is still winning", withFull, plain)
 	}
 }
+
+// A flat 1024 MiB compute floor on expert-only GPUs is a fixed margin in a
+// planner built on measurement. Measured on this project: 99 MiB against that
+// floor, so 925 MiB was withheld -- 67% of a 1371 MiB expert layer, and always
+// on the smallest card, since that is where the reviewer is seated.
+//
+// The per-GPU value was distrusted because a GPU measured as expert-only may be
+// a split owner next time. The magnitude settles it: a split owner measured
+// 4267 MiB on the same launch, so a value 43x smaller can only have come from a
+// run where that GPU was already expert-only.
+func TestExpertOnlyComputeReserveTrustsAnUnambiguousMeasurement(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		splitOwnerMB int
+		measuredMB   int
+		wantAtMost   int
+		wantExactly  int
+	}{
+		{"the real measurement is accepted with headroom", 4267, 99, computeFloorMB, 148},
+		{"no measurement keeps the floor", 4267, 0, computeFloorMB, computeFloorMB},
+		{"no aggregate keeps the floor", 0, 99, computeFloorMB, computeFloorMB},
+		{"ambiguous magnitude keeps the floor", 4267, 1000, computeFloorMB, computeFloorMB},
+		{"a large measurement never exceeds the floor", 40000, 4000, computeFloorMB, computeFloorMB},
+	} {
+		got := expertOnlyComputeReserveMB(tc.splitOwnerMB, tc.measuredMB)
+		if got != tc.wantExactly {
+			t.Errorf("%s: reserve = %d MiB, want %d", tc.name, got, tc.wantExactly)
+		}
+		if got > tc.wantAtMost {
+			t.Errorf("%s: reserve %d exceeds the floor %d", tc.name, got, tc.wantAtMost)
+		}
+	}
+	// The point of the change: the measured case must free most of a layer.
+	if freed := computeFloorMB - expertOnlyComputeReserveMB(4267, 99); freed < 800 {
+		t.Errorf("only %d MiB reclaimed; the floor withheld 925", freed)
+	}
+}

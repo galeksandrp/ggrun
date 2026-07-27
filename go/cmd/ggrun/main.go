@@ -1981,6 +1981,25 @@ func promptsForUpdates(args []string) bool {
 	return true
 }
 
+// printVRAMLedger shows how each GPU's expert budget was spent. Stranded space
+// below one expert layer is structural -- a layer is indivisible -- but more
+// than that means something reserved it, and every such question so far has
+// been answered by reconstructing this arithmetic from the -ot string and
+// nvidia-smi after the fact.
+func printVRAMLedger(strategy *placement.Strategy) {
+	if strategy == nil || len(strategy.VRAMLedger) == 0 {
+		return
+	}
+	for _, e := range strategy.VRAMLedger {
+		role := "split-owner"
+		if e.ExpertOnly {
+			role = "expert-only"
+		}
+		fmt.Printf("[launch] CUDA%d %-11s free %6d - fixed %6d = room %6d MiB -> %2d expert layers, %5d MiB stranded\n",
+			e.GPU, role, e.FreeMB, e.FixedMB, e.RoomMB, e.ExpertLayers, e.StrandedMB)
+	}
+}
+
 func claudeServerLogPath(cfg *config.Config, port int, scope string) string {
 	logDir := ""
 	if cfg != nil {
@@ -2277,6 +2296,7 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 			serverArgs = nextArgs
 		}
 		retries++
+		printVRAMLedger(strategy)
 		fmt.Printf("[launch] %s\n", formatCommand(serverArgs))
 	}
 }
