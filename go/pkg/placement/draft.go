@@ -34,6 +34,25 @@ const (
 	// (normally 2-3). Reusing the generic draft-model ceiling of 16 causes the
 	// one-layer MTP head to run repeatedly, collapsing acceptance and throughput.
 	defaultMTPDraftMax = 2
+	// DFlash is a block diffusion drafter, not an autoregressive one: it is
+	// trained to emit a whole block, and its GGUF reports that block as 16.
+	// Poolside's llama.cpp recipe passes 15 and describes it as "clamped to the
+	// trained block size of 15 + 1"; the 7 that stood here came from their vLLM
+	// recipe, where num_speculative_tokens is a separate knob.
+	//
+	// Running below the trained block asks the model for a truncated prefix of
+	// something it only ever learned to produce whole. On this project that
+	// configuration measured 0.27% acceptance -- 6 tokens out of 2254, mean
+	// accepted length 1.02 -- against the ~3.1 poolside report, and speculation
+	// cost 4x decode throughput rather than winning any.
+	//
+	// Whether the truncation is the cause is not settled: the same run also
+	// paired a BF16-trained drafter with a UD-Q4_K_XL target, which is an
+	// independent and documented cause of low acceptance. This value matches the
+	// published llama.cpp recipe so the cheaper hypothesis is the one being
+	// tested first.
+	defaultLagunaDFlashDraftMax = 15
+	defaultDraftKVType          = "q4_0"
 )
 
 // DraftConfig holds computed speculative decoding parameters.
@@ -47,6 +66,7 @@ type DraftConfig struct {
 	KVTypeDraft      string    `json:"kv_type_draft,omitempty"`      // KV type for draft
 	ThreadsDraft     int       `json:"threads_draft,omitempty"`      // threads for draft generation
 	GPULayersDraft   string    `json:"gpu_layers_draft,omitempty"`   // auto, all, or an exact count
+	VRAMMB           int       `json:"vram_mb,omitempty"`            // metadata-derived weights + KV reservation
 	SupportsDraftCTX bool      `json:"supports_draft_ctx,omitempty"` // backend accepts --ctx-size-draft
 	SpecAutoTune     bool      `json:"spec_autotune"`                // let llama.cpp auto-tune params
 	// Draft model params (calculated, not guessed)
@@ -209,6 +229,7 @@ func configureDFlashDraft(cfg *DraftConfig, target *ModelProfile, caps *detect.C
 	}
 	candidate := findOrDownloadSpecializedCandidate(target, modelDir, opts, "dflash")
 	if configureValidatedSpecializedModel(cfg, target, caps, opts, candidate, DraftDFlash, "draft-dflash", "dflash") {
+		cfg.DraftMax = dflashDraftMax(target)
 		if authorizeAutoSpecProfile(cfg, target, caps, opts, "dflash") {
 			return true
 		}
@@ -342,11 +363,14 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 	// context exceeds the launch context, which is the normal case.
 	cfg.CTXSizeDraft = draftContextFor(opts.ContextSize, target.ContextSize, draftInfo.ContextLength)
 
-	draftSizeMB := int(draftInfo.ExpertBytes+draftInfo.NonExpertBytes) / (1024 * 1024)
+	draftSizeMB := bytesToMiBCeil(draftInfo.ExpertBytes + draftInfo.NonExpertBytes)
 	if draftSizeMB <= 0 {
 		draftSizeMB = 1024
 	}
-	cfg.KVTypeDraft = computeDraftKVType(caps, draftInfo)
+	// External speculative models own a separate KV cache. Q4 is the stable
+	// default so a long-context drafter does not consume VRAM that placement
+	// promised to the target model.
+	cfg.KVTypeDraft = defaultDraftKVType
 	draftKVMB := computeKVTotalMB(&ModelProfile{
 		HeadCountKV:      draftInfo.HeadCountKV,
 		KeyLength:        draftInfo.KeyLength,
@@ -359,7 +383,14 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 		FullAttnInterval: draftInfo.FullAttnInterval,
 	}, cfg.CTXSizeDraft, cfg.KVTypeDraft)
 
-	cfg.DraftGPU = findDraftGPU(caps, target, draftSizeMB+draftKVMB+computeFloorMB)
+	cfg.VRAMMB = draftSizeMB + draftKVMB
+	cfg.DraftGPU = findDraftGPU(caps, target, cfg.VRAMMB)
+	if cfg.DraftGPU < 0 {
+		fmt.Fprintf(os.Stderr, "[spec] companion %s needs %d MiB for weights and %s KV, but no GPU has room; skipping\n",
+			filepath.Base(candidate), cfg.VRAMMB, cfg.KVTypeDraft)
+		*cfg = *newDraftConfig(opts)
+		return false
+	}
 	if caps.CPU.Cores >= 4 {
 		cfg.ThreadsDraft = 2
 	} else {
@@ -664,7 +695,7 @@ func findSpecializedCandidate(target *ModelProfile, modelDir string, opts Option
 			fmt.Fprintf(os.Stderr, "[spec] rejecting local %s companion %s: selected backend cannot load it: %v\n", strings.ToUpper(kind), filepath.Base(path), err)
 			continue
 		}
-		matches = append(matches, candidate{path: path, size: fi.Size(), rank: draftCandidateRank(path, kind)})
+		matches = append(matches, candidate{path: path, size: fi.Size(), rank: draftCandidateRankForTarget(path, kind, target)})
 	}
 	if len(matches) == 0 {
 		return ""
@@ -954,6 +985,9 @@ func downloadSpecCandidate(target *ModelProfile, modelDir string, opts Options, 
 		addRepo(repo)
 	}
 	if !reviewedOnly {
+		for _, repo := range compatibleSpecializedRepos(target, kind, opts.BackendTag) {
+			addRepo(repo)
+		}
 		for _, q := range []string{"unsloth", "bartowski", "lmstudio-community"} {
 			if q == target.QuantizedBy {
 				continue
@@ -974,7 +1008,9 @@ func downloadSpecCandidate(target *ModelProfile, modelDir string, opts Options, 
 			fmt.Fprintf(os.Stderr, "[spec] skipping %s: %s\n", repo, reason)
 			continue
 		}
-		if (kind == "mtp" || kind == "dflash") && !hfRepoGGUFArchitectureCompatible(client, repo, target, kind, opts.BackendTag) {
+		if (kind == "mtp" || kind == "dflash") &&
+			!reviewedSpecializedRepoCompatible(repo, target, kind, opts.BackendTag) &&
+			!hfRepoGGUFArchitectureCompatible(client, repo, target, kind, opts.BackendTag) {
 			continue
 		}
 		paths := listRepoDraftCandidates(client, repo, kind)
@@ -1149,6 +1185,30 @@ func knownSpecializedRepos(target *ModelProfile, kind string) []string {
 	return repos
 }
 
+func compatibleSpecializedRepos(target *ModelProfile, kind, backendTag string) []string {
+	var repos []string
+	seen := map[string]bool{}
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if !manifest.CompatibilityApproved || manifest.Kind != kind ||
+			!manifestTargetMatches(manifest, target) || !manifestBackendMatches(manifest, backendTag) ||
+			seen[manifest.Repo] {
+			continue
+		}
+		seen[manifest.Repo] = true
+		repos = append(repos, manifest.Repo)
+	}
+	return repos
+}
+
+func reviewedSpecializedRepoCompatible(repo string, target *ModelProfile, kind, backendTag string) bool {
+	for _, candidate := range compatibleSpecializedRepos(target, kind, backendTag) {
+		if strings.EqualFold(strings.Trim(repo, "/"), candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func unsupportedSpecializedRepo(repo, kind string) string {
 	for _, manifest := range reviewedSpecializedArtifacts {
 		if manifest.Kind == kind && strings.EqualFold(strings.Trim(repo, "/"), manifest.Repo) && manifest.UnsupportedReason != "" {
@@ -1159,6 +1219,12 @@ func unsupportedSpecializedRepo(repo, kind string) string {
 }
 
 const (
+	lagunaDFlashRepo     = "poolside/Laguna-S-2.1-GGUF"
+	lagunaDFlashFile     = "laguna-s-2.1-DFlash-BF16.gguf"
+	lagunaDFlashRevision = "e08e1fe855bb2d43f96ad78e24495283f3426c67"
+	lagunaDFlashSHA256   = "2ee8aa30338d6599bc7a8ce008cc57c56f2c2b2fdc21f6db9ecda203c751bfd4"
+	lagunaDFlashSize     = int64(2233764224)
+
 	deepSeekV4DFlashRepo     = "Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF"
 	deepSeekV4DFlashFile     = "DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf"
 	deepSeekV4DFlashRevision = "7c74cca4d266f084b5e14dc68c77e922cfed17ea"
@@ -1196,6 +1262,12 @@ type specializedArtifactManifest struct {
 // harness. Known-incompatible entries remain pinned here so mutable HF names or
 // mirrors cannot make ggrun rediscover and download them as if they were new.
 var reviewedSpecializedArtifacts = []specializedArtifactManifest{
+	{
+		Kind: "dflash", Repo: lagunaDFlashRepo, Revision: lagunaDFlashRevision,
+		File: lagunaDFlashFile, SHA256: lagunaDFlashSHA256, Size: lagunaDFlashSize,
+		TargetArch: "laguna", CompanionArch: "dflash", BackendTags: []string{"llama"},
+		CompatibilityApproved: true,
+	},
 	{
 		Kind: "dflash", Repo: deepSeekV4DFlashRepo, Revision: deepSeekV4DFlashRevision,
 		File: deepSeekV4DFlashFile, SHA256: deepSeekV4DFlashSHA256, Size: deepSeekV4DFlashSize,
@@ -1253,6 +1325,16 @@ func specializedArtifactFor(repo, remotePath string) (specializedArtifactManifes
 }
 
 func verifyKnownLocalSpecArtifact(path string, target *ModelProfile, kind string) error {
+	if target != nil && kind == "dflash" && strings.EqualFold(strings.TrimSpace(target.ModelArch), "laguna") {
+		name := strings.ToLower(filepath.Base(path))
+		if !strings.HasSuffix(name, strings.ToLower(sanitizeFilename(lagunaDFlashFile))) {
+			return fmt.Errorf("Laguna DFlash requires Poolside's corrected BF16 companion %s", lagunaDFlashFile)
+		}
+		if err := verifyFileSHA256(path, lagunaDFlashSize, lagunaDFlashSHA256); err != nil {
+			return fmt.Errorf("stale or modified Laguna DFlash companion: %w", err)
+		}
+		return nil
+	}
 	if !isDeepSeekV4FlashTarget(target) {
 		return nil
 	}
@@ -1603,6 +1685,26 @@ func draftCandidateRank(path, kind string) int {
 	return score*10 + draftQuantRank(name)
 }
 
+func draftCandidateRankForTarget(path, kind string, target *ModelProfile) int {
+	name := strings.ToLower(filepath.Base(path))
+	if kind == "dflash" && target != nil && strings.EqualFold(strings.TrimSpace(target.ModelArch), "laguna") {
+		if strings.HasSuffix(name, strings.ToLower(sanitizeFilename(lagunaDFlashFile))) {
+			return -100
+		}
+		if strings.Contains(name, "bf16") || strings.Contains(name, "f16") {
+			return -50
+		}
+	}
+	return draftCandidateRank(path, kind)
+}
+
+func dflashDraftMax(target *ModelProfile) int {
+	if target != nil && strings.EqualFold(strings.TrimSpace(target.ModelArch), "laguna") {
+		return defaultLagunaDFlashDraftMax
+	}
+	return 16
+}
+
 func draftQuantRank(name string) int {
 	name = strings.ToLower(name)
 	switch {
@@ -1626,17 +1728,22 @@ func draftQuantRank(name string) int {
 // findDraftGPU selects the GPU with the most free VRAM after the target model
 // loads its layers. This ensures the draft model has room without colliding.
 func findDraftGPU(caps *detect.Capabilities, target *ModelProfile, draftVRAMNeed int) int {
-	bestGPU := 0
-	bestFree := 0
+	bestGPU := -1
+	bestFree := -1
+	bestBandwidth := -1
 
 	for i, g := range caps.GPUs {
 		// Estimate target model's VRAM usage on this GPU
 		targetUse := estimateTargetVRAMUse(target, caps, i)
-		freeAfterTarget := g.VRAMTotalMB - targetUse - draftVRAMNeed
+		freeAfterTarget := g.VRAMFreeMB() - targetUse - draftVRAMNeed
+		if freeAfterTarget < 0 {
+			continue
+		}
 
-		if freeAfterTarget > bestFree {
+		if freeAfterTarget > bestFree || (freeAfterTarget == bestFree && g.BandwidthMBps > bestBandwidth) {
 			bestFree = freeAfterTarget
-			bestGPU = i
+			bestBandwidth = g.BandwidthMBps
+			bestGPU = g.Index
 		}
 	}
 	return bestGPU
@@ -1680,24 +1787,6 @@ func estimateTargetVRAMUse(target *ModelProfile, caps *detect.Capabilities, gpuI
 	}
 	share := float64(caps.GPUs[gpuIndex].VRAMFreeMB()) / float64(totalFree)
 	return int(float64(target.TotalSizeMB) * vramOverheadPercent / 100 * share)
-}
-
-// computeDraftKVType determines the KV cache type for the draft model.
-// Prefers the same type as the target for consistency, falls back to q4_0
-// if the draft model is too large for q8_0 on the selected GPU.
-func computeDraftKVType(caps *detect.Capabilities, draftInfo *gguf.Info) string {
-	if draftInfo == nil || len(caps.GPUs) == 0 {
-		return "q4_0"
-	}
-
-	// For draft models (typically < 2GB), q8_0 KV cache is fine
-	// on any GPU with > 4GB free. Use q4_0 on smaller GPUs.
-	for _, g := range caps.GPUs {
-		if g.VRAMFreeMB() > 4096 {
-			return "q8_0"
-		}
-	}
-	return "q4_0"
 }
 
 // DraftFlags returns the llama-server arguments for speculative decoding.

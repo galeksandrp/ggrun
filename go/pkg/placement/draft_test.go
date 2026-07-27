@@ -82,6 +82,54 @@ func TestDFlashCrossFamilyCompanionStillRejected(t *testing.T) {
 	}
 }
 
+func TestLagunaDFlashRequiresCorrectedOfficialBF16(t *testing.T) {
+	target := &ModelProfile{ModelArch: "laguna"}
+	q4 := filepath.Join(t.TempDir(), "laguna-s-2.1-dflash-Q4_0.gguf")
+	if err := os.WriteFile(q4, []byte("GGUF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyKnownLocalSpecArtifact(q4, target, "dflash"); err == nil {
+		t.Fatal("Laguna accepted an unsupported Q4 DFlash derivative")
+	}
+
+	stale := filepath.Join(t.TempDir(), lagunaDFlashFile)
+	if err := os.WriteFile(stale, []byte("GGUF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyKnownLocalSpecArtifact(stale, target, "dflash"); err == nil {
+		t.Fatal("Laguna accepted a stale or modified official DFlash file")
+	}
+	// 15 is poolside's llama.cpp recipe, "clamped to the trained block size of
+	// 15 + 1", and the drafter GGUF reports that block as 16. The 7 this once
+	// asserted came from their vLLM recipe, where the knob is a separate one;
+	// asking a block diffusion drafter for a truncated prefix measured 0.27%
+	// acceptance here against the ~3.1 poolside publish.
+	if got := dflashDraftMax(target); got != 15 {
+		t.Fatalf("Laguna DFlash max = %d, want 15 (poolside's trained block size)", got)
+	}
+	if got := dflashDraftMax(&ModelProfile{ModelArch: "other"}); got != 16 {
+		t.Fatalf("generic DFlash max = %d, want 16", got)
+	}
+}
+
+func TestLagunaDFlashManifestIsPinned(t *testing.T) {
+	manifest, ok := specializedArtifactFor(lagunaDFlashRepo, lagunaDFlashFile)
+	if !ok {
+		t.Fatal("official Laguna DFlash manifest is missing")
+	}
+	if manifest.Revision == "" || manifest.Revision == "main" || len(manifest.SHA256) != 64 || manifest.Size <= 0 {
+		t.Fatalf("Laguna DFlash artifact is not immutable: %#v", manifest)
+	}
+	target := &ModelProfile{ModelArch: "laguna"}
+	if !reviewedSpecializedRepoCompatible(lagunaDFlashRepo, target, "dflash", "llama") {
+		t.Fatal("explicit Laguna DFlash cannot discover its reviewed Poolside repository")
+	}
+	if got := draftCandidateRankForTarget(lagunaDFlashFile, "dflash", target); got >=
+		draftCandidateRankForTarget("laguna-s-2.1-dflash-Q4_0.gguf", "dflash", target) {
+		t.Fatal("official BF16 DFlash companion did not outrank the Q4 derivative")
+	}
+}
+
 // The drafter's KV must be sized to the context this launch serves, not to what
 // the target model was trained for. ModelProfile.ContextSize is the trained
 // length, so using it gave a 1M-trained target's drafter a 1,048,576-token KV
