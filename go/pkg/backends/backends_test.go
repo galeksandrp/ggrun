@@ -58,16 +58,49 @@ func TestMiniMaxM3RecipeIsPinnedAndRouted(t *testing.T) {
 	}
 }
 
-func TestLagunaRecipeIsPinnedAndRouted(t *testing.T) {
+// The default Laguna recipe must be poolside's own fork, not the upstream pull
+// request. The PR implements the target architecture only: its loader builds 69
+// of the 76 tensors the published DFlash drafter contains, so every speculative
+// launch dies during model load. On a RAM-resident MoE, where a forward pass
+// costs nearly the same carrying one token or a micro-batch, that forfeits the
+// largest measured lever available.
+func TestLagunaRecipeUsesThePoolsideForkForDFlash(t *testing.T) {
 	recipe := RecipeByName("laguna")
 	if recipe == nil {
 		t.Fatal("Laguna recipe missing")
 	}
-	if recipe.RouteArch != "laguna" || recipe.Branch != "add-laguna" {
-		t.Fatalf("unexpected Laguna route/branch: %#v", recipe)
+	if recipe.RouteArch != "laguna" {
+		t.Errorf("Laguna route arch = %q, want laguna", recipe.RouteArch)
 	}
-	if recipe.GitURL != "https://github.com/joerowell/llama.cpp.git" || len(recipe.Commit) != 40 {
-		t.Fatalf("Laguna source is not reproducibly pinned: %#v", recipe)
+	if recipe.GitURL != "https://github.com/poolsideai/llama.cpp.git" {
+		t.Errorf("Laguna source = %q, want poolside's fork (the upstream PR cannot load the DFlash drafter)", recipe.GitURL)
+	}
+	if recipe.Branch != "laguna" {
+		t.Errorf("Laguna branch = %q, want laguna", recipe.Branch)
+	}
+	if len(recipe.Commit) != 40 {
+		t.Errorf("Laguna source is not reproducibly pinned: %#v", recipe)
+	}
+}
+
+// The upstream PR stays selectable: it is what heads for mainline, so it is the
+// build to test against when the PR merges, and it is a working target-only
+// fallback if the poolside fork regresses.
+func TestLagunaUpstreamPRRecipeRemainsAvailable(t *testing.T) {
+	recipe := RecipeByName("laguna-upstream-pr")
+	if recipe == nil {
+		t.Fatal("upstream-PR Laguna recipe missing")
+	}
+	if recipe.GitURL != "https://github.com/joerowell/llama.cpp.git" || recipe.Branch != "add-laguna" {
+		t.Errorf("unexpected upstream-PR source: %#v", recipe)
+	}
+	if recipe.RouteArch != "laguna" || len(recipe.Commit) != 40 {
+		t.Errorf("upstream-PR recipe is not routed or pinned: %#v", recipe)
+	}
+	// The two recipes must be distinguishable, or installing one would silently
+	// register over the other.
+	if def := RecipeByName("laguna"); def != nil && def.Tag == recipe.Tag {
+		t.Errorf("both Laguna recipes share tag %q", recipe.Tag)
 	}
 }
 

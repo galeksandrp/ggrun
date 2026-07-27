@@ -81,9 +81,36 @@ var builtinRecipes = []Recipe{
 		Accel:       "",
 	},
 	{
+		// Poolside's own fork, not the upstream pull request.
+		//
+		// The upstream PR (joerowell/llama.cpp @ add-laguna) serves Laguna
+		// correctly but implements only the target architecture. Its loader
+		// builds 69 of the 76 tensors the published DFlash drafter contains, so
+		// any speculative launch dies during model load:
+		//
+		//   done_getting_tensors: wrong number of tensors; expected 76, got 69
+		//
+		// Poolside state it directly: "Upstream llama.cpp ships the generic
+		// DFlash framework but not the Laguna decoder contract this draft model
+		// needs." Speculation is the largest measured lever on a RAM-resident
+		// MoE -- a forward pass costs nearly the same carrying one token or a
+		// micro-batch -- so a recipe that cannot load the drafter forfeits it.
 		Name:        "laguna",
-		Description: "Poolside Laguna support from the open upstream llama.cpp PR",
+		Description: "Poolside Laguna support including the DFlash drafter (poolside fork, not the upstream PR)",
 		Tag:         "laguna",
+		GitURL:      "https://github.com/poolsideai/llama.cpp.git",
+		Branch:      "laguna",
+		Commit:      "04b2b72cb54048ead292884adbe11f284e3ec950",
+		RouteArch:   "laguna",
+		Accel:       "",
+	},
+	{
+		// Kept selectable: it is the branch heading for upstream, so it is the
+		// one to test against when the PR merges, and it remains a working
+		// target-only fallback if the poolside fork regresses.
+		Name:        "laguna-upstream-pr",
+		Description: "Laguna target architecture from the open upstream llama.cpp PR (no DFlash drafter)",
+		Tag:         "laguna-upstream-pr",
 		GitURL:      "https://github.com/joerowell/llama.cpp.git",
 		Branch:      "add-laguna",
 		Commit:      "54f214a09b8c4e709357ae661a77925edb154f13",
