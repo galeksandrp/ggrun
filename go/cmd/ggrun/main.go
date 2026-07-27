@@ -2363,6 +2363,44 @@ func previousClaudeLogMatches(logData string, model *placement.ModelProfile, str
 	return strings.Contains(logData, wantSlots)
 }
 
+// recordPreviousClaudePromptCache learns what a saved conversation actually
+// cost from the last run's log.
+//
+// It has to read the previous run rather than this one: eviction and skip lines
+// are emitted while serving, and the launch-time buffer ggrun records other
+// probes from is captured at the health check, before any request exists. That
+// makes this the same shape as the OOM recovery beside it, and it only became
+// reliable once the log scope stopped depending on values placement derives --
+// before that the previous run's log was filed under a name this one could not
+// reconstruct.
+// It reports whether the stored measurement grew, which is the caller's cue to
+// re-plan: CRAM was already computed from the old value.
+func recordPreviousClaudePromptCache(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, logData string) bool {
+	if cfg == nil || model == nil || strategy == nil || caps == nil || logData == "" {
+		return false
+	}
+	obs := placement.ObservePromptCache(logData)
+	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 {
+		return false
+	}
+	tag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
+	if err := placement.RecordPromptCacheObservation(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, tag, caps.GPUs, strategy.Parallel, obs); err != nil {
+		return false
+	}
+	grew := obs.LargestEntryMB > strategy.MeasuredPromptCacheEntryMB ||
+		obs.BytesPerToken > strategy.MeasuredPromptCacheBPT
+	switch {
+	case obs.Skipped > 0:
+		fmt.Printf("[launch] prompt cache: %d prompt(s) exceeded the whole budget last run, largest %.0f MiB; sizing from the measurement\n",
+			obs.Skipped, obs.LargestEntryMB)
+	case obs.Evicted > 0:
+		fmt.Printf("[launch] prompt cache: %d eviction(s) last run, largest entry %.0f MiB; sizing from the measurement\n",
+			obs.Evicted, obs.LargestEntryMB)
+	}
+	return grew
+}
+
 func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string) (*placement.Strategy, error) {
 	if req == nil || !req.ClaudeCode {
 		return strategy, nil
@@ -2373,13 +2411,29 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 	if err != nil || !previousClaudeLogMatches(string(logData), model, strategy, scope) {
 		return strategy, nil
 	}
+	// A served log carries what the prompt cache actually cost as well. Record
+	// it before anything re-plans, so one re-plan picks up both.
+	promptCacheGrew := recordPreviousClaudePromptCache(req, cfg, model, strategy, be, caps, string(logData))
 	markerPath := logPath + ".oom-recorded"
 	device, reserveMB, estimated, changed, ok, err := recordRuntimeOOMLog(req, cfg, model, strategy, be, caps, string(logData), markerPath)
 	if err != nil {
 		return nil, fmt.Errorf("recover previous Claude runtime OOM: %w", err)
 	}
 	if !ok || !changed {
-		return strategy, nil
+		if !promptCacheGrew {
+			return strategy, nil
+		}
+		// CRAM was sized before the measurement existed. Re-plan so the budget
+		// reaches the launch rather than waiting for the run after next.
+		opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+		opts.SkipPlacementCache = true
+		next, err := placement.Compute(caps, model, opts)
+		if err != nil {
+			return nil, err
+		}
+		claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+		fmt.Printf("[launch] prompt cache: re-planned -cram %d -> %d MiB from the measured entry size\n", strategy.CRAM, next.CRAM)
+		return next, nil
 	}
 	if estimated {
 		fmt.Printf("[launch] recovered previous CUDA VMM OOM on device %d; llama.cpp omitted its allocation size, reserving %d MiB runtime headroom and re-planning\n", device, reserveMB)

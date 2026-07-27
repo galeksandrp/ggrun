@@ -128,6 +128,92 @@ func promptCacheBudgetMB(bytesPerToken float64, promptTokens, slots int) int {
 	return int(perEntryMB * float64(slots+1))
 }
 
+// measuredPromptCacheBudgetMB sizes the cache from whichever measurement is
+// available, preferring the directly observed entry size.
+//
+// The entry size is preferred because it needs no assumption: the per-token
+// route has to guess how long a typical cached turn is, and on this project
+// that guess was the whole error -- KV for a full 1M context estimated 9238 MiB
+// while one real entry measured 6494. It is also the cheaper measurement, since
+// the backend prints entry sizes at warning level and the per-token state only
+// at trace.
+//
+// Returns 0 when nothing was measured, so the caller keeps its derived value
+// rather than acting on a guess dressed as a measurement.
+func measuredPromptCacheBudgetMB(s *Strategy, slots int) int {
+	if s == nil {
+		return 0
+	}
+	if slots < 1 {
+		slots = 1
+	}
+	if s.MeasuredPromptCacheEntryMB > 0 {
+		// One spare entry, for the same reason as below: a conversation is
+		// stored before the one it replaces is dropped.
+		return int(s.MeasuredPromptCacheEntryMB * float64(slots+1))
+	}
+	return promptCacheBudgetMB(s.MeasuredPromptCacheBPT, s.PromptCacheTypicalTokens, slots)
+}
+
+// LoadMeasuredPromptCache copies any stored prompt-cache measurement onto a
+// strategy so CRAM sizing can use it. Absent measurements leave the strategy
+// untouched, which keeps the derived budget in place.
+func LoadMeasuredPromptCache(cacheDir string, model *ModelProfile, s *Strategy, backendTag string, gpus []detect.GPU) {
+	if s == nil || model == nil {
+		return
+	}
+	pc := loadProbeCache(cacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendTag, gpus, s.Parallel)
+	if pc == nil {
+		return
+	}
+	if pc.PromptCacheEntryMB > 0 {
+		s.MeasuredPromptCacheEntryMB = pc.PromptCacheEntryMB
+	}
+	if pc.PromptCacheBytesPerToken > 0 {
+		s.MeasuredPromptCacheBPT = pc.PromptCacheBytesPerToken
+	}
+}
+
+// RecordPromptCacheObservation stores whatever a backend log revealed about the
+// prompt cache, keyed exactly like the other probes.
+//
+// The eviction and skip lines it reads only appear once the cache is already
+// too small, so this is self-correcting rather than predictive: the first run
+// with an undersized budget pays the re-prefill and the next one does not.
+func RecordPromptCacheObservation(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, obs PromptCacheObservation) error {
+	if model == nil || ctxSize <= 0 || ubatch <= 0 {
+		return nil
+	}
+	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 {
+		return nil
+	}
+	pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel)
+	compute := map[int]int{}
+	growth := map[int]int{}
+	estimated := map[int]bool{}
+	kvPerLayerMB := 0
+	if pc != nil {
+		for k, v := range pc.ComputeBufByGPU {
+			compute[k] = v
+		}
+		for k, v := range pc.RuntimeGraphGrowthByGPU {
+			growth[k] = v
+		}
+		for k, v := range pc.RuntimeGraphGrowthEstimatedByGPU {
+			estimated[k] = v
+		}
+		kvPerLayerMB = pc.KVPerLayerMB
+		// Keep the largest entry ever seen: a run that happened to cache only
+		// short turns must not shrink a budget a long one proved necessary.
+		if pc.PromptCacheEntryMB > obs.LargestEntryMB {
+			obs.LargestEntryMB = pc.PromptCacheEntryMB
+		}
+	}
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
+		compute, growth, estimated, kvPerLayerMB,
+		promptCacheProbe{BytesPerToken: obs.BytesPerToken, EntryMB: obs.LargestEntryMB})
+}
+
 // RecordMeasuredPromptCache stores a per-token prompt-cache cost read from
 // backend output, keyed exactly like the other probes so a different context,
 // KV type, slot count or backend cannot inherit it.
@@ -153,7 +239,7 @@ func RecordMeasuredPromptCache(cacheDir string, model *ModelProfile, ctxSize, ub
 		kvPerLayerMB = pc.KVPerLayerMB
 	}
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
-		compute, growth, estimated, kvPerLayerMB, bytesPerToken)
+		compute, growth, estimated, kvPerLayerMB, promptCacheProbe{BytesPerToken: bytesPerToken})
 }
 
 // MeasuredPromptCacheBytesPerToken returns a stored measurement, or 0 when this

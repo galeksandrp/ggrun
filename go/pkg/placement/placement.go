@@ -92,32 +92,36 @@ type Strategy struct {
 	// BackendSupportsKVOffload reports whether the backend accepts the positive
 	// --kv-offload switch. GPU KV is the backend default, so a backend which
 	// only exposes --no-kv-offload must receive no positive flag at all.
-	BackendSupportsKVOffload bool         `json:"-"`
-	MMap                     bool         `json:"mmap"`
-	MMapRequired             bool         `json:"mmap_required,omitempty"`
-	MLock                    bool         `json:"mlock"`
-	FlashAttention           bool         `json:"flash_attention"`
-	Threads                  int          `json:"threads"`
-	BatchSize                int          `json:"batch_size"`
-	UBatchSize               int          `json:"ubatch_size"`
-	BackendTag               string       `json:"backend_tag,omitempty"` // "llama" or "ik_llama"
-	IsMoE                    bool         `json:"is_moe"`
-	ReasoningOff             bool         `json:"reasoning_off"` // default off for OpenAI compat
-	ThreadsBatch             int          `json:"threads_batch"` // batch threads (logical cores)
-	Parallel                 int          `json:"parallel,omitempty"`
-	CRAM                     int          `json:"cram,omitempty"` // prompt cache MB
+	BackendSupportsKVOffload bool   `json:"-"`
+	MMap                     bool   `json:"mmap"`
+	MMapRequired             bool   `json:"mmap_required,omitempty"`
+	MLock                    bool   `json:"mlock"`
+	FlashAttention           bool   `json:"flash_attention"`
+	Threads                  int    `json:"threads"`
+	BatchSize                int    `json:"batch_size"`
+	UBatchSize               int    `json:"ubatch_size"`
+	BackendTag               string `json:"backend_tag,omitempty"` // "llama" or "ik_llama"
+	IsMoE                    bool   `json:"is_moe"`
+	ReasoningOff             bool   `json:"reasoning_off"` // default off for OpenAI compat
+	ThreadsBatch             int    `json:"threads_batch"` // batch threads (logical cores)
+	Parallel                 int    `json:"parallel,omitempty"`
+	CRAM                     int    `json:"cram,omitempty"` // prompt cache MB
 	// MeasuredPromptCacheBPT and PromptCacheTypicalTokens carry a measured
 	// prompt-cache cost into CRAM sizing. Zero means nothing was measured, and
 	// the derived budget stands.
 	MeasuredPromptCacheBPT   float64 `json:"measured_prompt_cache_bpt,omitempty"`
 	PromptCacheTypicalTokens int     `json:"prompt_cache_typical_tokens,omitempty"`
-	MaxCheckpoints           int          `json:"max_checkpoints,omitempty"`
-	UseCUDAGraphs            bool         `json:"use_cuda_graphs,omitempty"`
-	Host                     string       `json:"host,omitempty"`        // listen address
-	HasSSM                   bool         `json:"has_ssm,omitempty"`     // SSM/Mamba hybrid flag
-	Draft                    *DraftConfig `json:"draft,omitempty"`       // speculative decoding config
-	MMProjPath               string       `json:"mmproj_path,omitempty"` // vision projector GGUF
-	MMProjSizeMB             int          `json:"-"`                     // mmproj VRAM on primary GPU
+	// MeasuredPromptCacheEntryMB is what one saved conversation occupied, taken
+	// from the backend rather than derived. It is preferred over the per-token
+	// cost because it needs no assumption about how long a typical turn is.
+	MeasuredPromptCacheEntryMB float64      `json:"measured_prompt_cache_entry_mb,omitempty"`
+	MaxCheckpoints             int          `json:"max_checkpoints,omitempty"`
+	UseCUDAGraphs              bool         `json:"use_cuda_graphs,omitempty"`
+	Host                       string       `json:"host,omitempty"`        // listen address
+	HasSSM                     bool         `json:"has_ssm,omitempty"`     // SSM/Mamba hybrid flag
+	Draft                      *DraftConfig `json:"draft,omitempty"`       // speculative decoding config
+	MMProjPath                 string       `json:"mmproj_path,omitempty"` // vision projector GGUF
+	MMProjSizeMB               int          `json:"-"`                     // mmproj VRAM on primary GPU
 	// CompanionPlacements records where each Options.Companions reservation was
 	// placed: GPU index, or -1 for CPU. Runtime-only; the launcher starts the
 	// helper on the device the planner chose.
@@ -768,6 +772,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			// cache policy depends on current free RAM, slot count, and architecture,
 			// so recompute it on every launch instead of inheriting the zero-value
 			// checkpoint policy from the early cache-hit return.
+			LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
 			s.CRAM, s.MaxCheckpoints = computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
 			if opts.CacheRAMMB > 0 {
 				s.CRAM = opts.CacheRAMMB
@@ -823,6 +828,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 
 	// Compute CRAM (prompt cache)
+	LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
 	cram, maxCheckpoints := computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
 	if opts.CacheRAMMB > 0 {
 		cram = opts.CacheRAMMB
@@ -3308,10 +3314,12 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 	// is KV, and an entry is target state + draft state + checkpoints. Sizing is
 	// per slot, against the context a turn actually carries rather than the
 	// configured maximum, because a 1M-token allowance is not what gets cached.
-	if s.MeasuredPromptCacheBPT > 0 {
-		if measured := promptCacheBudgetMB(s.MeasuredPromptCacheBPT, s.PromptCacheTypicalTokens, slots); measured > cram {
-			cram = measured
-		}
+	//
+	// Until one of these is measured the budget does not vary with the slot
+	// count at all, which is why it could not be compared across slot settings:
+	// the same 9728 MiB came out at one slot and at four.
+	if measured := measuredPromptCacheBudgetMB(s, slots); measured > cram {
+		cram = measured
 	}
 	// Never take RAM the weights and their working set need: the backend runs
 	// inside a memory scope, and a cache that pushes it over the limit trades a
@@ -4801,6 +4809,10 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
 				pc.PromptCacheBytesPerToken = v
 			}
+		case k == "PROBED_PROMPT_CACHE_ENTRY_MB":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				pc.PromptCacheEntryMB = v
+			}
 		case strings.HasPrefix(k, "PROBED_COMPUTE_BUF_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(k, "PROBED_COMPUTE_BUF_MB_CUDA")
 			idx, idxErr := strconv.Atoi(idxRaw)
@@ -4955,6 +4967,24 @@ type probeCache struct {
 	// on the turn after -- 17.5% cache-read against 88.3% on a single-slot
 	// server sharing the same box and client.
 	PromptCacheBytesPerToken float64
+	// PromptCacheEntryMB is what one saved conversation actually occupied,
+	// read from the backend's own eviction and skip lines.
+	//
+	// This is the quantity the budget formula needs -- a cache holding fewer
+	// than one entry per slot evicts a conversation's prefix to admit the next
+	// -- and unlike the per-token cost it is printed at warning level, so it
+	// arrives without raising verbosity. It only appears once the cache is
+	// already under pressure, which is exactly when the budget is wrong.
+	PromptCacheEntryMB float64
+}
+
+// promptCacheProbe carries measured prompt-cache values into the probe writer.
+// It exists so the writer's optional tail stays type-safe: the alternative was
+// a positional ...float64, where adding a second measurement silently turns
+// every mis-ordered call into a wrong value rather than a compile error.
+type promptCacheProbe struct {
+	BytesPerToken float64
+	EntryMB       float64
 }
 
 const probeCacheSchema = 4
@@ -5017,17 +5047,24 @@ func WriteProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 // promptCacheBPT is variadic so the many existing writers stay untouched: they
 // know nothing about the prompt cache, and a fixed parameter would have made
 // every one of them assert a zero that erased a real measurement.
-func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, estimatedByGPU map[int]bool, kvPerLayerMB int, promptCacheBPT ...float64) error {
+func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, estimatedByGPU map[int]bool, kvPerLayerMB int, promptCache ...promptCacheProbe) error {
 	parallelKey := probeParallelKey(parallel)
 	// Absent means "unchanged", never "zero": a writer recording compute buffers
 	// must not discard a prompt-cache measurement it has no opinion about.
-	bpt := 0.0
-	if len(promptCacheBPT) > 0 && promptCacheBPT[0] > 0 {
-		bpt = promptCacheBPT[0]
-	} else if prev := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel); prev != nil {
-		bpt = prev.PromptCacheBytesPerToken
+	var measured promptCacheProbe
+	if len(promptCache) > 0 {
+		measured = promptCache[0]
 	}
-	promptCacheBPTValue := bpt
+	if measured.BytesPerToken <= 0 || measured.EntryMB <= 0 {
+		if prev := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel); prev != nil {
+			if measured.BytesPerToken <= 0 {
+				measured.BytesPerToken = prev.PromptCacheBytesPerToken
+			}
+			if measured.EntryMB <= 0 {
+				measured.EntryMB = prev.PromptCacheEntryMB
+			}
+		}
+	}
 	path := probeCachePath(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallelKey)
 	if path == "" {
 		return nil
@@ -5084,9 +5121,15 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	fmt.Fprintf(&b, "PROBE_CACHE_SCHEMA=%d\n", probeCacheSchema)
 	if maxCompute > 0 {
 		fmt.Fprintf(&b, "PROBED_COMPUTE_BUF_MB=%d\n", maxCompute)
-	if promptCacheBPTValue > 0 {
-		fmt.Fprintf(&b, "PROBED_PROMPT_CACHE_BYTES_PER_TOKEN=%.3f\n", promptCacheBPTValue)
 	}
+	// Outside the compute-buffer branch on purpose: these were nested inside it,
+	// so a prompt-cache measurement was discarded on every write that had no
+	// compute buffer to record alongside it.
+	if measured.BytesPerToken > 0 {
+		fmt.Fprintf(&b, "PROBED_PROMPT_CACHE_BYTES_PER_TOKEN=%.3f\n", measured.BytesPerToken)
+	}
+	if measured.EntryMB > 0 {
+		fmt.Fprintf(&b, "PROBED_PROMPT_CACHE_ENTRY_MB=%.1f\n", measured.EntryMB)
 	}
 	indices := make([]int, 0, len(mergedCompute))
 	for idx := range mergedCompute {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3505,6 +3506,57 @@ func TestPromptCacheBudgetIsQuantizedAgainstFreeRAMDrift(t *testing.T) {
 	ramAfterLoad := 120000 - (70000 - newCaps(120000).TotalVRAM())
 	if base > ramAfterLoad*2/3 {
 		t.Errorf("cram %d MiB exceeds the %d MiB host budget", base, ramAfterLoad*2/3)
+	}
+}
+
+// The point of a measured entry size is that the budget follows the slot count.
+// Without one it does not: `slots` was referenced only inside a branch gated on
+// a measurement nothing ever recorded, so one slot and four slots produced the
+// identical 9728 MiB and no A/B over --parallel could mean anything.
+func TestPromptCacheBudgetScalesWithSlotsOnceMeasured(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 120000},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "big-moe.gguf", Basename: "big-moe.gguf",
+		SizeBytes: 73000000000, TotalSizeMB: 70000,
+		NumLayers: 32, IsMoE: true, NumExperts: 128, ExpertUsedCount: 8,
+		ExpertFF: 2048, ExpertBytes: 68000000000, NonExpertBytes: 4000000000,
+		ModelArch: "qwen3moe", ContextSize: 262144, CTXTrain: 262144,
+	}
+	// The entry size actually observed on this project.
+	const entryMB float64 = 6494.703
+
+	unmeasured := map[int]int{}
+	measured := map[int]int{}
+	for _, slots := range []int{1, 2, 4} {
+		u, _ := computeCRAM(caps, model, &Strategy{Type: MoEOffload, Parallel: slots}, 70000, 8000)
+		m, _ := computeCRAM(caps, model,
+			&Strategy{Type: MoEOffload, Parallel: slots, MeasuredPromptCacheEntryMB: entryMB}, 70000, 8000)
+		unmeasured[slots], measured[slots] = u, m
+	}
+	if unmeasured[1] != unmeasured[4] {
+		t.Errorf("without a measurement the budget should not vary: 1 slot=%d, 4 slots=%d", unmeasured[1], unmeasured[4])
+	}
+	if !(measured[1] < measured[2] && measured[2] < measured[4]) {
+		t.Errorf("measured budget did not grow with slots: %d / %d / %d", measured[1], measured[2], measured[4])
+	}
+	// Four slots need one resident entry each, plus one so a conversation is
+	// stored before the one it replaces is dropped.
+	want := int(math.Floor(entryMB * 5))
+	if measured[4] < want-cramQuantumMB || measured[4] > want {
+		t.Errorf("4-slot budget %d MiB, want ~%d (5 x %.0f MiB entry)", measured[4], want, entryMB)
+	}
+	// It still may not exceed the host budget the weights need.
+	ramAfterLoad := 120000 - (70000 - caps.TotalVRAM())
+	if measured[4] > ramAfterLoad*2/3 {
+		t.Errorf("measured budget %d MiB exceeds the %d MiB host ceiling", measured[4], ramAfterLoad*2/3)
 	}
 }
 
