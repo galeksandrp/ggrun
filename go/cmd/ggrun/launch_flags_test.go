@@ -31,6 +31,10 @@ func TestValueFlagsParseInBothForms(t *testing.T) {
 			func(r *launchRequest) (int, int) { return r.CacheRAMMB, 32768 }},
 		{"cache-ram short spaced", []string{"m.gguf", "-cram", "32768"},
 			func(r *launchRequest) (int, int) { return r.CacheRAMMB, 32768 }},
+		{"claude-max-active spaced", []string{"m.gguf", "--claude-max-active", "4"},
+			func(r *launchRequest) (int, int) { return r.ClaudeMaxActive, 4 }},
+		{"claude-max-active equals", []string{"m.gguf", "--claude-max-active=4"},
+			func(r *launchRequest) (int, int) { return r.ClaudeMaxActive, 4 }},
 	}
 	for _, c := range cases {
 		req, err := parseLaunchArgs(c.args)
@@ -40,6 +44,42 @@ func TestValueFlagsParseInBothForms(t *testing.T) {
 		}
 		if got, want := c.check(req); got != want {
 			t.Errorf("%s: got %d, want %d", c.name, got, want)
+		}
+	}
+}
+
+// Adding --threads and --cache-ram between the "--parallel" case and its
+// trailing `req.ParallelSet = true` reattached that line to --cache-ram. The
+// value flags still parsed, so the both-forms test above passed, but
+// `--parallel 4` stopped marking itself explicit and `--cache-ram N` started
+// marking it instead -- which would have silently pinned the slot count during
+// the prompt-cache experiment that flag exists for. Set-flags need their own
+// assertions; a value that arrives correctly proves nothing about the bookkeeping
+// beside it.
+func TestExplicitParallelIsMarkedSetAndCacheRAMIsNot(t *testing.T) {
+	for _, args := range [][]string{
+		{"m.gguf", "--parallel", "4"},
+		{"m.gguf", "--parallel=4"},
+	} {
+		req, err := parseLaunchArgs(args)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if req.Parallel != 4 || !req.ParallelSet {
+			t.Errorf("%v: Parallel=%d ParallelSet=%v, want 4/true", args, req.Parallel, req.ParallelSet)
+		}
+	}
+	for _, args := range [][]string{
+		{"m.gguf", "--cache-ram", "32768"},
+		{"m.gguf", "-cram", "32768"},
+		{"m.gguf", "--threads", "16"},
+	} {
+		req, err := parseLaunchArgs(args)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		if req.ParallelSet {
+			t.Errorf("%v marked the slot count as explicitly chosen", args)
 		}
 	}
 }

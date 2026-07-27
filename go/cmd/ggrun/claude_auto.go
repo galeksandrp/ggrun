@@ -435,11 +435,48 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	return nil
 }
 
+// claudeMainMaxActive is how many main-model requests ggrun lets reach the
+// backend at once. It is the real concurrency of the server: the backend's slot
+// count only caps what this admits, so `--parallel 4` with a limit of 1 leaves
+// three slots permanently idle. Measured on this project across 339 requests,
+// the backend spent 75922.93 s with exactly one request in flight and 0.05 s
+// with two, against a 48-minute median queue for 3.4 minutes of service.
+//
+// The default stays 1 for host-offloaded models because that is the only value
+// with a measurement behind it -- 4-way decode returned 3.3 tok/s aggregate
+// against 4.13 single-stream. Everything arguing for more (86% of wall clock is
+// prefill, which batches rather than competes) is untested, and a default is not
+// where an untested hypothesis belongs. --claude-max-active is how that gets
+// measured; whichever wins should become the default, ideally calibrated rather
+// than constant.
 func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
-	if req == nil || !req.ClaudeCode || strategy == nil || strategy.Parallel <= 1 {
+	if req == nil || !req.ClaudeCode || strategy == nil {
 		return 0
 	}
+	limit := defaultClaudeMainMaxActive(strategy)
+	if req.ClaudeMaxActiveSet {
+		limit = req.ClaudeMaxActive
+	}
+	// Admission above the slot count does not buy concurrency, it relocates the
+	// queue into llama.cpp -- which serves FIFO and knows nothing about the
+	// safety lane, so a permission review would start waiting behind bulk work.
+	if limit > strategy.Parallel && strategy.Parallel > 0 {
+		limit = strategy.Parallel
+	}
+	if limit < 0 {
+		limit = 0
+	}
+	return limit
+}
+
+func defaultClaudeMainMaxActive(strategy *placement.Strategy) int {
 	if strategy.Type == placement.MoEOffload || strategy.Type == placement.DenseCPUOffload {
+		return 1
+	}
+	// A single slot can only serve one request, but the limit still matters:
+	// without it no scheduler is constructed at all, so lane priority, affinity
+	// and aging are switched off and llama.cpp queues the fan-out FIFO instead.
+	if strategy.Parallel <= 1 {
 		return 1
 	}
 	return 0

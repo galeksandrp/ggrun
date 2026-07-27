@@ -44,11 +44,53 @@ func TestClaudeMainMaxActiveLeavesGPUResidentParallel(t *testing.T) {
 		strategy *placement.Strategy
 	}{
 		{&launchRequest{ClaudeCode: true}, &placement.Strategy{Type: placement.MultiGPUDense, Parallel: 4}},
-		{&launchRequest{ClaudeCode: true}, &placement.Strategy{Type: placement.MoEOffload, Parallel: 1}},
 		{&launchRequest{}, &placement.Strategy{Type: placement.MoEOffload, Parallel: 4}},
 	} {
 		if got := claudeMainMaxActive(tc.req, tc.strategy); got != 0 {
 			t.Fatalf("unexpected admission cap %d for req=%+v strategy=%+v", got, tc.req, tc.strategy)
+		}
+	}
+}
+
+// A single slot used to return 0, and 0 means "build no scheduler at all" --
+// so the one configuration that most needs ordering got none: lane priority,
+// affinity and aging all off, with llama.cpp queueing the fan-out FIFO. One
+// slot serves one request either way; the limit is what keeps a permission
+// review from waiting behind bulk work.
+func TestClaudeMainMaxActiveStillSchedulesAtOneSlot(t *testing.T) {
+	for _, strategyType := range []placement.StrategyType{placement.MoEOffload, placement.MultiGPUDense} {
+		strategy := &placement.Strategy{Type: strategyType, Parallel: 1}
+		if got := claudeMainMaxActive(&launchRequest{ClaudeCode: true}, strategy); got != 1 {
+			t.Errorf("strategy %s at one slot: max active=%d, want 1", strategyType, got)
+		}
+	}
+}
+
+// The flag is how the serialized default gets tested against real concurrency,
+// so it has to actually override -- and it must never exceed the slot count,
+// because admitting more than there are slots moves the queue into llama.cpp
+// rather than removing it.
+func TestClaudeMaxActiveOverrideIsClampedToSlots(t *testing.T) {
+	moe := func(parallel int) *placement.Strategy {
+		return &placement.Strategy{Type: placement.MoEOffload, Parallel: parallel}
+	}
+	req := func(limit int) *launchRequest {
+		return &launchRequest{ClaudeCode: true, ClaudeMaxActive: limit, ClaudeMaxActiveSet: true}
+	}
+	for _, tc := range []struct {
+		name     string
+		req      *launchRequest
+		strategy *placement.Strategy
+		want     int
+	}{
+		{"override raises the host-offload default", req(4), moe(4), 4},
+		{"clamped to the available slots", req(8), moe(4), 4},
+		{"zero is an explicit opt out", req(0), moe(4), 0},
+		{"override lowers below the default", req(1), moe(4), 1},
+		{"unset keeps the measured default", &launchRequest{ClaudeCode: true}, moe(4), 1},
+	} {
+		if got := claudeMainMaxActive(tc.req, tc.strategy); got != tc.want {
+			t.Errorf("%s: max active=%d, want %d", tc.name, got, tc.want)
 		}
 	}
 }

@@ -161,6 +161,8 @@ Launch flags:
   --parallel int       Concurrent sequence slots
   --threads int, -t    CPU threads (default: physical cores)
   --cache-ram int      Host prompt-cache budget in MiB (-cram); 0 derives it
+  --claude-max-active int  Main-model requests admitted at once in --claude-code mode;
+                       0 removes the limit, and it is capped at --parallel
   --mmap               Explicitly approve file-backed mmap when placement needs it
   --no-mmap            Require fully resident model weights
   --ram-limit-percent int  Maximum whole-host RAM utilisation (default 95)
@@ -502,6 +504,8 @@ type launchRequest struct {
 	ParallelSet          bool // --parallel given explicitly; claude-code mode must not override it
 	Threads              int  // --threads; 0 keeps the physical-core default
 	CacheRAMMB           int  // --cache-ram; 0 keeps the derived prompt-cache budget
+	ClaudeMaxActive      int  // --claude-max-active; 0 means no admission limit
+	ClaudeMaxActiveSet   bool
 	BatchSize            int
 	BatchSizeSet         bool
 	UBatchSize           int
@@ -691,6 +695,14 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 					return nil, err
 				}
 				req.CacheRAMMB = cram
+				continue
+			case "--claude-max-active":
+				limit, err := parseNonNegativeFlag(key, val)
+				if err != nil {
+					return nil, err
+				}
+				req.ClaudeMaxActive = limit
+				req.ClaudeMaxActiveSet = true
 				continue
 			case "--batch-size", "-b":
 				batch, err := parsePositiveFlag(key, val)
@@ -928,6 +940,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.Parallel = parallel
+			req.ParallelSet = true
 		case "--threads", "-t":
 			v, err := next()
 			if err != nil {
@@ -948,7 +961,17 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.CacheRAMMB = cram
-			req.ParallelSet = true
+		case "--claude-max-active":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			limit, err := parseNonNegativeFlag(a, v)
+			if err != nil {
+				return nil, err
+			}
+			req.ClaudeMaxActive = limit
+			req.ClaudeMaxActiveSet = true
 		case "--batch-size", "-b":
 			v, err := next()
 			if err != nil {
@@ -1123,6 +1146,16 @@ func parsePositiveFlag(name, value string) (int, error) {
 	n, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || n < 1 {
 		return 0, fmt.Errorf("%s: must be a positive integer", name)
+	}
+	return n, nil
+}
+
+// parseNonNegativeFlag accepts zero, which several knobs use to mean "no limit"
+// rather than "off".
+func parseNonNegativeFlag(name, value string) (int, error) {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s: must be a non-negative integer", name)
 	}
 	return n, nil
 }
