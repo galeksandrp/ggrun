@@ -5,10 +5,8 @@ import (
 	"testing"
 )
 
-// The exact startup output Laguna produced on this project. Its template is not
-// one llama.cpp's autoparser recognises, so the server shipped no delimiters,
-// no checkpoint was ever created, and 132,317 prompt tokens across three turns
-// were re-processed at 0% reuse.
+// The exact startup output Laguna produced on this project, whose template is
+// not one llama.cpp's autoparser recognises.
 const lagunaStartupLog = `1.24.787.431 I srv          init: init: chat template, example_format: '<system>You are a helpful assistant</system>
 <user>Hello</user>
 <assistant><think></think>Hi there</assistant>

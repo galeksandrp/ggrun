@@ -7,24 +7,29 @@ import (
 	"strings"
 )
 
-// Prefix reuse on a sliding-window model depends entirely on context
-// checkpoints: partial KV removal is impossible there, so a checkpoint is the
-// only thing a later turn can resume from. llama.cpp creates one at the start of
-// a user message, found by matching role delimiters against the prompt tokens --
-// and those delimiters arrive in the request body:
+// Prefix reuse on a sliding-window model runs through context checkpoints:
+// partial KV removal is impossible there, so a checkpoint is what a later turn
+// resumes from. llama.cpp creates one at the start of a user message, located by
+// matching role delimiters against the prompt tokens, and those delimiters
+// arrive in the request body:
 //
 //	auto delimiters = common_chat_msg_delimiters_parse(
 //	        json_value(data, "message_delimiters", json::array()));
 //
 // They default to empty. The server fills them in for templates its autoparser
-// recognises, and ships nothing for the rest. Laguna's template is one of the
-// rest, so on this project a 62k-token prefill with seven checkpoint
-// opportunities created zero, and 132,317 prompt tokens across three turns were
-// re-processed with 0% reuse while LCP similarity said 78% was available.
+// recognises and ships nothing for the rest, so a fork with a custom template
+// can silently lose the boundaries checkpoints are placed at.
 //
-// ggrun does not have to guess what the delimiters are. The backend prints an
-// example of its own rendered template at startup, so they can be read back the
-// same way compute buffers, KV geometry and the reviewer's VRAM are.
+// ggrun does not have to guess what they are. The backend prints an example of
+// its own rendered template at startup, so they can be read back the same way
+// compute buffers, KV geometry and the reviewer's VRAM are.
+//
+// Scope, honestly: this was written while investigating zero prefix reuse on
+// Laguna, and it turned out not to be that cause -- checkpoints were being
+// created there anyway, and were then invalidated because the prompt prefix
+// itself changed between requests. It remains worth doing for templates the
+// autoparser genuinely does not cover, but no measurement on this project
+// attributes a reuse gain to it.
 
 // MessageDelimiter is one role marker in the backend's chat format.
 type MessageDelimiter struct {

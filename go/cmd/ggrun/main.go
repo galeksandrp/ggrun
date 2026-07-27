@@ -2816,10 +2816,10 @@ func cmdLaunch(args []string) {
 			os.Exit(1)
 		}
 		// Read the backend's own rendered chat template and hand the role
-		// markers to the router. Without them llama.cpp finds no user-message
-		// boundary, creates no context checkpoint, and a sliding-window model
-		// has no way to resume a prefix -- measured here as 0 reuse across
-		// 132,317 prompt tokens while 78% was available.
+		// markers to the router. llama.cpp places context checkpoints at
+		// user-message boundaries it can find, and it finds them by matching
+		// these delimiters; a fork whose template its autoparser does not cover
+		// otherwise ships none.
 		if p.LogBuf != nil {
 			if delims := claudeauto.ParseChatMessageDelimiters(p.LogBuf.String()); len(delims) > 0 {
 				claudeAuto.setMessageDelimiters(delims)
