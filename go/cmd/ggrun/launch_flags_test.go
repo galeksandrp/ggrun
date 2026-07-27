@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -251,5 +252,29 @@ func TestUpdatePromptSkipsQuietCommands(t *testing.T) {
 		if !promptsForUpdates(args) {
 			t.Errorf("%v skipped the update check", args)
 		}
+	}
+}
+
+// Claude Code prepends an attribution block carrying client version and a
+// fingerprint. Those bytes are at the very front of the prompt, so the first
+// tokens change on every request and no later turn can match a prefix.
+// Measured here: seven context checkpoints created, five invalidated against
+// pos_next = 0, and 0% reuse of 60,127 prompt tokens while the checkpoint
+// machinery itself worked correctly throughout.
+func TestClaudeClientEnvDisablesAttributionHeader(t *testing.T) {
+	env := claudeCodeEnv("127.0.0.1", 8081, nil)
+	var got string
+	seen := 0
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == "CLAUDE_CODE_ATTRIBUTION_HEADER" {
+			got = v
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("CLAUDE_CODE_ATTRIBUTION_HEADER appears %d times, want exactly 1", seen)
+	}
+	if got != "0" {
+		t.Errorf("CLAUDE_CODE_ATTRIBUTION_HEADER=%q, want 0", got)
 	}
 }

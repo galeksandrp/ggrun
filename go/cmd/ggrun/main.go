@@ -3806,7 +3806,8 @@ func claudeCodeEnv(host string, port int, serverArgs []string) []string {
 			"CLAUDE_CODE_EFFORT_LEVEL",
 			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
 			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
-			"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
+			"CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+			"CLAUDE_CODE_ATTRIBUTION_HEADER":
 			continue
 		}
 		env = append(env, kv)
@@ -3822,6 +3823,18 @@ func claudeCodeEnv(host string, port int, serverArgs []string) []string {
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL="+claudeauto.UtilityAlias,
 		"ANTHROPIC_DEFAULT_SONNET_MODEL=local",
 		"ANTHROPIC_DEFAULT_OPUS_MODEL=local",
+		// Claude Code prepends an attribution block carrying client version and
+		// a fingerprint. Those bytes sit at the very front of the prompt, so
+		// they change the first tokens on every request and no later turn can
+		// match a prefix -- llama.cpp computes a common prefix of zero, and
+		// every context checkpoint it saved is invalidated against pos_next = 0.
+		//
+		// Measured here: seven checkpoints created across one turn, five
+		// invalidated at pos_next = 0, and 0% reuse of 60,127 prompt tokens
+		// while the checkpoint machinery was working correctly the whole time.
+		// The header is worth nothing against a local backend that has no
+		// vendor telemetry to attribute to.
+		"CLAUDE_CODE_ATTRIBUTION_HEADER=0",
 		// xhigh is Claude Code's recommended balance for coding and agentic work.
 		// The official environment variable also accepts auto/max and lets an
 		// explicit user choice override this local-workflow default.
