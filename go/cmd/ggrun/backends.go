@@ -48,7 +48,13 @@ Examples:
   ggrun backend add https://github.com/your-org/llama.cpp \
     --branch feature/custom-arch --tag custom --route-arch custommoe --cuda-arch "86;89"
   ggrun backend install hy3 --cuda-arch "86;89"
+  ggrun backend update laguna
+  ggrun backend rollback laguna
   ggrun backend list
+
+update <tag>    Rebuild a backend at its recipe's current commit. The build it
+                replaces is kept, so a failed or bad update can be undone.
+rollback <tag>  Point a backend back at the build the last update replaced.
 `)
 }
 
@@ -68,6 +74,10 @@ func cmdBackend(args []string) {
 		cmdBackendAdd(args[1:])
 	case "register":
 		cmdBackendRegister(args[1:])
+	case "update":
+		cmdBackendUpdate(args[1:])
+	case "rollback":
+		cmdBackendRollback(args[1:])
 	case "remove", "rm":
 		cmdBackendRemove(args[1:])
 	default:

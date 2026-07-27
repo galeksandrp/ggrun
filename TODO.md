@@ -73,8 +73,21 @@ Source: `5e91131f/24`, retargeted by the user on 2026-07-12.
   and parallel-4 non-speculative benchmarks before calling it stable. The pinned
   fork deliberately removes MTP above one slot; re-test combined MTP +
   parallel-4 only after its server lifts that guard.
-- [ ] Add recipe update/rollback UX and CI smoke builds so future model forks are
-  one declarative entry rather than bespoke installer code.
+- [x] Add recipe update/rollback UX so future model forks are one declarative
+  entry rather than bespoke installer code. `ggrun backend update <tag>` rebuilds
+  at the recipe's pinned commit and keeps the build it replaces (renamed to
+  `build-<accel>-prev-<commit>`, so it is a rename rather than a copy);
+  `ggrun backend rollback <tag>` points the registration back at it, and the swap
+  is symmetric so the rollback itself can be undone. A failed build restores the
+  previous tree automatically — the poolside Laguna fork failing at 95% on a
+  missing include is what motivated this. Retention is one level.
+- [ ] CI smoke builds for recipes, so a fork that stops compiling is caught before
+  someone's backend is the thing that discovers it.
+- [x] Suggest the right fork when a backend cannot serve a model's architecture,
+  instead of letting the loader fail with a tensor count. `BackendSupportsArch`
+  follows a backend's own library graph and matches NUL-bracketed architecture
+  literals; it warns rather than blocks, because it cannot follow non-ELF
+  (Windows) dependencies and a false negative must not break a working setup.
 
 ## P1 — finish Claude Code integration
 
