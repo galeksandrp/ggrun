@@ -85,3 +85,45 @@ func TestInjectMessageDelimiters(t *testing.T) {
 		t.Error("mangled a body it could not parse")
 	}
 }
+
+// The delimiter reader has to work for whatever model a user launches, not just
+// the one that exposed the bug. Each family needs its own shape because the
+// delimiter is the literal prefix a later prompt must contain.
+func TestParseChatMessageDelimitersAcrossTemplateFamilies(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		example string
+		want    map[string]string
+	}{
+		{"chatml", "<|im_start|>system\nhelp<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+			map[string]string{"system": "<|im_start|>system", "user": "<|im_start|>user", "assistant": "<|im_start|>assistant"}},
+		{"llama3", "<|start_header_id|>system<|end_header_id|>\n\nhelp<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHi<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+			map[string]string{"system": "<|start_header_id|>system<|end_header_id|>", "user": "<|start_header_id|>user<|end_header_id|>", "assistant": "<|start_header_id|>assistant<|end_header_id|>"}},
+		{"gemma", "<start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\nHi<end_of_turn>\n",
+			map[string]string{"user": "<start_of_turn>user", "assistant": "<start_of_turn>model"}},
+		{"tag", "<system>help</system>\n<user>Hello</user>\n<assistant>Hi</assistant>",
+			map[string]string{"system": "<system>", "user": "<user>", "assistant": "<assistant>"}},
+	} {
+		got := ParseChatMessageDelimiters("example_format: '" + tc.example + "'")
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: got %+v, want %d delimiters", tc.name, got, len(tc.want))
+			continue
+		}
+		for _, d := range got {
+			if want, ok := tc.want[d.Role]; !ok || want != d.Delimiter {
+				t.Errorf("%s: %s = %q, want %q", tc.name, d.Role, d.Delimiter, want)
+			}
+		}
+	}
+}
+
+// One template belongs to one family. A looser pattern must not add a second,
+// conflicting delimiter for a role a more specific one already claimed.
+func TestParseChatMessageDelimitersDoesNotMixFamilies(t *testing.T) {
+	got := ParseChatMessageDelimiters("example_format: '<|im_start|>user\nHi<|im_end|>'")
+	for _, d := range got {
+		if d.Delimiter == "<user>" {
+			t.Errorf("tag-style delimiter leaked into a ChatML template: %+v", got)
+		}
+	}
+}

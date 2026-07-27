@@ -39,10 +39,31 @@ type MessageDelimiter struct {
 //	<assistant><think></think>Hi there</assistant>
 var exampleFormatRe = regexp.MustCompile(`example_format:\s*'`)
 
-// roleOpenerRe matches an opening role tag in the rendered example. Only the
-// four roles llama.cpp's parser understands are useful; anything else it maps to
-// COMMON_CHAT_ROLE_UNKNOWN and ignores.
-var roleOpenerRe = regexp.MustCompile(`(?i)(<\|?\s*(system|user|assistant|tool)\s*\|?>)`)
+// roleOpenerRes cover the chat-template families in wide use. A delimiter is
+// whatever string starts a message of a given role, so each family needs its own
+// shape:
+//
+//	<user>Hello</user>                              tag style (Laguna, several forks)
+//	<|im_start|>user\n                              ChatML (Qwen, Yi, many others)
+//	<|start_header_id|>user<|end_header_id|>        Llama 3
+//	<start_of_turn>user\n                           Gemma
+//	[INST]                                          Mistral (role implied by position)
+//
+// The whole match is the delimiter, not just the role word, because that is the
+// literal prefix a later prompt must contain for the split to line up.
+//
+// Only the four roles llama.cpp's parser understands are useful; anything else
+// maps to COMMON_CHAT_ROLE_UNKNOWN and is ignored.
+var roleOpenerRes = []*regexp.Regexp{
+	// Llama 3: <|start_header_id|>user<|end_header_id|>
+	regexp.MustCompile(`(?i)<\|start_header_id\|>\s*(system|user|assistant|tool)\s*<\|end_header_id\|>`),
+	// ChatML: <|im_start|>user
+	regexp.MustCompile(`(?i)<\|im_start\|>\s*(system|user|assistant|tool)`),
+	// Gemma: <start_of_turn>user
+	regexp.MustCompile(`(?i)<start_of_turn>\s*(system|user|assistant|model|tool)`),
+	// Tag style: <user>, <|user|>
+	regexp.MustCompile(`(?i)<\|?\s*(system|user|assistant|tool)\s*\|?>`),
+}
 
 // ParseChatMessageDelimiters reads the role delimiters out of a backend launch
 // log. Returns nil when the backend printed no example, in which case the caller
@@ -65,14 +86,29 @@ func ParseChatMessageDelimiters(logText string) []MessageDelimiter {
 
 	firstAt := map[string]int{}
 	seen := map[string]string{}
-	for _, m := range roleOpenerRe.FindAllStringSubmatchIndex(rest, -1) {
-		tag := rest[m[2]:m[3]]
-		role := strings.ToLower(rest[m[4]:m[5]])
-		if _, ok := seen[role]; ok {
-			continue
+	// Longest-matching family wins: ChatML's <|im_start|>user also contains no
+	// tag-style match, but Llama 3's header form would otherwise be truncated by
+	// a shorter pattern. Iterating most-specific first and skipping roles that
+	// are already claimed keeps one family per template.
+	for _, re := range roleOpenerRes {
+		for _, m := range re.FindAllStringSubmatchIndex(rest, -1) {
+			whole := rest[m[0]:m[1]]
+			role := strings.ToLower(rest[m[2]:m[3]])
+			// Gemma calls the assistant "model"; llama.cpp's roles do not.
+			if role == "model" {
+				role = "assistant"
+			}
+			if _, ok := seen[role]; ok {
+				continue
+			}
+			seen[role] = whole
+			firstAt[role] = m[0]
 		}
-		seen[role] = tag
-		firstAt[role] = m[0]
+		if len(seen) > 0 {
+			// A template belongs to one family. Stop before a looser pattern
+			// produces a second, conflicting delimiter for the same role.
+			break
+		}
 	}
 	if len(seen) == 0 {
 		return nil
