@@ -1486,8 +1486,13 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		Parallel:               req.Parallel,
 		Threads:                req.Threads,
 		CacheRAMMB:             req.CacheRAMMB,
-		BatchSize:              req.BatchSize,
-		UBatchSize:             req.UBatchSize,
+		// --swa-full is a passthrough flag, but placement cannot treat it as
+		// one: it decides whether sliding-window layers hold the whole context,
+		// which on Laguna is the difference between 13.8 GB and 54.0 GB of KV
+		// and therefore between fitting and not fitting.
+		SWAFull:    hasArg(req.ExtraArgs, "--swa-full"),
+		BatchSize:  req.BatchSize,
+		UBatchSize: req.UBatchSize,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
 		// normal launch keeps reasoning on so tools like Claude Code can think.
 		ReasoningOff: req.Benchmark,
@@ -1633,8 +1638,47 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 	serverArgs = claudeCodeSamplingArgs(serverArgs, req.ClaudeCode, model)
 	serverArgs = claudeCodeCacheArgs(serverArgs, req.ClaudeCode, be.Help, claudeCodeShiftableContext(model, strategy))
 	serverArgs = claudeCodeProgressServerArgs(serverArgs, req.ClaudeCode, be.Help)
+	serverArgs = backendVerbosityArgs(serverArgs, be.Help)
 	return serverArgs
 }
+
+// backendVerbosityArgs raises the backend's log level to trace, because ggrun's
+// whole approach is to read measurements out of the backend rather than model
+// them -- and the measurements that matter are not printed at the default level.
+//
+// llama.cpp defaults to verbosity 3 (info). At that level ggrun cannot see:
+//
+//   - "forcing full prompt re-processing due to lack of cache data" and
+//     "restored context checkpoint", which are the only evidence of whether a
+//     sliding-window model reused any prefix at all. This project ran for weeks
+//     re-prefilling every turn -- 0 reused tokens out of 1.16 million measured
+//     after the fact -- with nothing in the logs to say so.
+//   - "cache state: N prompts, X MiB (limits: ...)", the host prompt cache's own
+//     accounting, which is what CRAM should be sized from.
+//   - the per-checkpoint search decisions that explain a reuse miss.
+//
+// Trace, not debug: level 5 adds per-token output that makes a multi-hour agent
+// log unusable, while level 4 adds only these decision points. An explicit -lv
+// or --verbosity, or LLAMA_ARG_LOG_VERBOSITY in the environment, still wins.
+func backendVerbosityArgs(args []string, backendHelp string) []string {
+	if os.Getenv("LLAMA_ARG_LOG_VERBOSITY") != "" {
+		return args
+	}
+	for _, a := range args {
+		if a == "-lv" || a == "--verbosity" || a == "--log-verbosity" ||
+			strings.HasPrefix(a, "-lv=") || strings.HasPrefix(a, "--verbosity=") ||
+			strings.HasPrefix(a, "--log-verbosity=") {
+			return args
+		}
+	}
+	if backendHelp != "" && !strings.Contains(backendHelp, "-lv") && !strings.Contains(backendHelp, "--verbosity") {
+		return args
+	}
+	return append(args, "-lv", strconv.Itoa(backendTraceVerbosity))
+}
+
+// backendTraceVerbosity is llama.cpp's LOG_LEVEL_TRACE.
+const backendTraceVerbosity = 4
 
 // hy3CompatibilityArgs supplies only the metadata omitted by the known HY3
 // GGUF layout. The values are derived from tensors by parse_gguf.py, restricted

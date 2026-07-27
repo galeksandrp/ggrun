@@ -106,6 +106,11 @@ type Strategy struct {
 	ThreadsBatch             int    `json:"threads_batch"` // batch threads (logical cores)
 	Parallel                 int    `json:"parallel,omitempty"`
 	CRAM                     int    `json:"cram,omitempty"` // prompt cache MB
+	// SWAFull records that this launch gives sliding-window layers the full
+	// context. It belongs on the strategy rather than only on the request
+	// because it changes the KV size every later stage prices, not just the
+	// flag that gets emitted.
+	SWAFull bool `json:"swa_full,omitempty"`
 	// MeasuredPromptCacheBPT and PromptCacheTypicalTokens carry a measured
 	// prompt-cache cost into CRAM sizing. Zero means nothing was measured, and
 	// the derived budget stands.
@@ -188,14 +193,20 @@ type ModelProfile struct {
 	// this model, read back from the backend log. It is the ground truth for
 	// compressed-attention models (MLA/CSA-HCA/SWA) where the GGUF formula is
 	// unreliable; computeKVTotalMB prefers it over the formula when present.
-	MeasuredKVBytesPerTok     map[string]float64 `json:"-"`
-	ExpertFF                  int                `json:"expert_ff,omitempty"`
-	ExpertSharedFF            int                `json:"expert_shared_ff,omitempty"`
-	ExpertSharedCount         int                `json:"expert_shared_count,omitempty"`
-	ExpertSharedCountInferred bool               `json:"expert_shared_count_inferred,omitempty"`
-	LeadingDense              int                `json:"leading_dense,omitempty"`
-	LeadingDenseInferred      bool               `json:"leading_dense_inferred,omitempty"`
-	NextNPredictLayers        int                `json:"nextn_predict_layers,omitempty"`
+	MeasuredKVBytesPerTok map[string]float64 `json:"-"`
+	// MeasuredKVGeometry is the layout llama.cpp actually built, per KV type:
+	// how many layers attend over the whole context, how many over a window,
+	// and how deep that window's cache is. It supersedes the rate above because
+	// it predicts a context the model was never launched at, and because it is
+	// the only form that can price --swa-full.
+	MeasuredKVGeometry        map[string]KVGeometry `json:"-"`
+	ExpertFF                  int                   `json:"expert_ff,omitempty"`
+	ExpertSharedFF            int                   `json:"expert_shared_ff,omitempty"`
+	ExpertSharedCount         int                   `json:"expert_shared_count,omitempty"`
+	ExpertSharedCountInferred bool                  `json:"expert_shared_count_inferred,omitempty"`
+	LeadingDense              int                   `json:"leading_dense,omitempty"`
+	LeadingDenseInferred      bool                  `json:"leading_dense_inferred,omitempty"`
+	NextNPredictLayers        int                   `json:"nextn_predict_layers,omitempty"`
 }
 
 // CompanionReservation reserves VRAM on one GPU for a co-launched helper model
@@ -254,6 +265,14 @@ type Options struct {
 	// it is a claim worth being able to measure on a given box rather than
 	// assume, and it cannot be measured without a way to set it.
 	Threads int
+	// SWAFull mirrors the backend's --swa-full: every sliding-window layer gets
+	// the full context instead of a window-sized cache. It has to reach
+	// placement because it is not a small correction -- on Laguna it takes KV
+	// from 13.8 GB to 54.0 GB at 1M context, which decides how many expert
+	// layers fit. It is the only setting that lets a windowed model reuse a
+	// prompt prefix at all, so the cost has to be predictable in advance
+	// rather than discovered by an out-of-memory abort.
+	SWAFull bool
 	// CacheRAMMB overrides the host prompt-cache budget (-cram). The derived
 	// value takes a tenth of free RAM capped at 16 GiB, which is blind to what a
 	// single entry costs: on this project one conversation's entry measured
@@ -468,6 +487,11 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			model.MeasuredKVBytesPerTok = rates
 		}
 	}
+	if model.MeasuredKVGeometry == nil {
+		if g := loadMeasuredKVGeometry(opts.CacheDir, model); g != nil {
+			model.MeasuredKVGeometry = g
+		}
+	}
 
 	resolvedKVQuality, err := resolveKVQuality(model, opts.KVQuality, opts.BackendTag)
 	if err != nil {
@@ -476,6 +500,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 
 	s := &Strategy{
 		ContextSize:    opts.ContextSize,
+		SWAFull:        opts.SWAFull,
 		KVPlacement:    opts.KVPlacement,
 		KVQuality:      resolvedKVQuality,
 		MMap:           opts.ForceMMap || !opts.NoMMap,
@@ -562,7 +587,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		} else {
 			sysProbe := loadSystemProbe(opts.CacheDir, caps.GPUs)
 			perGPUOH := plannedPerGPUVRAMOverheadMB(sysProbe, 0, opts)
-			kvNeedMB := computeKVTotalMB(model, s.ContextSize, s.KVType)
+			kvNeedMB := computeKVTotalMB(model, s.ContextSize, s.KVType, opts.SWAFull)
 			s.KVPlacement = resolveAutoKVPlacement(caps, model, totalSizeMB, kvNeedMB, perGPUOH*len(caps.GPUs))
 		}
 	}
@@ -588,12 +613,12 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 
 			// Single-GPU estimate
 			singleCtx, singleKV := computeAutoContextSizeSingleGPU(caps, model, totalSizeMB, s.KVType, opts)
-			singleKVM := computeKVTotalMB(model, singleCtx, singleKV)
+			singleKVM := computeKVTotalMB(model, singleCtx, singleKV, opts.SWAFull)
 			singleFits := (totalSizeMB+perGPUOH+singleKVM) <= bestFree && singleCtx >= 32768
 
 			// Multi-GPU estimate
 			multiCtx, multiKV := computeAutoContextSize(caps, model, totalSizeMB, s.KVType, opts)
-			multiKVM := computeKVTotalMB(model, multiCtx, multiKV)
+			multiKVM := computeKVTotalMB(model, multiCtx, multiKV, opts.SWAFull)
 			multiFree := 0
 			for _, g := range caps.GPUs {
 				multiFree += g.VRAMFreeMB()
@@ -614,7 +639,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 				// (large window); auto → gpu if it fits, else cpu for a big MoE.
 				placement := s.KVPlacement
 				if placement == "auto" || placement == "" {
-					placement = resolveAutoKVPlacement(caps, model, totalSizeMB, computeKVTotalMB(model, s.ContextSize, s.KVType), perGPUOH*len(caps.GPUs))
+					placement = resolveAutoKVPlacement(caps, model, totalSizeMB, computeKVTotalMB(model, s.ContextSize, s.KVType, opts.SWAFull), perGPUOH*len(caps.GPUs))
 				}
 				s.KVPlacement = placement
 				s.ContextSize, s.KVType = computeAutoContextSizeKVPlacement(caps, model, totalSizeMB, s.KVType, placement, opts)
@@ -623,7 +648,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 
 	// Compute KV cache size
-	kvTotalMB := computeKVTotalMB(model, s.ContextSize, s.KVType)
+	kvTotalMB := computeKVTotalMB(model, s.ContextSize, s.KVType, opts.SWAFull)
 
 	// Batch sizes based on fit
 	bestGPUFree := 0
@@ -2046,7 +2071,7 @@ func retryMoEWithLowerAutoContext(base *Strategy, originalErr error, caps *detec
 	for _, ctx := range lowerContextRungs(base.ContextSize) {
 		cand := *base
 		cand.ContextSize = ctx
-		kvTotalMB := computeKVTotalMB(model, cand.ContextSize, cand.KVType)
+		kvTotalMB := computeKVTotalMB(model, cand.ContextSize, cand.KVType, opts.SWAFull)
 		cand.PlacementCachePath = placementCachePathForStrategy(&cand, caps, model, opts)
 		preUBatch := cand
 		next, err := buildMoEOffload(&cand, caps, model, totalSizeMB, kvTotalMB, opts)
@@ -2644,11 +2669,22 @@ func stringsJoin(parts []string, sep string) string {
 }
 
 // computeKVTotalMB calculates exact KV cache size.
-func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string) int {
+func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string, swaFull bool) int {
 	// Prefer the KV size llama.cpp actually allocated on a previous launch (read
 	// back from its log) — it is exact for every attention scheme, including the
 	// compressed ones (MLA / CSA-HCA / sliding-window) the formula below can't
 	// model. Falls through to the per-arch estimate when we have no measurement.
+	// A measured geometry beats a measured rate. The rate is bytes per token of
+	// context, which assumes KV grows linearly with the context -- true for a
+	// uniform model, wrong for an interleaved sliding-window one whose windowed
+	// layers are fixed-depth, and unable to express --swa-full at all. Laguna
+	// measured 13864 MiB at 1M and 55296 with --swa-full; one rate cannot be
+	// both.
+	if g, ok := model.MeasuredKVGeometry[strings.ToLower(kvType)]; ok && g.Measured() {
+		if mb := g.TotalMB(ctxSize, swaFull); mb > 0 {
+			return mb
+		}
+	}
 	if r, ok := model.MeasuredKVBytesPerTok[strings.ToLower(kvType)]; ok && r > 0 {
 		return int(r*float64(ctxSize)/1048576.0 + 0.5)
 	}
@@ -3439,7 +3475,7 @@ func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProf
 
 	for _, kvType := range orderedTypes {
 		refCtx := 32768
-		refKVTotalMB := computeKVTotalMB(model, refCtx, kvType)
+		refKVTotalMB := computeKVTotalMB(model, refCtx, kvType, opts.SWAFull)
 		if refKVTotalMB <= 0 {
 			continue
 		}
@@ -3540,7 +3576,7 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 
 	for _, kvType := range kvTypesForAutoContext(preferredKVType, opts.KVQuality) {
 		refCtx := 32768
-		refKVMB := computeKVTotalMB(model, refCtx, kvType)
+		refKVMB := computeKVTotalMB(model, refCtx, kvType, opts.SWAFull)
 		if refKVMB <= 0 {
 			continue
 		}
@@ -3591,7 +3627,7 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 
 	for _, kvType := range orderedTypes {
 		refCtx := 32768
-		refKVTotalMB := computeKVTotalMB(model, refCtx, kvType)
+		refKVTotalMB := computeKVTotalMB(model, refCtx, kvType, opts.SWAFull)
 		if refKVTotalMB <= 0 {
 			continue
 		}
@@ -3956,6 +3992,47 @@ func loadMeasuredKVRates(cacheDir string, model *ModelProfile) map[string]float6
 	return out
 }
 
+// loadMeasuredKVGeometry reads the per-KV-type cache layout recorded by a
+// previous launch. Kept separate from the rate loader so an older cache file
+// that predates the geometry still yields its rate rather than nothing.
+func loadMeasuredKVGeometry(cacheDir string, model *ModelProfile) map[string]KVGeometry {
+	data, err := os.ReadFile(kvCachePath(cacheDir, model))
+	if err != nil {
+		return nil
+	}
+	out := map[string]KVGeometry{}
+	const pfx = "KV_GEOMETRY_"
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, pfx) {
+			continue
+		}
+		kv := strings.SplitN(strings.TrimPrefix(line, pfx), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		f := strings.Split(kv[1], ",")
+		if len(f) != 4 {
+			continue
+		}
+		full, e1 := strconv.Atoi(strings.TrimSpace(f[0]))
+		swa, e2 := strconv.Atoi(strings.TrimSpace(f[1]))
+		cells, e3 := strconv.Atoi(strings.TrimSpace(f[2]))
+		bpc, e4 := strconv.ParseFloat(strings.TrimSpace(f[3]), 64)
+		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
+			continue
+		}
+		g := KVGeometry{FullLayers: full, SWALayers: swa, SWACells: cells, BytesPerCellPerLayer: bpc}
+		if g.Measured() {
+			out[strings.ToLower(strings.TrimSpace(kv[0]))] = g
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // parseKVBufferTotalMB extracts the model's TOTAL KV cache allocation (MiB) at the
 // launched context from a backend log. llama.cpp's wording varies across versions
 // and backends, so match all known forms: an aggregate "KV self size = X MiB" /
@@ -4121,6 +4198,14 @@ func RunPostLaunchKVProbe(cacheDir string, model *ModelProfile, ctxSize int, kvT
 	bytesPerTok := totalKVMB * 1048576.0 / float64(ctxSize)
 	if bytesPerTok <= 0 {
 		return
+	}
+	// The geometry is strictly better than the rate and comes from the same
+	// log, so record it whenever the backend printed its per-cache breakdown.
+	if g, ok := ParseKVGeometry(serverLog); ok {
+		if model.MeasuredKVGeometry == nil {
+			model.MeasuredKVGeometry = map[string]KVGeometry{}
+		}
+		model.MeasuredKVGeometry[kvType] = g
 	}
 	writeMeasuredKVRate(cacheDir, model, kvType, bytesPerTok,
 		fmt.Sprintf("launch log: ctx=%d total_kv=%.0fMB", ctxSize, totalKVMB))
@@ -4459,7 +4544,7 @@ func computeBuffersFromVRAMDelta(
 
 	kvTotalMB := 0
 	if strings.EqualFold(strategy.KVPlacement, "gpu") && strategy.ContextSize > 0 {
-		kvTotalMB = computeKVTotalMB(model, strategy.ContextSize, strategy.KVType)
+		kvTotalMB = computeKVTotalMB(model, strategy.ContextSize, strategy.KVType, strategy.SWAFull)
 	}
 
 	computeByGPU := map[int]int{}
@@ -4606,6 +4691,12 @@ func writeMeasuredKVRate(cacheDir string, model *ModelProfile, kvType string, by
 	fmt.Fprintf(&b, "# Measured KV cache for %s (%s)\n", model.Basename, note)
 	for k, v := range rates {
 		fmt.Fprintf(&b, "KV_BYTES_PER_TOK_%s=%.4f\n", k, v)
+	}
+	for k, g := range model.MeasuredKVGeometry {
+		if !g.Measured() {
+			continue
+		}
+		fmt.Fprintf(&b, "KV_GEOMETRY_%s=%d,%d,%d,%.4f\n", k, g.FullLayers, g.SWALayers, g.SWACells, g.BytesPerCellPerLayer)
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0644); err == nil {
 		fmt.Fprintf(os.Stderr, "  KV probe: %s = %.0f bytes/token (%s)\n", kvType, bytesPerTok, note)

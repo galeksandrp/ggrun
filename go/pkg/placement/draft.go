@@ -339,7 +339,9 @@ func EmbeddedMTPContextMB(model *ModelProfile, ctxSize int, kvType string) int {
 	mtp.SlidingWindow = 0
 	mtp.FullAttnInterval = 0
 	mtp.MeasuredKVBytesPerTok = nil
-	return computeKVTotalMB(&mtp, ctxSize, kvType)
+	// The drafter carries its own context; --swa-full is a target-side
+	// flag and these companions are dense models without windowed layers.
+	return computeKVTotalMB(&mtp, ctxSize, kvType, false)
 }
 
 func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, candidate string, draftInfo *gguf.Info, draftType DraftType, specType string) bool {
@@ -381,7 +383,7 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 		HasSSM:           draftInfo.SSM,
 		SlidingWindow:    draftInfo.SlidingWindow,
 		FullAttnInterval: draftInfo.FullAttnInterval,
-	}, cfg.CTXSizeDraft, cfg.KVTypeDraft)
+	}, cfg.CTXSizeDraft, cfg.KVTypeDraft, false)
 
 	cfg.VRAMMB = draftSizeMB + draftKVMB
 	cfg.DraftGPU = findDraftGPU(caps, target, cfg.VRAMMB)

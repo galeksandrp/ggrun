@@ -195,3 +195,36 @@ func TestRecoveryIdentityIgnoresPlanDerivedFlags(t *testing.T) {
 		t.Error("specLaunchIdentity must stay exact; only the recovery identity is coarsened")
 	}
 }
+
+// ggrun reads its measurements out of the backend's log, and the ones that
+// matter most are not printed at llama.cpp's default level. Prefix-reuse
+// decisions ("forcing full prompt re-processing", "restored context
+// checkpoint") and the host prompt cache's own accounting are all trace-level.
+// This project re-prefilled every turn for weeks -- 0 tokens reused out of
+// 1.16 million, measured only in hindsight -- with nothing in the log to say so.
+func TestBackendVerbosityDefaultsToTrace(t *testing.T) {
+	help := "  -lv, --verbosity N   set the verbosity level"
+	got := backendVerbosityArgs([]string{"llama-server", "-m", "m.gguf"}, help)
+	found := ""
+	for i, a := range got {
+		if a == "-lv" && i+1 < len(got) {
+			found = got[i+1]
+		}
+	}
+	if found != "4" {
+		t.Errorf("verbosity = %q, want 4 (trace); args=%v", found, got)
+	}
+	for _, explicit := range [][]string{
+		{"llama-server", "-lv", "2"},
+		{"llama-server", "--verbosity", "2"},
+		{"llama-server", "-lv=2"},
+	} {
+		if out := backendVerbosityArgs(explicit, help); len(out) != len(explicit) {
+			t.Errorf("%v: ggrun overrode an explicit verbosity -> %v", explicit, out)
+		}
+	}
+	// A backend that does not advertise the flag must not receive it.
+	if out := backendVerbosityArgs([]string{"srv"}, "--some-other-flag"); len(out) != 1 {
+		t.Errorf("added -lv to a backend that does not support it: %v", out)
+	}
+}

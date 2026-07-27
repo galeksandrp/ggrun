@@ -1855,7 +1855,7 @@ func TestComputeMoEHeterogeneousMultiGPUExactLedger(t *testing.T) {
 	}
 	expertPerLayerMB := ceilDivInt(bytesToMiBCeil(model.ExpertBytes), model.NumLayers-model.LeadingDense)
 	nonExpertTotalMB := bytesToMiBCeil(model.NonExpertBytes)
-	kvTotalMB := computeKVTotalMB(model, strat.ContextSize, strat.KVType)
+	kvTotalMB := computeKVTotalMB(model, strat.ContextSize, strat.KVType, false)
 	fixedPerGPU := computeFloorMB
 	expertMBByDevice := otExpertMBByDevice(t, strat.OTString, expertPerLayerMB)
 	for gi, gpu := range caps.GPUs {
@@ -3388,8 +3388,8 @@ func TestExactKVTypesAreSizedAndPreserved(t *testing.T) {
 	model := &ModelProfile{
 		NumLayers: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
 	}
-	q5 := computeKVTotalMB(model, 1048576, "q5_1")
-	q8 := computeKVTotalMB(model, 1048576, "q8_0")
+	q5 := computeKVTotalMB(model, 1048576, "q5_1", false)
+	q8 := computeKVTotalMB(model, 1048576, "q8_0", false)
 	if q5 != 49152 {
 		t.Fatalf("q5_1 KV size = %d MiB, want 49152 MiB", q5)
 	}

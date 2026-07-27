@@ -31,11 +31,11 @@ func TestMeasuredKVRateBeatsFormula(t *testing.T) {
 		MeasuredKVBytesPerTok: map[string]float64{"q8_0": 8192}, // 8 KiB/token (measured)
 	}
 	// 8192 bytes/token * 131072 tokens / 1MiB = 1024 MiB exactly
-	if got := computeKVTotalMB(model, 131072, "q8_0"); got != 1024 {
+	if got := computeKVTotalMB(model, 131072, "q8_0", false); got != 1024 {
 		t.Fatalf("measured KV = %d MiB, want 1024", got)
 	}
 	// A kvType with no measurement falls back to the formula (non-zero, different).
-	if got := computeKVTotalMB(model, 131072, "f16"); got == 1024 || got <= 0 {
+	if got := computeKVTotalMB(model, 131072, "f16", false); got == 1024 || got <= 0 {
 		t.Fatalf("f16 should use formula, got %d", got)
 	}
 }
@@ -71,7 +71,7 @@ func TestRecordMeasuredContextMBUpdatesImmediatePlacementState(t *testing.T) {
 	if got := model.MeasuredKVBytesPerTok["q8_0"]; got != 4096 {
 		t.Fatalf("existing in-memory rate was lost: %.2f", got)
 	}
-	if got := computeKVTotalMB(model, 524288, "f16"); got != 3456 {
+	if got := computeKVTotalMB(model, 524288, "f16", false); got != 3456 {
 		t.Fatalf("immediate placement context = %d MiB, want 3456", got)
 	}
 	// The final successful-launch log is still the most precise measurement and
