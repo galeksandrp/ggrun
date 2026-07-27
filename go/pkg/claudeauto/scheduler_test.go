@@ -290,3 +290,25 @@ func TestLaneOfReservesSafety(t *testing.T) {
 		t.Errorf("laneOf(normal) = %v, want LaneBulk", got)
 	}
 }
+
+// The backend answers /metrics from the same task queue as inference, so a poll
+// issued while a batch is running cannot return sooner than that batch. With
+// -ub 512 at ~143 t/s that floor is 3.58 s, and the deadline used to be 3 s --
+// shorter than the fastest possible reply under load, so every busy-time poll
+// was cancelled by construction. The snapshot then only refreshed while the
+// backend was idle, biasing the counters the router treats as authoritative on
+// throughput.
+func TestBackendPollDeadlineExceedsAMicrobatch(t *testing.T) {
+	const observedMicrobatchSeconds = 3.58
+	if backendPollTimeout.Seconds() <= observedMicrobatchSeconds {
+		t.Errorf("poll deadline %s does not exceed one measured microbatch (%.2fs)",
+			backendPollTimeout, observedMicrobatchSeconds)
+	}
+	// Fetch's nil-client default carries its own 5s timeout, and
+	// http.Client.Timeout wins over a longer context. The explicit client must
+	// therefore match the deadline, or raising it accomplishes nothing.
+	if backendPollClient.Timeout != backendPollTimeout {
+		t.Errorf("client timeout %s != context deadline %s; the shorter one silently wins",
+			backendPollClient.Timeout, backendPollTimeout)
+	}
+}

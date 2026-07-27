@@ -554,10 +554,38 @@ func (r *Router) StartBackendPolling(interval time.Duration) {
 	})
 }
 
+// backendPollTimeout must exceed how long the backend can take to answer while
+// it is working, not how long the answer "should" take.
+//
+// /metrics is not a static read: llama.cpp posts a SERVER_TASK_TYPE_METRICS
+// task onto the same queue as inference and blocks until the task loop reaches
+// it. High priority does not preempt the batch in flight, so the floor is one
+// microbatch -- 3.58 s at -ub 512 and 143 t/s on this project. The deadline was
+// 3 s, below that floor, so a poll issued while the backend was busy could not
+// succeed by construction. Measured live: 1.41 s, timeout, 3.66 s.
+//
+// Two consequences, and the second is the reason this matters. Each expired
+// poll left a cancelled task behind -- 281 in 33 minutes, 2756 task ids
+// consumed against 7 real inference tasks. And the snapshot only ever refreshed
+// when the backend was idle enough to answer inside 3 s, which biased the
+// counters this router treats as the authority on throughput toward exactly the
+// moments when nothing was running.
+//
+// Polling is sequential -- refreshBackendSnapshot returns before the next tick
+// is awaited -- so a generous deadline cannot stack requests. It only lowers the
+// sample rate while the backend is busy, which beats sampling nothing.
+const backendPollTimeout = 30 * time.Second
+
+// backendPollClient is passed explicitly because Fetch's nil-client default
+// carries its own 5 s timeout, and http.Client.Timeout is independent of the
+// context: whichever fires first wins. Raising only the context deadline would
+// have left the effective limit at 5 s and changed nothing.
+var backendPollClient = &http.Client{Timeout: backendPollTimeout}
+
 func (r *Router) refreshBackendSnapshot() {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), backendPollTimeout)
 	defer cancel()
-	m, err := backendmetrics.Fetch(ctx, nil, r.mainBaseURL)
+	m, err := backendmetrics.Fetch(ctx, backendPollClient, r.mainBaseURL)
 	if err != nil || !m.Available() {
 		return
 	}
