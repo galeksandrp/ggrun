@@ -293,10 +293,11 @@ func cmdClaude(args []string) {
 	case "list", "ls", "sessions":
 		cmdClaudeList()
 	case "resume", "continue":
-		target, force := parseClaudeResumeArgs(args)
-		cmdClaudeResume(target, force)
+		target, force, overrides := parseClaudeResumeArgs(args)
+		cmdClaudeResume(target, force, overrides)
 	default:
-		fmt.Fprintln(os.Stderr, "Usage: ggrun claude [list | resume [session-id|latest] [--force]]")
+		fmt.Fprintln(os.Stderr, "Usage: ggrun claude [list | resume [session-id|latest] [--force] [flag overrides...]]")
+		fmt.Fprintln(os.Stderr, "  e.g. ggrun claude resume latest --spec dflash")
 		os.Exit(2)
 	}
 }
@@ -306,18 +307,79 @@ func cmdClaude(args []string) {
 // legitimately recomputes between launches -- a reboot alone can move an expert
 // layer -- so a refused resume must have a recovery path that does not require
 // reconstructing the long-form launch command by hand.
-func parseClaudeResumeArgs(args []string) (target string, force bool) {
-	for _, arg := range args {
+// Anything else is an override applied on top of the recorded launch. A session
+// records the flags it was started with, and some of them are decisions rather
+// than facts: the long-running Laguna workflow here was recorded with --spec off
+// because speculative decoding could not load its drafter yet. Once the fork was
+// fixed there was no way to resume that session with speculation on, since the
+// only alternative was reconstructing a launch line of thirty-odd flags by hand
+// and losing the session binding that makes resume worth using.
+func parseClaudeResumeArgs(args []string) (target string, force bool, overrides []string) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch arg {
 		case "--force", "-f", "--claude-resume-force":
 			force = true
-		default:
-			if target == "" {
-				target = arg
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			overrides = append(overrides, arg)
+			// ggrun spells valued flags "--flag value", so a following token
+			// that is not itself a flag belongs to this one.
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				overrides = append(overrides, args[i+1])
+				i++
 			}
+			continue
+		}
+		if target == "" {
+			target = arg
 		}
 	}
-	return target, force
+	return target, force, overrides
+}
+
+// claudeApplyResumeOverrides layers override flags onto a recorded launch,
+// replacing a flag's value where it was already set and appending it otherwise.
+// Replacing rather than appending matters: ggrun takes the first occurrence of
+// several flags, so an appended --spec would be read as a duplicate and the
+// recorded "off" would still win.
+func claudeApplyResumeOverrides(recorded, overrides []string) []string {
+	if len(overrides) == 0 {
+		return recorded
+	}
+	out := append([]string(nil), recorded...)
+	for i := 0; i < len(overrides); i++ {
+		flag := overrides[i]
+		value := ""
+		hasValue := false
+		if i+1 < len(overrides) && !strings.HasPrefix(overrides[i+1], "-") {
+			value, hasValue = overrides[i+1], true
+			i++
+		}
+		at := -1
+		for j, tok := range out {
+			if tok == flag {
+				at = j
+				break
+			}
+		}
+		switch {
+		case at < 0 && hasValue:
+			out = append(out, flag, value)
+		case at < 0:
+			out = append(out, flag)
+		case !hasValue:
+			// A bare flag already present needs nothing.
+		case at+1 < len(out) && !strings.HasPrefix(out[at+1], "-"):
+			out[at+1] = value
+		default:
+			// Recorded as a bare flag but overridden with a value.
+			rest := append([]string{value}, out[at+1:]...)
+			out = append(out[:at+1], rest...)
+		}
+	}
+	return out
 }
 
 func cmdClaudeList() {
@@ -352,7 +414,7 @@ func cmdClaudeList() {
 // session. It replays the recorded launch argv rather than re-deriving flags,
 // because a placement or KV default that changed since would silently
 // reinterpret the cached conversation.
-func cmdClaudeResume(target string, force bool) {
+func cmdClaudeResume(target string, force bool, overrides []string) {
 	cfg := loadConfigOrExit()
 	workDir, err := os.Getwd()
 	if err != nil {
@@ -376,6 +438,10 @@ func cmdClaudeResume(target string, force bool) {
 			os.Exit(1)
 		}
 		launchArgs = []string{rec.ModelPath, "--claude-code"}
+	}
+	if len(overrides) > 0 {
+		launchArgs = claudeApplyResumeOverrides(launchArgs, overrides)
+		fmt.Printf("[claude-code] Overriding recorded launch: %s\n", strings.Join(overrides, " "))
 	}
 	launchArgs = append(launchArgs, "--claude-resume", rec.SessionID)
 	if force {

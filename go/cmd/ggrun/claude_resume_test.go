@@ -251,10 +251,83 @@ func TestClaudeResumeSubcommandParsesForceAndTarget(t *testing.T) {
 		{[]string{"--force", "072e63a1-819a-4682-a742-559695c3cd76"}, "072e63a1-819a-4682-a742-559695c3cd76", true},
 		{[]string{"--claude-resume-force"}, "", true},
 	} {
-		target, force := parseClaudeResumeArgs(tc.args)
+		target, force, overrides := parseClaudeResumeArgs(tc.args)
 		if target != tc.wantTarget || force != tc.wantForce {
 			t.Errorf("parseClaudeResumeArgs(%v) = (%q,%v), want (%q,%v)",
 				tc.args, target, force, tc.wantTarget, tc.wantForce)
 		}
+		// The force aliases are consumed, not passed through to the launch.
+		if len(overrides) != 0 {
+			t.Errorf("parseClaudeResumeArgs(%v) produced overrides %v", tc.args, overrides)
+		}
+	}
+}
+
+func TestParseClaudeResumeArgsOverrides(t *testing.T) {
+	target, force, over := parseClaudeResumeArgs([]string{"latest", "--force", "--spec", "dflash"})
+	if target != "latest" || !force {
+		t.Fatalf("target=%q force=%v", target, force)
+	}
+	if strings.Join(over, " ") != "--spec dflash" {
+		t.Errorf("overrides = %v", over)
+	}
+	// A session id must not be mistaken for a flag value, nor a flag value for
+	// the session id.
+	target, _, over = parseClaudeResumeArgs([]string{"--spec", "dflash", "072e63a1"})
+	if target != "072e63a1" {
+		t.Errorf("target = %q, want the session id", target)
+	}
+	if strings.Join(over, " ") != "--spec dflash" {
+		t.Errorf("overrides = %v", over)
+	}
+	// Bare flags carry no value.
+	_, _, over = parseClaudeResumeArgs([]string{"latest", "--no-mmap", "--spec", "off"})
+	if strings.Join(over, " ") != "--no-mmap --spec off" {
+		t.Errorf("overrides = %v", over)
+	}
+}
+
+func TestClaudeApplyResumeOverrides(t *testing.T) {
+	recorded := []string{"/m.gguf", "--claude-code", "--ctx-size", "1048576", "--spec", "off", "--no-mmap"}
+
+	// The case this exists for: the workflow was recorded with spec disabled.
+	got := claudeApplyResumeOverrides(recorded, []string{"--spec", "dflash"})
+	want := "/m.gguf --claude-code --ctx-size 1048576 --spec dflash --no-mmap"
+	if strings.Join(got, " ") != want {
+		t.Errorf("got  %s\nwant %s", strings.Join(got, " "), want)
+	}
+	// The recorded slice must not be mutated underneath the caller.
+	if recorded[5] != "off" {
+		t.Error("override mutated the recorded launch args")
+	}
+	// An unset flag is appended.
+	got = claudeApplyResumeOverrides(recorded, []string{"--draft-max", "8"})
+	if !strings.HasSuffix(strings.Join(got, " "), "--draft-max 8") {
+		t.Errorf("unset flag not appended: %v", got)
+	}
+	// A bare flag already present stays a no-op rather than duplicating.
+	got = claudeApplyResumeOverrides(recorded, []string{"--no-mmap"})
+	if strings.Join(got, " ") != strings.Join(recorded, " ") {
+		t.Errorf("bare flag duplicated: %v", got)
+	}
+	// Several overrides at once.
+	got = claudeApplyResumeOverrides(recorded, []string{"--spec", "mtp", "--ctx-size", "65536"})
+	want = "/m.gguf --claude-code --ctx-size 65536 --spec mtp --no-mmap"
+	if strings.Join(got, " ") != want {
+		t.Errorf("got  %s\nwant %s", strings.Join(got, " "), want)
+	}
+	// No overrides is exactly the recorded launch.
+	if got := claudeApplyResumeOverrides(recorded, nil); strings.Join(got, " ") != strings.Join(recorded, " ") {
+		t.Errorf("nil overrides changed the launch: %v", got)
+	}
+}
+
+func TestClaudeApplyResumeOverridesValueOntoBareFlag(t *testing.T) {
+	// A flag recorded without a value must gain one rather than swallow the
+	// next flag's name.
+	recorded := []string{"/m.gguf", "--spec", "--no-mmap"}
+	got := claudeApplyResumeOverrides(recorded, []string{"--spec", "dflash"})
+	if strings.Join(got, " ") != "/m.gguf --spec dflash --no-mmap" {
+		t.Errorf("got %v", got)
 	}
 }
