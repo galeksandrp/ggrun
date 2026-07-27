@@ -55,6 +55,19 @@ func main() {
 		return
 	}
 
+	// Offer updates before a long-running command starts. The machinery for
+	// this already existed -- upstream-behind detection, release check, and a
+	// dismiss-for-N-days window -- and had no caller, so backends drifted
+	// silently. That is not cosmetic: a checkpoint-creation fix landed upstream
+	// in May 2026 that directly governs whether prefix reuse works at all on
+	// sliding-window models, and nothing here would have said so.
+	//
+	// PromptOnStartup already declines on non-interactive shells, on repeat
+	// runs, and under LLM_SERVER_NO_UPDATE_CHECK, so scripts and CI never block.
+	if promptsForUpdates(args) {
+		update.PromptOnStartup()
+	}
+
 	switch args[0] {
 	case "help", "--help", "-h":
 		usage()
@@ -1938,6 +1951,36 @@ func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement
 	return server.StartWithTimeoutToOptions(serverArgs, req.Port, timeout, os.Stdout, os.Stderr, startOpts)
 }
 
+// formatMessageDelimiters renders the role markers for the launch line so a
+// template whose markers were misread is visible immediately rather than as an
+// unexplained absence of prefix reuse.
+func formatMessageDelimiters(delims []claudeauto.MessageDelimiter) string {
+	parts := make([]string, 0, len(delims))
+	for _, d := range delims {
+		parts = append(parts, d.Role+"="+d.Delimiter)
+	}
+	return strings.Join(parts, " ")
+}
+
+// promptsForUpdates keeps the check off commands that must stay silent or fast:
+// machine-readable output, the updater itself, and trivial queries.
+func promptsForUpdates(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "help", "--help", "-h", "version", "--version", "-v",
+		"update", "--update", "self-update", "dry-run", "detect":
+		return false
+	}
+	for _, a := range args {
+		if a == "--emit-server-argv-json" || a == "--json" {
+			return false
+		}
+	}
+	return true
+}
+
 func claudeServerLogPath(cfg *config.Config, port int, scope string) string {
 	logDir := ""
 	if cfg != nil {
@@ -2751,6 +2794,17 @@ func cmdLaunch(args []string) {
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error starting Claude Auto router: %v\n", err)
 			os.Exit(1)
+		}
+		// Read the backend's own rendered chat template and hand the role
+		// markers to the router. Without them llama.cpp finds no user-message
+		// boundary, creates no context checkpoint, and a sliding-window model
+		// has no way to resume a prefix -- measured here as 0 reuse across
+		// 132,317 prompt tokens while 78% was available.
+		if p.LogBuf != nil {
+			if delims := claudeauto.ParseChatMessageDelimiters(p.LogBuf.String()); len(delims) > 0 {
+				claudeAuto.setMessageDelimiters(delims)
+				fmt.Printf("[claude-code] chat delimiters read from the backend: %s\n", formatMessageDelimiters(delims))
+			}
 		}
 		claudeClientPort = claudeAuto.clientPort(req.Port)
 	}

@@ -568,6 +568,14 @@ func defaultClaudeMainMaxActive(strategy *placement.Strategy) int {
 	return 0
 }
 
+// setMessageDelimiters forwards the backend's chat role markers to the router.
+func (r *claudeAutoRuntime) setMessageDelimiters(delims []claudeauto.MessageDelimiter) {
+	if r == nil || r.router == nil {
+		return
+	}
+	r.router.SetMessageDelimiters(delims)
+}
+
 func (r *claudeAutoRuntime) clientPort(fallback int) int {
 	if r != nil && r.router != nil && r.router.Port() > 0 {
 		return r.router.Port()

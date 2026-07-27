@@ -228,3 +228,28 @@ func TestBackendVerbosityDefaultsToTrace(t *testing.T) {
 		t.Errorf("added -lv to a backend that does not support it: %v", out)
 	}
 }
+
+// The startup update prompt existed with upstream-behind detection, a release
+// check and a dismiss window, and had no caller -- so backends drifted silently
+// while a checkpoint-creation fix that governs prefix reuse sat unmerged
+// locally. It must stay off commands that have to be silent, fast, or
+// machine-readable.
+func TestUpdatePromptSkipsQuietCommands(t *testing.T) {
+	for _, args := range [][]string{
+		{"version"}, {"--version"}, {"help"}, {"-h"},
+		{"update"}, {"dry-run", "m.gguf"}, {"detect"},
+		{"launch", "m.gguf", "--emit-server-argv-json"},
+	} {
+		if promptsForUpdates(args) {
+			t.Errorf("%v would block on an update prompt", args)
+		}
+	}
+	for _, args := range [][]string{
+		{"launch", "m.gguf"},
+		{"claude", "resume", "latest"},
+	} {
+		if !promptsForUpdates(args) {
+			t.Errorf("%v skipped the update check", args)
+		}
+	}
+}

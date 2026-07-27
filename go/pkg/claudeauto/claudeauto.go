@@ -257,15 +257,21 @@ type Router struct {
 	companionAlias string
 	hasCompanion   bool
 	mainBaseURL    string
-	ubatch         int
-	backendMu      sync.Mutex
-	backend        map[string]any
-	pollOnce       sync.Once
-	pollStop       chan struct{}
-	stopPollOnce   sync.Once
-	mainActive     atomic.Int64
-	mainQueued     atomic.Int64
-	metrics        *metricsSink
+	// msgDelimiters are the chat role markers read from the backend's own
+	// startup output. They are injected into main-route requests that carry
+	// none, because a sliding-window model can only reuse a prefix from a
+	// context checkpoint and llama.cpp only creates one at a user-message
+	// boundary it can find.
+	msgDelimiters []MessageDelimiter
+	ubatch        int
+	backendMu     sync.Mutex
+	backend       map[string]any
+	pollOnce      sync.Once
+	pollStop      chan struct{}
+	stopPollOnce  sync.Once
+	mainActive    atomic.Int64
+	mainQueued    atomic.Int64
+	metrics       *metricsSink
 }
 
 // SetCompanion enables the cheap-tier lane. alias is the model name the
@@ -349,6 +355,16 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 		if IsClassifierRequest(body) {
 			router.serve(w, r, reviewerProxy, routeReviewer, body)
 			return
+		}
+		// Main-model work only: the reviewer is a different model with its own
+		// template, and its conversations are short enough that a missing
+		// checkpoint costs little.
+		if delims := router.messageDelimiters(); len(delims) > 0 {
+			if injected := InjectMessageDelimiters(body, delims); len(injected) > 0 {
+				body = injected
+				r.Body = io.NopCloser(bodyReader(body))
+				r.ContentLength = int64(len(body))
+			}
 		}
 		// Claude Code's cheap tiers address the utility alias. Send that work
 		// to the companion backend instead of the main model, rewriting the
@@ -519,6 +535,26 @@ func (r *Router) Close() error {
 		err = closeErr
 	}
 	return err
+}
+
+// SetMessageDelimiters records the chat role markers for the main model. Safe to
+// call once the backend has started and its startup output has been read.
+func (r *Router) SetMessageDelimiters(delims []MessageDelimiter) {
+	if r == nil {
+		return
+	}
+	r.backendMu.Lock()
+	defer r.backendMu.Unlock()
+	r.msgDelimiters = append([]MessageDelimiter(nil), delims...)
+}
+
+func (r *Router) messageDelimiters() []MessageDelimiter {
+	if r == nil {
+		return nil
+	}
+	r.backendMu.Lock()
+	defer r.backendMu.Unlock()
+	return r.msgDelimiters
 }
 
 // StartBackendPolling samples the model server's own timing counters on a
