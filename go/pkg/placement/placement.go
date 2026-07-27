@@ -3998,6 +3998,16 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 	return args
 }
 
+// systemProbeSchema is bumped when the meaning of a stored value changes, so a
+// file written by an older method is re-measured rather than trusted.
+const systemProbeSchema = 2
+
+// systemProbeOutlierRatio is how far above its peers a stored per-GPU overhead
+// must sit before it is treated as contaminated rather than measured. Real
+// variation between a 24 GB and a 12 GB card is well under 2x; the contaminated
+// reading on this project was 9x.
+const systemProbeOutlierRatio = 4
+
 // loadSystemProbe tries to load measured CUDA overhead from cache.
 // Keys the probe cache by a GPU-signature hash.
 // SystemCUDAOverheadMB returns the legacy measured CUDA context overhead. New
@@ -4064,6 +4074,7 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 		return nil
 	}
 	sp := &systemProbe{CUDAOverheadByGPU: map[int]int{}}
+	sysSchema := 1
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -4081,6 +4092,10 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 			if v, err := strconv.Atoi(val); err == nil && v >= 0 {
 				sp.CUDAOverheadMB = v
 			}
+		case key == "SYS_PROBE_SCHEMA":
+			if v, err := strconv.Atoi(val); err == nil {
+				sysSchema = v
+			}
 		case strings.HasPrefix(key, "SYS_CUDA_OVERHEAD_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(key, "SYS_CUDA_OVERHEAD_MB_CUDA")
 			idx, idxErr := strconv.Atoi(idxRaw)
@@ -4092,6 +4107,33 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 	}
 	if sp.CUDAOverheadMB == 0 && len(sp.CUDAOverheadByGPU) == 0 {
 		return nil
+	}
+	// Schema 1 measured CUDA overhead as the whole device's usage minus the
+	// server's own logged buffers, so anything else resident on that card was
+	// recorded as permanent overhead. On this project the Auto reviewer, seated
+	// on the least valuable GPU by design, was written in as 2299 MiB of
+	// "overhead" against 397 and 255 on the other two cards -- then charged on
+	// every later placement on top of the reviewer's own reservation, costing
+	// the smallest GPU a full expert layer.
+	//
+	// Only an outlier is discarded, not every legacy value: CUDA context
+	// overhead is broadly similar across devices sharing a driver, so a card
+	// several times its peers is measuring something else. A single-GPU record
+	// has no peer to compare against and is kept.
+	if sysSchema < systemProbeSchema && len(sp.CUDAOverheadByGPU) > 1 {
+		lo := 0
+		for _, v := range sp.CUDAOverheadByGPU {
+			if v > 0 && (lo == 0 || v < lo) {
+				lo = v
+			}
+		}
+		if lo > 0 {
+			for idx, v := range sp.CUDAOverheadByGPU {
+				if v > lo*systemProbeOutlierRatio {
+					delete(sp.CUDAOverheadByGPU, idx)
+				}
+			}
+		}
 	}
 	return sp
 }
@@ -4886,7 +4928,7 @@ func writeMeasuredKVRate(cacheDir string, model *ModelProfile, kvType string, by
 	}
 }
 
-func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string) {
+func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, serverPID int) {
 	if len(gpus) == 0 || serverLog == "" {
 		return
 	}
@@ -4904,7 +4946,14 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string) {
 
 	overheadByGPU := map[int]int{}
 	for _, gpu := range gpus {
-		usedMB := QueryVRAMUsed(gpu.Index)
+		// Prefer what the server itself holds on this device. A whole-device
+		// reading includes every other process, and ggrun deliberately seats
+		// the Auto reviewer on the least valuable card -- so the card most
+		// hurt by an inflated overhead is exactly the one that gets it.
+		usedMB := QueryVRAMUsedByPIDOnGPU(serverPID, gpu.Index)
+		if usedMB <= 0 {
+			usedMB = QueryVRAMUsed(gpu.Index)
+		}
 		if usedMB <= 0 {
 			continue
 		}
@@ -4930,6 +4979,7 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string) {
 	path := filepath.Join(cacheDir, fmt.Sprintf("system_%s.cache", gpuSig))
 	var b strings.Builder
 	fmt.Fprintf(&b, "# System probe (post-launch per-device measurement)\n")
+	fmt.Fprintf(&b, "SYS_PROBE_SCHEMA=%d\n", systemProbeSchema)
 	fmt.Fprintf(&b, "# Generated: %s\n", time.Now().Format(time.RFC3339))
 	indices := make([]int, 0, len(overheadByGPU))
 	for idx := range overheadByGPU {
@@ -4968,6 +5018,67 @@ func QueryVRAMUsed(gpuIndex int) int {
 		return 0
 	}
 	return v
+}
+
+// QueryVRAMUsedByPIDOnGPU returns the VRAM one process holds on one device.
+//
+// It exists because a whole-device reading cannot separate the model from
+// anything else ggrun launched beside it. The system CUDA overhead probe
+// subtracted the server's own logged buffers from the card's total usage, so on
+// a card that also hosted the Auto reviewer the reviewer's memory landed in
+// "system overhead" -- recorded as 2299 MiB on a 12 GB card against 397 and 255
+// on the other two, and then charged on every later placement on top of the
+// reviewer's own reservation. That cost the smallest GPU a full expert layer.
+//
+// Returns 0 when nvidia-smi is unavailable or the process holds nothing there,
+// which leaves the caller on its previous behaviour.
+func QueryVRAMUsedByPIDOnGPU(pid, gpuIndex int) int {
+	if pid <= 0 || gpuIndex < 0 {
+		return 0
+	}
+	uuid := gpuUUIDForIndex(gpuIndex)
+	if uuid == "" {
+		return 0
+	}
+	out, err := exec.Command("nvidia-smi",
+		"--query-compute-apps=pid,gpu_uuid,used_memory", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0
+	}
+	total := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(line, ",")
+		if len(f) != 3 {
+			continue
+		}
+		gotPID, err1 := strconv.Atoi(strings.TrimSpace(f[0]))
+		mb, err2 := strconv.Atoi(strings.TrimSpace(f[2]))
+		if err1 != nil || err2 != nil || gotPID != pid || mb <= 0 {
+			continue
+		}
+		if strings.TrimSpace(f[1]) != uuid {
+			continue
+		}
+		total += mb
+	}
+	return total
+}
+
+func gpuUUIDForIndex(gpuIndex int) string {
+	out, err := exec.Command("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader").Output()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		f := strings.Split(line, ",")
+		if len(f) != 2 {
+			continue
+		}
+		if idx, err := strconv.Atoi(strings.TrimSpace(f[0])); err == nil && idx == gpuIndex {
+			return strings.TrimSpace(f[1])
+		}
+	}
+	return ""
 }
 
 // QueryVRAMUsedByPID returns the VRAM a single process holds, summed across

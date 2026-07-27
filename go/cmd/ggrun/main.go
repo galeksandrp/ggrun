@@ -2000,6 +2000,14 @@ func printVRAMLedger(strategy *placement.Strategy) {
 	}
 }
 
+// serverProcessPID is the backend's PID, or 0 when it is not running.
+func serverProcessPID(p *server.Process) int {
+	if p == nil || p.Cmd == nil || p.Cmd.Process == nil {
+		return 0
+	}
+	return p.Cmd.Process.Pid
+}
+
 func claudeServerLogPath(cfg *config.Config, port int, scope string) string {
 	logDir := ""
 	if cfg != nil {
@@ -2019,7 +2027,7 @@ func claudeOOMMarkerPath(cfg *config.Config, req *launchRequest, model *placemen
 	return claudeServerLogPath(cfg, req.Port, scope) + ".oom-recorded"
 }
 
-func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverLog string, baselineVRAMByGPU map[int]int) map[int]int {
+func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverLog string, baselineVRAMByGPU map[int]int, serverPID int) map[int]int {
 	if cfg == nil || model == nil || strategy == nil || be == nil || serverLog == "" {
 		return nil
 	}
@@ -2032,7 +2040,7 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 		return nil
 	}
 	if model.IsMoE && len(gpus) > 0 {
-		placement.RunPostLaunchProbe(cfg.CacheDir, gpus, serverLog)
+		placement.RunPostLaunchProbe(cfg.CacheDir, gpus, serverLog, serverPID)
 		placement.RunPostLaunchModelProbeVRAMDelta(cfg.CacheDir, model, strategy, cacheBackendTag, gpus, baselineVRAMByGPU)
 	}
 	computeByGPU := placement.ParseComputeBuffersByGPU(serverLog)
@@ -2232,7 +2240,7 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 		var measuredComputeByGPU map[int]int
 		if p != nil && p.LogBuf != nil {
 			logData = p.LogBuf.String()
-			measuredComputeByGPU = recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, logData, nil)
+			measuredComputeByGPU = recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, logData, nil, serverProcessPID(p))
 		}
 		// Diagnose before checking the retry budget: a clean, parseable OOM on
 		// the very last allowed attempt still deserves its real cause recorded
@@ -2761,7 +2769,7 @@ func cmdLaunch(args []string) {
 
 	fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 	if p.LogBuf != nil {
-		recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM)
+		recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
 	}
 	// First-launch calibration: measure alternative placements for this exact
 	// model/hardware/workload scope and switch to the fastest, then never pay
@@ -2791,7 +2799,7 @@ func cmdLaunch(args []string) {
 			serverArgs = nextArgs
 			fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 			if p.LogBuf != nil {
-				go recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM)
+				go recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
 			}
 		}
 	}

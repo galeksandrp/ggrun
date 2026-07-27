@@ -607,7 +607,7 @@ func TestStartupComputeMeasurementMustMatchFailedGPU(t *testing.T) {
 		"ggml_backend_cuda_buffer_type_alloc_buffer: allocating 8000.00 MiB on device 0: cudaMalloc failed: out of memory\n" +
 		"ggml_gallocr_reserve_n: graph_reserve failed\n"
 
-	measured := recordMeasuredLaunchProbes(nil, cfg, model, strategy, be, caps, log, nil)
+	measured := recordMeasuredLaunchProbes(nil, cfg, model, strategy, be, caps, log, nil, 0)
 	device, _, isCompute, ok := startupLogCUDAOOMDetailed(log)
 	if !ok || !isCompute || device != 0 {
 		t.Fatalf("failed allocation parse = device %d compute=%v ok=%v", device, isCompute, ok)

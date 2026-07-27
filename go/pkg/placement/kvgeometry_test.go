@@ -1,6 +1,13 @@
 package placement
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/raketenkater/ggrun/pkg/detect"
+)
 
 // The exact lines llama.cpp printed for Laguna at 1M context, q4_0 K/V.
 const lagunaKVLog = `
@@ -176,5 +183,53 @@ func TestCheckpointSpacingTilesTheContext(t *testing.T) {
 	}
 	if got := checkpointMinStep(nil, 512); got != 0 {
 		t.Errorf("nil model got spacing %d", got)
+	}
+}
+
+// The system CUDA overhead probe measured a whole device's usage minus the
+// server's own logged buffers, so anything else resident on that card became
+// permanent "overhead". ggrun seats the Auto reviewer on the least valuable
+// GPU by design, so the card least able to afford it is exactly the one that
+// got charged: 2299 MiB recorded on a 12 GB card against 397 and 255 on the
+// other two, then applied on every later placement on top of the reviewer's own
+// reservation. At 1371 MiB per expert layer that is a full layer, permanently.
+func TestContaminatedSystemOverheadIsDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	gpus := []detect.GPU{
+		{Index: 0, Name: "RTX 3090 Ti", Driver: "580"},
+		{Index: 1, Name: "RTX 3060", Driver: "580"},
+		{Index: 2, Name: "RTX 4070", Driver: "580"},
+	}
+	path := filepath.Join(dir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(gpus)))
+	// Exactly what this project recorded, without a schema marker.
+	body := "SYS_CUDA_OVERHEAD_MB_CUDA0=397\nSYS_CUDA_OVERHEAD_MB_CUDA1=2299\nSYS_CUDA_OVERHEAD_MB_CUDA2=255\nSYS_CUDA_OVERHEAD_MB=2299\n"
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := SystemCUDAOverheadByGPU(dir, gpus)
+	if _, ok := got[1]; ok {
+		t.Errorf("kept the contaminated 2299 MiB reading for CUDA1: %v", got)
+	}
+	for _, idx := range []int{0, 2} {
+		if got[idx] == 0 {
+			t.Errorf("discarded the plausible reading for CUDA%d: %v", idx, got)
+		}
+	}
+}
+
+// Plausible spreads must survive, or every multi-GPU host re-measures forever.
+func TestPlausibleSystemOverheadSpreadIsKept(t *testing.T) {
+	dir := t.TempDir()
+	gpus := []detect.GPU{
+		{Index: 0, Name: "RTX 3090 Ti", Driver: "580"},
+		{Index: 1, Name: "RTX 3060", Driver: "580"},
+	}
+	path := filepath.Join(dir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(gpus)))
+	if err := os.WriteFile(path, []byte("SYS_CUDA_OVERHEAD_MB_CUDA0=488\nSYS_CUDA_OVERHEAD_MB_CUDA1=311\nSYS_CUDA_OVERHEAD_MB=488\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got := SystemCUDAOverheadByGPU(dir, gpus)
+	if got[0] != 488 || got[1] != 311 {
+		t.Errorf("discarded a plausible spread: %v", got)
 	}
 }
