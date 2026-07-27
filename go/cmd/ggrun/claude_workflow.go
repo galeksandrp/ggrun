@@ -91,15 +91,30 @@ func claudeWorkflowPatchInput(toolInput map[string]interface{}, transcriptPath s
 	return nil
 }
 
+// claudeWorkflowPatchedScriptPath names the patched copy of a workflow script.
+//
+// Resuming a run feeds the previous scriptPath straight back in, and that path
+// is already a patched one, so appending unconditionally grew a suffix per
+// resume: one session on this machine accumulated
+// deep-research-....ggrun.ggrun.ggrun.ggrun.ggrun.js, a fresh copy of the script
+// each time. Patching is idempotent -- the content is regenerated from the same
+// source either way -- so an already-patched path patches back onto itself.
+func claudeWorkflowPatchedScriptPath(path string) string {
+	ext := filepath.Ext(path)
+	base := strings.TrimSuffix(path, ext)
+	if strings.HasSuffix(base, ".ggrun") {
+		return path
+	}
+	return base + ".ggrun" + ext
+}
+
 func claudeWorkflowPatchedScriptFile(path string) (string, error) {
 	script, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
 	}
 	patched := claudeWorkflowNoTimeoutScript(string(script))
-	ext := filepath.Ext(path)
-	base := strings.TrimSuffix(path, ext)
-	patchedPath := base + ".ggrun" + ext
+	patchedPath := claudeWorkflowPatchedScriptPath(path)
 	if err := os.WriteFile(patchedPath, []byte(patched), 0o600); err != nil {
 		return "", fmt.Errorf("write %s: %w", patchedPath, err)
 	}

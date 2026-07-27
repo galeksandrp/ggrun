@@ -112,3 +112,25 @@ func TestClaudeWorkflowPatchInputRejectsUnresolvedName(t *testing.T) {
 		t.Fatal("unresolved named workflow must fail before the 180-second default can run")
 	}
 }
+
+func TestClaudeWorkflowPatchedScriptPathIsIdempotent(t *testing.T) {
+	first := claudeWorkflowPatchedScriptPath("/w/scripts/deep-research-wf_894b.js")
+	if first != "/w/scripts/deep-research-wf_894b.ggrun.js" {
+		t.Fatalf("first patch = %q", first)
+	}
+	// Resuming feeds the patched path back in. Before this was idempotent each
+	// resume added another suffix and wrote another copy of the script.
+	if again := claudeWorkflowPatchedScriptPath(first); again != first {
+		t.Errorf("re-patching %q gave %q, want the same path", first, again)
+	}
+	// Already-accumulated paths from earlier runs must stop growing too.
+	grown := "/w/scripts/deep-research-wf_894b.ggrun.ggrun.ggrun.js"
+	if got := claudeWorkflowPatchedScriptPath(grown); got != grown {
+		t.Errorf("re-patching %q gave %q", grown, got)
+	}
+	// A script whose name merely contains "ggrun" is not already patched.
+	other := claudeWorkflowPatchedScriptPath("/w/scripts/ggrun-bench.js")
+	if other != "/w/scripts/ggrun-bench.ggrun.js" {
+		t.Errorf("unpatched name = %q", other)
+	}
+}
