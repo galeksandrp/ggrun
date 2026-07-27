@@ -53,6 +53,19 @@ func TestUnchangedComputeReplanLowersUBatch(t *testing.T) {
 	}
 }
 
+func TestComputeRecoveryNeverRaisesDeratedUBatch(t *testing.T) {
+	model, caps, args, candidate := preflightRecoveryFixture()
+	args = replaceUBatchArg(args, 256)
+	candidate.UBatchSize = 512
+	candidate.NCPUMoE++
+	next, entry, method, ok := selectChangedPreflightRecovery(args, candidate, model, caps, preflightOutcome{
+		Device: 0, AllocMB: 2132, DeficitMB: 74, IsComputeBuffer: true,
+	})
+	if !ok || method != "ubatch-derate" || entry == nil || entry.UBatchSize != 128 {
+		t.Fatalf("recovery raised a derated ubatch: method=%q entry=%+v ok=%v args=%v", method, entry, ok, next)
+	}
+}
+
 func TestUnchangedWeightReplanMovesExpertLayer(t *testing.T) {
 	model, caps, args, unchanged := preflightRecoveryFixture()
 	next, entry, method, ok := selectChangedPreflightRecovery(args, unchanged, model, caps, preflightOutcome{

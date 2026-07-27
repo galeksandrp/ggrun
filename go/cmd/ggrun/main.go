@@ -159,6 +159,8 @@ Launch flags:
   -gpus string         Comma-separated GPU indices
   --backend string     auto|llama|ik_llama|registered backend tag
   --parallel int       Concurrent sequence slots
+  --threads int, -t    CPU threads (default: physical cores)
+  --cache-ram int      Host prompt-cache budget in MiB (-cram); 0 derives it
   --mmap               Explicitly approve file-backed mmap when placement needs it
   --no-mmap            Require fully resident model weights
   --ram-limit-percent int  Maximum whole-host RAM utilisation (default 95)
@@ -445,7 +447,7 @@ func firstPositional(args []string) string {
 		if strings.HasPrefix(a, "-") {
 			// Must stay in sync with the value-taking flags in parseLaunchArgs.
 			switch a {
-			case "--model", "-m", "--port", "-port", "--ctx", "-ctx", "--ctx-size", "-c", "--kv", "-kv", "--kv-placement", "--kv-quality", "--gpus", "--host", "--server-bin", "--mmproj", "--backend", "--tune-cache", "--rounds", "--ram-budget", "--ram-limit-percent", "--vram-headroom", "--ram-headroom", "--spec", "--parallel", "--claude-profile", "--lib-path", "--threads", "-t", "--batch-size", "-b", "--ubatch-size", "-ub":
+			case "--model", "-m", "--port", "-port", "--ctx", "-ctx", "--ctx-size", "-c", "--kv", "-kv", "--kv-placement", "--kv-quality", "--gpus", "--host", "--server-bin", "--mmproj", "--backend", "--tune-cache", "--rounds", "--ram-budget", "--ram-limit-percent", "--vram-headroom", "--ram-headroom", "--spec", "--parallel", "--claude-profile", "--lib-path", "--threads", "-t", "--cache-ram", "-cram", "--batch-size", "-b", "--ubatch-size", "-ub":
 				skip = true
 			}
 			continue
@@ -498,6 +500,8 @@ type launchRequest struct {
 	ForceMMap            bool
 	Parallel             int
 	ParallelSet          bool // --parallel given explicitly; claude-code mode must not override it
+	Threads              int  // --threads; 0 keeps the physical-core default
+	CacheRAMMB           int  // --cache-ram; 0 keeps the derived prompt-cache budget
 	BatchSize            int
 	BatchSizeSet         bool
 	UBatchSize           int
@@ -673,6 +677,20 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				}
 				req.Parallel = parallel
 				req.ParallelSet = true
+				continue
+			case "--threads", "-t":
+				threads, err := parsePositiveFlag(key, val)
+				if err != nil {
+					return nil, err
+				}
+				req.Threads = threads
+				continue
+			case "--cache-ram", "-cram":
+				cram, err := parsePositiveFlag(key, val)
+				if err != nil {
+					return nil, err
+				}
+				req.CacheRAMMB = cram
 				continue
 			case "--batch-size", "-b":
 				batch, err := parsePositiveFlag(key, val)
@@ -910,6 +928,26 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.Parallel = parallel
+		case "--threads", "-t":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			threads, err := parsePositiveFlag(a, v)
+			if err != nil {
+				return nil, err
+			}
+			req.Threads = threads
+		case "--cache-ram", "-cram":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			cram, err := parsePositiveFlag(a, v)
+			if err != nil {
+				return nil, err
+			}
+			req.CacheRAMMB = cram
 			req.ParallelSet = true
 		case "--batch-size", "-b":
 			v, err := next()
@@ -1039,6 +1077,14 @@ func evidenceBackendCacheTag(be *backendInfo) string {
 
 func scopedProbeBackendTag(req *launchRequest, model *placement.ModelProfile, be *backendInfo) string {
 	return placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), requestWorkloadProfile(req, model))
+}
+
+func scopedProbeBackendTagForStrategy(req *launchRequest, model *placement.ModelProfile, be *backendInfo, strategy *placement.Strategy) string {
+	workload := requestWorkloadProfile(req, model)
+	if strategy != nil {
+		workload = placement.SpecWorkloadProfile(workload, strategy.Draft)
+	}
+	return placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), workload)
 }
 
 // resolveKVCacheTypeFlags turns llama.cpp's direct K/V flags into one planned
@@ -1405,6 +1451,8 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		SpecCandidateValidator: backendSpecCandidateValidator(be),
 		CacheFile:              req.TuneCache,
 		Parallel:               req.Parallel,
+		Threads:                req.Threads,
+		CacheRAMMB:             req.CacheRAMMB,
 		BatchSize:              req.BatchSize,
 		UBatchSize:             req.UBatchSize,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
@@ -1633,16 +1681,56 @@ func specLaunchIdentity(args []string) string {
 	return fmt.Sprintf("%x", sum[:16])
 }
 
+// planDerivedLaunchFlags are the flags placement computes rather than the user
+// choosing. Each carries a value, and all of them are excluded from the identity
+// a crash log is filed under.
+//
+// They have to be: recovery exists precisely to change these. Keying the log on
+// them files every attempt under a different name, so the next launch reads a
+// path that was never written and re-plans the placement that just aborted. That
+// is not hypothetical -- it is what happened here once `-cram` became a derived
+// value. Three consecutive launches crashed at `--n-cpu-moe 23`; their argv
+// differed only in `-cram` (9753, 9752, 9742, tracking free-RAM drift), which
+// was enough to give each its own scope, and no OOM was ever recorded.
+var planDerivedLaunchFlags = map[string]bool{
+	"--port": true, "--host": true,
+	"-ot": true, "--override-tensor": true,
+	"--n-cpu-moe": true, "--tensor-split": true, "--split-mode": true,
+	"-ngl": true, "--n-gpu-layers": true, "--gpu-layers": true,
+	"-cram": true, "--cache-ram": true, "--ctx-checkpoints": true,
+}
+
+// recoveryLaunchIdentity identifies the launch *shape* -- model, context, slots,
+// KV, batch, sampling, spec -- with the placement decisions removed. Two runs
+// that differ only in how placement split the model share an identity, which is
+// what lets the second one read the first one's crash.
+//
+// Kept separate from specLaunchIdentity on purpose: that one verifies a
+// speculative result was produced by an exact command line and must stay exact.
+func recoveryLaunchIdentity(args []string) string {
+	canonical := make([]string, 0, len(args))
+	for i := 1; i < len(args); i++ { // backend binary has its own scope identity
+		if planDerivedLaunchFlags[args[i]] {
+			i++
+			continue
+		}
+		canonical = append(canonical, args[i])
+	}
+	data, _ := json.Marshal(canonical)
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:16])
+}
+
 // claudeLaunchLogScope ties a recoverable Claude server log to the effective
-// workload profile, exact backend build, and final canonical launch argv. A
-// port-only filename let an old interactive/parallel run donate (or suppress)
-// OOM evidence for a different runtime shape.
+// workload profile, exact backend build, and the launch shape. A port-only
+// filename let an old interactive/parallel run donate (or suppress) OOM evidence
+// for a different runtime shape.
 func claudeLaunchLogScope(req *launchRequest, model *placement.ModelProfile, be *backendInfo, serverArgs []string) string {
 	material := strings.Join([]string{
 		"claude-server-log-v2",
 		requestWorkloadProfile(req, model),
 		evidenceBackendCacheTag(be),
-		specLaunchIdentity(serverArgs),
+		recoveryLaunchIdentity(serverArgs),
 	}, "\x00")
 	sum := sha256.Sum256([]byte(material))
 	return fmt.Sprintf("%x", sum[:12])
@@ -1760,6 +1848,11 @@ func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement
 		logPath := claudeServerLogPath(cfg, req.Port, scope)
 		if lf, ferr := os.Create(logPath); ferr == nil {
 			_, _ = fmt.Fprintf(lf, "[ggrun] launch-scope: %s\n", scope)
+			// The scope is a hash, so a mismatch between two runs is invisible
+			// from the filenames alone -- diagnosing one cost an afternoon.
+			// Write the parts it is made of.
+			_, _ = fmt.Fprintf(lf, "[ggrun] launch-identity: workload=%s backend=%s shape=%s\n",
+				requestWorkloadProfile(req, model), evidenceBackendCacheTag(be), recoveryLaunchIdentity(serverArgs))
 			_, _ = fmt.Fprintf(lf, "[ggrun] launch: %s\n", formatCommand(serverArgs))
 			fmt.Printf("[claude-code] backend logs -> %s\n", logPath)
 			return server.StartWithTimeoutToOptions(serverArgs, req.Port, timeout, lf, lf, startOpts)
@@ -1791,10 +1884,13 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 	if cfg == nil || model == nil || strategy == nil || be == nil || serverLog == "" {
 		return nil
 	}
-	cacheBackendTag := scopedProbeBackendTag(req, model, be)
+	cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 	var gpus []detect.GPU
 	if caps != nil {
 		gpus = caps.GPUs
+	}
+	if hasExternalSpecCompanion(strategy) {
+		return nil
 	}
 	if model.IsMoE && len(gpus) > 0 {
 		placement.RunPostLaunchProbe(cfg.CacheDir, gpus, serverLog)
@@ -1819,7 +1915,7 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 	if req == nil || cfg == nil || be == nil || caps == nil || model == nil || current == nil || !model.IsMoE || len(caps.GPUs) == 0 {
 		return nil, nil, false
 	}
-	if placement.RequiresConservativeSplitOwnerProtection(model) && !placement.HasLongContextValidation(cfg.CacheDir, model, current.ContextSize, current.UBatchSize, current.KVQuality, current.KVPlacement, scopedProbeBackendTag(req, model, be), caps.GPUs, current.Parallel, placement.LongContextValidationMinTokens) {
+	if placement.RequiresConservativeSplitOwnerProtection(model) && !placement.HasLongContextValidation(cfg.CacheDir, model, current.ContextSize, current.UBatchSize, current.KVQuality, current.KVPlacement, scopedProbeBackendTagForStrategy(req, model, be, current), caps.GPUs, current.Parallel, placement.LongContextValidationMinTokens) {
 		// A load-time probe and health check do not validate the deferred graph
 		// allocations exercised by a long hybrid-MoE request. Keep this automatic
 		// calibration from undoing the conservative split-owner placement until a
@@ -2120,7 +2216,7 @@ const unknownRuntimeCUDAOOMReserveMinMB = 2048
 // 10% of that device (at least 2 GiB). A repeat adds another such block. This is
 // learned only for the exact runtime probe key; normal first launches retain
 // measured, margin-free packing.
-func runtimeLogCUDAOOM(logData string, caps *detect.Capabilities, prior map[int]int) (device int, reserveMB int, estimated bool, ok bool) {
+func runtimeLogCUDAOOM(logData string, caps *detect.Capabilities, model *placement.ModelProfile, prior map[int]int) (device int, reserveMB int, estimated bool, ok bool) {
 	lines := strings.Split(logData, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		if device, allocMB, ok := recovery.ParseCUDAOOM(lines[i]); ok {
@@ -2140,14 +2236,25 @@ func runtimeLogCUDAOOM(logData string, caps *detect.Capabilities, prior map[int]
 		if !isOOM {
 			continue
 		}
-		reserveMB = unknownRuntimeCUDAOOMReserveMinMB
-		if caps != nil {
-			for _, gpu := range caps.GPUs {
-				if gpu.Index == device {
-					if scaled := (gpu.VRAMTotalMB + 9) / 10; scaled > reserveMB {
-						reserveMB = scaled
+		// Reserve exactly one routed expert layer: that is the unit placement
+		// moves between GPU and CPU, its size is known exactly from the GGUF
+		// ledger, and it is the smallest step that changes the outcome. A tenth
+		// of the card, which this used to reserve, is a quantity derived from
+		// nothing -- on a 24 GiB device it withheld 2457 MiB, close to two
+		// layers, and a second abort compounded it permanently.
+		reserveMB = placement.LargestRoutedExpertLayerMB(model)
+		if reserveMB <= 0 {
+			// No ledger: fall back to the old fraction rather than reserve
+			// nothing, since an OOM is proof that something must give.
+			reserveMB = unknownRuntimeCUDAOOMReserveMinMB
+			if caps != nil {
+				for _, gpu := range caps.GPUs {
+					if gpu.Index == device {
+						if scaled := (gpu.VRAMTotalMB + 9) / 10; scaled > reserveMB {
+							reserveMB = scaled
+						}
+						break
 					}
-					break
 				}
 			}
 		}
@@ -2177,9 +2284,9 @@ func recordRuntimeOOMLog(req *launchRequest, cfg *config.Config, model *placemen
 			return 0, 0, false, false, false, nil
 		}
 	}
-	cacheBackendTag := scopedProbeBackendTag(req, model, be)
+	cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 	prior := placement.RuntimeGraphGrowthByGPU(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel)
-	device, reserveMB, estimated, ok = runtimeLogCUDAOOM(logData, caps, prior)
+	device, reserveMB, estimated, ok = runtimeLogCUDAOOM(logData, caps, model, prior)
 	if !ok {
 		return 0, 0, false, false, false, nil
 	}
@@ -2202,8 +2309,22 @@ func previousClaudeLogMatches(logData string, model *placement.ModelProfile, str
 	if scope == "" || !strings.Contains(logData, "[ggrun] launch-scope: "+scope) {
 		return false
 	}
-	if !strings.Contains(logData, "health check OK") || !strings.Contains(logData, filepath.Base(model.Path)) {
+	if !strings.Contains(logData, filepath.Base(model.Path)) {
 		return false
+	}
+	// A crash before the health check never reaches slot init, so neither the
+	// health marker nor the slots line exists -- and refusing those logs meant
+	// the only failures ggrun could not learn from were the ones that stopped it
+	// starting. On this project a backend swap invalidated the probe history,
+	// placement packed three expert layers too many, and every retry re-read a
+	// log it had decided was unusable and repeated the same choice.
+	//
+	// The scope already pins the exact canonical argv, including context and
+	// slot count, so it is sufficient evidence that the log describes this
+	// launch. The caller still records nothing unless a real OOM is parsed out
+	// of it.
+	if !strings.Contains(logData, "health check OK") {
+		return true
 	}
 	wantSlots := fmt.Sprintf("n_slots = %d, n_ctx_slot = %d", strategy.Parallel, strategy.ContextSize/strategy.Parallel)
 	return strings.Contains(logData, wantSlots)
@@ -2626,9 +2747,9 @@ func cmdLaunch(args []string) {
 		if p.LogBuf != nil {
 			logData = p.LogBuf.String()
 		}
-		cacheBackendTag := scopedProbeBackendTag(req, model, be)
+		cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 		prior := placement.RuntimeGraphGrowthByGPU(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel)
-		device, allocMB, estimated, ok := runtimeLogCUDAOOM(logData, caps, prior)
+		device, allocMB, estimated, ok := runtimeLogCUDAOOM(logData, caps, model, prior)
 		if !ok || runtimeOOMRetries >= maxRuntimeOOMRetries {
 			claudeAuto.stop()
 			if ok {
@@ -3213,6 +3334,7 @@ func cmdDryRun(args []string) {
 			BackendTag    string            `json:"backend_tag"`
 			BackendID     string            `json:"backend_identity"`
 			ClaudeProfile string            `json:"claude_profile,omitempty"`
+			LaunchScope   string            `json:"launch_scope,omitempty"`
 			MemoryMaxMB   int               `json:"memory_max_mb,omitempty"`
 			Environment   map[string]string `json:"environment"`
 			ServerArgv    []string          `json:"server_argv"`
@@ -3222,9 +3344,13 @@ func cmdDryRun(args []string) {
 			BackendTag:    be.Tag,
 			BackendID:     be.Identity,
 			ClaudeProfile: effectiveClaudeProfile(req),
-			MemoryMaxMB:   backendMemoryMaxMB(req, caps),
-			Environment:   launchPlanEnvironment(serverArgs, envPrefix, be.Path),
-			ServerArgv:    serverArgs,
+			// The name a crash log would be filed under. Exposed because it is a
+			// hash: when recovery silently fails to find a previous OOM, the only
+			// way to see why is to compare this between two runs.
+			LaunchScope: claudeLaunchLogScope(req, model, be, serverArgs),
+			MemoryMaxMB: backendMemoryMaxMB(req, caps),
+			Environment: launchPlanEnvironment(serverArgs, envPrefix, be.Path),
+			ServerArgv:  serverArgs,
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(plan); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing launch plan: %v\n", err)
@@ -3294,7 +3420,7 @@ func cmdRecordLongContextValidation(args []string) {
 			}
 		}
 	}
-	cacheBackendTag := scopedProbeBackendTag(req, model, be)
+	cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 	if err := placement.RecordLongContextValidation(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, promptTokens, gpuUsed); err != nil {
 		fmt.Fprintf(os.Stderr, "Error recording validation: %v\n", err)
 		os.Exit(1)

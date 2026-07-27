@@ -182,6 +182,20 @@ func TestComputeSingleGPUChoosesFastestDeviceThatActuallyFits(t *testing.T) {
 	}
 }
 
+func TestFindDraftGPUFailsClosedAndReturnsPhysicalIndex(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 3, VRAMTotalMB: 12288, BandwidthMBps: 8000},
+		{Index: 7, VRAMTotalMB: 24576, BandwidthMBps: 32000},
+	}}
+	target := &ModelProfile{IsMoE: true}
+	if got := findDraftGPU(caps, target, 8000); got != 7 {
+		t.Fatalf("draft GPU = %d, want physical CUDA7", got)
+	}
+	if got := findDraftGPU(caps, target, 25000); got != -1 {
+		t.Fatalf("no-fit draft returned CUDA%d instead of failing closed", got)
+	}
+}
+
 func TestApplyCompanionReservationsSeatsAndReserves(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
@@ -1262,8 +1276,12 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	if strat.CRAM < minCramMB {
 		t.Fatalf("expected a host-RAM prompt cache, got CRAM=%d", strat.CRAM)
 	}
-	if strat.CRAM > 37623/10+1 {
-		t.Fatalf("prompt cache %d MiB exceeds the host RAM budget after load", strat.CRAM)
+	// The bound is the safety one -- the cache must not crowd out the weights'
+	// working set inside the memory scope -- not the old tenth-of-free-RAM
+	// policy, which was too small to hold even one saved slot and so evicted a
+	// conversation's prefix on every new admission.
+	if budget := 37623 * 2 / 3; strat.CRAM > budget {
+		t.Fatalf("prompt cache %d MiB exceeds the host RAM budget %d after load", strat.CRAM, budget)
 	}
 	if strat.MaxCheckpoints != 1 {
 		t.Fatalf("expected one bounded recurrent checkpoint, got MaxCheckpoints=%d", strat.MaxCheckpoints)
@@ -2695,6 +2713,8 @@ func TestComputeDraftAutoUsesDFlashForDeepSeekV4MoE(t *testing.T) {
 	target := &ModelProfile{
 		Path: filepath.Join(dir, "DeepSeek-V4-Flash-Q4.gguf"), TotalSizeMB: 137000,
 		Name: "DeepSeek V4 Flash", ModelArch: "deepseek4", IsMoE: true,
+		NumLayers: 60, NumExperts: 256, SizeBytes: 137000 * 1024 * 1024,
+		ExpertBytes: 120000 * 1024 * 1024, NonExpertBytes: 17000 * 1024 * 1024,
 		EmbeddingLength: 4096, ContextSize: 1048576, VocabSize: 64,
 		TokenizerModel: "gpt2", TokenizerPre: "joyai-llm",
 	}
@@ -2702,15 +2722,29 @@ func TestComputeDraftAutoUsesDFlashForDeepSeekV4MoE(t *testing.T) {
 	opts := Options{
 		SpecMode: "auto", BackendTag: "llama", BackendHelp: help,
 		SpecCandidateValidator: func(string) error { return nil }, CacheDir: dir,
+		ContextSize: 1048576, KVPlacement: "cpu", KVQuality: "high", RequireMeasuredBuffers: true,
 	}
 	saveEligibleSpecProfile(t, target, caps, opts, "dflash", drafter, 2)
 	draft := ComputeDraft(target, caps, opts)
 	if draft.Type != DraftDFlash || draft.Path != drafter || draft.SpecType != "draft-dflash" {
 		t.Fatalf("expected DFlash before the generic MoE gate, got %#v", draft)
 	}
+	if draft.KVTypeDraft != "q4_0" {
+		t.Fatalf("DFlash draft KV type = %q, want q4_0 default", draft.KVTypeDraft)
+	}
 	args := DraftFlags(draft)
-	if !contains(args, "draft-dflash") || !contains(args, "--model-draft") {
+	if !contains(args, "draft-dflash") || !contains(args, "--model-draft") || !contains(args, "q4_0") {
 		t.Fatalf("DFlash flags missing: %v", args)
+	}
+	strategy, err := Compute(caps, target, opts)
+	if err != nil {
+		t.Fatalf("compute with DFlash reservation: %v", err)
+	}
+	if strategy.Draft == nil || strategy.Draft.Type != DraftDFlash {
+		t.Fatalf("target placement lost DFlash: %#v", strategy.Draft)
+	}
+	if len(strategy.CompanionPlacements) != 1 || strategy.CompanionPlacements[0].Name != "spec-dflash" || strategy.CompanionPlacements[0].GPU != strategy.Draft.DraftGPU {
+		t.Fatalf("DFlash was not reserved before target placement: draft=%#v companions=%+v", strategy.Draft, strategy.CompanionPlacements)
 	}
 
 	mtp := ComputeDraft(target, caps, Options{SpecMode: "mtp", BackendTag: "llama", BackendHelp: help})
@@ -3424,6 +3458,56 @@ func TestPromptCacheSizedFromHostRAMNotVRAM(t *testing.T) {
 	}
 }
 
+// cram is derived from free RAM, so it moves a few MiB between otherwise
+// identical runs. That drift reached the launch argv, and the Claude crash log
+// was filed under a hash of the argv, so two aborts differing only by `-cram
+// 9752` against `-cram 9742` were stored under different names and neither
+// could teach the next launch.
+//
+// Quantizing absorbs the ordinary drift. It is not a guarantee -- free RAM does
+// cross a boundary sometimes, measured going 9728 -> 9216 across three
+// consecutive plans -- so this test pins the granularity, not reproducibility.
+// Recovery is made independent of the value instead, by excluding it from the
+// launch identity.
+func TestPromptCacheBudgetIsQuantizedAgainstFreeRAMDrift(t *testing.T) {
+	newCaps := func(freeMB int) *detect.Capabilities {
+		return &detect.Capabilities{
+			GPUs: []detect.GPU{
+				{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+				{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+				{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+			},
+			RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: freeMB},
+			CPU: detect.CPUInfo{Cores: 8},
+		}
+	}
+	model := &ModelProfile{
+		Path: "big-moe.gguf", Basename: "big-moe.gguf",
+		SizeBytes: 73000000000, TotalSizeMB: 70000,
+		NumLayers: 32, IsMoE: true, NumExperts: 128, ExpertUsedCount: 8,
+		ExpertFF: 2048, ExpertBytes: 68000000000, NonExpertBytes: 4000000000,
+		ModelArch: "qwen3moe", ContextSize: 262144, CTXTrain: 262144,
+	}
+	// The real drift that broke recovery: 120000 vs 119900 MiB free moved cram
+	// by ten MiB and the launch stopped reproducing.
+	base, baseCkpt := computeCRAM(newCaps(120000), model, &Strategy{Type: MoEOffload, Parallel: 4}, 70000, 8000)
+	drift, driftCkpt := computeCRAM(newCaps(119900), model, &Strategy{Type: MoEOffload, Parallel: 4}, 70000, 8000)
+	if base != drift {
+		t.Errorf("cram moved %d -> %d MiB on 100 MiB of free-RAM drift", base, drift)
+	}
+	if baseCkpt != driftCkpt {
+		t.Errorf("ctx-checkpoints moved %d -> %d on the same drift", baseCkpt, driftCkpt)
+	}
+	if base%cramQuantumMB != 0 {
+		t.Errorf("cram %d MiB is not on a %d MiB boundary", base, cramQuantumMB)
+	}
+	// Quantizing rounds down so the host-RAM ceiling above it still holds.
+	ramAfterLoad := 120000 - (70000 - newCaps(120000).TotalVRAM())
+	if base > ramAfterLoad*2/3 {
+		t.Errorf("cram %d MiB exceeds the %d MiB host budget", base, ramAfterLoad*2/3)
+	}
+}
+
 // A genuinely RAM-starved host must still disable the cache rather than push
 // the machine into swap.
 func TestPromptCacheStaysDisabledWhenHostRAMIsExhausted(t *testing.T) {
@@ -3447,5 +3531,88 @@ func TestPromptCacheStaysDisabledWhenHostRAMIsExhausted(t *testing.T) {
 	cram, _ := computeCRAM(caps, model, &Strategy{Type: MoEOffload, Parallel: 4}, 80000, 4000)
 	if cram != 0 {
 		t.Errorf("expected the prompt cache disabled on a RAM-starved host, got %d MiB", cram)
+	}
+}
+
+func TestThreadsOptionOverridesPhysicalCoreDefault(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},
+		RAM:  detect.RAMInfo{TotalMB: 65536},
+		CPU:  detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "model.gguf", SizeBytes: 15 * 1024 * 1024 * 1024,
+		NumLayers: 64, NumParams: 32_000_000_000, ContextSize: 32768, HiddenSize: 4096,
+	}
+
+	// Physical cores stay the default: CPU-resident experts are bandwidth-bound
+	// and SMT siblings share the ports that bound them.
+	base, err := Compute(caps, model, Options{})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if base.Threads != 8 || base.ThreadsBatch != 8 {
+		t.Errorf("default threads = %d/%d, want 8/8", base.Threads, base.ThreadsBatch)
+	}
+
+	// An explicit request wins, so the default can be measured rather than
+	// assumed. Batch threads follow, matching how the pair is emitted.
+	over, err := Compute(caps, model, Options{Threads: 16})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if over.Threads != 16 || over.ThreadsBatch != 16 {
+		t.Errorf("overridden threads = %d/%d, want 16/16", over.Threads, over.ThreadsBatch)
+	}
+
+	// Zero means "unset", not "zero threads".
+	zero, err := Compute(caps, model, Options{Threads: 0})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if zero.Threads != 8 {
+		t.Errorf("threads with 0 = %d, want the 8-core default", zero.Threads)
+	}
+}
+
+func TestCacheRAMOverrideBeatsDerivedBudget(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},
+		RAM:  detect.RAMInfo{TotalMB: 131072, FreeMB: 120000},
+		CPU:  detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "model.gguf", SizeBytes: 15 * 1024 * 1024 * 1024,
+		NumLayers: 64, NumParams: 32_000_000_000, ContextSize: 32768, HiddenSize: 4096,
+	}
+
+	derived, err := Compute(caps, model, Options{})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	// Whatever it derives, it must stay inside the safety budget: the cache
+	// shares a memory scope with the weights, and overshooting turns a slow
+	// launch into a failed one.
+	if derived.CRAM > caps.RAM.FreeMB*2/3 {
+		t.Errorf("derived CRAM = %d exceeds the safety budget", derived.CRAM)
+	}
+
+	// An explicit budget wins, including above that cap -- one measured entry
+	// here was ~6.5 GiB, so holding one per slot needs far more than 16 GiB.
+	over, err := Compute(caps, model, Options{CacheRAMMB: 40960})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if over.CRAM != 40960 {
+		t.Errorf("overridden CRAM = %d, want 40960", over.CRAM)
+	}
+
+	// Zero means "derive it", not "disable the cache".
+	zero, err := Compute(caps, model, Options{CacheRAMMB: 0})
+	if err != nil {
+		t.Fatalf("compute: %v", err)
+	}
+	if zero.CRAM != derived.CRAM {
+		t.Errorf("CRAM with 0 = %d, want the derived %d", zero.CRAM, derived.CRAM)
 	}
 }

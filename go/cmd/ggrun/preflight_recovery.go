@@ -38,7 +38,7 @@ func recoverPreflightOOM(
 	var candidate *placement.Strategy
 	var replanErr error
 	if outcome.IsComputeBuffer && cfg != nil && be != nil && runtimeCaps != nil {
-		cacheBackendTag := scopedProbeBackendTag(req, model, be)
+		cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 		recordErr := placement.RecordMeasuredComputeBuffers(
 			cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize,
 			strategy.KVQuality, strategy.KVPlacement, cacheBackendTag,
@@ -46,6 +46,9 @@ func recoverPreflightOOM(
 		)
 		if recordErr == nil {
 			opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+			// Preserve a prior derating: a retry at ubatch 256 must never be
+			// recomputed from the original automatic request back to 512.
+			opts.UBatchSize = strategy.UBatchSize
 			opts.SkipPlacementCache = true
 			opts.CacheFile = ""
 			candidate, replanErr = placement.Compute(caps, model, opts)
@@ -98,6 +101,12 @@ func selectChangedPreflightRecovery(
 	outcome preflightOutcome,
 ) ([]string, *placement.CacheEntry, string, bool) {
 	currentFingerprint := effectiveMemoryArgsFingerprint(currentArgs)
+	if candidate != nil {
+		currentUB := placement.CurrentUBatch(currentArgs)
+		if outcome.IsComputeBuffer && currentUB > 0 && candidate.UBatchSize > currentUB {
+			candidate = nil
+		}
+	}
 	if candidate != nil {
 		nextArgs := patchPlacementArgs(currentArgs, candidate)
 		if effectiveMemoryArgsFingerprint(nextArgs) != currentFingerprint {

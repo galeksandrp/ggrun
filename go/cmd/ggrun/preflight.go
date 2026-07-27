@@ -726,6 +726,10 @@ func mergePreflightDevices(groups ...[]preflightDevice) []preflightDevice {
 	return out
 }
 
+func hasExternalSpecCompanion(strategy *placement.Strategy) bool {
+	return strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone && strategy.Draft.Path != ""
+}
+
 func isEmbeddedMainlineMTP(strategy *placement.Strategy) bool {
 	return strategy != nil && strategy.Draft != nil &&
 		strategy.Draft.Type == placement.DraftMTP && strategy.Draft.Path == "" &&
@@ -826,7 +830,7 @@ func preflightPlacement(req *launchRequest, be *backendInfo, cfg *configForPrefl
 	if be == nil || caps == nil || len(caps.GPUs) == 0 {
 		return outcome
 	}
-	cacheBackendTag := scopedProbeBackendTag(req, model, be)
+	cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 	fitBin := findFitParamsBin(be.Path)
 	allocationProbe := false
 	var targetDevs []preflightDevice
@@ -900,7 +904,9 @@ func preflightPlacement(req *launchRequest, be *backendInfo, cfg *configForPrefl
 				computeByGPU[idx] = d.ComputeMB
 			}
 		}
-		placement.RecordMeasuredContextMB(cfg.CacheDir, model, strategy.ContextSize, strategy.KVType, preflightContextTotalMB(targetDevs))
+		if !allocationProbe || !hasExternalSpecCompanion(strategy) {
+			placement.RecordMeasuredContextMB(cfg.CacheDir, model, strategy.ContextSize, strategy.KVType, preflightContextTotalMB(targetDevs))
+		}
 		_ = placement.RecordMeasuredComputeBuffers(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, computeByGPU)
 	}
 	overheadByGPU := placement.SystemCUDAOverheadByGPU(cfg.CacheDir, caps.GPUs)

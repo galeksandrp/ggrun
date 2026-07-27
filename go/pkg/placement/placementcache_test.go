@@ -128,6 +128,26 @@ func TestPlacementCachePathIsolatedBySpecMode(t *testing.T) {
 	}
 }
 
+func TestSpecCacheIdentityIncludesCompanionArtifact(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "draft-a.gguf")
+	b := filepath.Join(dir, "draft-b.gguf")
+	if err := os.WriteFile(a, []byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b, []byte("different"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	draftA := &DraftConfig{Type: DraftDFlash, Path: a, DraftGPU: 0, CTXSizeDraft: 1048576, KVTypeDraft: "q4_0", VRAMMB: 7500}
+	draftB := &DraftConfig{Type: DraftDFlash, Path: b, DraftGPU: 0, CTXSizeDraft: 1048576, KVTypeDraft: "q4_0", VRAMMB: 7500}
+	if placementCachePathForSpec("model.place", "dflash", draftA) == placementCachePathForSpec("model.place", "dflash", draftB) {
+		t.Fatal("different DFlash artifacts shared a placement cache")
+	}
+	if SpecWorkloadProfile("claude", draftA) == SpecWorkloadProfile("claude", draftB) {
+		t.Fatal("different DFlash artifacts shared probe evidence")
+	}
+}
+
 func TestPlacementCacheHitStillResolvesSpeculativeMode(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{{Index: 0, Name: "GPU", VRAMTotalMB: 24576}},

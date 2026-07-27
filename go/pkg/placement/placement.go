@@ -22,6 +22,17 @@ const (
 	computePerGPUMB     = 512  // legacy; non-MoE single-GPU sizing only
 	computeFloorMB      = 1024 // cited llama.cpp compute floor; CUDA overhead measured separately
 	minCramMB           = 512
+	// cramQuantumMB coarsens the derived prompt-cache budget, which is computed
+	// from free RAM and therefore drifts by a few MiB between otherwise
+	// identical runs (9753, 9752, 9742 on three consecutive launches here).
+	// Prompt-cache precision below a few hundred MiB buys nothing, so the drift
+	// is pure churn in every artifact keyed on the launch command.
+	//
+	// This narrows that window; it does not close it. Free RAM still crosses a
+	// boundary now and then, which is why nothing that must survive a re-plan
+	// may key on a derived value -- see recoveryLaunchIdentity, which excludes
+	// this flag outright.
+	cramQuantumMB = 512
 	// Hybrid and recurrent prompt restoration needs a context checkpoint because
 	// its state cannot be shifted like an ordinary transformer KV cache. Keep the
 	// policy bounded to one checkpoint per slot and require generous host headroom;
@@ -95,6 +106,11 @@ type Strategy struct {
 	ThreadsBatch             int          `json:"threads_batch"` // batch threads (logical cores)
 	Parallel                 int          `json:"parallel,omitempty"`
 	CRAM                     int          `json:"cram,omitempty"` // prompt cache MB
+	// MeasuredPromptCacheBPT and PromptCacheTypicalTokens carry a measured
+	// prompt-cache cost into CRAM sizing. Zero means nothing was measured, and
+	// the derived budget stands.
+	MeasuredPromptCacheBPT   float64 `json:"measured_prompt_cache_bpt,omitempty"`
+	PromptCacheTypicalTokens int     `json:"prompt_cache_typical_tokens,omitempty"`
 	MaxCheckpoints           int          `json:"max_checkpoints,omitempty"`
 	UseCUDAGraphs            bool         `json:"use_cuda_graphs,omitempty"`
 	Host                     string       `json:"host,omitempty"`        // listen address
@@ -228,6 +244,20 @@ type Options struct {
 	NoMMap          bool
 	ForceMMap       bool
 	Parallel        int
+	// Threads overrides the CPU thread count, which otherwise follows physical
+	// cores. Physical cores is the right default -- MoE experts on CPU are
+	// bandwidth-bound, and SMT siblings share the ports that bound them -- but
+	// it is a claim worth being able to measure on a given box rather than
+	// assume, and it cannot be measured without a way to set it.
+	Threads int
+	// CacheRAMMB overrides the host prompt-cache budget (-cram). The derived
+	// value takes a tenth of free RAM capped at 16 GiB, which is blind to what a
+	// single entry costs: on this project one conversation's entry measured
+	// ~6.5 GiB, so the cache held one and every new conversation evicted the
+	// previous one -- 17.5% cache-read against 88.3% for a single-slot server on
+	// the same box. Sizing that correctly needs a measurement per model, so the
+	// override exists to take it.
+	CacheRAMMB int
 	// BatchSize and UBatchSize are explicit launcher requests. A positive value
 	// must be accounted for before placement is chosen; treating it as a late
 	// backend override can make the emitted server graph exceed the plan.
@@ -271,6 +301,20 @@ func ScopedBackendCacheTag(backendTag, workloadProfile string) string {
 		return backendTag
 	}
 	return backendTag + "|workload=" + workloadProfile
+}
+
+func SpecWorkloadProfile(base string, draft *DraftConfig) string {
+	if draft == nil || draft.Type == DraftNone || draft.Path == "" {
+		return base
+	}
+	identity := strings.Join([]string{
+		"spec-v1", string(draft.Type), SpecCompanionIdentity(draft.Path), draft.KVTypeDraft,
+		strconv.Itoa(draft.CTXSizeDraft), strconv.Itoa(draft.VRAMMB), strconv.Itoa(draft.DraftGPU),
+	}, ":")
+	if strings.TrimSpace(base) == "" {
+		return identity
+	}
+	return base + "|" + identity
 }
 
 func backendCacheTag(opts Options) string {
@@ -373,6 +417,17 @@ func chooseCompanionGPU(gpus []detect.GPU, comp CompanionReservation) int {
 	return -1
 }
 
+func speculativeCompanionReservation(draft *DraftConfig) (CompanionReservation, bool) {
+	if draft == nil || draft.Type == DraftNone || draft.Path == "" || draft.VRAMMB <= 0 || draft.DraftGPU < 0 {
+		return CompanionReservation{}, false
+	}
+	return CompanionReservation{
+		Name:          "spec-" + string(draft.Type),
+		VRAMMB:        draft.VRAMMB,
+		GPUPreference: []int{draft.DraftGPU},
+	}, true
+}
+
 func applyRAMBudget(caps *detect.Capabilities, budgetMB int) *detect.Capabilities {
 	if budgetMB <= 0 || caps == nil {
 		return caps
@@ -452,6 +507,10 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 	if opts.Parallel > 0 {
 		s.Parallel = opts.Parallel
+	}
+	if opts.Threads > 0 {
+		s.Threads = opts.Threads
+		s.ThreadsBatch = opts.Threads
 	}
 
 	// Vision: use an explicit projector, or auto-detect one when --vision is set.
@@ -600,6 +659,27 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		s.UBatchSize = opts.UBatchSize
 	}
 
+	// Resolve external speculation before target placement. Its metadata-derived
+	// weights and KV footprint become occupied VRAM in the same ledger, so the
+	// target packer cannot assign those bytes a second time.
+	if opts.SpecMode != "" && opts.SpecMode != "off" {
+		draftOpts := opts
+		draftOpts.ContextSize = s.ContextSize
+		s.Draft = ComputeDraft(model, caps, draftOpts)
+	}
+	opts.WorkloadProfile = SpecWorkloadProfile(opts.WorkloadProfile, s.Draft)
+	companions := append([]CompanionReservation(nil), opts.Companions...)
+	if draftReservation, ok := speculativeCompanionReservation(s.Draft); ok {
+		companions = append([]CompanionReservation{draftReservation}, companions...)
+	}
+	if len(companions) > 0 {
+		var compErr error
+		caps, s.CompanionPlacements, compErr = applyCompanionReservations(caps, companions)
+		if compErr != nil {
+			return nil, compErr
+		}
+	}
+
 	// Persist/reuse this exact placement under a key that includes kv placement,
 	// ctx, ubatch, backend, and the GPU set — computed from the now-resolved
 	// strategy so the launcher (save) and this load agree byte-for-byte.
@@ -612,7 +692,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		}
 	}
 	s.PlacementCachePath = PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey)
-	s.PlacementCachePath = placementCachePathForSpecMode(s.PlacementCachePath, opts.SpecMode)
+	s.PlacementCachePath = placementCachePathForSpec(s.PlacementCachePath, opts.SpecMode, s.Draft)
 
 	// Try cached placement first (MoE only). Prefer the keyed placement cache
 	// (remembers a load that landed right or was OOM-corrected); fall back to a
@@ -684,35 +764,18 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 				}
 			}
 			s.FlashAttention = defaultFlashAttention(model, opts, s.KVPlacement)
-			// A placement cache stores only target-model placement. Speculative
-			// mode is a launch choice and its companion may have appeared since
-			// the target cache was written, so resolve it on cache hits too.
-			if opts.SpecMode != "" && opts.SpecMode != "off" {
-				draftOpts := opts
-				draftOpts.ContextSize = s.ContextSize
-				s.Draft = ComputeDraft(model, caps, draftOpts)
-			}
 			// Placement caches intentionally persist only weight placement. Runtime
 			// cache policy depends on current free RAM, slot count, and architecture,
 			// so recompute it on every launch instead of inheriting the zero-value
 			// checkpoint policy from the early cache-hit return.
 			s.CRAM, s.MaxCheckpoints = computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
+			if opts.CacheRAMMB > 0 {
+				s.CRAM = opts.CacheRAMMB
+			}
 			if s.Host == "" {
 				s.Host = "127.0.0.1"
 			}
 			return s, nil
-		}
-	}
-
-	// Companion reservations seat co-launched helper models inside this same
-	// ledger. The main model's split is computed against the VRAM that remains
-	// after each helper is placed, so the helpers stop being invisible
-	// competitors discovered only after launch.
-	if len(opts.Companions) > 0 {
-		var compErr error
-		caps, s.CompanionPlacements, compErr = applyCompanionReservations(caps, opts.Companions)
-		if compErr != nil {
-			return nil, compErr
 		}
 	}
 
@@ -759,14 +822,11 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		}
 	}
 
-	if opts.SpecMode != "" && opts.SpecMode != "off" {
-		draftOpts := opts
-		draftOpts.ContextSize = s.ContextSize
-		s.Draft = ComputeDraft(model, caps, draftOpts)
-	}
-
 	// Compute CRAM (prompt cache)
 	cram, maxCheckpoints := computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
+	if opts.CacheRAMMB > 0 {
+		cram = opts.CacheRAMMB
+	}
 	s.CRAM = cram
 	s.MaxCheckpoints = maxCheckpoints
 
@@ -812,14 +872,26 @@ func resolveKVQuality(model *ModelProfile, requested, backendTag string) (string
 // Keep those successful placements away from the faster spec-off cache (and
 // vice versa); otherwise launching DFlash once could permanently CPU-offload
 // extra target experts even on later non-speculative launches.
-func placementCachePathForSpecMode(path, mode string) string {
+func placementCachePathForSpec(path, mode string, draft *DraftConfig) string {
 	mode = normalizeSpecMode(mode)
 	if path == "" || mode == "off" {
 		return path
 	}
 	ext := filepath.Ext(path)
 	base := strings.TrimSuffix(path, ext)
-	return base + "-spec-" + sanitizeFilename(mode) + ext
+	suffix := sanitizeFilename(mode)
+	if draft != nil && draft.Type != DraftNone {
+		identity := strings.Join([]string{
+			string(draft.Type), SpecCompanionIdentity(draft.Path), draft.KVTypeDraft,
+			strconv.Itoa(draft.CTXSizeDraft), strconv.Itoa(draft.VRAMMB), strconv.Itoa(draft.DraftGPU),
+		}, ":")
+		suffix += "-" + md5Hash12(identity)
+	}
+	return base + "-spec-" + suffix + ext
+}
+
+func placementCachePathForSpecMode(path, mode string) string {
+	return placementCachePathForSpec(path, mode, nil)
 }
 
 // restrictGPUs filters caps.GPUs to the user-selected device indices (--gpus).
@@ -2005,7 +2077,7 @@ func placementCachePathForStrategy(s *Strategy, caps *detect.Capabilities, model
 		}
 	}
 	path := PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey)
-	return placementCachePathForSpecMode(path, opts.SpecMode)
+	return placementCachePathForSpec(path, opts.SpecMode, s.Draft)
 }
 
 func bytesToMiBCeil(n int64) int {
@@ -2158,6 +2230,11 @@ func ReplanAfterOOM(caps *detect.Capabilities, model *ModelProfile, opts Options
 	o.SkipPlacementCache = true // derive fresh, don't reload the placement that OOM'd
 	o.CacheFile = ""
 	return Compute(&c2, model, o)
+}
+
+// CurrentUBatch exposes the effective micro-batch size for launch recovery.
+func CurrentUBatch(args []string) int {
+	return currentUBatch(args)
 }
 
 // currentUBatch reads the launch args' current -ub/--ubatch-size value, or 0
@@ -3208,11 +3285,43 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 		}
 	}
 
-	// Single-GPU / CPU-only CRAM
-	cram := ramAfterLoad / 10
-	if cram > 16384 {
-		cram = 16384
+	// Size the cache to what an entry actually costs, not to an arbitrary
+	// fraction of RAM. An entry is one slot's saved KV, so a cache that cannot
+	// hold one per slot evicts a conversation's prefix to admit the next and
+	// every turn re-prefills from zero. Measured on this project: entries of
+	// ~6.5 GiB against a 9761 MiB budget gave 17.5% cache-read on the 4-slot
+	// server while a 1-slot server on the same box, same client, reached 88.3%.
+	//
+	// The old tenth-of-free-RAM rule with a 16 GiB ceiling could not express
+	// that: at four slots it was short by a factor of two before the ceiling
+	// even bound. Keeping it as a floor means hosts whose KV estimate is small
+	// or missing are no worse off than before.
+	slots := s.Parallel
+	if slots < 1 {
+		slots = 1
 	}
+	cram := ramAfterLoad / 10
+	if want := kvTotalMB; want > cram {
+		cram = want
+	}
+	// A measurement of what an entry really costs beats both: the estimate above
+	// is KV, and an entry is target state + draft state + checkpoints. Sizing is
+	// per slot, against the context a turn actually carries rather than the
+	// configured maximum, because a 1M-token allowance is not what gets cached.
+	if s.MeasuredPromptCacheBPT > 0 {
+		if measured := promptCacheBudgetMB(s.MeasuredPromptCacheBPT, s.PromptCacheTypicalTokens, slots); measured > cram {
+			cram = measured
+		}
+	}
+	// Never take RAM the weights and their working set need: the backend runs
+	// inside a memory scope, and a cache that pushes it over the limit trades a
+	// slow launch for a failed one.
+	if budget := ramAfterLoad * 2 / 3; cram > budget {
+		cram = budget
+	}
+	// Round down, never up: the budget above is a ceiling and quantizing must
+	// not push the cache past it.
+	cram -= cram % cramQuantumMB
 	if cram < minCramMB {
 		cram = 0
 	}
@@ -4688,6 +4797,10 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			if v, err := strconv.Atoi(val); err == nil && v >= 0 {
 				pc.ComputeBufMB = v
 			}
+		case k == "PROBED_PROMPT_CACHE_BYTES_PER_TOKEN":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				pc.PromptCacheBytesPerToken = v
+			}
 		case strings.HasPrefix(k, "PROBED_COMPUTE_BUF_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(k, "PROBED_COMPUTE_BUF_MB_CUDA")
 			idx, idxErr := strconv.Atoi(idxRaw)
@@ -4775,7 +4888,7 @@ func probeCachePath(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 // Bump whenever placement semantics can change the emitted expert residency.
 // Version 3 invalidates v2 entries that could pin experts on hybrid split owners
 // before the conservative long-context safety gate existed.
-const placementPlannerCacheVersion = 3
+const placementPlannerCacheVersion = 4
 
 func PlacementCachePathFor(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, tensorSplit string) string {
 	if model == nil {
@@ -4831,9 +4944,20 @@ type probeCache struct {
 	// a malformed launch that proved nothing about capacity.
 	RuntimeGraphGrowthEstimatedByGPU map[int]bool
 	KVPerLayerMB                     int
+	// PromptCacheBytesPerToken is what one cached prompt actually costs per
+	// token of prefix, read from the backend rather than derived.
+	//
+	// A saved entry is target state + draft state + checkpoints, and no formula
+	// over KV predicted it: KV for a whole 1M context estimated 9238 MiB while
+	// one entry for a 126k-token prompt measured 6494. Sizing the budget from
+	// the estimate left room for a single entry, so a four-slot server evicted
+	// one conversation's prefix to admit the next and re-prefilled ~126k tokens
+	// on the turn after -- 17.5% cache-read against 88.3% on a single-slot
+	// server sharing the same box and client.
+	PromptCacheBytesPerToken float64
 }
 
-const probeCacheSchema = 3
+const probeCacheSchema = 4
 
 // probeParallelKey preserves the legacy serial key (0) for normal --parallel 1
 // launches while isolating multi-slot graph measurements such as Claude Code's
@@ -4890,8 +5014,20 @@ func WriteProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, 0, computeByGPU, nil, nil, kvPerLayerMB)
 }
 
-func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, estimatedByGPU map[int]bool, kvPerLayerMB int) error {
+// promptCacheBPT is variadic so the many existing writers stay untouched: they
+// know nothing about the prompt cache, and a fixed parameter would have made
+// every one of them assert a zero that erased a real measurement.
+func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, computeByGPU map[int]int, runtimeGrowthByGPU map[int]int, estimatedByGPU map[int]bool, kvPerLayerMB int, promptCacheBPT ...float64) error {
 	parallelKey := probeParallelKey(parallel)
+	// Absent means "unchanged", never "zero": a writer recording compute buffers
+	// must not discard a prompt-cache measurement it has no opinion about.
+	bpt := 0.0
+	if len(promptCacheBPT) > 0 && promptCacheBPT[0] > 0 {
+		bpt = promptCacheBPT[0]
+	} else if prev := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel); prev != nil {
+		bpt = prev.PromptCacheBytesPerToken
+	}
+	promptCacheBPTValue := bpt
 	path := probeCachePath(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallelKey)
 	if path == "" {
 		return nil
@@ -4948,6 +5084,9 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	fmt.Fprintf(&b, "PROBE_CACHE_SCHEMA=%d\n", probeCacheSchema)
 	if maxCompute > 0 {
 		fmt.Fprintf(&b, "PROBED_COMPUTE_BUF_MB=%d\n", maxCompute)
+	if promptCacheBPTValue > 0 {
+		fmt.Fprintf(&b, "PROBED_PROMPT_CACHE_BYTES_PER_TOKEN=%.3f\n", promptCacheBPTValue)
+	}
 	}
 	indices := make([]int, 0, len(mergedCompute))
 	for idx := range mergedCompute {
