@@ -4467,9 +4467,48 @@ func availableIKBinary(caps *detect.Capabilities) string {
 // ik_llama.cpp but the resolved backend is mainline llama.cpp, instead of letting
 // the backend die later with a cryptic "unknown model architecture" load error.
 func preflightBackendArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) {
-	if model == nil || be == nil || be.IsIK || !isIKOnlyArch(model.ModelArch) {
+	if model == nil || be == nil {
 		return
 	}
+	if !be.IsIK && isIKOnlyArch(model.ModelArch) {
+		preflightIKOnlyArch(model, be, caps)
+		return
+	}
+	suggestForkForArch(model.ModelArch, be)
+}
+
+// suggestForkForArch warns when the resolved backend does not know the model's
+// architecture and a reviewed recipe does. Without it the launch dies inside the
+// loader -- a Laguna model on mainline reports only a tensor count -- and
+// nothing connects that to the fork that would serve it.
+//
+// It warns rather than exits. The probe reads a backend's own library graph,
+// which it can only do for ELF objects; a Windows build that keeps its
+// architectures in a DLL would probe as unsupported while working perfectly, and
+// refusing that launch would be a worse failure than the one being replaced. A
+// genuinely unsupported architecture still fails at load, now with the fix named
+// beforehand.
+func suggestForkForArch(arch string, be *backendInfo) {
+	if arch == "" || be == nil || be.Path == "" {
+		return
+	}
+	supported, probed := backends.BackendSupportsArch(be.Path, arch)
+	if !probed || supported {
+		return
+	}
+	recipes := backends.RecipesForArch(arch)
+	if len(recipes) == 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"[launch] warning: backend %s does not appear to support model architecture %q.\n", be.Path, arch)
+	for _, r := range recipes {
+		fmt.Fprintf(os.Stderr, "[launch]   reviewed fork available: ggrun backend install %s   (%s)\n", r.Name, r.Description)
+	}
+	fmt.Fprintln(os.Stderr, "[launch] continuing anyway; if the model fails to load, install the fork above.")
+}
+
+func preflightIKOnlyArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) {
 	fmt.Fprintf(os.Stderr,
 		"Error: model architecture %q needs the ik_llama.cpp backend, but the selected backend is mainline llama.cpp.\n"+
 			"  backend binary: %s\n", model.ModelArch, be.Path)

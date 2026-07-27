@@ -1,0 +1,10 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -12,5 +12,6 @@
+ #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
+ 
+ #include <algorithm>
+ #include <cassert>
++#include <cmath>
+ #include <cstring>

@@ -27,6 +27,21 @@ type Backend struct {
 	// AppliedPatches identifies reviewed source fixes applied while building the
 	// backend. It makes a recipe-built binary auditable from backends.json.
 	AppliedPatches []string `json:"applied_patches,omitempty"`
+	// Previous is the build this backend replaced, kept so a bad update can be
+	// undone. One level is deliberate: the value of a rollback is getting back
+	// to the build that was working an hour ago, and each retained build costs a
+	// full compiled tree on disk.
+	Previous *BackendVersion `json:"previous,omitempty"`
+}
+
+// BackendVersion is a superseded build, retained only if its binary still
+// exists. Recording a path whose tree had been rebuilt over would make rollback
+// claim a recovery it cannot perform.
+type BackendVersion struct {
+	Path           string   `json:"path"`
+	Commit         string   `json:"commit,omitempty"`
+	AppliedPatches []string `json:"applied_patches,omitempty"`
+	ReplacedAt     string   `json:"replaced_at,omitempty"`
 }
 
 // RecipePatch is a narrow, reviewed source correction applied to a pinned fork.
@@ -54,6 +69,15 @@ type Recipe struct {
 
 //go:embed patches/hy3/0001-fix-router-tensor-name.patch
 var hy3RouterTensorNamePatch []byte
+
+// common/speculative.cpp calls std::isfinite without including <cmath>. The
+// declaration reaches poolside's compiler transitively and ours not at all, so
+// the fork builds for them and fails here at 95% with "'isfinite' is not a
+// member of 'std'". Adding the include is the whole fix and changes no
+// behaviour.
+//
+//go:embed patches/laguna/0001-include-cmath-for-isfinite.patch
+var lagunaCmathPatch []byte
 
 var builtinRecipes = []Recipe{
 	{
@@ -103,6 +127,10 @@ var builtinRecipes = []Recipe{
 		Commit:      "04b2b72cb54048ead292884adbe11f284e3ec950",
 		RouteArch:   "laguna",
 		Accel:       "",
+		Patches: []RecipePatch{{
+			Name:     "laguna/0001-include-cmath-for-isfinite",
+			contents: lagunaCmathPatch,
+		}},
 	},
 	{
 		// Kept selectable: it is the branch heading for upstream, so it is the
