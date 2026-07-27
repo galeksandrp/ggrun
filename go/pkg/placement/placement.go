@@ -4787,6 +4787,38 @@ func QueryVRAMUsed(gpuIndex int) int {
 	return v
 }
 
+// QueryVRAMUsedByPID returns the VRAM a single process holds, summed across
+// devices. nvidia-smi reports one row per (process, device), so a process with
+// contexts on several cards appears more than once.
+//
+// This exists so a companion's reservation can be a measurement rather than a
+// constant: memory.used for a whole GPU cannot separate the companion from the
+// model it sits beside.
+func QueryVRAMUsedByPID(pid int) int {
+	if pid <= 0 {
+		return 0
+	}
+	out, err := exec.Command("nvidia-smi",
+		"--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return 0
+	}
+	total := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, ",")
+		if len(fields) != 2 {
+			continue
+		}
+		got, err1 := strconv.Atoi(strings.TrimSpace(fields[0]))
+		mb, err2 := strconv.Atoi(strings.TrimSpace(fields[1]))
+		if err1 != nil || err2 != nil || got != pid || mb <= 0 {
+			continue
+		}
+		total += mb
+	}
+	return total
+}
+
 // parseBuffersFromLog parses llama-server log for CUDA buffer sizes on a specific GPU.
 // Returns modelBufMB, kvBufMB, computeBufMB.
 // Handles both mainline ("CUDAN model buffer size = X MiB") and

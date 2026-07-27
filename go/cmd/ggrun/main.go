@@ -2598,7 +2598,7 @@ func cmdLaunch(args []string) {
 	// returns the GPU the reviewer should occupy. The reservation lives on the
 	// request so every placement.Compute path — first plan and every re-plan —
 	// keeps the reviewer's VRAM accounted.
-	req.ReviewerReservation = claudeReviewerReservation(req, caps)
+	req.ReviewerReservation = claudeReviewerReservation(req, caps, cfg.CacheDir)
 
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
 	if err != nil {

@@ -66,18 +66,50 @@ const claudeReviewerReservationVRAMMB = 2600
 // least-valuable (slowest-link, smallest) first, main GPU last — but expressed
 // as data so the planner owns the final seat and the main model packs around it.
 // CPU fallback stays allowed: a full-GPU host must keep fail-closed Auto working.
-func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities) *placement.CompanionReservation {
+func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, cacheDir string) *placement.CompanionReservation {
 	if req == nil || !req.ClaudeCode || !claudeAutoReviewerNeeded(nil) || req.CPUMode {
 		return nil
 	}
 	if caps == nil || len(caps.GPUs) == 0 {
 		return nil
 	}
+	// Prefer what the reviewer actually took on a previous launch. The constant
+	// below is a conservative bound and always overshoots -- measured 2114 MiB
+	// against 2600 reserved -- and it overshoots on the least valuable GPU by
+	// design, which is where withheld VRAM is worth the most.
+	vramMB := claudeReviewerReservationVRAMMB
+	if cacheDir != "" {
+		if measured := placement.MeasuredCompanionVRAMMB(cacheDir, claudeReviewerCompanionName); measured > 0 {
+			vramMB = measured
+		}
+	}
 	return &placement.CompanionReservation{
 		Name:          claudeReviewerCompanionName,
-		VRAMMB:        claudeReviewerReservationVRAMMB,
+		VRAMMB:        vramMB,
 		GPUPreference: claudeReviewerGPUCandidates(caps, req),
 		AllowCPU:      true,
+	}
+}
+
+// recordReviewerVRAM stores what the reviewer actually occupies so the next
+// launch reserves that instead of the constant. It runs after the health check,
+// when weights and the CUDA context are resident; the stored value only ever
+// grows, because a sample taken before the reviewer's KV fills would shrink the
+// reservation and overrun on the next long conversation.
+func recordReviewerVRAM(cfg *config.Config, p *server.Process) {
+	if cfg == nil || p == nil || p.Cmd == nil || p.Cmd.Process == nil {
+		return
+	}
+	usedMB := placement.QueryVRAMUsedByPID(p.Cmd.Process.Pid)
+	if usedMB <= 0 {
+		return
+	}
+	if err := placement.RecordCompanionVRAM(cfg.CacheDir, claudeReviewerCompanionName, usedMB); err != nil {
+		return
+	}
+	if usedMB < claudeReviewerReservationVRAMMB {
+		fmt.Printf("[claude-code] Auto reviewer measured at %d MiB; releasing %d MiB the %d MiB reservation withheld\n",
+			usedMB, claudeReviewerReservationVRAMMB-usedMB, claudeReviewerReservationVRAMMB)
 	}
 }
 
@@ -150,6 +182,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, env)
 		if err == nil {
 			fmt.Printf("[claude-code] Auto reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, claudeauto.DefaultReviewerDisplayName)
+			recordReviewerVRAM(cfg, p)
 			return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: gpu}, nil
 		}
 		lastErr = err

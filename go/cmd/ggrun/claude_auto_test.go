@@ -240,7 +240,7 @@ func TestClaudeReviewerReservationBuildsCompanion(t *testing.T) {
 		{Index: 0, VRAMTotalMB: 24564, BandwidthMBps: 15754},
 		{Index: 1, VRAMTotalMB: 12288, BandwidthMBps: 985},
 	}}
-	res := claudeReviewerReservation(&launchRequest{ClaudeCode: true}, caps)
+	res := claudeReviewerReservation(&launchRequest{ClaudeCode: true}, caps, "")
 	if res == nil {
 		t.Fatal("Claude Code launch with GPUs must reserve the reviewer")
 	}
@@ -263,13 +263,13 @@ func TestClaudeReviewerReservationSkipsNonClaudeAndCPU(t *testing.T) {
 	t.Setenv("GGRUN_CLAUDE_PERMISSION_MODE", "")
 	t.Setenv("GGRUN_CLAUDE_AUTO_REVIEWER", "")
 	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}}
-	if res := claudeReviewerReservation(&launchRequest{}, caps); res != nil {
+	if res := claudeReviewerReservation(&launchRequest{}, caps, ""); res != nil {
 		t.Fatal("non-Claude launch must not reserve a reviewer")
 	}
-	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true, CPUMode: true}, caps); res != nil {
+	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true, CPUMode: true}, caps, ""); res != nil {
 		t.Fatal("CPU-mode launch must not reserve GPU VRAM for the reviewer")
 	}
-	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true}, &detect.Capabilities{}); res != nil {
+	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true}, &detect.Capabilities{}, ""); res != nil {
 		t.Fatal("GPU-less host must not reserve GPU VRAM for the reviewer")
 	}
 }
