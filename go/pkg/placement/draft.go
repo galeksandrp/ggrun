@@ -329,14 +329,18 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 		cfg.GPULayersDraft = "all"
 	}
 
-	draftCTX := target.ContextSize
-	if draftCTX <= 0 {
-		draftCTX = draftInfo.ContextLength
-	}
-	if draftInfo.ContextLength > 0 && draftInfo.ContextLength < draftCTX {
-		draftCTX = draftInfo.ContextLength
-	}
-	cfg.CTXSizeDraft = draftCTX
+	// Size the draft's KV cache to the context this launch will actually serve,
+	// not to what the target model was trained for.
+	//
+	// ModelProfile.ContextSize is the model's own trained length. Using it gave
+	// a 1M-trained target's drafter a 1,048,576-token KV cache even when the
+	// server was launched at 65,536, and the drafter runs entirely on one GPU
+	// (--spec-draft-ngl all). Measured on a 118B MoE: the draft consumed enough
+	// of CUDA0 that the target's own 21.75 GiB weight allocation then failed,
+	// so every speculative launch died during model load with a cudaMalloc
+	// out-of-memory. Speculation was unusable on any model whose trained
+	// context exceeds the launch context, which is the normal case.
+	cfg.CTXSizeDraft = draftContextFor(opts.ContextSize, target.ContextSize, draftInfo.ContextLength)
 
 	draftSizeMB := int(draftInfo.ExpertBytes+draftInfo.NonExpertBytes) / (1024 * 1024)
 	if draftSizeMB <= 0 {
@@ -353,7 +357,7 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 		HasSSM:           draftInfo.SSM,
 		SlidingWindow:    draftInfo.SlidingWindow,
 		FullAttnInterval: draftInfo.FullAttnInterval,
-	}, draftCTX, cfg.KVTypeDraft)
+	}, cfg.CTXSizeDraft, cfg.KVTypeDraft)
 
 	cfg.DraftGPU = findDraftGPU(caps, target, draftSizeMB+draftKVMB+computeFloorMB)
 	if caps.CPU.Cores >= 4 {
@@ -718,6 +722,23 @@ func specCandidateFiles(modelDir string) []string {
 		}
 	}
 	return out
+}
+
+// draftContextFor sizes the drafter's KV cache. See the call site for why the
+// launch context rather than the model's trained length is authoritative.
+func draftContextFor(launchCtx, targetTrainedCtx, draftTrainedCtx int) int {
+	ctx := launchCtx
+	if ctx <= 0 {
+		ctx = targetTrainedCtx
+	}
+	if ctx <= 0 {
+		ctx = draftTrainedCtx
+	}
+	// A drafter trained shorter than the target cannot serve more than it knows.
+	if draftTrainedCtx > 0 && draftTrainedCtx < ctx {
+		ctx = draftTrainedCtx
+	}
+	return ctx
 }
 
 func backendSupportsMTP(backendTag string) bool {

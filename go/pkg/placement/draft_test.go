@@ -81,3 +81,32 @@ func TestDFlashCrossFamilyCompanionStillRejected(t *testing.T) {
 		t.Error("bare dflash architecture was rejected")
 	}
 }
+
+// The drafter's KV must be sized to the context this launch serves, not to what
+// the target model was trained for. ModelProfile.ContextSize is the trained
+// length, so using it gave a 1M-trained target's drafter a 1,048,576-token KV
+// cache at a 65,536-token launch. The drafter runs entirely on one GPU, so that
+// consumed enough of it that the target's own weight allocation then failed and
+// every speculative launch died during model load.
+func TestDraftContextFollowsTheLaunchNotTheTrainedLength(t *testing.T) {
+	cases := []struct {
+		name       string
+		launchCtx  int
+		targetCtx  int
+		draftTrain int
+		want       int
+	}{
+		{"launch below trained length", 65536, 1048576, 1048576, 65536},
+		{"launch at trained length", 1048576, 1048576, 1048576, 1048576},
+		{"drafter trained shorter than launch", 65536, 1048576, 32768, 32768},
+		{"no launch context falls back to the model", 0, 131072, 1048576, 131072},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := draftContextFor(tc.launchCtx, tc.targetCtx, tc.draftTrain)
+			if got != tc.want {
+				t.Errorf("draft ctx = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
