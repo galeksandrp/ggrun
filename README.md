@@ -151,6 +151,7 @@ ggrun does not own are forwarded unchanged.
 [Troubleshooting](docs/troubleshooting.md) ·
 [Usage](docs/usage.md) ·
 [Architecture](docs/architecture.md) ·
+[Fitting the hardware](docs/fitting-the-hardware.md) ·
 [Benchmarks](docs/launch-performance.md) ·
 [Speculative decoding](docs/speculative-decoding.md) ·
 [Model recommendations](docs/model-recommendations.md) ·
