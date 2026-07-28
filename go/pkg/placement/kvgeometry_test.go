@@ -233,3 +233,157 @@ func TestPlausibleSystemOverheadSpreadIsKept(t *testing.T) {
 		t.Errorf("discarded a plausible spread: %v", got)
 	}
 }
+
+// Laguna is measured at q4_0 but routinely planned at q8_0, and --swa-full
+// gives its 36 windowed layers the full context. Before the geometry was
+// rescaled across KV types, that combination fell through to the formula,
+// which clamped the windowed layers to the sliding window and under-predicted
+// the allocation roughly 4x -- a plan that llama.cpp then OOMed on at load.
+func TestComputeKVTotalMBPricesSWAFullAtAnUnmeasuredKVType(t *testing.T) {
+	model := &ModelProfile{
+		NumLayers:     48,
+		SlidingWindow: 1024,
+		HeadCountKV:   8,
+		KeyLength:     128,
+		ValueLength:   128,
+		MeasuredKVGeometry: map[string]KVGeometry{
+			"q4_0": {FullLayers: 12, SWALayers: 36, SWACells: 1024, BytesPerCellPerLayer: 1152},
+		},
+	}
+
+	const ctx = 81920
+	q4Plain := computeKVTotalMB(model, ctx, "q4_0", false)
+	q4Full := computeKVTotalMB(model, ctx, "q4_0", true)
+	q8Plain := computeKVTotalMB(model, ctx, "q8_0", false)
+	q8Full := computeKVTotalMB(model, ctx, "q8_0", true)
+
+	if q4Full <= q4Plain {
+		t.Fatalf("--swa-full must cost more at the measured type: plain=%d full=%d", q4Plain, q4Full)
+	}
+	// 48 layers instead of 12 once the windowed cache is full depth.
+	if got, want := q4Full, 48*ctx*1152/(1024*1024); got != want {
+		t.Errorf("q4_0 --swa-full = %d MiB, want %d", got, want)
+	}
+	if q8Full <= q8Plain {
+		t.Fatalf("--swa-full must cost more at an unmeasured type too: plain=%d full=%d", q8Plain, q8Full)
+	}
+	// q8_0 is 1.0625 B/elem against q4_0's 0.5625, so the same layout costs
+	// that ratio more. Allow a MiB of rounding.
+	wantQ8 := int(float64(q4Full) * (1.0625 / 0.5625))
+	if diff := q8Full - wantQ8; diff > 1 || diff < -1 {
+		t.Errorf("q8_0 --swa-full = %d MiB, want ~%d (rescaled from q4_0)", q8Full, wantQ8)
+	}
+}
+
+// Without a measured geometry the formula still has to price --swa-full, or a
+// model ggrun has never launched plans as if its windowed layers were shallow.
+func TestComputeKVTotalMBFormulaHonoursSWAFull(t *testing.T) {
+	model := &ModelProfile{
+		NumLayers:     48,
+		SlidingWindow: 1024,
+		HeadCountKV:   8,
+		KeyLength:     128,
+		ValueLength:   128,
+		ModelArch:     "gemma3",
+	}
+	plain := computeKVTotalMB(model, 81920, "q8_0", false)
+	full := computeKVTotalMB(model, 81920, "q8_0", true)
+	if full <= plain {
+		t.Fatalf("formula ignored --swa-full: plain=%d full=%d", plain, full)
+	}
+}
+
+// The bytes-per-token rate cannot express --swa-full, so it must not be used
+// to price it -- silently reusing it reintroduces the same under-prediction.
+func TestComputeKVTotalMBSkipsRateForSWAFull(t *testing.T) {
+	model := &ModelProfile{
+		NumLayers:             48,
+		SlidingWindow:         1024,
+		HeadCountKV:           8,
+		KeyLength:             128,
+		ValueLength:           128,
+		ModelArch:             "gemma3",
+		MeasuredKVBytesPerTok: map[string]float64{"q8_0": 13864.5},
+	}
+	rate := computeKVTotalMB(model, 81920, "q8_0", false)
+	full := computeKVTotalMB(model, 81920, "q8_0", true)
+	perTok := 13864.5
+	want := int(perTok*float64(81920)/1048576.0 + 0.5)
+	if rate != want {
+		t.Errorf("without --swa-full the measured rate should win: got %d want %d", rate, want)
+	}
+	if full <= rate {
+		t.Fatalf("--swa-full priced off the rate: rate=%d full=%d", rate, full)
+	}
+}
+
+// A --swa-full launch prints both caches at the same depth, so the log no
+// longer says which layers are windowed. Recording it anyway produced
+// "48 full-attention layers, no SWA", which priced a plain launch 4x too high
+// and made --swa-full look free -- the two plans came out byte-identical.
+func TestParseKVGeometryRejectsSWAFullFlattenedLog(t *testing.T) {
+	flattened := `
+llama_kv_cache: creating non-SWA KV cache, size = 524288 cells
+llama_kv_cache: size = 13824.00 MiB (524288 cells,  12 layers,  1/1 seqs), K (q4_0): ...
+llama_kv_cache: creating     SWA KV cache, size = 524288 cells
+llama_kv_cache: size = 41472.00 MiB (524288 cells,  36 layers,  1/1 seqs), K (q4_0): ...
+`
+	if g, ok := ParseKVGeometry(flattened); ok {
+		t.Errorf("recorded a geometry from a flattened --swa-full log: %+v", g)
+	}
+
+	// The ordinary two-depth log still parses, and keeps the split.
+	normal := `
+llama_kv_cache: size = 13824.00 MiB (1048576 cells,  12 layers,  1/1 seqs), K (q4_0): ...
+llama_kv_cache: size =    40.50 MiB (   1024 cells,  36 layers,  1/1 seqs), K (q4_0): ...
+`
+	g, ok := ParseKVGeometry(normal)
+	if !ok {
+		t.Fatal("a normal iSWA log must still parse")
+	}
+	if g.FullLayers != 12 || g.SWALayers != 36 || g.SWACells != 1024 {
+		t.Errorf("got %+v, want 12 full / 36 swa / 1024 cells", g)
+	}
+
+	// A model with no sliding-window layers prints one line and must survive.
+	single := "llama_kv_cache: size = 1024.00 MiB (65536 cells,  32 layers,  1/1 seqs), K (f16): ...\n"
+	g, ok = ParseKVGeometry(single)
+	if !ok || g.FullLayers != 32 || g.SWALayers != 0 {
+		t.Errorf("single-cache model broke: %+v ok=%v", g, ok)
+	}
+}
+
+// The rate is poisoned by a --swa-full launch just as the geometry is: 55296
+// B/token was recorded against a true 13864, and being a single number it
+// cannot be corrected later. The probe has to decline the whole measurement.
+func TestPostLaunchKVProbeIgnoresSWAFullLaunches(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242}
+
+	// A good, non-flattened launch establishes the truth.
+	RunPostLaunchKVProbe(dir, model, 1048576, "q4_0", lagunaKVLog)
+	good := model.MeasuredKVGeometry["q4_0"]
+	if good.FullLayers != 12 || good.SWALayers != 36 {
+		t.Fatalf("baseline geometry not recorded: %+v", good)
+	}
+
+	// Then a --swa-full launch prints both caches at the same depth.
+	swaFullLog := `
+llama_kv_cache: size = 13824.00 MiB (524288 cells,  12 layers,  1/1 seqs), K (q4_0): ...
+llama_kv_cache: size = 41472.00 MiB (524288 cells,  36 layers,  1/1 seqs), K (q4_0): ...
+`
+	RunPostLaunchKVProbe(dir, model, 524288, "q4_0", swaFullLog)
+
+	if got := model.MeasuredKVGeometry["q4_0"]; got != good {
+		t.Errorf("a --swa-full launch overwrote the geometry: %+v, want %+v", got, good)
+	}
+	reloaded := loadMeasuredKVGeometry(dir, &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242})
+	if got := reloaded["q4_0"]; got != good {
+		t.Errorf("cache file was overwritten: %+v, want %+v", got, good)
+	}
+	// And the rate must still be the plain one, not the swa-full 4x.
+	rates := loadMeasuredKVRates(dir, &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242})
+	if r := rates["q4_0"]; r > 20000 {
+		t.Errorf("rate poisoned by --swa-full: %.0f B/token, want ~13864", r)
+	}
+}

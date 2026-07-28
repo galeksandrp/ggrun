@@ -798,7 +798,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			cacheSplitKey += ":cold"
 		}
 	}
-	s.PlacementCachePath = PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey)
+	s.PlacementCachePath = PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey, opts.SWAFull)
 	s.PlacementCachePath = placementCachePathForSpec(s.PlacementCachePath, opts.SpecMode, s.Draft)
 
 	// Try cached placement first (MoE only). Prefer the keyed placement cache
@@ -2230,7 +2230,7 @@ func placementCachePathForStrategy(s *Strategy, caps *detect.Capabilities, model
 			cacheSplitKey += ":cold"
 		}
 	}
-	path := PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey)
+	path := PlacementCachePathFor(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel, cacheSplitKey, opts.SWAFull)
 	return placementCachePathForSpec(path, opts.SpecMode, s.Draft)
 }
 
@@ -2808,7 +2808,24 @@ func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string, swaFull b
 			return mb
 		}
 	}
-	if r, ok := model.MeasuredKVBytesPerTok[strings.ToLower(kvType)]; ok && r > 0 {
+	// A geometry measured at one KV type still describes this model at every
+	// other one: the layer split and the window depth are properties of the
+	// architecture, and only the per-cell width follows the quantisation. So
+	// rescale rather than fall through to the formula -- a measured layout at
+	// the wrong type predicts --swa-full far better than an estimate at the
+	// right one, and launches routinely pick a type the model was never
+	// measured at (Laguna is measured at q4_0 and planned at q8_0).
+	if g, from, ok := anyMeasuredKVGeometry(model); ok {
+		if scaled, ok := rescaleKVGeometry(g, from, kvType); ok {
+			if mb := scaled.TotalMB(ctxSize, swaFull); mb > 0 {
+				return mb
+			}
+		}
+	}
+	// The rate cannot express --swa-full at all (it is bytes per token of
+	// context, and swa-full changes which layers scale with context), so it is
+	// only safe when the windowed layers keep their fixed depth.
+	if r, ok := model.MeasuredKVBytesPerTok[strings.ToLower(kvType)]; ok && r > 0 && !swaFull {
 		return int(r*float64(ctxSize)/1048576.0 + 0.5)
 	}
 
@@ -2847,8 +2864,13 @@ func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string, swaFull b
 		}
 		fullLayers := (model.NumLayers + swaPeriod - 1) / swaPeriod
 		swaLayers := model.NumLayers - fullLayers
+		// --swa-full sets size_swa = size_base, so the windowed layers stop being
+		// fixed-depth and scale with the context like the full ones. Clamping to
+		// the sliding window here under-predicts by the SWA layer count -- for
+		// Laguna, 36 of 48 layers, a 4x miss that surfaces as an OOM at load
+		// rather than as a rejected plan.
 		swaCtx := ctxSize
-		if swaCtx > model.SlidingWindow {
+		if !swaFull && swaCtx > model.SlidingWindow {
 			swaCtx = model.SlidingWindow
 		}
 		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
@@ -4426,7 +4448,17 @@ func RunPostLaunchKVProbe(cacheDir string, model *ModelProfile, ctxSize int, kvT
 	}
 	// The geometry is strictly better than the rate and comes from the same
 	// log, so record it whenever the backend printed its per-cache breakdown.
-	if g, ok := ParseKVGeometry(serverLog); ok {
+	g, ok := ParseKVGeometry(serverLog)
+	if !ok && kvCacheLogIsSWAFlattened(serverLog) {
+		// A --swa-full launch allocates every layer at full depth, so both the
+		// layout and the rate it produces describe that launch and no other.
+		// Storing either one poisons the next plain launch, which would then
+		// reserve the swa-full total: measured here as 55296 B/token against a
+		// true 13864, a 4x over-reservation that costs expert layers on every
+		// GPU. Keep whatever an earlier non-flattened launch measured.
+		return
+	}
+	if ok {
 		if model.MeasuredKVGeometry == nil {
 			model.MeasuredKVGeometry = map[string]KVGeometry{}
 		}
@@ -5317,9 +5349,17 @@ func probeCachePath(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 // Bump whenever placement semantics can change the emitted expert residency.
 // Version 3 invalidates v2 entries that could pin experts on hybrid split owners
 // before the conservative long-context safety gate existed.
-const placementPlannerCacheVersion = 4
+// Version 5 invalidates v4 entries planned against an under-sized KV cache:
+// sliding-window layers were priced at their window depth even under --swa-full,
+// and a geometry measured at one KV type was not reused for another, so plans
+// were validated against an allocation the backend would never make.
+const placementPlannerCacheVersion = 5
 
-func PlacementCachePathFor(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, tensorSplit string) string {
+// swaFull belongs in the key because it changes the KV allocation without
+// changing anything else the key already carries: on Laguna the same context
+// costs 4x more with it, so a plan cached from a plain launch is not a plan for
+// a --swa-full one, and reusing it hands the backend a layout that cannot fit.
+func PlacementCachePathFor(cacheDir string, model *ModelProfile, ctxSize, ubatch int, kvQuality, kvPlacement, backendTag string, gpus []detect.GPU, parallel int, tensorSplit string, swaFull bool) string {
 	if model == nil {
 		return ""
 	}
@@ -5336,10 +5376,10 @@ func PlacementCachePathFor(cacheDir string, model *ModelProfile, ctxSize, ubatch
 	if backendTag == "" {
 		backendTag = "llama"
 	}
-	key := fmt.Sprintf("place:v%d:%s:%d:%d:%d:%d:%d:%d:%s:%s:%s:%s:%d:%s",
+	key := fmt.Sprintf("place:v%d:%s:%d:%d:%d:%d:%d:%d:%s:%s:%s:%s:%d:%s:swafull=%t",
 		placementPlannerCacheVersion, filepath.Base(model.Path), model.NumLayers, model.NumExperts,
 		model.EmbeddingLength, model.FeedForwardLength,
-		ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpuSignatureHash(gpus), parallel, tensorSplit)
+		ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpuSignatureHash(gpus), parallel, tensorSplit, swaFull)
 	return filepath.Join(cacheDir, md5Hash12(key)+".place")
 }
 

@@ -73,6 +73,75 @@ func (g KVGeometry) TotalMB(ctxSize int, swaFull bool) int {
 	return int(float64(cells)*g.BytesPerCellPerLayer/(1024*1024) + 0.5)
 }
 
+// anyMeasuredKVGeometry returns one usable geometry for this model together
+// with the KV type it was measured at. Which one does not matter -- the layout
+// is identical across types and only the per-cell width differs -- but the map
+// iterates in random order, so pick deterministically to keep a plan stable
+// across runs.
+func anyMeasuredKVGeometry(model *ModelProfile) (KVGeometry, string, bool) {
+	if model == nil {
+		return KVGeometry{}, "", false
+	}
+	best := ""
+	for kvType, g := range model.MeasuredKVGeometry {
+		if !g.Measured() {
+			continue
+		}
+		if best == "" || kvType < best {
+			best = kvType
+		}
+	}
+	if best == "" {
+		return KVGeometry{}, "", false
+	}
+	return model.MeasuredKVGeometry[best], best, true
+}
+
+// rescaleKVGeometry converts a geometry measured at one KV type to another by
+// the ratio of their per-element widths. The cell counts are untouched: how
+// many layers attend over what depth is set by the architecture, not by how
+// the cells are quantised.
+func rescaleKVGeometry(g KVGeometry, fromType, toType string) (KVGeometry, bool) {
+	if !g.Measured() {
+		return g, false
+	}
+	if strings.EqualFold(fromType, toType) {
+		return g, true
+	}
+	fromBytes, ok1 := kvTypeBytesPerElement(fromType)
+	toBytes, ok2 := kvTypeBytesPerElement(toType)
+	if !ok1 || !ok2 || fromBytes <= 0 {
+		return g, false
+	}
+	g.BytesPerCellPerLayer *= toBytes / fromBytes
+	return g, true
+}
+
+// kvCacheLogIsSWAFlattened reports whether a log carries several KV caches that
+// all have the same depth. That is the --swa-full signature, and it is the one
+// case where a failed parse means "this launch cannot describe the model"
+// rather than "this log has no KV lines in it".
+func kvCacheLogIsSWAFlattened(logText string) bool {
+	depths := map[int]bool{}
+	count := 0
+	for _, line := range strings.Split(logText, "\n") {
+		if !strings.Contains(line, "llama_kv_cache") {
+			continue
+		}
+		m := kvCacheLineRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		cells, err := strconv.Atoi(m[2])
+		if err != nil || cells <= 0 {
+			continue
+		}
+		depths[cells] = true
+		count++
+	}
+	return count > 1 && len(depths) == 1
+}
+
 // ParseKVGeometry reads the layout out of a backend launch log.
 //
 // A model without sliding-window layers prints one cache line and lands in
@@ -108,10 +177,23 @@ func ParseKVGeometry(logText string) (KVGeometry, bool) {
 	// windowed. Depth rather than layer count, because a model can have more
 	// full layers than windowed ones.
 	deepest := entries[0]
+	shallowest := entries[0]
 	for _, e := range entries {
 		if e.cells > deepest.cells {
 			deepest = e
 		}
+		if e.cells < shallowest.cells {
+			shallowest = e
+		}
+	}
+	// --swa-full sets size_swa = size_base, so every cache prints the same depth
+	// and the windowed layers become indistinguishable from the full ones. The
+	// split is what this geometry exists to record, and a log that flattened it
+	// cannot supply it -- reading one anyway yields "all layers full attention",
+	// which over-reserves 4x on a plain launch and makes --swa-full look free.
+	// Report no measurement so an earlier, non-flattened one survives.
+	if len(entries) > 1 && deepest.cells == shallowest.cells {
+		return KVGeometry{}, false
 	}
 	for _, e := range entries {
 		if e.cells == deepest.cells {

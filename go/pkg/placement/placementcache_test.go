@@ -67,9 +67,9 @@ func TestPlacementCachePathFor_KeyedByKVAndCtx(t *testing.T) {
 	gpus := []detect.GPU{{Index: 0, Name: "3090 Ti"}, {Index: 1, Name: "3060"}}
 	dir := "/tmp/cache"
 
-	gpuKV := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "gpu", "llama", gpus, 0, "")
-	cpuKV := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "cpu", "llama", gpus, 0, "")
-	smallCtx := PlacementCachePathFor(dir, m, 131072, 512, "mid", "gpu", "llama", gpus, 0, "")
+	gpuKV := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "gpu", "llama", gpus, 0, "", false)
+	cpuKV := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "cpu", "llama", gpus, 0, "", false)
+	smallCtx := PlacementCachePathFor(dir, m, 131072, 512, "mid", "gpu", "llama", gpus, 0, "", false)
 
 	if gpuKV == cpuKV {
 		t.Errorf("kv=gpu and kv=cpu must not share a placement cache file:\n  %s", gpuKV)
@@ -78,7 +78,7 @@ func TestPlacementCachePathFor_KeyedByKVAndCtx(t *testing.T) {
 		t.Errorf("different context sizes must not share a placement cache file")
 	}
 	// Deterministic + lands in the cache dir with a .place extension.
-	if again := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "gpu", "llama", gpus, 0, ""); again != gpuKV {
+	if again := PlacementCachePathFor(dir, m, 1048576, 512, "mid", "gpu", "llama", gpus, 0, "", false); again != gpuKV {
 		t.Errorf("path must be deterministic: %s != %s", again, gpuKV)
 	}
 	if filepath.Dir(gpuKV) != dir || filepath.Ext(gpuKV) != ".place" {
@@ -99,9 +99,9 @@ func TestWorkloadProfileScopesPlacementAndProbeCacheIdentity(t *testing.T) {
 	if interactiveTag == legacyTag || parallelTag == legacyTag || interactiveTag == parallelTag {
 		t.Fatalf("workload tags are not isolated: legacy=%q interactive=%q parallel=%q", legacyTag, interactiveTag, parallelTag)
 	}
-	legacyPlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", legacyTag, gpus, 1, "")
-	interactivePlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", interactiveTag, gpus, 1, "")
-	parallelPlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", parallelTag, gpus, 4, "")
+	legacyPlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", legacyTag, gpus, 1, "", false)
+	interactivePlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", interactiveTag, gpus, 1, "", false)
+	parallelPlace := PlacementCachePathFor(dir, model, 65536, 512, "high", "gpu", parallelTag, gpus, 4, "", false)
 	if legacyPlace == interactivePlace || legacyPlace == parallelPlace || interactivePlace == parallelPlace {
 		t.Fatalf("placement cache paths are not workload-scoped: %q %q %q", legacyPlace, interactivePlace, parallelPlace)
 	}
@@ -232,5 +232,29 @@ func TestPlacementCacheRoundTripPreservesSubPins(t *testing.T) {
 	}
 	if loaded.NCPUMoE != 33 || len(loaded.TensorSplit) != 3 {
 		t.Errorf("cache round-trip lost fields: ncpumoe=%d split=%v", loaded.NCPUMoE, loaded.TensorSplit)
+	}
+}
+
+// A --swa-full launch allocates a different KV cache than a plain one at the
+// same context -- 4x on an interleaved sliding-window model -- so it must not
+// be handed a plan validated without it. The key carried every other input that
+// moves the allocation but not this one.
+func TestPlacementCacheKeySeparatesSWAFull(t *testing.T) {
+	dir := t.TempDir()
+	m := &ModelProfile{Path: "/models/laguna.gguf", NumLayers: 48, NumExperts: 128,
+		EmbeddingLength: 4096, FeedForwardLength: 14336}
+	gpus := []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564}}
+
+	plain := PlacementCachePathFor(dir, m, 81920, 512, "mid", "gpu", "laguna", gpus, 1, "", false)
+	full := PlacementCachePathFor(dir, m, 81920, 512, "mid", "gpu", "laguna", gpus, 1, "", true)
+
+	if plain == "" || full == "" {
+		t.Fatal("expected a cache path for both")
+	}
+	if plain == full {
+		t.Errorf("--swa-full shares a placement cache entry with a plain launch: %s", plain)
+	}
+	if again := PlacementCachePathFor(dir, m, 81920, 512, "mid", "gpu", "laguna", gpus, 1, "", true); again != full {
+		t.Errorf("key is not stable for the same inputs: %s vs %s", again, full)
 	}
 }
