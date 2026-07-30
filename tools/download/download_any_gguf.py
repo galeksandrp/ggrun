@@ -370,8 +370,6 @@ def download_files(repo, files_to_download, output_dir):
                     repo_id=repo,
                     filename=filename,
                     local_dir=output_dir,
-                    resume_download=True,
-                    local_dir_use_symlinks=False,
                     library_name="gguf-downloader",
                 )
 
