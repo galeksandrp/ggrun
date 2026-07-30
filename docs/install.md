@@ -50,6 +50,8 @@ Use it with:
 ~/ggrun/ggrun <repo/name> --download
 ```
 
+(`ggrun download <repo/name>` is the same action, the form used in getting-started.md.)
+
 Only `LLM_APP_HOME` and `PATH` are exported by the environment; everything else (model
 dir, backend, cache, logs, llama-server path) is read from `.config/config`, so CLI and
 GUI edits take effect instead of being shadowed by environment variables.

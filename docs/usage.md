@@ -229,6 +229,8 @@ Two deliberate restrictions:
 - **`--fork-session` is refused with a resume.** Forking mints a new session ID,
   which moves the workflow journal path and silently discards every cached agent.
 
+### Context sizing and concurrency
+
 - **Thinking is on** — a normal launch never passes `--reasoning off` (measurement-only:
   benchmark and the deterministic core `spec-test` matrix).
 - **Context fits the slot.** `--parallel` splits `--ctx-size` across sequence slots,
@@ -254,11 +256,17 @@ Two deliberate restrictions:
   deterministically rewrites every `agent()` call to the maximum safe value before it
   runs. Startup, process-health, and shell-command guards remain active so a real crash
   or hung command is still visible.
+
+### Sampling defaults
+
 - **Anti-loop sampling.** The Anthropic API has no repetition-penalty fields and the
   client only sends temperature, so ggrun sets server-side defaults in claude-code
   mode (`--presence-penalty 1.0 --repeat-penalty 1.05 --repeat-last-n 512 --top-k 40
   --top-p 0.95 --min-p 0.05`) — quantized thinking models loop endlessly without them.
   Pass any of these flags yourself (after `--`) and your value wins.
+
+### Prompt caching and hybrid models
+
 - **Compaction reuses moved prompt chunks.** On shiftable transformer contexts, when
   the backend supports it, Claude mode enables `--cache-reuse 256`. This complements
   ordinary common-prefix caching by
@@ -275,6 +283,9 @@ Two deliberate restrictions:
   hybrid/recurrent models. Physical ubatch remains placement-derived. This prevents a
   long prefill batch from withholding decode work from the other active slot for more
   than a minute; explicit backend arguments still win.
+
+### Permissions and Auto mode
+
 - **Web research:** the built-in WebSearch runs on Anthropic's servers and is hidden
   on a non-first-party endpoint, so ggrun disables it and auto-wires a no-key
   DuckDuckGo MCP when `uvx` is installed. Its `search` and `fetch_content` tools
@@ -295,6 +306,9 @@ Two deliberate restrictions:
   choose another permission mode with `GGRUN_CLAUDE_PERMISSION_MODE=acceptEdits`, or
   use `inherit` to preserve your global Claude setting. See Claude Code's
   [permission-mode requirements](https://code.claude.com/docs/en/permission-modes#eliminate-prompts-with-auto-mode).
+
+### Progress display
+
 - **Live local progress:** while a local request is queued, ingesting its prompt, or
   generating, ggrun adds a session-only Claude status line with the active slot,
   prompt progress bar, token counts, tok/s, active requests, and queue depth. It uses

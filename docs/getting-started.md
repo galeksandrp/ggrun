@@ -45,7 +45,7 @@ ggrun models list
 ggrun <model.gguf>
 ~~~
 
-ggrun download chooses a quant using detected VRAM and RAM. ggrun models list
+ggrun download chooses a quant using detected VRAM and RAM (equivalently: `ggrun <owner/repository> --download`, the form used in the top-level README). ggrun models list
 shows the downloaded GGUFs, including split GGUFs as one model. Use the name
 printed by that command to launch a model.
 

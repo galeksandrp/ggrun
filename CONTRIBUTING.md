@@ -1,7 +1,18 @@
 # Contributing
 
+Thanks for looking at ggrun. This file covers what we expect from a change.
+
 ggrun is Go-first. Changes should preserve the public product layout and
 include tests that match the risk of the change.
+
+## Building locally
+
+```bash
+cd go && go build ./cmd/ggrun
+```
+
+For the full clone-and-run setup (app home, models dir, config), see the
+"From a clone" steps in [docs/install.md](docs/install.md#recommended-self-contained-app-home).
 
 ## Reporting bugs and proposing changes
 
@@ -10,6 +21,9 @@ For launch or performance reports, include ggrun version, redacted ggrun
 detect output, model/quant, backend, context, parallelism, and the relevant
 --dry-run output. Never attach model files, credentials, private paths, or
 prompt contents.
+
+Not sure about something? Open a [GitHub issue](https://github.com/raketenkater/ggrun/issues)
+and ask.
 
 Before opening a pull request:
 

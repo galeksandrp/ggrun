@@ -1,9 +1,12 @@
 # ggrun
 
-ggrun is my launcher around [llama.cpp](https://github.com/ggml-org/llama.cpp)
-and ik_llama.cpp. I started it because loading one GGUF is easy, but getting a
-large model to use a weird mix of GPUs and system RAM without bad splits, OOMs,
-or a pile of manual flags is not.
+ggrun (pronounced "g-run", from "gguf run") is my launcher around
+[llama.cpp](https://github.com/ggml-org/llama.cpp) and ik_llama.cpp. It reads a
+GGUF's tensor layout against the VRAM, RAM, and per-GPU bandwidth actually on
+the machine, then places big MoE models across a mismatched multi-GPU setup so
+the split fits and the server starts without an OOM or a pile of hand-tuned
+flags. I started it because loading one GGUF is easy, but getting that split
+right by hand was not.
 
 The project is mainly about three things:
 
@@ -22,6 +25,7 @@ through to `llama-server`.
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/raketenkater/ggrun)](https://github.com/raketenkater/ggrun/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#backends)
+[![CI](https://github.com/raketenkater/ggrun/actions/workflows/ci.yml/badge.svg)](https://github.com/raketenkater/ggrun/actions/workflows/ci.yml)
 
 ## Quick start
 
@@ -42,6 +46,7 @@ Then run a local GGUF, download one from Hugging Face, or open the TUI:
 ```bash
 ggrun model.gguf
 ggrun unsloth/Qwen3.6-27B-GGUF --download
+# (equivalently: ggrun download unsloth/Qwen3.6-27B-GGUF)
 ggrun
 ```
 
@@ -58,6 +63,9 @@ ggrun
   preserves the winning configuration for the same setup.
 - Keeps model downloads, recommendations, launches, and the generated command
   in one inspectable TUI flow.
+- Exposes llama.cpp's OpenAI-compatible `/v1` API (chat completions and
+  completions) at the configured host:port, alongside the Anthropic endpoint
+  used for Claude Code.
 
 ## Local Claude Code and Ultracode workflows
 
@@ -155,6 +163,8 @@ ggrun does not own are forwarded unchanged.
 [Benchmarks](docs/launch-performance.md) ·
 [Speculative decoding](docs/speculative-decoding.md) ·
 [Model recommendations](docs/model-recommendations.md) ·
+[Docker](docker/README.md) ·
+[Release verification](docs/releases.md) ·
 [Changelog](CHANGELOG.md)
 
 ## License

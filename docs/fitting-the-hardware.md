@@ -116,26 +116,3 @@ launch.
 
 **Principle: record a measurement with the conditions it was taken under, and refuse
 to record one whose conditions erase the thing being measured.**
-
-## What ggrun should do next
-
-Ordered by expected value on agentic workloads:
-
-1. **Make `--swa-full` first-class** (config key + flag + emitted from the strategy).
-   Today it is an ExtraArgs passthrough: unpersistable, absent from
-   `planDerivedLaunchFlags`, and silently worth ~3x turn time when forgotten.
-2. **Skip context checkpoints when swa-full is on.** `server-context.cpp` gates
-   checkpoint creation on `n_swa > 0`, which stays true under swa-full even though
-   its own comment says checkpoints are for the non-swa-full case. They are
-   redundant memory in that configuration.
-3. **Auto-enable swa-full** for iSWA models when KV resolves to GPU and the
-   swa-full total fits. In that regime it measured 87% reuse at no decode cost —
-   there is no trade to weigh. Leave the KV-on-CPU case alone, where it is a real
-   tradeoff (117 s vs 174 s) supported by a single workload.
-4. **Close the plan-to-OOM gap.** A plan that needs OOM retries to launch is the
-   planner under-reserving. This run was planned at `--n-cpu-moe 27` and reached 30
-   by retry; those three layers are decode speed given away.
-5. **Search context size against turn time.** Context is currently taken as a user
-   constraint and everything else bends around it, but it is the single largest
-   lever on expert placement. The planner should be able to report "ctx 131072 buys
-   you 5 expert layers" rather than requiring the operator to work it out.

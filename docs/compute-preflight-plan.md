@@ -1,3 +1,5 @@
+> Internal engineering design note — not end-user documentation. See [Architecture](architecture.md) or [Usage](usage.md) for user-facing docs.
+
 # Compute preflight: fastest stable placement without paying for failed loads
 
 Status: backend-neutral contained allocation measurement implemented 2026-07-21.

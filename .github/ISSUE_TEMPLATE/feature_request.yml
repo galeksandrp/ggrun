@@ -6,7 +6,10 @@ body:
   - type: markdown
     attributes:
       value: |
-        Concrete workflows are more useful than a list of desired flags.
+        Thanks for the suggestion. Concrete workflows are more useful than a
+        list of desired flags — for example, "I queue overnight batch jobs
+        and want ggrun to leave the 3090 Ti free for interactive use instead
+        of grabbing whichever GPU has room."
   - type: textarea
     id: problem
     attributes:
