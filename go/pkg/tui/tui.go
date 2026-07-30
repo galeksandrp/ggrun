@@ -268,6 +268,24 @@ func newMainList(models []ModelItem) list.Model {
 	return l
 }
 
+// rebuildMainList replaces m.mainList (e.g. after the model set changes) and
+// re-applies the real terminal size. newMainList's own list.New call only
+// carries a placeholder 40x20 size; without this, any mid-session rebuild
+// snaps the visible list back to that placeholder instead of the size the
+// last WindowSizeMsg reported, splitting the screen. Before the first
+// WindowSizeMsg arrives (m.width/m.height still zero, e.g. during initial
+// Model construction), this intentionally leaves the placeholder size in
+// place — the upcoming WindowSizeMsg sizes it correctly on its own.
+func (m *Model) rebuildMainList() {
+	m.mainList = newMainList(m.models)
+	if m.width > 0 {
+		m.mainList.SetWidth(m.width - 4)
+	}
+	if m.height > 0 {
+		m.mainList.SetHeight(m.height - 12)
+	}
+}
+
 type mainItem struct {
 	title    string
 	desc     string
@@ -764,7 +782,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if val != "" {
 				m.modelDir = val
 				m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
-				m.mainList = newMainList(m.models)
+				m.rebuildMainList()
 				if err := persistConfig(func(c *config.Config) { c.ModelDir = val }); err != nil {
 					m.message = fmt.Sprintf("Warning: Using %s for this session — could not save config: %v", val, err)
 					m.messageType = "warning"
@@ -1765,7 +1783,7 @@ func (m *Model) refreshTunedCounts() {
 		}
 		m.models[i].Tuned = tune.CountTunedConfigs(m.cacheDir, m.models[i].Name, modelTag)
 	}
-	m.mainList = newMainList(m.models)
+	m.rebuildMainList()
 }
 
 // settingRow describes one editable config setting on the Settings screen.
@@ -1887,7 +1905,7 @@ func (m *Model) applySetting(row settingRow, val string) {
 	case "Model directory":
 		m.modelDir = val
 		m.models = loadModels(val, m.cacheDir, m.backend, m.caps)
-		m.mainList = newMainList(m.models)
+		m.rebuildMainList()
 		if m.messageType != "warning" {
 			m.message = fmt.Sprintf("Saved: Model directory = %s (%d models)", val, len(m.models))
 		}
@@ -2079,7 +2097,7 @@ matched:
 		return
 	}
 	m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
-	m.mainList = newMainList(m.models)
+	m.rebuildMainList()
 	m.message = fmt.Sprintf("Removed %s (%.1fGB freed).", removed.Name, float64(removed.Bytes)/(1024*1024*1024))
 	m.messageType = "info"
 }

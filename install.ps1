@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Installs a native Windows ggrun app home from a release bundle.
 

@@ -255,6 +255,30 @@ func TestRemoveModelAtDisambiguatesSameBasenameByPath(t *testing.T) {
 	}
 }
 
+// TestRebuildMainListPreservesWindowSize guards against the list snapping
+// back to newMainList's 40x20 placeholder size (and splitting the screen)
+// whenever the model set changes mid-session — e.g. after a delete, a model
+// directory change, or a tuned-count refresh, all of which rebuild the list
+// well after the initial WindowSizeMsg has already sized it.
+func TestRebuildMainListPreservesWindowSize(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "test-Q4_K_M.gguf"), []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+	m := &Model{modelDir: dir, models: models, mainList: newMainList(models), width: 120, height: 40}
+
+	m.rebuildMainList()
+
+	wantW, wantH := 120-4, 40-12
+	if got := m.mainList.Width(); got != wantW {
+		t.Fatalf("mainList.Width() = %d, want %d (fell back to the 40x20 placeholder?)", got, wantW)
+	}
+	if got := m.mainList.Height(); got != wantH {
+		t.Fatalf("mainList.Height() = %d, want %d (fell back to the 40x20 placeholder?)", got, wantH)
+	}
+}
+
 func TestDiscoverModelsHidesAuxiliaryArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{
