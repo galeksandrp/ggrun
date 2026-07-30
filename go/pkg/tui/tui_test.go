@@ -141,6 +141,120 @@ func TestDiscoverModelsKeepsSameBasenameInDifferentDirectories(t *testing.T) {
 	}
 }
 
+func TestDeleteModelKeyOpensConfirmDefaultedToCancel(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "test-Q4_K_M.gguf"), []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
+	m.input = textinput.New()
+	m.mainList.Select(1) // list index 0 is the "Recommended downloads" row
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = nm.(Model)
+	if m.screen != ScreenChoice {
+		t.Fatalf("expected the delete shortcut to open the confirm screen, got screen=%v", m.screen)
+	}
+	if !strings.Contains(m.choiceTitle, models[0].Name) {
+		t.Fatalf("confirm title should name the model, got %q", m.choiceTitle)
+	}
+	if m.choiceOptions[m.choiceCursor] != "Cancel" {
+		t.Fatalf("confirm cursor must default to Cancel, got %q", m.choiceOptions[m.choiceCursor])
+	}
+}
+
+func TestDeleteModelConfirmRemovesFileWithoutQuitting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-Q4_K_M.gguf")
+	if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
+	m.input = textinput.New()
+	m.mainList.Select(1)
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = nm.(Model)
+	for i, opt := range m.choiceOptions {
+		if strings.HasPrefix(opt, "Confirm: delete ") {
+			m.choiceCursor = i
+			break
+		}
+	}
+	nm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected the model file to be removed from disk, stat err=%v", err)
+	}
+	if len(m.models) != 0 {
+		t.Fatalf("expected the Main model list to refresh after removal, got %d models", len(m.models))
+	}
+	if m.screen != ScreenMain {
+		t.Fatalf("expected to return to the Main screen after removal, got %v", m.screen)
+	}
+	if m.messageType != "info" || !strings.Contains(m.message, "Removed") {
+		t.Fatalf("expected an info message confirming removal, got type=%q msg=%q", m.messageType, m.message)
+	}
+	if cmd != nil {
+		t.Fatal("model removal must not quit the TUI — unlike backend removal it needs no external process")
+	}
+}
+
+func TestDeleteModelCancelLeavesFileInPlace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test-Q4_K_M.gguf")
+	if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
+	m.input = textinput.New()
+	m.mainList.Select(1)
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = nm.(Model)
+	// Cursor already defaults to "Cancel".
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Cancel must leave the model file in place, stat err=%v", err)
+	}
+	if len(m.models) != 1 {
+		t.Fatalf("Cancel must not touch the Main model list, got %d models", len(m.models))
+	}
+}
+
+func TestRemoveModelAtDisambiguatesSameBasenameByPath(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"repo-a", "repo-b"} {
+		modelDir := filepath.Join(dir, sub)
+		if err := os.MkdirAll(modelDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(modelDir, "model-Q4.gguf"), []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	models := discoverModels(dir)
+	if len(models) != 2 {
+		t.Fatalf("setup: expected 2 same-basename models, got %d", len(models))
+	}
+
+	m := Model{modelDir: dir, models: models}
+	m.removeModelAt(0)
+
+	if _, err := os.Stat(models[0].Path); !os.IsNotExist(err) {
+		t.Fatalf("expected the selected model's file to be removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(models[1].Path); err != nil {
+		t.Fatalf("expected the other same-basename model to survive, stat err=%v", err)
+	}
+}
+
 func TestDiscoverModelsHidesAuxiliaryArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{

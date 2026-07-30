@@ -19,6 +19,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/gguf"
+	modelstore "github.com/raketenkater/ggrun/pkg/models"
 	"github.com/raketenkater/ggrun/pkg/probe"
 	"github.com/raketenkater/ggrun/pkg/recommend"
 	"github.com/raketenkater/ggrun/pkg/tune"
@@ -219,7 +220,7 @@ func InitialModel() Model {
 
 	m.mainList = newMainList(m.models)
 	if configErr != nil {
-		m.message = fmt.Sprintf("Configuration error: %v. Fix it with ggrun config edit or reset before launching.", configErr)
+		m.message = fmt.Sprintf("Warning: Configuration error: %v. Fix it with ggrun config edit or reset before launching.", configErr)
 		m.messageType = "warning"
 	}
 	return m
@@ -434,6 +435,11 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = ScreenModelConfig
 				return m, nil
 			}
+		case "x", "X":
+			if item, ok := m.mainList.SelectedItem().(mainItem); ok && item.isModel {
+				m.openRemoveModelChoice(item.index)
+				return m, nil
+			}
 		}
 	}
 
@@ -474,7 +480,7 @@ func (m *Model) setCtx(val string) {
 	default:
 		n, err := strconv.Atoi(val)
 		if err != nil || n < 1 {
-			m.message = "Context must be fit, max, or a positive token count"
+			m.message = "Warning: Context must be fit, max, or a positive token count"
 			m.messageType = "warning"
 			return
 		}
@@ -593,7 +599,7 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.parallel = strconv.Itoa(n)
 					m.parallelSet = true
 				} else {
-					m.message = "Parallel must be a positive integer"
+					m.message = "Warning: Parallel must be a positive integer"
 					m.messageType = "warning"
 				}
 			case "aitune":
@@ -665,6 +671,8 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tunedConfigs = tune.ListTunedConfigs(m.cacheDir, m.models[m.selectedModel].Name, m.backendTag(), false)
 		m.tunedIndex = -1
 		m.screen = ScreenTunedPicker
+	case "q", "Q":
+		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -749,7 +757,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.launchRequest = &LaunchRequest{DownloadRepo: val}
 				return m, tea.Quit
 			}
-			m.message = "Enter a Hugging Face GGUF repository"
+			m.message = "Warning: Enter a Hugging Face GGUF repository"
 			m.messageType = "warning"
 		case "modeldir":
 			val = strings.TrimSpace(val)
@@ -758,7 +766,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
 				m.mainList = newMainList(m.models)
 				if err := persistConfig(func(c *config.Config) { c.ModelDir = val }); err != nil {
-					m.message = fmt.Sprintf("Using %s for this session — could not save config: %v", val, err)
+					m.message = fmt.Sprintf("Warning: Using %s for this session — could not save config: %v", val, err)
 					m.messageType = "warning"
 				} else {
 					m.message = fmt.Sprintf("Model directory saved: %s (%d models)", val, len(m.models))
@@ -768,7 +776,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "backend-add":
 			fields := strings.Fields(val)
 			if len(fields) == 0 {
-				m.message = "Enter a Git repository URL"
+				m.message = "Warning: Enter a Git repository URL"
 				m.messageType = "warning"
 				return m, cmd
 			}
@@ -784,7 +792,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "backend-register":
 			fields := strings.Fields(val)
 			if len(fields) < 2 {
-				m.message = "Enter a tag and llama-server binary path"
+				m.message = "Warning: Enter a tag and llama-server binary path"
 				m.messageType = "warning"
 				return m, cmd
 			}
@@ -845,7 +853,7 @@ func (m Model) viewMain() string {
 	b.WriteString(m.mainList.View())
 
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("  Enter configure · / search · r downloads · s settings · u update"))
+	b.WriteString(mutedStyle.Render("  Enter configure · / search · x delete · r downloads · s settings · u update · q quit"))
 
 	if m.message != "" {
 		b.WriteString("\n")
@@ -1033,6 +1041,8 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.screen = ScreenModelConfig
 			return m, nil
+		case "q", "Q":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -1155,6 +1165,8 @@ func (m Model) updateTunedPicker(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.tunedIndex >= len(m.tunedConfigs) {
 				m.tunedIndex = -1
 			}
+		case "q", "Q":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -1252,6 +1264,8 @@ func (m Model) updateRecommended(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "m", "M":
 			m.focusRecommendedHeadroom("ram")
 			return m, nil
+		case "q", "Q":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -1287,7 +1301,7 @@ func (m *Model) setRecommendedHeadroom(kind string, mb int) {
 			c.RAMHeadroom = val
 		}
 	}); err != nil {
-		m.message = fmt.Sprintf("%s set for this session — save failed: %v", label, err)
+		m.message = fmt.Sprintf("Warning: %s set for this session — save failed: %v", label, err)
 		m.messageType = "warning"
 	} else {
 		m.message = fmt.Sprintf("Saved: %s = %s", label, formatHeadroomMB(mb))
@@ -1396,12 +1410,37 @@ func (m *Model) refreshRecommendations() {
 	}
 }
 
+// wordWrap greedily packs words from s into lines no wider than width,
+// breaking only at spaces. width <= 0 falls back to 78 columns.
+func wordWrap(s string, width int) []string {
+	if width <= 0 {
+		width = 78
+	}
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return nil
+	}
+	lines := []string{words[0]}
+	for _, w := range words[1:] {
+		last := lines[len(lines)-1]
+		if len(last)+1+len(w) > width {
+			lines = append(lines, w)
+		} else {
+			lines[len(lines)-1] = last + " " + w
+		}
+	}
+	return lines
+}
+
 func (m Model) viewRecommended() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("═══ Recommended Downloads ═══") + "\n")
 	b.WriteString(fmt.Sprintf("  Hardware: %s\n", hwSummary(m.caps)))
 	b.WriteString("  " + m.recommendedHeadroomControls() + "\n")
-	b.WriteString("  " + recommend.CatalogAttribution() + "\n\n")
+	for _, line := range wordWrap(recommend.CatalogAttribution(), m.width) {
+		b.WriteString("  " + line + "\n")
+	}
+	b.WriteString("\n")
 
 	if len(m.recommendations) == 0 {
 		b.WriteString(warningStyle.Render("  No safe recommendation fits the detected RAM/VRAM."))
@@ -1447,7 +1486,7 @@ func (m Model) viewRecommended() string {
 			if len(name) > 34 {
 				name = name[:33] + "…"
 			}
-			line := fmt.Sprintf("%-34s %-9s %-8s %5.1fG %3.0f%% %7s",
+			line := fmt.Sprintf("%-34s %-9s %-11s %5.1fG %3.0f%% %7s",
 				name, recommend.DisplayFit(rec.Fit), quant, rec.QuantSizeGB, rec.QualityRetained*100, tps)
 			if idx == m.selectedRecommendation {
 				b.WriteString(prefix + selectedStyle.Render(line) + "\n")
@@ -1811,13 +1850,13 @@ func settingRows() []settingRow {
 // any side effects (re-scan models, refresh tuned counts) for the given row.
 func (m *Model) applySetting(row settingRow, val string) {
 	if err := validateSettingValue(row.label, val); err != nil {
-		m.message = fmt.Sprintf("%s was not changed: %v", row.label, err)
+		m.message = fmt.Sprintf("Warning: %s was not changed: %v", row.label, err)
 		m.messageType = "warning"
 		return
 	}
 	row.set(m.settingsCfg, val)
 	if err := m.settingsCfg.Save(); err != nil {
-		m.message = fmt.Sprintf("%s set to %s for this session — save failed: %v", row.label, val, err)
+		m.message = fmt.Sprintf("Warning: %s set to %s for this session — save failed: %v", row.label, val, err)
 		m.messageType = "warning"
 	} else {
 		m.message = fmt.Sprintf("Saved: %s = %s", row.label, val)
@@ -1926,7 +1965,7 @@ func (m *Model) openBackendChoice(ret Screen) {
 	m.openChoice("Backend", backendOptions(), m.backend, ret, func(mm *Model, v string) {
 		mm.backend = v
 		if err := persistConfig(func(c *config.Config) { c.Backend = v }); err != nil {
-			mm.message = fmt.Sprintf("Backend set to %s for this session — save failed: %v", v, err)
+			mm.message = fmt.Sprintf("Warning: Backend set to %s for this session — save failed: %v", v, err)
 			mm.messageType = "warning"
 		} else {
 			mm.message = "Backend saved: " + v
@@ -1968,9 +2007,81 @@ func (m *Model) openBackendManager(ret Screen) {
 			mm.input.Focus()
 		case strings.HasPrefix(value, "Remove installed: "):
 			tag := strings.TrimSpace(strings.TrimPrefix(value, "Remove installed: "))
-			mm.launchRequest = &LaunchRequest{BackendArgs: []string{"remove", tag}}
+			mm.openChoice("Remove "+tag+"?", []string{"Cancel", "Confirm: remove " + tag}, "Cancel", ret, func(cm *Model, confirm string) {
+				if confirm == "Cancel" {
+					return
+				}
+				cm.launchRequest = &LaunchRequest{BackendArgs: []string{"remove", tag}}
+			})
 		}
 	})
+}
+
+// openRemoveModelChoice confirms before deleting the selected model's GGUF
+// file(s) from disk, reusing the same confirm-first choice screen as backend
+// fork removal (default cursor on Cancel).
+func (m *Model) openRemoveModelChoice(idx int) {
+	if idx < 0 || idx >= len(m.models) {
+		return
+	}
+	name := m.models[idx].Name
+	m.openChoice("Delete "+name+"?", []string{"Cancel", "Confirm: delete " + name}, "Cancel", ScreenMain, func(cm *Model, confirm string) {
+		if confirm == "Cancel" {
+			return
+		}
+		cm.removeModelAt(idx)
+	})
+}
+
+// removeModelAt deletes a model's GGUF file(s) from disk — the same removal
+// path as `ggrun models rm` — then refreshes the Main list. It matches by
+// file path rather than display name: two models in different directories
+// can share the same basename (see
+// TestDiscoverModelsKeepsSameBasenameInDifferentDirectories), so the display
+// name alone cannot be trusted to pick the right one.
+func (m *Model) removeModelAt(idx int) {
+	if idx < 0 || idx >= len(m.models) {
+		return
+	}
+	item := m.models[idx]
+	rel, err := filepath.Rel(m.modelDir, item.Path)
+	if err != nil {
+		m.message = fmt.Sprintf("Error removing %s: %v", item.Name, err)
+		m.messageType = "error"
+		return
+	}
+	rel = filepath.Clean(rel)
+	all, err := modelstore.List(m.modelDir)
+	if err != nil {
+		m.message = fmt.Sprintf("Error removing %s: %v", item.Name, err)
+		m.messageType = "error"
+		return
+	}
+	var name string
+matched:
+	for _, candidate := range all {
+		for _, f := range candidate.Files {
+			if f == rel {
+				name = candidate.Name
+				break matched
+			}
+		}
+	}
+	if name == "" {
+		m.message = fmt.Sprintf("Model not found on disk: %s", item.Name)
+		m.messageType = "error"
+		return
+	}
+	removed, err := modelstore.Remove(m.modelDir, name)
+	if err != nil {
+		m.message = fmt.Sprintf("Error removing %s: %v", item.Name, err)
+		m.messageType = "error"
+		return
+	}
+	m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
+	m.mainList = newMainList(m.models)
+	m.message = fmt.Sprintf("Removed %s (%.1fGB freed).", removed.Name, float64(removed.Bytes)/(1024*1024*1024))
+	m.messageType = "info"
 }
 
 func indexOf(opts []string, v string) int {
@@ -2017,6 +2128,8 @@ func (m Model) updateChoice(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.launchRequest != nil && len(m.launchRequest.BackendArgs) > 0 {
 				return m, tea.Quit
 			}
+		case "q", "Q":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
@@ -2089,6 +2202,8 @@ func (m Model) updateSettings(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cfg, err := config.Load(); err == nil {
 			m.settingsCfg = cfg
 		}
+	case "q", "Q":
+		return m, tea.Quit
 	}
 	return m, nil
 }
