@@ -178,7 +178,7 @@ say "  ✓ $ok_msg"
 
 say ""
 say "╔════════════════════════════════════════════════════════════╗"
-say "║ ggrun is installed and ready                         ║"
+say "║ ggrun is installed and ready                               ║"
 say "╚════════════════════════════════════════════════════════════╝"
 say "Backend:   ${backend_bin:-not installed}"
 say "CLI:       $APP_HOME/ggrun"

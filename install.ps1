@@ -27,13 +27,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'raketenkater/ggrun'
+
+if (-not $PSBoundParameters.ContainsKey('Backend') -and (Get-Command 'nvidia-smi' -ErrorAction SilentlyContinue)) {
+    try {
+        $gpuList = & nvidia-smi -L 2>$null
+        if ($LASTEXITCODE -eq 0 -and $gpuList) {
+            $Backend = 'cuda'
+            Write-Host "NVIDIA GPU detected - installing the CUDA backend. Pass -Backend cpu to force CPU-only." -ForegroundColor Cyan
+        }
+    } catch {}
+}
+
 $Asset = "ggrun-windows-x86_64-$Backend.zip"
 $CpuAsset = 'ggrun-windows-x86_64-cpu.zip'
 $ReleaseInfo = $null
 
 function Say($Message) { Write-Host $Message }
-function Ok($Message) { Write-Host "  OK $Message" -ForegroundColor Green }
-function Warn($Message) { Write-Host "  WARN $Message" -ForegroundColor Yellow }
+function Ok($Message) { Write-Host "  ✓ $Message" -ForegroundColor Green }
+function Warn($Message) { Write-Host "  ⚠ $Message" -ForegroundColor Yellow }
 function Fail($Message) { throw $Message }
 
 function Test-Command($Name) {
@@ -234,8 +245,8 @@ function Install-PrebuiltCudaBackend([string]$BinDir) {
     }
     $assets = $rel.assets
     # Prefer the cuda-12.4 build for broad driver compatibility, else any win-cuda x64.
-    $server = $assets | Where-Object { $_.name -match 'bin-win-cuda-12\.4-x64\.zip$' } | Select-Object -First 1
-    if (-not $server) { $server = $assets | Where-Object { $_.name -match 'bin-win-cuda-.*-x64\.zip$' } | Select-Object -First 1 }
+    $server = $assets | Where-Object { $_.name -match 'bin-win-cuda-12\.4-x64\.zip$' -and $_.name -notmatch '^cudart-' } | Select-Object -First 1
+    if (-not $server) { $server = $assets | Where-Object { $_.name -match 'bin-win-cuda-.*-x64\.zip$' -and $_.name -notmatch '^cudart-' } | Select-Object -First 1 }
     if (-not $server) { Warn 'No prebuilt win-cuda asset in the latest llama.cpp release.'; return $false }
     # Match the cudart redistributable to the server asset's CUDA version.
     $cudaVer = if ($server.name -match 'cuda-([0-9.]+)-x64') { $Matches[1] } else { '' }
@@ -542,6 +553,12 @@ if ($Backend -eq 'cuda') {
     Say 'CUDA mode:   native Windows NVIDIA via llama.cpp GGML_CUDA'
 }
 
+$logsDir = Join-Path $InstallDir '.logs'
+New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+$transcriptPath = Join-Path $logsDir ("setup-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+try { Start-Transcript -Path $transcriptPath -Append | Out-Null } catch { Warn "Could not start transcript: $($_.Exception.Message)" }
+Say "Log:         $transcriptPath"
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ggrun-install-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
@@ -632,12 +649,23 @@ try {
 
     Ok 'Installed native Windows ggrun'
     Ok 'CLI, hardware detection, and backend startup checks passed'
+    Say ''
+    Say '╔════════════════════════════════════════════════════════════╗'
+    Say '║ ggrun installer finished                                   ║'
+    Say '╚════════════════════════════════════════════════════════════╝'
     Say "CLI/GUI: $InstallDir\ggrun.cmd   (no arguments opens the GUI)"
     Say "Models:  $models"
     Say "Config:  $cfgPath"
+    Say ''
+    Say 'Next:'
+    Say "  $InstallDir\ggrun.cmd                 # interactive GUI"
+    Say "  $InstallDir\ggrun.cmd detect"
+    Say "  $InstallDir\ggrun.cmd <hf-repo> --download"
+    Say "  $InstallDir\ggrun.cmd $models\your-model.gguf"
 } catch {
     Report-InstallFailure $_
     throw
 } finally {
+    try { Stop-Transcript | Out-Null } catch { }
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 }

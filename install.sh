@@ -328,7 +328,7 @@ if (( ! NONINTERACTIVE )) && [[ "${LLM_INSTALL_PROMPT:-auto}" != "0" && "$BACKEN
             esac
         fi
         if [[ "$BACKEND_CHOICE" != "skip" && "$DEPS_MODE" == "auto" ]]; then
-            if ask "Install missing system build dependencies if needed? [Y/n]" y; then
+            if ask "Install missing system build dependencies (git, cmake, build-essential, etc.) via sudo? You may be asked for your password. [Y/n]" y; then
                 DEPS_MODE="install"
             else
                 DEPS_MODE="skip"
@@ -522,7 +522,7 @@ download_go_toolchain() {
     say "── Installing Go toolchain: go$need ($platform) ──"
     tmp="$(mktemp -d -t llm-server-go.XXXXXX)"
     archive="$tmp/go.tar.gz"
-    if ! curl -fL "$url" -o "$archive"; then
+    if ! curl -fsL --show-error "$url" -o "$archive"; then
         rm -rf "$tmp"
         warn "Go download failed: $url"
         return 1
@@ -614,13 +614,13 @@ install_release_bundle() {
     say "── Installing release bundle: $asset ──"
     tmp="$(mktemp -d -t ggrun-release.XXXXXX)"
     archive="$tmp/$asset"
-    if ! curl -fL "$url" -o "$archive"; then
+    if ! curl -fsL --show-error "$url" -o "$archive"; then
         rm -rf "$tmp"
         return 1
     fi
     sums_url="$(find_release_asset_url "SHA256SUMS" || true)"
     if [[ -n "$sums_url" ]]; then
-        if ! curl -fL "$sums_url" -o "$tmp/SHA256SUMS"; then
+        if ! curl -fsL --show-error "$sums_url" -o "$tmp/SHA256SUMS"; then
             rm -rf "$tmp"
             warn "Checksum download failed"
             return 1
@@ -900,7 +900,7 @@ else
         command -v cc >/dev/null 2>&1 || { err "a C compiler is required to build the CUDA allocation firewall"; exit 1; }
         make -C "$SRC_DIR/native/memguard" libggrun-memguard.so
         install -m 0644 "$SRC_DIR/native/memguard/libggrun-memguard.so" "$INSTALL_DIR/libggrun-memguard.so"
-        ok "Installed CUDA allocation firewall"
+        ok "Installed GPU memory-safety guard (prevents out-of-memory crashes)"
     fi
 fi
 
@@ -995,6 +995,7 @@ if [[ -n "$BACKEND_REPO" ]]; then
         err "Release mode selected but no compatible backend bundle was installed. Rerun with LLM_INSTALL_MODE=build."
         exit 1
     else
+        say "Building from source can take 10-30+ minutes depending on your CPU — the compiler output below is normal, not a hang."
         if build_backend; then
             ok "Built llama-server at $backend_binary"
             link_backend_binary "$backend_binary" || true
@@ -1058,7 +1059,7 @@ fi
 
 say ""
 say "╔════════════════════════════════════════════════════════════╗"
-say "║ ggrun installer finished                             ║"
+say "║ ggrun installer finished                                   ║"
 say "╚════════════════════════════════════════════════════════════╝"
 say "CLI:       $INSTALL_DIR/ggrun"
 say "GUI:       $INSTALL_DIR/ggrun   (no arguments opens the GUI)"
