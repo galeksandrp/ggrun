@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -276,6 +277,198 @@ func TestRebuildMainListPreservesWindowSize(t *testing.T) {
 	}
 	if got := m.mainList.Height(); got != wantH {
 		t.Fatalf("mainList.Height() = %d, want %d (fell back to the 40x20 placeholder?)", got, wantH)
+	}
+}
+
+// TestRebuildMainListClampsIndexAgainstFilteredNotRawCount guards against a
+// crash found by the second audit pass: rebuildMainList used to clamp the
+// restored cursor against the RAW (unfiltered) item count. If a filter was
+// active, scrolled deep, and the rebuild's filtered match count shrinks a lot
+// while the raw count stays large enough to dodge that clamp, list.Select()
+// lands the paginator past the real number of filtered pages and the next
+// View() panics with a slice-bounds-out-of-range, killing the whole TUI.
+func TestRebuildMainListClampsIndexAgainstFilteredNotRawCount(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("match-%02d-Q4_K_M.gguf", i)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	models := discoverModels(dir)
+	if len(models) != 20 {
+		t.Fatalf("setup: expected 20 models, got %d", len(models))
+	}
+
+	m := &Model{models: models, mainList: newMainList(models), width: 120, height: 40}
+	m.mainList.SetFilterText("match") // matches all 20
+	m.mainList.Select(15)             // deep into a filtered page
+
+	// New model set: raw count stays large (20, dodging a raw-count clamp),
+	// but only 2 of them still match "match" - the filtered count crashes
+	// down to 2 while the raw count doesn't.
+	newDir := t.TempDir()
+	for i := 0; i < 2; i++ {
+		name := fmt.Sprintf("match-%02d-Q4_K_M.gguf", i)
+		if err := os.WriteFile(filepath.Join(newDir, name), []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 18; i++ {
+		name := fmt.Sprintf("other-%02d-Q4_K_M.gguf", i)
+		if err := os.WriteFile(filepath.Join(newDir, name), []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.models = discoverModels(newDir)
+	if len(m.models) != 20 {
+		t.Fatalf("setup: expected 20 new models, got %d", len(m.models))
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("rebuildMainList + View panicked (index clamped against the wrong count): %v", r)
+		}
+	}()
+	m.rebuildMainList()
+	_ = m.mainList.View()
+
+	if got := len(m.mainList.VisibleItems()); got != 2 {
+		t.Fatalf("expected the reapplied filter to match 2 items, got %d", got)
+	}
+	if idx := m.mainList.Index(); idx >= 2 {
+		t.Fatalf("Index() = %d, want < 2 (clamped against the filtered count)", idx)
+	}
+}
+
+func TestEscCancelsInputModeWithoutLeavingScreen(t *testing.T) {
+	m := Model{screen: ScreenModelConfig, inputMode: "download"}
+	m.input = textinput.New()
+	m.input.Focus()
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = nm.(Model)
+
+	if m.inputMode != "" {
+		t.Fatalf("expected esc to clear inputMode, got %q", m.inputMode)
+	}
+	if m.screen != ScreenModelConfig {
+		t.Fatalf("expected esc to cancel the input in place, not navigate; got screen=%v", m.screen)
+	}
+	if m.input.Focused() {
+		t.Fatal("expected the stale text input to be blurred after esc")
+	}
+}
+
+// TestEscOnDownloadScreenReturnsToMainInOnePress guards against a regression
+// found by the second audit pass: ScreenDownload/ScreenBackend have no local
+// "esc" case of their own (unlike ModelConfig/Settings, which have a row menu
+// to fall back into on the same screen), so clearing inputMode alone left the
+// user stuck on a blurred, unresponsive "Input" screen until a second Esc.
+func TestEscOnDownloadScreenReturnsToMainInOnePress(t *testing.T) {
+	m := Model{screen: ScreenDownload, inputMode: "download"}
+	m.input = textinput.New()
+	m.input.Focus()
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = nm.(Model)
+
+	if m.inputMode != "" {
+		t.Fatalf("expected esc to clear inputMode, got %q", m.inputMode)
+	}
+	if m.screen != ScreenMain {
+		t.Fatalf("expected a single esc to leave ScreenDownload (no on-screen fallback menu), got screen=%v", m.screen)
+	}
+}
+
+func TestEscOnPrelaunchReturnsToModelConfigNotMain(t *testing.T) {
+	m := Model{screen: ScreenPrelaunch, models: []ModelItem{{Name: "test.gguf"}}}
+	m.input = textinput.New()
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = nm.(Model)
+
+	if m.screen != ScreenModelConfig {
+		t.Fatalf("expected esc on Prelaunch to go back to ModelConfig (its own case), got screen=%v", m.screen)
+	}
+}
+
+func TestEscOnRecommendedClearsHeadroomFocusWithoutLeaving(t *testing.T) {
+	m := Model{screen: ScreenRecommended, recHeadroomFocus: "vram", message: "Saved: VRAM reserve = 24G"}
+	m.input = textinput.New()
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = nm.(Model)
+
+	if m.recHeadroomFocus != "" {
+		t.Fatalf("expected esc to defocus the headroom control, got recHeadroomFocus=%q", m.recHeadroomFocus)
+	}
+	if m.screen != ScreenRecommended {
+		t.Fatalf("expected the first esc to stay on Recommended (defocus only), got screen=%v", m.screen)
+	}
+}
+
+func TestOpenTunedPickerRestoresIndexForActiveConfig(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "test-Q4_K_M.gguf"), []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+
+	// ListTunedConfigs (pkg/tune) globs cacheDir for tune_<modelName>_*.json,
+	// requires doc.Model == modelName and a positive best_config.gen_tps, and
+	// infers backend "llama" / non-vision from the absence of "_ik"/"_vulkan"/
+	// "_v_" in the filename — backendTag() defaults to "llama" too, so these
+	// two fixture files match what Model{backend: ""} will actually look up.
+	writeTunedConfig := func(suffix string, genTPS float64) string {
+		path := filepath.Join(cacheDir, fmt.Sprintf("tune_%s_%s.json", models[0].Name, suffix))
+		doc := fmt.Sprintf(`{"model":%q,"baseline_gen_tps":10,"best_config":{"gen_tps":%f,"flags":{}},"rounds":5,"tuned_at":"2026-07-01T00:00:00Z"}`, models[0].Name, genTPS)
+		if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	writeTunedConfig("variant-a", 20)
+	activePath := writeTunedConfig("variant-b", 30)
+
+	m := &Model{cacheDir: cacheDir, models: models, selectedModel: 0, tunePath: activePath}
+	m.openTunedPicker()
+
+	if m.screen != ScreenTunedPicker {
+		t.Fatalf("expected openTunedPicker to switch to ScreenTunedPicker, got %v", m.screen)
+	}
+	if m.tunedIndex < 0 || m.tunedIndex >= len(m.tunedConfigs) {
+		t.Fatalf("expected tunedIndex to point at the active config, got %d (len=%d)", m.tunedIndex, len(m.tunedConfigs))
+	}
+	if got := m.tunedConfigs[m.tunedIndex].Path; got != activePath {
+		t.Fatalf("expected the restored index to match the active tuned config; got %q, want %q", got, activePath)
+	}
+}
+
+// TestOpenTunedPickerFallsBackToAutoForStaleTunePath covers the case the
+// happy-path test above doesn't: m.tunePath pointing at a config that no
+// longer exists in the freshly-rebuilt list (e.g. its file was deleted out
+// from under it). openTunedPicker must fall back to -1 ("Auto"), not leave a
+// stale non-matching index in place.
+func TestOpenTunedPickerFallsBackToAutoForStaleTunePath(t *testing.T) {
+	dir := t.TempDir()
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "test-Q4_K_M.gguf"), []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	models := discoverModels(dir)
+
+	m := &Model{
+		cacheDir:      cacheDir,
+		models:        models,
+		selectedModel: 0,
+		tunePath:      filepath.Join(cacheDir, "tune_"+models[0].Name+"_deleted-config.json"),
+	}
+	m.openTunedPicker()
+
+	if m.tunedIndex != -1 {
+		t.Fatalf("expected tunedIndex to fall back to -1 (Auto) for a tunePath with no matching config, got %d", m.tunedIndex)
 	}
 }
 

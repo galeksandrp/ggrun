@@ -269,14 +269,23 @@ func newMainList(models []ModelItem) list.Model {
 }
 
 // rebuildMainList replaces m.mainList (e.g. after the model set changes) and
-// re-applies the real terminal size. newMainList's own list.New call only
-// carries a placeholder 40x20 size; without this, any mid-session rebuild
-// snaps the visible list back to that placeholder instead of the size the
-// last WindowSizeMsg reported, splitting the screen. Before the first
-// WindowSizeMsg arrives (m.width/m.height still zero, e.g. during initial
-// Model construction), this intentionally leaves the placeholder size in
-// place — the upcoming WindowSizeMsg sizes it correctly on its own.
+// re-applies the real terminal size plus the outgoing list's cursor position
+// and active search filter. newMainList's own list.New call always starts a
+// brand-new list.Model at index 0, unfiltered, with a placeholder 40x20 size;
+// without re-applying all three, any mid-session rebuild (a model delete, a
+// model-directory change, a tuned-count refresh after switching backends)
+// silently resets the user's scroll position and drops whatever they were
+// searching for, on top of the terminal-size regression this helper was
+// first written to fix. Before the first WindowSizeMsg arrives (m.width/
+// m.height still zero, e.g. during initial Model construction), this
+// intentionally leaves the placeholder size in place — the upcoming
+// WindowSizeMsg sizes it correctly on its own; there's no prior selection or
+// filter to restore at that point either.
 func (m *Model) rebuildMainList() {
+	prevIndex := m.mainList.Index()
+	prevFilterState := m.mainList.FilterState()
+	prevFilterValue := m.mainList.FilterValue()
+
 	m.mainList = newMainList(m.models)
 	if m.width > 0 {
 		m.mainList.SetWidth(m.width - 4)
@@ -284,6 +293,42 @@ func (m *Model) rebuildMainList() {
 	if m.height > 0 {
 		m.mainList.SetHeight(m.height - 12)
 	}
+
+	if prevFilterState != list.Unfiltered && prevFilterValue != "" {
+		m.mainList.SetFilterText(prevFilterValue)
+	}
+	// Clamp against VisibleItems(), not Items(): once a filter is applied,
+	// list.Select()/the paginator index into the FILTERED set, and clamping
+	// against the raw (unfiltered) count can leave prevIndex pointing past
+	// the last filtered page — the next View() then slices out of range and
+	// panics, killing the whole TUI session.
+	if itemCount := len(m.mainList.VisibleItems()); itemCount > 0 {
+		if prevIndex >= itemCount {
+			prevIndex = itemCount - 1
+		}
+		if prevIndex > 0 {
+			m.mainList.Select(prevIndex)
+		}
+	}
+}
+
+// openTunedPicker rebuilds the tuned-config list for the current model and
+// opens the picker with the cursor on whatever config is actually active
+// (m.tunePath), instead of always defaulting to "Auto". Without this,
+// reopening the picker just to look — then reflexively pressing Enter to
+// close it — silently reverted an already-chosen tuned config back to Auto.
+func (m *Model) openTunedPicker() {
+	m.tunedConfigs = tune.ListTunedConfigs(m.cacheDir, m.models[m.selectedModel].Name, m.backendTag(), false)
+	m.tunedIndex = -1
+	if m.tunePath != "" {
+		for i, c := range m.tunedConfigs {
+			if c.Path == m.tunePath {
+				m.tunedIndex = i
+				break
+			}
+		}
+	}
+	m.screen = ScreenTunedPicker
 }
 
 type mainItem struct {
@@ -344,11 +389,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.screen = m.choiceReturn
 				return m, nil
 			}
-			if m.inputMode == "setting" {
+			// Cancel any in-progress free-text edit. On ScreenModelConfig/
+			// ScreenSettings this stays put - there's a row menu on the same
+			// screen to fall back into. ScreenDownload/ScreenBackend are pure
+			// single-field prompts with no such fallback (updateInputScreen
+			// has no "esc" case of its own), so clearing the input there also
+			// has to leave the screen in the same keypress, or it dead-ends on
+			// a blurred, unresponsive input box until a second Esc/Enter.
+			if m.inputMode != "" {
 				m.inputMode = ""
+				m.input.Blur()
+				if m.screen == ScreenDownload || m.screen == ScreenBackend {
+					m.screen = ScreenMain
+					m.message = ""
+				}
 				return m, nil
 			}
-			if m.screen != ScreenMain {
+			// These screens own their own "esc" case (back a level, or defocus a
+			// control before leaving) - let the per-screen dispatch below run
+			// instead of jumping straight to Main and skipping it.
+			switch m.screen {
+			case ScreenPrelaunch, ScreenTunedPicker, ScreenRecommended:
+			case ScreenMain:
+			default:
 				m.screen = ScreenMain
 				m.message = ""
 				return m, nil
@@ -562,9 +625,7 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 	case "kv":
 		m.cycleCfgRow("kv", 1)
 	case "tuned":
-		m.tunedConfigs = tune.ListTunedConfigs(m.cacheDir, m.models[m.selectedModel].Name, m.backendTag(), false)
-		m.tunedIndex = -1
-		m.screen = ScreenTunedPicker
+		m.openTunedPicker()
 	case "rounds":
 		m.openCfgInput("aitune", strconv.Itoa(m.aituneRounds), "AI tune rounds (1-30, default 8)")
 	case "aitune":
@@ -686,9 +747,7 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.message = fmt.Sprintf("Dry run: %s", strings.Join(m.buildArgs(), " "))
 		m.messageType = "info"
 	case "t", "T":
-		m.tunedConfigs = tune.ListTunedConfigs(m.cacheDir, m.models[m.selectedModel].Name, m.backendTag(), false)
-		m.tunedIndex = -1
-		m.screen = ScreenTunedPicker
+		m.openTunedPicker()
 	case "q", "Q":
 		return m, tea.Quit
 	}
