@@ -620,7 +620,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			case "--kv", "-kv", "--kv-placement":
 				req.KVPlacement = val
 				continue
-			case "--kv-quality":
+			case "--kv-quality", "-kv-quality":
 				req.KVQuality = val
 				continue
 			case "--cache-type-k", "-ctk":
@@ -629,7 +629,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			case "--cache-type-v", "-ctv":
 				req.KVTypeV = val
 				continue
-			case "--gpus":
+			case "--gpus", "-gpus":
 				req.GPUsFlag = val
 				continue
 			case "--host":
@@ -4613,7 +4613,7 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 	// flags the backend rejects (e.g. `--split-mode row`, unsupported by ik).
 	be := selectBackend(caps, &launchRequest{ServerBin: cfg.LlamaServer, Backend: cfg.Backend})
 	if be == nil {
-		return nil, fmt.Errorf("no llama-server binary found")
+		return nil, fmt.Errorf("no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
 	}
 	opts := placement.Options{
 		ContextSize:     resolveCtxFlag(cfg.CtxValue(), model.CTXTrain),

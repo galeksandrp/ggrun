@@ -884,6 +884,32 @@ func TestParseLaunchArgsEqualsForms(t *testing.T) {
 	}
 }
 
+func TestParseLaunchArgsSingleDashEqualsFormsAreNotOpaquePassthrough(t *testing.T) {
+	isolateConfig(t)
+	// -gpus and -kv-quality had a bare double-dash case in the "=value" switch
+	// (--gpus=/--kv-quality=) but no single-dash alias, unlike every other
+	// value-taking flag with one (-ctx=, -kv=, -t=, -cram=, ...). The
+	// single-dash "=value" form matched neither switch and fell through to
+	// ExtraArgs verbatim instead of setting GPUsFlag/KVQuality.
+	req, err := parseLaunchArgs([]string{
+		"-gpus=0,1", "-kv-quality=q5_1", "model.gguf",
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if req.GPUsFlag != "0,1" {
+		t.Fatalf("-gpus=0,1 was not parsed into GPUsFlag: %#v", req)
+	}
+	if req.KVQuality != "q5_1" {
+		t.Fatalf("-kv-quality=q5_1 was not parsed into KVQuality: %#v", req)
+	}
+	for _, extra := range req.ExtraArgs {
+		if strings.HasPrefix(extra, "-gpus=") || strings.HasPrefix(extra, "-kv-quality=") {
+			t.Fatalf("single-dash equals-form flag leaked into ExtraArgs instead of being parsed: %v", req.ExtraArgs)
+		}
+	}
+}
+
 func TestExplicitBatchFlagsFeedPlacementInsteadOfExtraArgs(t *testing.T) {
 	isolateConfig(t)
 	req, err := parseLaunchArgs([]string{
