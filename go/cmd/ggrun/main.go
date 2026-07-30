@@ -138,21 +138,13 @@ With no command, launches the interactive TUI (same as ggrun gui).
 Commands:
   version              Show version
   detect               Detect hardware capabilities
-  probe                Check free GPU/RAM memory
-  memory-probe <model> Measure a contained backend memory plan and stop (--json supported)
-  probe-reset <model>  Clear learned runtime-VRAM reserve for a launch shape so it
-                       is re-derived; measured compute/KV probes are kept
-  kv-probe <model>     Measure real KV cache size (2 short launches) and cache it,
-                       so context sizing is exact for compressed-attention models
-  record-longctx-validation <model> --prompt-tokens N
-                       Record a passed long-context validation for placement promotion
   launch <model.gguf>  Launch model with auto-placement
   benchmark <model>    Benchmark a running server
   daemon               Start persistent daemon
   dry-run <model.gguf> Print computed flags without launching
+                       (--emit-server-argv-json supported)
   download <repo/name> Download from HuggingFace
   tune <model.gguf>    AI-tune model for best performance
-  spec-test <model>    Verify MTP ceilings 1-4 against a target-only baseline
   recommend [-n N]     Rank models that fit this machine (intelligence x speed)
   models [list|browse|path|rm] List, browse, locate, or safely remove GGUF models
   config [show|edit|path|reset]  Manage settings
@@ -163,17 +155,36 @@ Commands:
                        backend shape and resume one (default: newest in this directory)
   gui, tui             Interactive TUI (model picker, settings, launch)
 
+Diagnostics (advanced):
+  probe                Check free GPU/RAM memory (useful when a launch's capacity numbers look wrong)
+  memory-probe <model> Preview the computed backend memory plan without launching (--json supported)
+  probe-reset <model>  Clear a learned VRAM reserve that's making launches overly conservative
+                       (e.g. after an unrelated OOM); measured compute/KV probes are kept
+  kv-probe <model>     Measure exact KV cache size for compressed-attention models; only needed
+                       if launches undersize context
+  record-longctx-validation <model> --prompt-tokens N
+                       Confirm a manually verified long-context launch, so future auto-placement
+                       trusts that context size
+  spec-test <model>    Verify speculative-decoding (MTP) ceilings 1-4 against a target-only
+                       baseline; only relevant with --spec mtp
+
+Examples:
+  ggrun model.gguf
+  ggrun model.gguf --claude-code
+  ggrun recommend
+  ggrun model.gguf --dry-run
+
 Launch flags:
   -port int            Server port (default 8081)
   -ctx string          Context size: fit|max|token count (default fit)
   -kv string           KV placement: auto|gpu|cpu (default auto)
-  -kv-quality string   KV quality: auto|high|mid|low or an exact llama.cpp type such as q5_1 (default auto)
-  -cpu                 Force CPU-only mode
-  -gpus string         Comma-separated GPU indices
+  --kv-quality, -kv-quality string  KV quality: auto|high|mid|low or an exact llama.cpp type such as q5_1 (default auto)
+  --cpu, -cpu          Force CPU-only mode
+  --gpus, -gpus string  Comma-separated GPU indices
   --backend string     auto|llama|ik_llama|registered backend tag
   --parallel int       Concurrent sequence slots
   --threads int, -t    CPU threads (default: physical cores)
-  --cache-ram int      Host prompt-cache budget in MiB (-cram); 0 derives it
+  --cache-ram, -cram int  Host prompt-cache budget in MiB; 0 derives it
   --claude-max-active int  Main-model requests admitted at once in --claude-code mode;
                        0 removes the limit, and it is capped at --parallel
   --mmap               Explicitly approve file-backed mmap when placement needs it
@@ -182,7 +193,7 @@ Launch flags:
   --vram-headroom str  Reserve VRAM the recommender/placement won't use, e.g. 2G
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
   --allow-live-memory-probe  Approve a contained full-load probe when no complete dry-run is available
-  -vision              Enable vision (auto-detect mmproj)
+  --vision, -vision    Enable vision (auto-detect mmproj)
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
   --claude-resume str  Reopen a recorded Claude Code session (id or "latest") and resume
@@ -801,7 +812,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.KVPlacement = v
-		case "--kv-quality":
+		case "--kv-quality", "-kv-quality":
 			v, err := next()
 			if err != nil {
 				return nil, err
@@ -819,9 +830,9 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.KVTypeV = v
-		case "--cpu":
+		case "--cpu", "-cpu":
 			req.CPUMode = true
-		case "--gpus":
+		case "--gpus", "-gpus":
 			v, err := next()
 			if err != nil {
 				return nil, err
@@ -833,7 +844,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.Host = v
-		case "--vision":
+		case "--vision", "-vision":
 			req.VisionAuto = true
 		case "--claude-code":
 			req.ClaudeCode = true
@@ -2651,7 +2662,7 @@ func cmdLaunch(args []string) {
 
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found")
+		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
 		os.Exit(1)
 	}
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
@@ -3527,7 +3538,7 @@ func cmdDryRun(args []string) {
 
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found")
+		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
 		os.Exit(1)
 	}
 
@@ -3616,7 +3627,7 @@ func cmdRecordLongContextValidation(args []string) {
 	}
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found")
+		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
 		os.Exit(1)
 	}
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
@@ -4448,7 +4459,7 @@ func cmdTune(args []string) {
 
 	be := selectBackend(caps, req)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found")
+		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
 		os.Exit(1)
 	}
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
@@ -4730,6 +4741,8 @@ func cmdConfig(args []string) {
 		sub = args[0]
 	}
 	switch sub {
+	case "help", "--help", "-h":
+		fmt.Fprintln(os.Stderr, "Usage: ggrun config [show|edit|path|reset]")
 	case "show", "":
 		cfg, err := config.Load()
 		if err != nil {

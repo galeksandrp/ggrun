@@ -430,7 +430,7 @@ func runGuardedAllocationPreflight(req *launchRequest, be *backendInfo, cfg *con
 	}
 	evidence := memoryPlanEvidence{Level: level, Backend: be.Identity, Devices: devices, Host: summary.Host, Coverage: coverage}
 	if len(evidence.Devices) == 0 {
-		return memoryPlanEvidence{}, fmt.Errorf("contained backend probe reached health but produced neither allocator events nor parseable memory buffers")
+		return memoryPlanEvidence{}, fmt.Errorf("contained backend probe reached health but produced neither allocator events nor parseable memory buffers; this is unexpected — try again, or check that the selected backend and its memory guard library installed correctly")
 	}
 	if coverageComplete {
 		planDevices, host := guardedPlanDevices(devices, summary)
@@ -579,7 +579,7 @@ func runFitPreflight(fitBin string, serverArgs []string) ([]preflightDevice, err
 	case <-time.After(2 * time.Minute):
 		_ = cmd.Process.Kill()
 		<-done
-		return nil, fmt.Errorf("fit-params preflight timed out")
+		return nil, fmt.Errorf("fit-params preflight timed out; falling back automatically for this launch")
 	}
 	if err != nil {
 		detail := ""
@@ -747,7 +747,7 @@ func embeddedMTPPreflightReservation(model *placement.ModelProfile, strategy *pl
 		return nil, nil
 	}
 	if !strings.EqualFold(strategy.KVPlacement, "gpu") {
-		return nil, fmt.Errorf("embedded MTP Auto requires verified GPU KV placement")
+		return nil, fmt.Errorf("embedded MTP Auto requires verified GPU KV placement; rerun with --spec off to skip this check")
 	}
 	kvType := strategy.Draft.KVTypeDraft
 	if kvType == "" {
@@ -755,7 +755,7 @@ func embeddedMTPPreflightReservation(model *placement.ModelProfile, strategy *pl
 	}
 	contextMB := placement.EmbeddedMTPContextMB(model, strategy.ContextSize, kvType)
 	if contextMB <= 0 {
-		return nil, fmt.Errorf("embedded MTP context cannot be derived from GGUF metadata")
+		return nil, fmt.Errorf("embedded MTP context cannot be derived from GGUF metadata; rerun with --spec off to skip this check")
 	}
 	const computeFloorMB = 1024
 	rows := make([]preflightDevice, 0, len(target))
@@ -770,7 +770,7 @@ func embeddedMTPPreflightReservation(model *placement.ModelProfile, strategy *pl
 		rows = append(rows, preflightDevice{Name: d.Name, ContextMB: contextMB, ComputeMB: computeMB})
 	}
 	if len(rows) == 0 {
-		return nil, fmt.Errorf("embedded MTP has no measured CUDA device rows")
+		return nil, fmt.Errorf("embedded MTP has no measured CUDA device rows; rerun with --spec off to skip this check")
 	}
 	return rows, nil
 }

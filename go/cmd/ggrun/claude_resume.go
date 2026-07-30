@@ -290,6 +290,9 @@ func cmdClaude(args []string) {
 		args = args[1:]
 	}
 	switch sub {
+	case "help", "--help", "-h":
+		fmt.Fprintln(os.Stderr, "Usage: ggrun claude [list | resume [session-id|latest] [--force] [flag overrides...]]")
+		fmt.Fprintln(os.Stderr, "  e.g. ggrun claude resume latest --spec dflash")
 	case "list", "ls", "sessions":
 		cmdClaudeList()
 	case "resume", "continue":

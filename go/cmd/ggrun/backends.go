@@ -64,6 +64,8 @@ func cmdBackend(args []string) {
 		return
 	}
 	switch args[0] {
+	case "help", "--help", "-h":
+		backendUsage()
 	case "list", "ls":
 		cmdBackendList()
 	case "recipes":
