@@ -123,9 +123,9 @@
   32k context, v3 default placement beat upstream auto-fit on every model;
   driving the same master binary the win held, so it is placement, not just
   backend choice. See `docs/launch-performance.md`.
-- **Repositioned README and repo metadata** for discoverability: pain-first
-  intro, honest comparison vs raw llama.cpp `--fit` / Ollama / llama-swap,
-  benchmark methodology statement, release-asset install path.
+- **Rewrote the README intro and repo metadata.** Added a benchmark table
+  against raw llama.cpp `--fit` and Ollama, a methodology note for it, and
+  the release-asset install path.
 
 ## v3.0.0 — 2026-06-11
 

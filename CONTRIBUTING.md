@@ -22,16 +22,26 @@ detect output, model/quant, backend, context, parallelism, and the relevant
 --dry-run output. Never attach model files, credentials, private paths, or
 prompt contents.
 
-Not sure about something? Open a [GitHub issue](https://github.com/raketenkater/ggrun/issues)
-and ask.
+Not sure about something? Ask in [Discussions](https://github.com/raketenkater/ggrun/discussions);
+open an [issue](https://github.com/raketenkater/ggrun/issues) once it's an actual bug or a
+concrete proposal.
 
-Before opening a pull request:
+Before opening a pull request, run what CI actually gates merges on — all of it, not just the
+Go tests:
 
 ```bash
-cd go && go test ./...
+cd go && go build ./... && go vet ./... && test -z "$(gofmt -l .)" && go test -race ./...
+GOOS=windows GOARCH=amd64 go vet ./...
+shellcheck --severity=error $(git ls-files '*.sh')
 bash -n install.sh scripts/*.sh setup.sh setup-linux.sh setup-mac.sh
 python3 tests/test_parse_gguf.py
+for f in tests/test_estimator.sh tests/test_safety.sh tests/test_setup_home.sh tests/test_model_index.sh tests/test_moe_placement.sh; do bash "$f"; done
+python3 -m pytest tests/test_downloader_quant.py tests/test_update_recommendations.py
 ```
+
+The install/release-packaging and cross-platform build jobs in `ci.yml` stay CI-only — not
+practical to reproduce locally — but the suites above are exactly the ones that fail silently
+if you only ran `go test ./...`.
 
 For performance changes, include the benchmark command, hardware, model, backend,
 context size, and generated artifact path. Do not commit generated benchmark run
@@ -43,3 +53,10 @@ Use a `scope: lowercase summary` subject (e.g. `tune: protect KV-cache flags fro
 AI-tune`), with an optional body explaining the why. Keep messages human and
 specific — no `Update X` placeholders, and no AI co-author or attribution
 trailers in the public history.
+
+## AI-assisted contributions
+
+AI-assisted contributions are welcome — the code and the reasoning behind it are what get
+reviewed, not how they were produced. Same rule as commit messages, extended to the PR
+description: no AI-attribution trailers or disclaimers, just the change and why. Read your
+own diff before opening the PR; you're accountable for it either way.

@@ -83,6 +83,19 @@ Context is shared between slots: `1M` total context with `--parallel 4` is about
 `256k` per request. ggrun lowers the default parallelism when that split would
 make the individual slots too small, and explicit values always win.
 
+Agent loops resend a mostly-repeated prompt every turn — system prompt, tool
+schemas, prior turns — so reprocessing all of it each time is the expensive
+part, not generation. On backends that can shift a transformer context, Claude
+mode turns on `--cache-reuse 256`, which reuses prompt chunks that moved after
+a compaction or context shift, not just an exact prefix match: a compacted
+4,506-token prefill went from 45.1 seconds to one processed token in 0.15
+seconds in a production test. Hybrid/recurrent and multimodal models that
+can't shift context that way (native DeepSeek V4, Laguna) get a rolling
+context checkpoint per slot instead, kept when there's enough host RAM
+headroom to hold it. Either path, a turn after the first one costs a fraction
+of what it would cold. Mechanics and the opt-out flags are in
+[docs/usage.md](docs/usage.md#prompt-caching-and-hybrid-models).
+
 Claude Code itself still needs to be installed separately. ggrun replaces its
 model endpoint and wires the local workflow; it does not make a model with weak
 tool use behave like a strong coding model. The complete setup and overrides are
@@ -165,7 +178,8 @@ ggrun does not own are forwarded unchanged.
 [Model recommendations](docs/model-recommendations.md) ·
 [Docker](docker/README.md) ·
 [Release verification](docs/releases.md) ·
-[Changelog](CHANGELOG.md)
+[Changelog](CHANGELOG.md) ·
+[Contributing](CONTRIBUTING.md)
 
 ## License
 
