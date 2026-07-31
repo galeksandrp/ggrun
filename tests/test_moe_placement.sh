@@ -24,13 +24,37 @@ exit 0
 EOF
 chmod +x "$TMP/llama-server"
 
+# KV-Heavy-MoE is a minimax-m2, and ggrun refuses that architecture on mainline
+# llama.cpp. detectBackend classifies a binary from its --help text, so the
+# KV-placement cases need a stub that advertises an ik_llama marker; the stub
+# above deliberately does not, because the Kimi cases must stay on mainline.
+cat >"$TMP/ik-llama-server" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    --help|-h) echo "fake ik llama-server --reasoning --n-cpu-moe --kv-unified --split-mode-graph"; exit 0 ;;
+    --version) echo "fake-ik 0.0.0"; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/ik-llama-server"
+
+# The field list must track detect.go's query exactly. It is matched as a
+# literal substring, so when memory.free was added to the query this stub
+# stopped matching, fell through to the catch-all, and reported no GPUs at all.
+# Detect() then fell back to Vulkan -- which finds the real cards on a developer
+# box and nothing on a CI runner, so the suite passed locally and failed in CI
+# with a CPU-only "does not fit in RAM" for a 512G model. Columns are
+# index, bus, name, total, used, free, driver, compute_cap.
 cat >"$TMP/bin/nvidia-smi" <<'EOF'
 #!/usr/bin/env bash
 case "$*" in
-    *"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,driver_version,compute_cap"*)
-        echo "0, 00000000:01:00.0, RTX 4090, 24576, 0, 580.0, 8.9"
-        echo "1, 00000000:02:00.0, RTX 4090, 24576, 0, 580.0, 8.9"
-        echo "2, 00000000:03:00.0, RTX 4090, 24576, 0, 580.0, 8.9"
+    *"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,memory.free,driver_version,compute_cap"*)
+        # Prove the stub was actually consumed, so a future query change fails
+        # here instead of quietly degrading the suite to a CPU-only run.
+        touch "$(dirname "$0")/../gpu-query-matched"
+        echo "0, 00000000:01:00.0, RTX 4090, 24576, 0, 24576, 580.0, 8.9"
+        echo "1, 00000000:02:00.0, RTX 4090, 24576, 0, 24576, 580.0, 8.9"
+        echo "2, 00000000:03:00.0, RTX 4090, 24576, 0, 24576, 580.0, 8.9"
         exit 0
         ;;
     *"--query-gpu=pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max"*)
@@ -65,6 +89,16 @@ if ! out=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/llama-server" \
     "$TMP/models/Kimi-K2.6-IQ3_K.gguf" 2>&1); then
     echo "Kimi-style MoE dry-run failed"
     echo "$out"
+    exit 1
+fi
+
+# These are placement tests for a three-GPU machine. If the stub was not
+# consumed, Detect() falls back to Vulkan and the whole suite silently becomes a
+# CPU-only run: it still passes on a developer box with real cards and fails in
+# CI for reasons that have nothing to do with placement.
+if [[ ! -f "$TMP/gpu-query-matched" ]]; then
+    echo "nvidia-smi stub was never matched: detect.go's --query-gpu field list has changed"
+    echo "update the stub in this file to match it exactly, including column order"
     exit 1
 fi
 
@@ -112,11 +146,11 @@ python3 "$ROOT/tests/build_synthetic_gguf.py" \
     --tensor 'blk.0.ffn_down_exps.weight:40000000000:138'
 truncate -s 64G "$TMP/models/KV-Heavy-MoE.gguf"
 
-if ! out=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/llama-server" \
+if ! out=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/ik-llama-server" \
     LLM_CONFIG="$TMP/empty.conf" \
     LLM_ASSUME_YES=1 LLM_SERVER_UPDATE_CHECKED=1 \
     LLM_CACHE_DIR="$TMP/cache-kv-gpu" LLM_MODEL_DIR="$TMP/models" \
-    "$GO_BIN" --dry-run --server-bin "$TMP/llama-server" \
+    "$GO_BIN" --dry-run --server-bin "$TMP/ik-llama-server" \
     --ctx-size 196608 --kv-quality mid "$TMP/models/KV-Heavy-MoE.gguf" 2>&1); then
     echo "KV-heavy MoE dry-run failed"
     echo "$out"
@@ -159,11 +193,11 @@ if [[ "$out_dsv4" == *"--no-kv-offload"* ]]; then
     exit 1
 fi
 
-if ! out_cpu=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/llama-server" \
+if ! out_cpu=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/ik-llama-server" \
     LLM_CONFIG="$TMP/empty.conf" \
     LLM_ASSUME_YES=1 LLM_SERVER_UPDATE_CHECKED=1 \
     LLM_CACHE_DIR="$TMP/cache-kv-cpu" LLM_MODEL_DIR="$TMP/models" \
-    "$GO_BIN" --dry-run --server-bin "$TMP/llama-server" \
+    "$GO_BIN" --dry-run --server-bin "$TMP/ik-llama-server" \
     --ram-budget 128000 --ctx-size 196608 --kv-quality mid --kv-placement cpu \
     "$TMP/models/KV-Heavy-MoE.gguf" 2>&1); then
     echo "KV-heavy MoE CPU-KV dry-run failed"
@@ -184,10 +218,10 @@ if [[ "$out_cpu" == *"GPU KV reserve first"* ]]; then
 fi
 
 printf 'LLM_KV_PLACEMENT="cpu"\n' > "$TMP/kv-placement.conf"
-if ! out_settings=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/llama-server" \
+if ! out_settings=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/ik-llama-server" \
     LLM_CONFIG="$TMP/kv-placement.conf" LLM_ASSUME_YES=1 LLM_SERVER_UPDATE_CHECKED=1 \
     LLM_CACHE_DIR="$TMP/cache-kv-settings" LLM_MODEL_DIR="$TMP/models" \
-    "$GO_BIN" --dry-run --server-bin "$TMP/llama-server" \
+    "$GO_BIN" --dry-run --server-bin "$TMP/ik-llama-server" \
     --ram-budget 128000 --ctx-size 196608 --kv-quality mid "$TMP/models/KV-Heavy-MoE.gguf" 2>&1); then
     echo "KV-heavy MoE settings dry-run failed"
     echo "$out_settings"
