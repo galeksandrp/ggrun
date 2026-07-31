@@ -276,8 +276,16 @@ func claudeReviewerArgs(binary, modelPath string, port int, device, help string)
 		"--alias", "local", "--jinja",
 		"--temp", "0", "--presence-penalty", "0", "--repeat-penalty", "1",
 	}
-	if strings.Contains(help, "--reasoning") {
+	// Exact-flag matching, not substring: mainline's --reasoning-format and
+	// --reasoning-budget both contain "--reasoning" but reject `--reasoning off`,
+	// and an unknown flag kills the server at startup. --reasoning-budget 0 is
+	// mainline's way of disabling thinking, so a recent fork still gets a
+	// non-thinking classifier rather than a dead one.
+	switch {
+	case helpHasExactFlag(help, "--reasoning"):
 		args = append(args, "--reasoning", "off")
+	case helpHasExactFlag(help, "--reasoning-budget"):
+		args = append(args, "--reasoning-budget", "0")
 	}
 	// The classifier carries a large policy prompt, so its KV cache is a
 	// meaningful part of the reviewer footprint. Q8 halves that cache versus
@@ -292,6 +300,18 @@ func claudeReviewerArgs(binary, modelPath string, port int, device, help string)
 		args = append(args, "-ngl", "0")
 	}
 	return args
+}
+
+// helpHasExactFlag reports whether a backend's --help advertises exactly this
+// flag, so "--reasoning" cannot be satisfied by "--reasoning-format".
+func helpHasExactFlag(help, flag string) bool {
+	for _, field := range strings.Fields(help) {
+		trimmed := strings.Trim(field, " ,;[]()")
+		if trimmed == flag || strings.HasPrefix(field, flag+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func claudeReviewerGPUDevice(binary string, env []string) (string, error) {
@@ -336,6 +356,14 @@ func claudeReviewerBackendEnv(binary string, env []string) []string {
 func findClaudeReviewerBackend(caps *detect.Capabilities) *backendInfo {
 	seen := map[string]bool{}
 	var candidates []string
+	// GGRUN_CLAUDE_REVIEWER_BIN pairs with GGRUN_CLAUDE_REVIEWER_MODEL: a
+	// reviewer model whose architecture only a fork understands (Nanbeige's
+	// looped transformer, say) is unusable without also naming the binary that
+	// can load it, and the resolution below deliberately prefers ggrun's own
+	// mainline bundle over any fork.
+	if bin := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")); bin != "" {
+		candidates = append(candidates, bin)
+	}
 	// Prefer ggrun's maintained mainline binary over an arbitrary LLAMA_SERVER
 	// or architecture fork selected for the main model.
 	appHome := backends.AppHome()
@@ -361,7 +389,7 @@ func findClaudeReviewerBackend(caps *detect.Capabilities) *backendInfo {
 			continue
 		}
 		be := detectBackend(path)
-		if !be.IsIK && strings.Contains(be.Help, "--reasoning") {
+		if !be.IsIK && (helpHasExactFlag(be.Help, "--reasoning") || helpHasExactFlag(be.Help, "--reasoning-budget")) {
 			if fallback == nil {
 				fallback = be
 			}

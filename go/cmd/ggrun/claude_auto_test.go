@@ -348,3 +348,35 @@ func TestExplicitMaxActiveOverridesExplicitParallel(t *testing.T) {
 		t.Fatalf("max active=%d, want the explicit 1", got)
 	}
 }
+
+// "--reasoning" must not be satisfied by "--reasoning-format": mainline rejects
+// `--reasoning off` and an unknown flag kills the reviewer at startup. Recent
+// mainline disables thinking with --reasoning-budget 0 instead.
+func TestClaudeReviewerArgsMatchReasoningFlagsExactly(t *testing.T) {
+	legacy := strings.Join(claudeReviewerArgs("bin", "m.gguf", 1, "", "--reasoning FMT --cache-type-k T"), " ")
+	if !strings.Contains(legacy, "--reasoning off") {
+		t.Errorf("binary with exact --reasoning must get `--reasoning off`: %s", legacy)
+	}
+	mainline := strings.Join(claudeReviewerArgs("bin", "m.gguf", 1, "", "--reasoning-format FMT --reasoning-budget N"), " ")
+	if strings.Contains(mainline, "--reasoning off") {
+		t.Errorf("substring match sent a fatal flag to a mainline binary: %s", mainline)
+	}
+	if !strings.Contains(mainline, "--reasoning-budget 0") {
+		t.Errorf("mainline binary must disable thinking via --reasoning-budget 0: %s", mainline)
+	}
+}
+
+// A reviewer model only a fork can load needs the binary named alongside it.
+func TestReviewerBinaryOverrideWinsResolution(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "fork-server")
+	script := "#!/bin/sh\ncase \"$1\" in\n--help) echo '--reasoning-budget N --cache-type-k T' ;;\n--list-devices) echo 'CUDA0: stub' ;;\nesac\nexit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GGRUN_CLAUDE_REVIEWER_BIN", stub)
+	be := findClaudeReviewerBackend(&detect.Capabilities{})
+	if be == nil || be.Path != stub {
+		t.Fatalf("GGRUN_CLAUDE_REVIEWER_BIN was not honoured: %+v", be)
+	}
+}
