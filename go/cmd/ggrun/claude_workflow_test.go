@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -132,5 +133,50 @@ func TestClaudeWorkflowPatchedScriptPathIsIdempotent(t *testing.T) {
 	other := claudeWorkflowPatchedScriptPath("/w/scripts/ggrun-bench.js")
 	if other != "/w/scripts/ggrun-bench.ggrun.js" {
 		t.Errorf("unpatched name = %q", other)
+	}
+}
+
+// A named workflow has no materialized script until it has already run once, so
+// denying an unpatchable call made built-in workflows impossible to start and
+// broke resume-by-name after a restart. The timeout policy is an optimisation;
+// losing it must not cost the run.
+func TestClaudeWorkflowHookAllowsAnUnpatchableNamedWorkflow(t *testing.T) {
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIn, oldOut, oldErr := os.Stdin, os.Stdout, os.Stderr
+	os.Stdin, os.Stdout, os.Stderr = inR, outW, errW
+	defer func() { os.Stdin, os.Stdout, os.Stderr = oldIn, oldOut, oldErr }()
+
+	go func() {
+		_, _ = inW.WriteString(`{"tool_name":"Workflow","tool_input":{"name":"deep-research"},"transcript_path":""}`)
+		_ = inW.Close()
+	}()
+	cmdClaudeWorkflowHook(nil)
+	_ = outW.Close()
+	_ = errW.Close()
+
+	var out, stderr bytes.Buffer
+	_, _ = out.ReadFrom(outR)
+	_, _ = stderr.ReadFrom(errR)
+	os.Stdin, os.Stdout, os.Stderr = oldIn, oldOut, oldErr
+
+	if strings.Contains(out.String(), "deny") {
+		t.Fatalf("hook denied a legitimate named workflow: %s", out.String())
+	}
+	if strings.TrimSpace(out.String()) != "{}" {
+		t.Fatalf("hook must leave permission handling alone, got %q", out.String())
+	}
+	if !strings.Contains(stderr.String(), "stall-timeout policy not applied") {
+		t.Fatalf("dropping the policy must be reported, got %q", stderr.String())
 	}
 }

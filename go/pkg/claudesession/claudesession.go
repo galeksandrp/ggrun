@@ -13,6 +13,7 @@
 package claudesession
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -235,10 +236,40 @@ func (m Mismatch) String() string {
 // Growing the slot is fine, and everything else -- placement, KV type, batch
 // sizes, rope settings -- is deliberately not checked. Those change how the
 // model runs, not whether recorded data can be replayed.
+//
+// The shrink alone is not the question, though: what matters is whether the
+// conversation being resumed still fits, and that is measurable rather than
+// inferable from flags. Going from --parallel 1 to 2 at the same --ctx-size
+// halves the slot and refused a session whose current context was 82,846
+// tokens against a new slot of 131,072 -- a 37% margin. Its historical peak had
+// touched 131,402, but that was seven turns out of 332 and days before the
+// compaction that shrank it. So consult the transcript when one is available
+// and compare against what the next turn will actually send; fall back to the
+// flag comparison only when there is nothing to measure.
 func (r Record) ShapeMismatches(serverArgs []string) []Mismatch {
+	return r.shapeMismatches(serverArgs, CurrentContextTokens)
+}
+
+// shapeMismatches takes the measurement function so the decision can be tested
+// without a transcript on disk.
+func (r Record) shapeMismatches(serverArgs []string, currentTokens func(projectsDir, workDir, sessionID string) (int, bool)) []Mismatch {
 	was, now := perSlotContext(r.ServerArgs), perSlotContext(serverArgs)
 	if was <= 0 || now <= 0 || now >= was {
 		return nil
+	}
+	if currentTokens != nil {
+		if tokens, ok := currentTokens(defaultProjectsDir(), r.WorkDir, r.SessionID); ok {
+			// Leave the same headroom the client does before it compacts, so a
+			// resume that fits today does not overflow on the very next reply.
+			if tokens > 0 && tokens <= now*3/4 {
+				return nil
+			}
+			return []Mismatch{{
+				Key:      "context per slot",
+				Recorded: strconv.Itoa(was) + " (conversation is " + strconv.Itoa(tokens) + " tokens)",
+				Proposed: strconv.Itoa(now),
+			}}
+		}
 	}
 	return []Mismatch{{
 		Key:      "context per slot",
@@ -338,4 +369,65 @@ func ProjectKey(workDir string) string {
 	key = strings.ReplaceAll(key, "/", "-")
 	key = strings.ReplaceAll(key, ".", "-")
 	return key
+}
+
+// defaultProjectsDir locates Claude Code's transcript root the same way the
+// client does. An empty result simply means "nothing to measure".
+func defaultProjectsDir() string {
+	if dir := os.Getenv("CLAUDE_CONFIG_DIR"); dir != "" {
+		return filepath.Join(dir, "projects")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".claude", "projects")
+}
+
+// CurrentContextTokens reports how large the session's conversation currently
+// is, which is what a resume will actually send. It reads the last assistant
+// turn's usage out of the transcript rather than the largest ever seen: a
+// compaction earlier in the session means the peak says nothing about what has
+// to fit now.
+//
+// Returns ok=false when there is no readable transcript, so the caller can fall
+// back to comparing flags instead of assuming a session is small.
+func CurrentContextTokens(projectsDir, workDir, sessionID string) (int, bool) {
+	if projectsDir == "" || sessionID == "" {
+		return 0, false
+	}
+	f, err := os.Open(filepath.Join(projectsDir, ProjectKey(workDir), sessionID+".jsonl"))
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	// Transcript lines carry whole assistant messages and can be far longer than
+	// the default 64 KiB limit; a truncated line just fails to parse, which would
+	// silently look like "no usage recorded".
+	scanner.Buffer(make([]byte, 0, 1<<20), 64<<20)
+	latest, found := 0, false
+	for scanner.Scan() {
+		var row struct {
+			Message struct {
+				Usage struct {
+					InputTokens         int `json:"input_tokens"`
+					CacheReadTokens     int `json:"cache_read_input_tokens"`
+					CacheCreationTokens int `json:"cache_creation_input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &row) != nil {
+			continue
+		}
+		u := row.Message.Usage
+		if total := u.InputTokens + u.CacheReadTokens + u.CacheCreationTokens; total > 0 {
+			latest, found = total, true
+		}
+	}
+	if scanner.Err() != nil && !found {
+		return 0, false
+	}
+	return latest, found
 }

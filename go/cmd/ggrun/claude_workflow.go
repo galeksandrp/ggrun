@@ -39,14 +39,24 @@ func cmdClaudeWorkflowHook(_ []string) {
 		return
 	}
 	if err := claudeWorkflowPatchInput(input.ToolInput, input.TranscriptPath); err != nil {
-		output := map[string]interface{}{
-			"hookSpecificOutput": map[string]interface{}{
-				"hookEventName":            "PreToolUse",
-				"permissionDecision":       "deny",
-				"permissionDecisionReason": err.Error(),
-			},
-		}
-		_ = json.NewEncoder(os.Stdout).Encode(output)
+		// Denying was too strong. The timeout policy is an optimisation for a
+		// slow local model; the tool call is legitimate either way. A built-in
+		// or saved workflow invoked by name has no materialized script under the
+		// session directory until it has already run once, so a hard deny made
+		// `Workflow({name: "deep-research"})` impossible to run at all -- and its
+		// own advice, "invoke it once as inline script", is circular for a
+		// workflow the user did not author. A restart loses the materialized
+		// copy and breaks resume-by-name the same way.
+		//
+		// So fall through unpatched: an unpatched run may stall on a slow model,
+		// a denied one certainly does nothing. claudeCodeWorkflowPromptArgs
+		// already asks the model to set stallMs itself, which is the remaining
+		// cover. An empty decision leaves normal permission handling alone.
+		fmt.Fprintf(os.Stderr,
+			"[claude-code] Workflow stall-timeout policy not applied: %v\n"+
+				"[claude-code] the run proceeds; set stallMs: %d on every agent() call if it stalls\n",
+			err, claudeNoTimeoutMS)
+		fmt.Println(`{}`)
 		return
 	}
 	output := map[string]interface{}{

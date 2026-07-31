@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"strings"
 )
 
 func TestNewSessionIDIsAValidUUIDAndUnique(t *testing.T) {
@@ -197,4 +198,92 @@ func valueOf(args []string, key string) string {
 		}
 	}
 	return ""
+}
+
+// Going from --parallel 1 to 2 at the same --ctx-size halves the slot, which
+// the flag comparison alone reads as "cannot hold the session". Measured on a
+// live run the conversation was 82,846 tokens against a new slot of 131,072, so
+// the refusal cost a resume that would have worked with a 37% margin.
+func TestShapeMismatchesAllowsAShrinkTheConversationStillFitsIn(t *testing.T) {
+	rec := Record{
+		SessionID:  "11111111-2222-4333-8444-555555555555",
+		ServerArgs: []string{"--ctx-size", "262144", "--parallel", "1"},
+	}
+	now := []string{"--ctx-size", "262144", "--parallel", "2"}
+	measured := func(_, _, _ string) (int, bool) { return 82846, true }
+	if got := rec.shapeMismatches(now, measured); len(got) != 0 {
+		t.Fatalf("refused a resume that fits: %v", got)
+	}
+}
+
+func TestShapeMismatchesStillRefusesAConversationThatNoLongerFits(t *testing.T) {
+	rec := Record{
+		SessionID:  "11111111-2222-4333-8444-555555555555",
+		ServerArgs: []string{"--ctx-size", "262144", "--parallel", "1"},
+	}
+	now := []string{"--ctx-size", "262144", "--parallel", "2"}
+	// Inside the slot but past the compaction margin: the next reply overflows.
+	measured := func(_, _, _ string) (int, bool) { return 120000, true }
+	got := rec.shapeMismatches(now, measured)
+	if len(got) != 1 {
+		t.Fatalf("expected one mismatch, got %v", got)
+	}
+	if !strings.Contains(got[0].Recorded, "120000") {
+		t.Errorf("the refusal must show the measured size, got %q", got[0].Recorded)
+	}
+}
+
+// With no readable transcript there is nothing to measure, and assuming the
+// session is small would resume straight into a mid-run truncation.
+func TestShapeMismatchesFallsBackToFlagsWithoutATranscript(t *testing.T) {
+	rec := Record{
+		SessionID:  "11111111-2222-4333-8444-555555555555",
+		ServerArgs: []string{"--ctx-size", "262144", "--parallel", "1"},
+	}
+	now := []string{"--ctx-size", "262144", "--parallel", "2"}
+	unmeasurable := func(_, _, _ string) (int, bool) { return 0, false }
+	if got := rec.shapeMismatches(now, unmeasurable); len(got) != 1 {
+		t.Fatalf("expected the flag comparison to stand in, got %v", got)
+	}
+}
+
+// A grown slot is never a mismatch, measured or not.
+func TestShapeMismatchesIgnoresAGrownSlot(t *testing.T) {
+	rec := Record{ServerArgs: []string{"--ctx-size", "131072", "--parallel", "1"}}
+	now := []string{"--ctx-size", "262144", "--parallel", "1"}
+	if got := rec.shapeMismatches(now, nil); len(got) != 0 {
+		t.Fatalf("a larger slot must never refuse: %v", got)
+	}
+}
+
+func TestCurrentContextTokensReadsTheLatestTurnNotThePeak(t *testing.T) {
+	projects := t.TempDir()
+	workDir := "/tmp/some-project"
+	dir := filepath.Join(projects, ProjectKey(workDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session := "11111111-2222-4333-8444-555555555555"
+	// Peak first, then a compaction shrinks it. The peak says nothing about what
+	// the next turn has to fit.
+	lines := `{"message":{"usage":{"input_tokens":1000,"cache_read_input_tokens":130402}}}
+{"message":{"usage":{"input_tokens":500,"cache_read_input_tokens":82346}}}
+{"type":"user","message":{"role":"user","content":"no usage here"}}
+`
+	if err := os.WriteFile(filepath.Join(dir, session+".jsonl"), []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := CurrentContextTokens(projects, workDir, session)
+	if !ok {
+		t.Fatal("a readable transcript must report a measurement")
+	}
+	if got != 82846 {
+		t.Errorf("got %d, want the latest turn 82846 rather than the 131402 peak", got)
+	}
+}
+
+func TestCurrentContextTokensReportsNothingToMeasure(t *testing.T) {
+	if _, ok := CurrentContextTokens(t.TempDir(), "/nope", "11111111-2222-4333-8444-555555555555"); ok {
+		t.Error("a missing transcript must not report a measurement")
+	}
 }
