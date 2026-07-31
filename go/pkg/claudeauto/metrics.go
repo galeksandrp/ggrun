@@ -205,6 +205,22 @@ func (r *Router) MetricsSummary() map[string]any {
 // an identifier: an agent's system prompt and opening message are stable across
 // its turns, so their digest is a usable per-agent key. It is a local grouping
 // key only and never leaves the machine.
+//
+// metadata.user_id used to short-circuit the digest, on the assumption that a
+// client-supplied identifier beats a guess. Claude Code sends this instead:
+//
+//	{"device_id":"b5243393...","account_uuid":"","session_id":"072e63a1-..."}
+//
+// which identifies the *install*, not the conversation -- every subagent in a
+// workflow fan-out carries the same blob as the foreground turn. Measured on a
+// production run, all 4231 requests collapsed onto one key, which silently
+// disabled every per-conversation feature built on top: slot affinity had a
+// single entry to compare, and the scheduler degenerated to plain FIFO, so a
+// foreground turn queued behind the whole fan-out (p50 wait 35.4 minutes).
+//
+// So user_id is folded into the digest rather than replacing it. It still
+// separates two sessions or two devices sharing one server, and the system
+// prompt and opening message go back to separating the agents within them.
 func conversationKey(body []byte) string {
 	var request struct {
 		System   json.RawMessage   `json:"system"`
@@ -216,10 +232,8 @@ func conversationKey(body []byte) string {
 	if json.Unmarshal(body, &request) != nil {
 		return ""
 	}
-	if request.Metadata.UserID != "" {
-		return request.Metadata.UserID
-	}
 	sum := sha256.New()
+	sum.Write([]byte(request.Metadata.UserID))
 	sum.Write(request.System)
 	if len(request.Messages) > 0 {
 		sum.Write(request.Messages[0])

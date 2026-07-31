@@ -339,7 +339,25 @@ func TestConversationKeyIsStablePerAgentAndDistinctAcrossAgents(t *testing.T) {
 	if conversationKey(first) == conversationKey(other) {
 		t.Error("different agents share a conversation key")
 	}
-	if got := conversationKey([]byte(`{"metadata":{"user_id":"agent-7"}}`)); got != "agent-7" {
-		t.Errorf("explicit user_id = %q, want agent-7", got)
+	// user_id still separates two sessions sharing one server...
+	sessionA := []byte(`{"metadata":{"user_id":"{\"session_id\":\"a\"}"},"system":"agent A","messages":[{"role":"user","content":"start"}]}`)
+	sessionB := []byte(`{"metadata":{"user_id":"{\"session_id\":\"b\"}"},"system":"agent A","messages":[{"role":"user","content":"start"}]}`)
+	if conversationKey(sessionA) == conversationKey(sessionB) {
+		t.Error("two sessions collapsed onto one conversation key")
+	}
+	// ...but it must not erase the agent distinction within a session, which is
+	// what Claude Code's per-install user_id blob used to do to every request.
+	blob := `{\"device_id\":\"b524\",\"account_uuid\":\"\",\"session_id\":\"072e\"}`
+	agentA := []byte(`{"metadata":{"user_id":"` + blob + `"},"system":"agent A","messages":[{"role":"user","content":"start"}]}`)
+	agentB := []byte(`{"metadata":{"user_id":"` + blob + `"},"system":"agent B","messages":[{"role":"user","content":"start"}]}`)
+	if conversationKey(agentA) == conversationKey(agentB) {
+		t.Error("a shared per-install user_id collapsed two agents onto one key")
+	}
+	agentALater := []byte(`{"metadata":{"user_id":"` + blob + `"},"system":"agent A","messages":[{"role":"user","content":"start"},{"role":"assistant","content":"ok"}]}`)
+	if conversationKey(agentA) != conversationKey(agentALater) {
+		t.Error("conversation key changed across turns of the same agent")
+	}
+	if conversationKey(agentA) == "" {
+		t.Fatal("the per-install user_id blob must still parse; an empty key disables grouping entirely")
 	}
 }

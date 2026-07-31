@@ -86,59 +86,98 @@ func TestSchedulerAdmitsUpToTheLimitWithoutQueueing(t *testing.T) {
 	}
 }
 
-// The whole point of the change: when a slot frees, prefer the conversation
-// whose prefix the backend most likely still holds.
-func TestSchedulerPrefersAWarmConversation(t *testing.T) {
+// The whole point of the change: a conversation that just held a slot yields to
+// one that has not, even if the one that just ran queued first. This is what
+// keeps a foreground turn from waiting behind an entire workflow fan-out.
+func TestSchedulerPrefersTheLeastRecentlyServedConversation(t *testing.T) {
 	s, clock := newTestScheduler(1)
-	// "warm" ran recently, so its prefix should still be resident.
-	if !s.acquire(context.Background(), "warm", LaneBulk) {
+	// "agent" just ran, so it has the weakest claim on the next slot.
+	if !s.acquire(context.Background(), "agent", LaneBulk) {
 		t.Fatal("acquire failed")
 	}
-	s.release("warm")
+	s.release("agent")
 
 	if !s.acquire(context.Background(), "blocker", LaneBulk) {
 		t.Fatal("acquire failed")
 	}
-	// Enqueue the cold one first, so FIFO alone would pick it.
-	cold := enqueue(t, s, "cold", LaneBulk, 1)
+	// Enqueue the recently-served one first, so FIFO alone would pick it.
+	agent := enqueue(t, s, "agent", LaneBulk, 1)
 	clock.advance(time.Second)
-	warm := enqueue(t, s, "warm", LaneBulk, 2)
+	foreground := enqueue(t, s, "foreground", LaneBulk, 2)
 
 	s.release("blocker")
-	if !admittedWithin(warm, time.Second) {
-		t.Fatal("warm conversation was not preferred over a colder one queued earlier")
+	if !admittedWithin(foreground, time.Second) {
+		t.Fatal("an idle conversation lost to one that had just been served")
 	}
-	if admittedWithin(cold, 50*time.Millisecond) {
-		t.Fatal("cold conversation was admitted while capacity was 1")
+	if admittedWithin(agent, 50*time.Millisecond) {
+		t.Fatal("second waiter was admitted while capacity was 1")
 	}
-	s.release("warm")
-	if !admittedWithin(cold, time.Second) {
-		t.Fatal("cold conversation never ran")
+	s.release("foreground")
+	if !admittedWithin(agent, time.Second) {
+		t.Fatal("the recently-served conversation never ran")
 	}
 }
 
-func TestSchedulerForgetsAffinityAfterTheWindow(t *testing.T) {
+// A single foreground turn must not scale with the depth of the queue. With one
+// slot and a fan-out already parked, it should wait for at most one agent turn,
+// not for all of them.
+func TestForegroundTurnDoesNotWaitBehindAWholeFanOut(t *testing.T) {
 	s, clock := newTestScheduler(1)
-	if !s.acquire(context.Background(), "stale", LaneBulk) {
+	// Ten agents each take a turn, so all of them are recently served.
+	for i := 0; i < 10; i++ {
+		conv := "agent" + string(rune('0'+i))
+		if !s.acquire(context.Background(), conv, LaneBulk) {
+			t.Fatal("acquire failed")
+		}
+		s.release(conv)
+		clock.advance(time.Second)
+	}
+	if !s.acquire(context.Background(), "blocker", LaneBulk) {
 		t.Fatal("acquire failed")
 	}
-	s.release("stale")
-	// Past the window the prefix is assumed evicted, so preferring it buys
-	// nothing and plain fairness should win.
-	clock.advance(affinityWindow + time.Minute)
+	// The whole fan-out queues its next turn ahead of the user.
+	agents := make([]chan struct{}, 10)
+	for i := 0; i < 10; i++ {
+		agents[i] = enqueue(t, s, "agent"+string(rune('0'+i)), LaneBulk, i+1)
+	}
+	clock.advance(time.Second)
+	foreground := enqueue(t, s, "foreground", LaneBulk, 11)
+
+	// One slot frees. Under FIFO this went to agent0 and the user waited for all
+	// ten; under fair share the never-served conversation goes first.
+	s.release("blocker")
+	if !admittedWithin(foreground, time.Second) {
+		t.Fatal("foreground turn queued behind the fan-out")
+	}
+	s.release("foreground")
+	for i := range agents {
+		<-agents[i]
+		s.release("agent" + string(rune('0'+i)))
+	}
+}
+
+func TestSchedulerForgetsAServedTurnAfterTheWindow(t *testing.T) {
+	s, clock := newTestScheduler(1)
+	if !s.acquire(context.Background(), "long-idle", LaneBulk) {
+		t.Fatal("acquire failed")
+	}
+	s.release("long-idle")
+	// Past the window a conversation counts as idle again, so it stops being
+	// held back by a turn it took ages ago and plain FIFO decides.
+	clock.advance(fairShareWindow + time.Minute)
 
 	if !s.acquire(context.Background(), "blocker", LaneBulk) {
 		t.Fatal("acquire failed")
 	}
-	first := enqueue(t, s, "fresh", LaneBulk, 1)
+	first := enqueue(t, s, "long-idle", LaneBulk, 1)
 	clock.advance(time.Second)
-	second := enqueue(t, s, "stale", LaneBulk, 2)
+	second := enqueue(t, s, "other", LaneBulk, 2)
 
 	s.release("blocker")
 	if !admittedWithin(first, time.Second) {
-		t.Fatal("stale affinity still won after the window expired")
+		t.Fatal("a turn older than the window was still held against the conversation")
 	}
-	s.release("fresh")
+	s.release("long-idle")
 	<-second
 }
 
@@ -267,7 +306,7 @@ func TestPruneRecentBoundsMemoryOnLongRuns(t *testing.T) {
 	for i := 0; i < 400; i++ {
 		s.recent[string(rune('a'+i%26))+string(rune(i))] = clock.now()
 	}
-	clock.advance(affinityWindow + time.Minute)
+	clock.advance(fairShareWindow + time.Minute)
 	s.recent["fresh"] = clock.now()
 	s.mu.Lock()
 	s.pruneRecentLocked()

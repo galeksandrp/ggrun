@@ -17,12 +17,28 @@ import (
 // The scheduler therefore orders waiting requests by, in priority order:
 //
 //  1. lane, so a safety review never waits behind bulk work;
-//  2. affinity, preferring a conversation whose prefix was served recently and
-//     is therefore likely still resident;
+//  2. fair share, preferring the conversation that has gone longest without a
+//     slot, so no conversation's wait scales with the depth of the queue;
 //  3. age, so nothing starves.
 //
 // This needs no backend support and no particular llama.cpp version: it only
 // changes the order in which ggrun hands requests over.
+//
+// Step 2 used to be the opposite -- affinity, preferring the *most* recently
+// served conversation on the theory that its prefix was still resident. Two
+// measurements from one production run retired that:
+//
+//   - It was inert. conversationKey returned one key for every request, so
+//     there was never more than one entry to compare (see its doc comment).
+//     Reuse still came in at 64.9% across 37.1M prompt tokens, which says the
+//     backend's own slot prefix matching carries reuse, not ggrun's ordering.
+//   - The cost of getting it wrong is enormous. With ordering degenerated to
+//     FIFO, a foreground turn arriving during a workflow fan-out waited a median
+//     of 35.4 minutes and up to 125, against ~109 s of actual compute per turn.
+//
+// Affinity optimises the term that turned out not to need help, and fair share
+// bounds the term that dominates: a conversation now waits behind at most one
+// turn per *other active conversation*, not one per queued request.
 
 // Lane ranks a request's scheduling class. Lower runs first.
 type Lane int
@@ -38,11 +54,13 @@ const (
 )
 
 const (
-	// affinityWindow is how long a served conversation is assumed to still hold
-	// its prefix. Beyond it, preferring that conversation buys nothing.
-	affinityWindow = 5 * time.Minute
+	// fairShareWindow is how long a conversation's turn is held against it.
+	// Past it a conversation counts as idle again and regains full claim on the
+	// next slot, which is what lets a user who stepped away for a coffee return
+	// to a responsive session rather than to the back of the fan-out.
+	fairShareWindow = 5 * time.Minute
 	// agingAfter promotes a waiter that has been passed over for too long, so
-	// affinity can never starve an unlucky conversation.
+	// no arrival pattern can starve an unlucky conversation.
 	agingAfter = 90 * time.Second
 )
 
@@ -55,8 +73,14 @@ const (
 //
 // Everything else is bulk on purpose. Separating foreground coordinator turns
 // from workflow fan-out needs a signal the Anthropic request body does not
-// carry reliably, and a wrong guess would deprioritise the user's own turn.
-// Affinity and aging below do the ordering work until such a signal exists.
+// carry: metadata.user_id is per-install, and a subagent's system prompt is not
+// reliably distinguishable from the main loop's. A wrong guess would
+// deprioritise the user's own turn, which is the failure this exists to prevent.
+//
+// Fair share below makes the classification unnecessary rather than merely
+// deferred. A foreground turn is, by construction, the conversation that has
+// gone longest without a slot while the fan-out cycles through its agents, so
+// ordering by that promotes it without having to recognise it.
 func laneOf(body []byte) Lane {
 	if IsClassifierRequest(body) {
 		return LaneSafety
@@ -172,9 +196,11 @@ func (s *scheduler) bestWaiterLocked() int {
 }
 
 type waiterKey struct {
-	lane     Lane
-	warm     bool
-	lastSeen time.Time
+	lane Lane
+	// served is when this conversation last held a slot. The zero time means
+	// "not recently", which sorts first: a conversation the scheduler has not
+	// seen in a while has the strongest claim on the next one.
+	served   time.Time
 	enqueued time.Time
 }
 
@@ -182,13 +208,12 @@ func (k waiterKey) less(other waiterKey) bool {
 	if k.lane != other.lane {
 		return k.lane < other.lane
 	}
-	if k.warm != other.warm {
-		return k.warm
-	}
-	if k.warm && !k.lastSeen.Equal(other.lastSeen) {
-		// Among warm conversations prefer the most recently served, whose
-		// prefix is least likely to have been evicted.
-		return k.lastSeen.After(other.lastSeen)
+	if !k.served.Equal(other.served) {
+		// Least recently served first. This is what bounds a foreground turn's
+		// wait by the number of active conversations instead of the queue depth:
+		// each agent in a fan-out becomes recently-served the moment it runs, so
+		// it yields to everyone who has not.
+		return k.served.Before(other.served)
 	}
 	return k.enqueued.Before(other.enqueued)
 }
@@ -196,14 +221,14 @@ func (k waiterKey) less(other waiterKey) bool {
 func (s *scheduler) sortKeyLocked(w *waiter, now time.Time) waiterKey {
 	lane := w.lane
 	// Aging: a waiter passed over for too long is promoted to the front of the
-	// interactive lane so affinity cannot starve it indefinitely.
+	// interactive lane, so a pathological arrival pattern cannot starve it.
 	if lane > LaneInteractive && now.Sub(w.enqueued) >= agingAfter {
 		lane = LaneInteractive
 	}
 	key := waiterKey{lane: lane, enqueued: w.enqueued}
 	if w.conversation != "" {
-		if seen, ok := s.recent[w.conversation]; ok && now.Sub(seen) <= affinityWindow {
-			key.warm, key.lastSeen = true, seen
+		if seen, ok := s.recent[w.conversation]; ok && now.Sub(seen) <= fairShareWindow {
+			key.served = seen
 		}
 	}
 	return key
@@ -217,7 +242,7 @@ func (s *scheduler) pruneRecentLocked() {
 	}
 	now := s.now()
 	for conv, seen := range s.recent {
-		if now.Sub(seen) > affinityWindow {
+		if now.Sub(seen) > fairShareWindow {
 			delete(s.recent, conv)
 		}
 	}
