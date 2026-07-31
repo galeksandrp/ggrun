@@ -535,11 +535,18 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 // where an untested hypothesis belongs. --claude-max-active is how that gets
 // measured; whichever wins should become the default, ideally calibrated rather
 // than constant.
+//
+// That reasoning covers the *default*. It must not survive an explicit
+// --parallel, which is the user asking for that many lanes: allocating the slots
+// and then admitting one is strictly worse than never allocating them, because
+// --ctx-size is split across slots either way. Observed live -- `--parallel 2`
+// produced two slots of 131072, one of them permanently idle, at the same
+// throughput a single 262144 slot had delivered.
 func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
 	if req == nil || !req.ClaudeCode || strategy == nil {
 		return 0
 	}
-	limit := defaultClaudeMainMaxActive(strategy)
+	limit := defaultClaudeMainMaxActive(req, strategy)
 	if req.ClaudeMaxActiveSet {
 		limit = req.ClaudeMaxActive
 	}
@@ -555,7 +562,15 @@ func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
 	return limit
 }
 
-func defaultClaudeMainMaxActive(strategy *placement.Strategy) int {
+func defaultClaudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
+	// An explicit --parallel is an instruction, not a hint. Every slot costs
+	// context whether or not it is ever used, so honouring the flag by allocating
+	// slots while refusing to admit into them is the one outcome nobody asked
+	// for. The conservative host-offload default below still applies whenever
+	// ggrun chose the slot count itself.
+	if req != nil && req.ParallelSet && strategy.Parallel > 1 {
+		return strategy.Parallel
+	}
 	if strategy.Type == placement.MoEOffload || strategy.Type == placement.DenseCPUOffload {
 		return 1
 	}

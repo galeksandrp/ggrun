@@ -316,3 +316,35 @@ func TestReviewerReservationIsNotChargedTwice(t *testing.T) {
 		t.Errorf("reservation = %+v, want the uncovered 596 MiB", got)
 	}
 }
+
+// --parallel is an instruction. Every slot costs context whether or not it is
+// ever used, so allocating the slots and then admitting one request is the one
+// outcome nobody asked for: observed live as two 131072 slots, one permanently
+// idle, at the throughput a single 262144 slot already delivered.
+func TestExplicitParallelRaisesAdmissionOnHostOffload(t *testing.T) {
+	req := &launchRequest{ClaudeCode: true, ParallelSet: true}
+	for _, strategyType := range []placement.StrategyType{placement.MoEOffload, placement.DenseCPUOffload} {
+		strategy := &placement.Strategy{Type: strategyType, Parallel: 2}
+		if got := claudeMainMaxActive(req, strategy); got != 2 {
+			t.Fatalf("strategy %s with explicit --parallel 2: max active=%d, want 2", strategyType, got)
+		}
+	}
+}
+
+// The conservative default still stands when ggrun picked the slot count.
+func TestImplicitParallelKeepsHostOffloadSerialized(t *testing.T) {
+	req := &launchRequest{ClaudeCode: true}
+	strategy := &placement.Strategy{Type: placement.MoEOffload, Parallel: 4}
+	if got := claudeMainMaxActive(req, strategy); got != 1 {
+		t.Fatalf("max active=%d, want the conservative default of 1", got)
+	}
+}
+
+// An explicit --claude-max-active is more specific than --parallel and wins.
+func TestExplicitMaxActiveOverridesExplicitParallel(t *testing.T) {
+	req := &launchRequest{ClaudeCode: true, ParallelSet: true, ClaudeMaxActive: 1, ClaudeMaxActiveSet: true}
+	strategy := &placement.Strategy{Type: placement.MoEOffload, Parallel: 4}
+	if got := claudeMainMaxActive(req, strategy); got != 1 {
+		t.Fatalf("max active=%d, want the explicit 1", got)
+	}
+}

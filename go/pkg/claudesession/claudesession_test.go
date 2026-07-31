@@ -3,9 +3,9 @@ package claudesession
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
-	"strings"
 )
 
 func TestNewSessionIDIsAValidUUIDAndUnique(t *testing.T) {
