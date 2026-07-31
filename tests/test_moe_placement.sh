@@ -151,6 +151,7 @@ if ! out=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/ik-llama-server" \
     LLM_ASSUME_YES=1 LLM_SERVER_UPDATE_CHECKED=1 \
     LLM_CACHE_DIR="$TMP/cache-kv-gpu" LLM_MODEL_DIR="$TMP/models" \
     "$GO_BIN" --dry-run --server-bin "$TMP/ik-llama-server" \
+    --ram-budget 128000 \
     --ctx-size 196608 --kv-quality mid "$TMP/models/KV-Heavy-MoE.gguf" 2>&1); then
     echo "KV-heavy MoE dry-run failed"
     echo "$out"
@@ -182,6 +183,7 @@ if ! out_dsv4=$(PATH="$TMP/bin:$PATH" LLAMA_SERVER="$TMP/llama-server" \
     LLM_CONFIG="$TMP/empty.conf" LLM_ASSUME_YES=1 LLM_SERVER_UPDATE_CHECKED=1 \
     LLM_CACHE_DIR="$TMP/cache-kv-dsv4" LLM_MODEL_DIR="$TMP/models" \
     "$GO_BIN" --dry-run --server-bin "$TMP/llama-server" \
+    --ram-budget 128000 \
     --ctx-size 196608 --kv-quality mid "$TMP/models/DeepSeek4-KV-MoE.gguf" 2>&1); then
     echo "DeepSeek4 GPU-KV dry-run failed"
     echo "$out_dsv4"
