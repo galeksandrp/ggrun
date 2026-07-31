@@ -7,9 +7,12 @@ import (
 	"strings"
 	"testing"
 
+	"bytes"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/memprobe"
 	"github.com/raketenkater/ggrun/pkg/placement"
+	"net"
+	"time"
 )
 
 func TestFindFitParamsDoesNotCrossCustomForksViaPATH(t *testing.T) {
@@ -369,5 +372,30 @@ func TestPreflightFallsBackToEstimateWhenProbeCannotRun(t *testing.T) {
 	}
 	if outcome.Evidence.Level != memoryEvidenceNone {
 		t.Fatalf("evidence level = %v, want none", outcome.Evidence.Level)
+	}
+}
+
+// A restart races the predecessor's teardown: the port it held is the one
+// signal that distinguishes "VRAM about to be released" from "VRAM genuinely
+// in use", because the new server cannot bind until it exits either way.
+func TestWaitForPredecessorPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	var warn bytes.Buffer
+	if waitForPredecessorPort(port, 250*time.Millisecond, &warn) {
+		t.Fatal("reported free while the predecessor still held the port")
+	}
+	if !strings.Contains(warn.String(), "still held") {
+		t.Errorf("the wait must be explained: %q", warn.String())
+	}
+	_ = ln.Close()
+	if !waitForPredecessorPort(port, time.Second, &warn) {
+		t.Fatal("port was free but the wait never returned")
+	}
+	if !waitForPredecessorPort(0, time.Second, &warn) {
+		t.Fatal("an unknown port must not block the launch")
 	}
 }

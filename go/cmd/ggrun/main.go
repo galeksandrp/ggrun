@@ -2648,6 +2648,17 @@ func cmdLaunch(args []string) {
 
 	cfg := loadConfigOrExit()
 
+	// A restart races the previous server's teardown: it can hold tens of GB
+	// of VRAM for seconds after ggrun exits, and a plan computed in that window
+	// bakes the shortage in. Wait for the port it must release anyway.
+	launchPort := req.Port
+	if launchPort <= 0 {
+		launchPort = cfg.Port
+	}
+	if !waitForPredecessorPort(launchPort, 20*time.Second, os.Stderr) {
+		fmt.Fprintf(os.Stderr, "[launch] port %d is still occupied after 20s; continuing, but placement may see its VRAM as used and the bind may fail\n", launchPort)
+	}
+
 	caps, err := detect.Detect()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)

@@ -116,6 +116,11 @@ type Strategy struct {
 	// because it changes the KV size every later stage prices, not just the
 	// flag that gets emitted.
 	SWAFull bool `json:"swa_full,omitempty"`
+	// PlanFreeVRAM is the free VRAM each GPU showed when this plan was
+	// computed, by CUDA index. The placement cache stores it so a plan made
+	// under transiently tight VRAM -- a previous server mid-teardown -- is
+	// recomputed once the VRAM is back, instead of replaying its pessimism.
+	PlanFreeVRAM map[int]int `json:"plan_free_vram,omitempty"`
 	// MeasuredPromptCacheBPT and PromptCacheTypicalTokens carry a measured
 	// prompt-cache cost into CRAM sizing. Zero means nothing was measured, and
 	// the derived budget stands.
@@ -579,6 +584,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	s := &Strategy{
 		ContextSize:    opts.ContextSize,
 		SWAFull:        opts.SWAFull,
+		PlanFreeVRAM:   snapshotPlanFreeVRAM(caps),
 		KVPlacement:    opts.KVPlacement,
 		KVQuality:      resolvedKVQuality,
 		MMap:           opts.ForceMMap || !opts.NoMMap,

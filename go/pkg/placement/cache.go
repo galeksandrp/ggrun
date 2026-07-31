@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,22 @@ type CacheEntry struct {
 	KVUnified      bool            `json:"kv_unified"`
 	NoPinned       bool            `json:"no_pinned"`
 	MMap           bool            `json:"mmap"`
+	// PlanFreeVRAM records the free VRAM each GPU showed when this plan was
+	// computed, by CUDA index. A plan is only as good as that reading: one
+	// computed while the previous server was still releasing 43 GB pinned
+	// --n-cpu-moe at the old context's value and left 8.4 GB of the split
+	// owner idle, and because the plan was cached, every restart replayed the
+	// mistake. Deficits fix themselves -- the launch preflight measures and
+	// re-plans -- but nothing downstream ever notices a plan that asks for too
+	// little, so the cache has to.
+	PlanFreeVRAM map[int]int `json:"plan_free_vram,omitempty"`
 }
+
+// planFreeVRAMSlackMB is how much more free VRAM the machine may show before a
+// cached plan is considered stale-pessimistic. An expert layer costs ~1.4 GB,
+// so a full gigabyte of unclaimed VRAM is the scale at which the plan starts
+// leaving whole layers on the CPU; ordinary allocator jitter is far below it.
+const planFreeVRAMSlackMB = 1024
 
 // GPUAssignment describes layers assigned to a GPU.
 type GPUAssignment struct {
@@ -84,6 +100,22 @@ func LoadPlacementCache(cachePath string, caps *detect.Capabilities, kvTotalMB i
 		case "CACHED_MMAP":
 			hasMMap = true
 			entry.MMap = val == "1"
+		case "CACHED_PLAN_FREEVRAM":
+			entry.PlanFreeVRAM = parsePlanFreeVRAM(val)
+		}
+	}
+
+	// A plan computed under tighter VRAM than the machine now shows would
+	// replay its pessimism forever; recompute instead. Entries from before this
+	// field carry no reading to compare, and are grandfathered because the
+	// deficit direction is still covered by the launch preflight.
+	for idx, plannedFree := range entry.PlanFreeVRAM {
+		for _, g := range caps.GPUs {
+			if g.Index == idx && g.VRAMFreeMB() > plannedFree+planFreeVRAMSlackMB {
+				return nil, fmt.Errorf(
+					"cached plan is stale: GPU%d now has %dMB free but the plan was computed against %dMB",
+					idx, g.VRAMFreeMB(), plannedFree)
+			}
 		}
 	}
 
@@ -123,7 +155,7 @@ func StrategyToCacheEntry(s *Strategy) *CacheEntry {
 	if s == nil {
 		return nil
 	}
-	return &CacheEntry{
+	entry := &CacheEntry{
 		OTString:    s.OTString,
 		TensorSplit: append([]float64(nil), s.TensorSplit...),
 		SplitMode:   s.SplitMode,
@@ -134,6 +166,13 @@ func StrategyToCacheEntry(s *Strategy) *CacheEntry {
 		MMap:        s.MMap,
 		KVUnified:   s.KVPlacement == "gpu",
 	}
+	if len(s.PlanFreeVRAM) > 0 {
+		entry.PlanFreeVRAM = make(map[int]int, len(s.PlanFreeVRAM))
+		for idx, free := range s.PlanFreeVRAM {
+			entry.PlanFreeVRAM[idx] = free
+		}
+	}
+	return entry
 }
 
 // SavePlacementCache writes a placement cache file in bash-compatible format.
@@ -178,7 +217,52 @@ func SavePlacementCache(cachePath string, entry *CacheEntry) error {
 	} else {
 		parts = append(parts, "CACHED_MMAP=\"0\"")
 	}
+	if len(entry.PlanFreeVRAM) > 0 {
+		idxs := make([]int, 0, len(entry.PlanFreeVRAM))
+		for idx := range entry.PlanFreeVRAM {
+			idxs = append(idxs, idx)
+		}
+		sort.Ints(idxs)
+		var tokens []string
+		for _, idx := range idxs {
+			tokens = append(tokens, fmt.Sprintf("%d:%d", idx, entry.PlanFreeVRAM[idx]))
+		}
+		parts = append(parts, fmt.Sprintf("CACHED_PLAN_FREEVRAM=\"%s\"", strings.Join(tokens, " ")))
+	}
 	return os.WriteFile(cachePath, []byte(strings.Join(parts, "\n")+"\n"), 0644)
+}
+
+// snapshotPlanFreeVRAM captures the planning view of free VRAM so it can be
+// stored beside the plan it produced.
+func snapshotPlanFreeVRAM(caps *detect.Capabilities) map[int]int {
+	if caps == nil || len(caps.GPUs) == 0 {
+		return nil
+	}
+	out := make(map[int]int, len(caps.GPUs))
+	for _, g := range caps.GPUs {
+		out[g.Index] = g.VRAMFreeMB()
+	}
+	return out
+}
+
+func parsePlanFreeVRAM(s string) map[int]int {
+	out := map[int]int{}
+	for _, tok := range strings.Fields(s) {
+		parts := strings.Split(tok, ":")
+		if len(parts) != 2 {
+			continue
+		}
+		idx, err1 := strconv.Atoi(parts[0])
+		free, err2 := strconv.Atoi(parts[1])
+		if err1 != nil || err2 != nil || free < 0 {
+			continue
+		}
+		out[idx] = free
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func parseTensorSplit(s string) []float64 {

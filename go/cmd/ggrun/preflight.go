@@ -18,6 +18,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/memprobe"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/server"
+	"net"
 )
 
 // Launch preflight: before paying a real model load (15+ minutes for a big MoE
@@ -93,6 +94,45 @@ type liveMemoryProbeConsentError struct {
 
 func (e *liveMemoryProbeConsentError) Error() string {
 	return e.Reason + "; rerun with --allow-live-memory-probe or approve the interactive prompt"
+}
+
+// waitForPredecessorPort blocks until the requested server port is bindable,
+// so placement is not computed against the VRAM of a predecessor still
+// exiting. The settle rounds in detect cannot catch this: a server that has
+// not started releasing yet reads as perfectly stable, and the information
+// that its 43 GB is about to vanish is not in the numbers. The port is: if the
+// previous server still holds it, the machine ggrun is about to measure is not
+// the machine it will launch into -- and launching would fail to bind anyway.
+// Returns false if the port never freed within the timeout, which is worth a
+// warning but not an abort: the holder may be an unrelated persistent server,
+// and then its VRAM use is genuinely occupied and the plan is right to see it.
+func waitForPredecessorPort(port int, timeout time.Duration, warn io.Writer) bool {
+	if port <= 0 {
+		return true
+	}
+	deadline := time.Now().Add(timeout)
+	waited := false
+	for {
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err == nil {
+			_ = ln.Close()
+			if waited {
+				// The process releases the port before the driver finishes
+				// releasing its VRAM; give the frees a moment to land and let
+				// the normal settle rounds absorb the tail.
+				time.Sleep(1500 * time.Millisecond)
+			}
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		if !waited {
+			fmt.Fprintf(warn, "[launch] port %d is still held by the previous server; waiting for it to exit so placement sees the real free VRAM\n", port)
+			waited = true
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // memoryProbeUnavailableError marks a host that can never run the guarded
