@@ -52,7 +52,7 @@ python3 "$ROOT/tests/build_synthetic_gguf.py" --out "$APP_HOME/models/setup-mode
     --arch llama --name Setup-Home-Smoke --layers 2 --hkv 1 --kl 16 --vl 16 \
     --embd 64 --ff 128 --ctx-train 2048
 
-out=$(HOME="$TMP/home" LLM_ASSUME_YES=1 \
+out=$(HOME="$TMP/home" LLM_ASSUME_YES=1 LLAMA_SERVER="$TMP/llama-server" \
     "$APP_HOME/ggrun" --dry-run --cpu setup-model.gguf 2>&1)
 
 if [[ "$out" != *"$APP_HOME/models/setup-model.gguf"* ]]; then

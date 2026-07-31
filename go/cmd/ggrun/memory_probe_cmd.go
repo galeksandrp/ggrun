@@ -93,6 +93,13 @@ func cmdMemoryProbe(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: memory probe failed closed: %v\n", outcome.Err)
 			os.Exit(1)
 		}
+		// A launch treats an unavailable probe as "fall back to the estimate",
+		// but this command exists to produce the measurement, so reporting
+		// success without one would be a lie.
+		if outcome.ProbeUnavailable != "" {
+			fmt.Fprintf(os.Stderr, "Error: memory probe unavailable on this host: %s\n", outcome.ProbeUnavailable)
+			os.Exit(1)
+		}
 		if outcome.CompanionRejected {
 			fmt.Fprintln(os.Stderr, "Error: selected backend rejected the speculative companion; rerun with --spec off")
 			os.Exit(1)

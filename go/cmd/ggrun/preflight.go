@@ -66,6 +66,12 @@ type preflightOutcome struct {
 	CompanionRejected bool
 	Evidence          memoryPlanEvidence
 	Err               error
+	// ProbeUnavailable is set when the host cannot run the guarded allocation
+	// probe at all, as opposed to running it and learning something. It is not
+	// an error: a launch continues on the planner's estimate, exactly as it does
+	// on a machine with no GPU. `ggrun memory-probe` asked for the measurement
+	// specifically, so it still treats this as a failure.
+	ProbeUnavailable string
 }
 
 const memoryEvidenceSchemaVersion = memprobe.SchemaVersion
@@ -88,6 +94,23 @@ type liveMemoryProbeConsentError struct {
 func (e *liveMemoryProbeConsentError) Error() string {
 	return e.Reason + "; rerun with --allow-live-memory-probe or approve the interactive prompt"
 }
+
+// memoryProbeUnavailableError marks a host that can never run the guarded
+// allocation probe, as distinct from a probe that ran and found a deficit.
+//
+// The probe contains a live model load in a cgroup v2 memory scope, which only
+// exists on Linux -- backendMemoryMaxMB returns 0 off Linux by construction. So
+// on macOS/Metal and Windows/CUDA, both supported backends, every launch that
+// reached this path failed outright with "requires a positive backend
+// MemoryMax". Refusing to launch because the *optional* measurement is
+// impossible rejects the platform rather than protecting it; a host with no GPU
+// already skips preflight and launches on the planner's estimate, and this is
+// the same situation.
+type memoryProbeUnavailableError struct {
+	Reason string
+}
+
+func (e *memoryProbeUnavailableError) Error() string { return e.Reason }
 
 var ikBufferLinePattern = regexp.MustCompile(`(CUDA[0-9]+|CUDA_Host|CPU|Host)[^=\n]*buffer size\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*MiB`)
 
@@ -310,10 +333,14 @@ func runGuardedAllocationPreflight(req *launchRequest, be *backendInfo, cfg *con
 	}
 	memoryMaxMB := backendMemoryMaxMB(req, caps)
 	if memoryMaxMB <= 0 {
-		return memoryPlanEvidence{}, fmt.Errorf("allocation probe requires a positive backend MemoryMax")
+		return memoryPlanEvidence{}, &memoryProbeUnavailableError{
+			Reason: "allocation probe needs a positive backend MemoryMax, which only Linux hosts report",
+		}
 	}
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
-		return memoryPlanEvidence{}, fmt.Errorf("allocation probe requires Linux cgroup v2 containment: %w", err)
+		return memoryPlanEvidence{}, &memoryProbeUnavailableError{
+			Reason: fmt.Sprintf("allocation probe needs Linux cgroup v2 containment: %v", err),
+		}
 	}
 	dryRun := backendSupportsAllocationDryRun(be)
 	guardLibrary := memprobe.FindGuardLibrary()
@@ -841,6 +868,10 @@ func preflightPlacement(req *launchRequest, be *backendInfo, cfg *configForPrefl
 			if oom, ok := err.(*ikAllocationOOMError); ok {
 				return allocationOOMOutcome(outcome, oom)
 			}
+			if unavailable, ok := err.(*memoryProbeUnavailableError); ok {
+				outcome.ProbeUnavailable = unavailable.Reason
+				return outcome
+			}
 			outcome.Err = err
 			return outcome
 		}
@@ -857,6 +888,10 @@ func preflightPlacement(req *launchRequest, be *backendInfo, cfg *configForPrefl
 			if allocationErr != nil {
 				if oom, ok := allocationErr.(*ikAllocationOOMError); ok {
 					return allocationOOMOutcome(outcome, oom)
+				}
+				if unavailable, ok := allocationErr.(*memoryProbeUnavailableError); ok {
+					outcome.ProbeUnavailable = unavailable.Reason
+					return outcome
 				}
 				outcome.Err = allocationErr
 				return outcome

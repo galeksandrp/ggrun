@@ -335,3 +335,39 @@ func TestPreflightWorstDeficitIgnoresUnknownDevices(t *testing.T) {
 		t.Fatalf("unknown devices must not produce deficits, got dev %d deficit %d", dev, deficit)
 	}
 }
+
+// A host that cannot contain a live model load -- macOS, Windows, or Linux
+// without cgroup v2 -- used to fail every launch with "requires a positive
+// backend MemoryMax", because backendMemoryMaxMB returns 0 off Linux by
+// construction. The measurement is an optimisation; a host with no GPU already
+// skips it and launches on the planner's estimate.
+func TestPreflightFallsBackToEstimateWhenProbeCannotRun(t *testing.T) {
+	dir := t.TempDir()
+	serverBin := filepath.Join(dir, "llama-server")
+	if err := os.WriteFile(serverBin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	be := &backendInfo{Path: serverBin, Tag: "llama", Dialect: "llama", Help: "--dry-run"}
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, Name: "Test GPU", VRAMTotalMB: 24564}},
+		RAM:  detect.RAMInfo{FreeMB: 0}, // forces backendMemoryMaxMB to 0, as off-Linux
+	}
+	model := &placement.ModelProfile{Name: "test", Path: filepath.Join(dir, "m.gguf")}
+	strategy := &placement.Strategy{ContextSize: 4096, Parallel: 1}
+
+	outcome := preflightPlacement(&launchRequest{}, be, &configForPreflight{CacheDir: dir},
+		caps, model, strategy, []string{"--ctx-size", "4096"})
+
+	if outcome.Err != nil {
+		t.Fatalf("an unrunnable probe must not fail the launch: %v", outcome.Err)
+	}
+	if outcome.ProbeUnavailable == "" {
+		t.Fatal("the skip must be reported so the launch can say it used an estimate")
+	}
+	if outcome.DoesNotFit {
+		t.Fatal("no measurement was taken, so nothing can be known not to fit")
+	}
+	if outcome.Evidence.Level != memoryEvidenceNone {
+		t.Fatalf("evidence level = %v, want none", outcome.Evidence.Level)
+	}
+}

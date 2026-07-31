@@ -2154,6 +2154,9 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 				}
 				return nil, strategy, serverArgs, fmt.Errorf("memory preflight failed closed: %w", preflight.Err)
 			}
+			if preflight.ProbeUnavailable != "" {
+				fmt.Fprintf(os.Stderr, "[launch] %s; continuing on the planner's estimate\n", preflight.ProbeUnavailable)
+			}
 			if preflight.CompanionRejected {
 				specDisabled = true
 				opts := placementOpts()
