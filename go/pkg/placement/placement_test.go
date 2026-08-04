@@ -3874,3 +3874,49 @@ func TestRelatedModelRuntimeGraphGrowthRejectsNonEvidence(t *testing.T) {
 		}
 	})
 }
+
+// The prompt cache was sized against RAM that the plan had already spent. A
+// --n-cpu-moe plan parks more expert bytes in host memory than
+// totalSizeMB-TotalVRAM() predicts, and the surplus grant got the backend
+// OOM-killed by its own cgroup mid-serve on 2026-08-04.
+func TestPlannedHostExpertMBReflectsTheCPULayerCount(t *testing.T) {
+	model := &ModelProfile{NumLayers: 43, ExpertBytes: 131240296448} // ~125 GiB of experts
+	expertMB := int(float64(model.ExpertBytes) / (1024 * 1024))
+
+	if got := plannedHostExpertMB(model, &Strategy{NCPUMoE: 43}); got != expertMB {
+		t.Fatalf("all-CPU plan = %d MiB, want the whole expert mass %d MiB", got, expertMB)
+	}
+
+	half := plannedHostExpertMB(model, &Strategy{NCPUMoE: 21})
+	if half <= 0 || half >= expertMB {
+		t.Fatalf("half-CPU plan = %d MiB, want between 0 and %d", half, expertMB)
+	}
+
+	// A plan that offloads more layers must never claim less host memory.
+	if more, fewer := plannedHostExpertMB(model, &Strategy{NCPUMoE: 42}), plannedHostExpertMB(model, &Strategy{NCPUMoE: 35}); more <= fewer {
+		t.Fatalf("42 CPU layers (%d MiB) did not exceed 35 (%d MiB)", more, fewer)
+	}
+
+	// Never over-report: a layer count above the model's is clamped.
+	if got := plannedHostExpertMB(model, &Strategy{NCPUMoE: 999}); got != expertMB {
+		t.Fatalf("clamped plan = %d MiB, want %d", got, expertMB)
+	}
+
+	// Missing evidence yields 0 so the caller keeps its prior estimate rather
+	// than acting on a number this function cannot justify.
+	for _, tc := range []struct {
+		name  string
+		model *ModelProfile
+		strat *Strategy
+	}{
+		{"no cpu layers", model, &Strategy{NCPUMoE: 0}},
+		{"no expert metadata", &ModelProfile{NumLayers: 43}, &Strategy{NCPUMoE: 42}},
+		{"no layer count", &ModelProfile{ExpertBytes: 1 << 30}, &Strategy{NCPUMoE: 42}},
+		{"nil model", nil, &Strategy{NCPUMoE: 42}},
+		{"nil strategy", model, nil},
+	} {
+		if got := plannedHostExpertMB(tc.model, tc.strat); got != 0 {
+			t.Fatalf("%s = %d MiB, want 0", tc.name, got)
+		}
+	}
+}
