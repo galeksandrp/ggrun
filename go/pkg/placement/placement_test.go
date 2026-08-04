@@ -3818,14 +3818,28 @@ func TestRelatedModelRuntimeGraphGrowthRejectsNonEvidence(t *testing.T) {
 		}
 	})
 
-	t.Run("a different parallel is not evidence", func(t *testing.T) {
+	// Slot count is part of the graph shape, so a cross-parallel measurement is
+	// weaker evidence — but it is still evidence, and the alternative is zero,
+	// a value already known to be wrong. It therefore fills a device the exact
+	// tier left empty, and never displaces an exact-parallel measurement.
+	t.Run("a different parallel fills a zero but never wins", func(t *testing.T) {
 		cacheDir := t.TempDir()
 		if err := writeProbeCacheForModel(cacheDir, model, 131072, 512, "high", "gpu", "llama", gpus, 4,
 			nil, map[int]int{0: 5504}, nil, 0); err != nil {
 			t.Fatalf("write parallel-4 probe: %v", err)
 		}
-		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama"); got[0] != 0 {
-			t.Fatalf("parallel-4 measurement carried into a parallel-1 launch: %d MiB", got[0])
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama")[0]; got != 5504 {
+			t.Fatalf("cross-parallel fallback = %d MiB, want 5504 rather than budgeting zero", got)
+		}
+
+		// Once the launch's own slot count has a measurement it must win, even
+		// though it is the smaller number.
+		if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1,
+			nil, map[int]int{0: 2457}, nil, 0); err != nil {
+			t.Fatalf("write parallel-1 probe: %v", err)
+		}
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama")[0]; got != 2457 {
+			t.Fatalf("exact-parallel measurement = %d MiB, want it to beat the cross-parallel 5504", got)
 		}
 	})
 

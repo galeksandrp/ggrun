@@ -1313,11 +1313,30 @@ func TestChooseAutoBackendRejectsProfileIncompatibleCandidate(t *testing.T) {
 	}
 }
 
-func TestNormalizeDeepSeek4AutoKVRequestUsesIKCompatibleBaseline(t *testing.T) {
-	req := &launchRequest{KVQuality: "q4_0", KVTypeK: "q4_0", KVTypeV: "q4_0"}
-	normalizeDeepSeek4AutoKVRequest(req, &placement.ModelProfile{ModelArch: "deepseek4"})
-	if req.KVQuality != "q8_0" || req.KVTypeK != "" || req.KVTypeV != "" {
-		t.Fatalf("auto backend KV normalization = quality %q, K %q, V %q", req.KVQuality, req.KVTypeK, req.KVTypeV)
+// The auto baseline is f16, NOT the q8_0 that ik_llama's loader accepts. V4's
+// attention weights are already FP8, so a q8_0 K-cache compounds the precision
+// loss into repetition loops or '='-spam that no backend reports as an error.
+func TestNormalizeDeepSeek4AutoKVRequestPinsF16(t *testing.T) {
+	for _, quality := range []string{"q4_0", "q8_0"} {
+		req := &launchRequest{KVQuality: quality, KVTypeK: quality, KVTypeV: quality}
+		normalizeDeepSeek4AutoKVRequest(req, &placement.ModelProfile{ModelArch: "deepseek4"})
+		if req.KVQuality != "f16" || req.KVTypeK != "" || req.KVTypeV != "" {
+			t.Fatalf("auto KV normalization from %s = quality %q, K %q, V %q", quality, req.KVQuality, req.KVTypeK, req.KVTypeV)
+		}
+	}
+
+	// bf16 carries no requantization loss, so it is left alone.
+	keep := &launchRequest{KVQuality: "bf16"}
+	normalizeDeepSeek4AutoKVRequest(keep, &placement.ModelProfile{ModelArch: "deepseek4"})
+	if keep.KVQuality != "bf16" {
+		t.Fatalf("bf16 K-cache was rewritten to %q", keep.KVQuality)
+	}
+
+	// Other architectures keep whatever the user asked for.
+	other := &launchRequest{KVQuality: "q4_0"}
+	normalizeDeepSeek4AutoKVRequest(other, &placement.ModelProfile{ModelArch: "qwen3moe"})
+	if other.KVQuality != "q4_0" {
+		t.Fatalf("non-deepseek4 KV quality was rewritten to %q", other.KVQuality)
 	}
 }
 
@@ -1360,12 +1379,23 @@ func TestBackendFeatureCompatibilityPreservesExplicitKHadamard(t *testing.T) {
 	}
 }
 
-func TestBackendFeatureCompatibilityPromotesUnsupportedDeepSeek4IKKV(t *testing.T) {
-	req := &launchRequest{KVQuality: "q4_0", KVTypeK: "q4_0", KVTypeV: "q4_0"}
-	be := &backendInfo{Path: "/ik/llama-server", IsIK: true}
-	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
-	if req.KVQuality != "q8_0" || req.KVTypeK != "" || req.KVTypeV != "" {
-		t.Fatalf("DeepSeek4 IK KV compatibility = quality %q, K %q, V %q", req.KVQuality, req.KVTypeK, req.KVTypeV)
+// Both backend families are held to f16. ik_llama's loader accepting a q8_0
+// K-cache for deepseek4 is not permission to use one: the old rule read that
+// acceptance as support and promoted ik launches to q8_0, which is the silent
+// corruption path. Mainline rejects it outright, so only ik ever got there.
+func TestBackendFeatureCompatibilityPinsDeepSeek4KVToF16(t *testing.T) {
+	for _, be := range []*backendInfo{
+		{Path: "/ik/llama-server", IsIK: true},
+		{Path: "/llama/llama-server"},
+	} {
+		for _, quality := range []string{"q4_0", "q8_0"} {
+			req := &launchRequest{KVQuality: quality, KVTypeK: quality, KVTypeV: quality}
+			applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
+			if req.KVQuality != "f16" || req.KVTypeK != "" || req.KVTypeV != "" {
+				t.Fatalf("DeepSeek4 KV on %s from %s = quality %q, K %q, V %q",
+					be.Path, quality, req.KVQuality, req.KVTypeK, req.KVTypeV)
+			}
+		}
 	}
 }
 
@@ -2527,5 +2557,37 @@ func TestReleaseReadingsAtBaseline(t *testing.T) {
 	}
 	if releaseReadingsAtBaseline(baseline, 100000, map[int]int{0: 700, 2: 900}) {
 		t.Fatal("unreleased main-model VRAM was accepted")
+	}
+}
+
+// ik_llama's CUDA host buffer prefaults and page-locks the whole allocation, so
+// an 84 GiB CPU-expert plan stalls the launch before a single weight is read.
+// GGML_CUDA_NO_PINNED routes those tensors to an ordinary CPU buffer instead.
+func TestHostExpertPinningEnvDisablesPinnedIKHostBuffer(t *testing.T) {
+	ik := &backendInfo{Path: "/ik/llama-server", IsIK: true}
+
+	for _, args := range [][]string{
+		{"-m", "model.gguf", "--n-cpu-moe", "32"},
+		{"-m", "model.gguf", "-ot", `blk\.(0|1)\.ffn.*=CUDA0,exps=CPU`},
+	} {
+		got := hostExpertPinningEnv(ik, args)
+		if len(got) != 1 || got[0] != "GGML_CUDA_NO_PINNED=1" {
+			t.Fatalf("CPU-expert ik launch env = %v, want GGML_CUDA_NO_PINNED=1 (args %v)", got, args)
+		}
+	}
+
+	// A fully GPU-resident plan keeps pinning: there is no large host buffer to
+	// pay for, and pinned memory is genuinely faster for prompt processing.
+	if got := hostExpertPinningEnv(ik, []string{"-m", "model.gguf", "-ngl", "999", "--n-cpu-moe", "0"}); got != nil {
+		t.Fatalf("GPU-resident ik launch disabled pinning: %v", got)
+	}
+
+	// Mainline allocates CPU experts differently and is not subject to this.
+	mainline := &backendInfo{Path: "/llama/llama-server"}
+	if got := hostExpertPinningEnv(mainline, []string{"--n-cpu-moe", "32"}); got != nil {
+		t.Fatalf("mainline launch disabled pinning: %v", got)
+	}
+	if got := hostExpertPinningEnv(nil, []string{"--n-cpu-moe", "32"}); got != nil {
+		t.Fatalf("nil backend produced env %v", got)
 	}
 }

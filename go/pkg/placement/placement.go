@@ -4871,11 +4871,24 @@ func RuntimeGraphGrowthByGPU(cacheDir string, model *ModelProfile, ctxSize, ubat
 // carried the growth, and it self-heals once the cold key records its own value.
 //
 // Match width: SpecTargetIdentity (via the probe header model basename) +
-// gpuSignatureHash + probeParallelKey + backend tag. ctx/ubatch/kv_quality/
-// kv_placement are deliberately relaxed — runtime growth is model-graph state
-// that scales with model shape, not context/ubatch. parallel is NOT relaxed:
-// a measurement from a different slot count is deliberately not evidence for
-// this launch (mirrors placement_test.go:955-985 cross-parallel contract).
+// gpuSignatureHash. ctx/ubatch/kv_quality/kv_placement are relaxed — runtime
+// growth is model-graph state that scales with model shape, not context/ubatch.
+//
+// parallel is preferred but not required, in two tiers: a measurement at the
+// launch's own slot count wins outright, and one from a different slot count
+// fills in only for a device that would otherwise be budgeted zero. Slot count
+// is part of the graph shape (n_seqs), so cross-parallel growth is genuinely
+// weaker evidence — but zero is not a neutral default. It is a value already
+// known to be wrong for any model that has recorded growth at all, and it is
+// what made the carry a no-op for the exact launch it was written to protect:
+// on a rig whose only measured DeepSeek-V4 growth sat in a parallel=2 probe, a
+// parallel=1 launch matched nothing and planned blind. Filling a zero with a
+// same-model, same-hardware observation is strictly closer to the truth, and
+// the exact tier means it never displaces better evidence.
+//
+// This does NOT relax the compute-buffer cache, where slot count really does
+// change the measurement (per-slot batch buffers) — that path is untouched and
+// its cross-parallel contract in placement_test.go still holds.
 func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus []detect.GPU, parallel int, backendTag string) map[int]int {
 	if model == nil || cacheDir == "" {
 		return nil
@@ -4883,7 +4896,10 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 	modelBase := filepath.Base(model.Path)
 	wantSig := gpuSignatureHash(gpus)
 	wantParallel := probeParallelKey(parallel)
-	byDevice := map[int]int{}
+	// Tier 1: measurements at this launch's slot count. Tier 2: any other slot
+	// count for the same model and hardware, used only where tier 1 is silent.
+	exactByDevice := map[int]int{}
+	anyParallelByDevice := map[int]int{}
 	entries, err := os.ReadDir(cacheDir)
 	if err != nil {
 		return nil
@@ -4922,11 +4938,12 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 					}
 				}
 			}
-			// Match on model basename + gpu_sig + parallel. backend is part of the
-			// backend= value in the key line but its exact form varies; relax it
-			// here (the gpu_sig + parallel + same-model match is the load-bearing
-			// filter the design specifies).
-			if headerKV == modelBase && sig == wantSig && probeParallelKey(par) == wantParallel {
+			// Match on model basename + gpu_sig. backend is part of the backend=
+			// value in the key line but its exact form varies; relax it here (the
+			// gpu_sig + same-model match is the load-bearing filter). Slot count
+			// is recorded rather than required, so the two tiers can be split
+			// after parsing.
+			if headerKV == modelBase && sig == wantSig {
 				matched = true
 			}
 			if strings.HasPrefix(line, "PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA") {
@@ -4947,13 +4964,28 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 		if !matched {
 			continue
 		}
+		target := anyParallelByDevice
+		if probeParallelKey(par) == wantParallel {
+			target = exactByDevice
+		}
 		for dev, v := range growth {
 			if hasEstimate[dev] {
 				continue // estimated (guessed) growth is not evidence for a carry
 			}
-			if v > byDevice[dev] {
-				byDevice[dev] = v
+			if v > target[dev] {
+				target[dev] = v
 			}
+		}
+	}
+	byDevice := map[int]int{}
+	for dev, v := range exactByDevice {
+		byDevice[dev] = v
+	}
+	// Cross-parallel evidence only reaches a device that the exact tier left at
+	// zero, so a same-slot-count measurement is never displaced by a weaker one.
+	for dev, v := range anyParallelByDevice {
+		if byDevice[dev] == 0 {
+			byDevice[dev] = v
 		}
 	}
 	if len(byDevice) == 0 {

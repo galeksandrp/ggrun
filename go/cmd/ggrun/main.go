@@ -1874,11 +1874,19 @@ func normalizeDeepSeek4AutoKVRequest(req *launchRequest, model *placement.ModelP
 		return
 	}
 	kvType, err := placement.NormalizeKVType(req.KVQuality)
-	if err != nil || kvType == "f16" || kvType == "bf16" || kvType == "q8_0" {
+	if err != nil || kvType == "f16" || kvType == "bf16" {
 		return
 	}
-	fmt.Printf("[launch] DeepSeek4 does not support %s K-cache on the preferred ik backend; using q8_0 for backend selection and placement.\n", kvType)
-	req.KVQuality = "q8_0"
+	// q8_0 is deliberately NOT accepted, even though ik_llama's loader lists it
+	// as legal ("deepseek4 k-cache supports only f16, bf16, and q8_0" -- see the
+	// classifier in preflight.go). Accepting a type is not the same as computing
+	// correctly with it: V4 ships FP8 attention weights that are already
+	// quantized, so a q8_0 KV compounds the precision loss and the model
+	// degenerates into repetition loops or '='-spam with no error from the
+	// backend at all. A silent wrong answer is the worst failure mode an agentic
+	// launcher can have, so the K-cache is pinned to f16.
+	fmt.Printf("[launch] DeepSeek4 needs an f16 K-cache for correct output (%s risks silent corruption); using f16 for backend selection and placement.\n", kvType)
+	req.KVQuality = "f16"
 	req.KVTypeK, req.KVTypeV = "", ""
 }
 
@@ -2723,13 +2731,61 @@ func stdinIsTerminal() bool {
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
+// hostExpertPinningEnv disables ik_llama's pinned host buffer when the plan
+// parks expert tensors on the CPU.
+//
+// ik's CUDA host buffer is not a plain allocation. On Linux
+// (ggml/src/ggml-cuda.cu ggml_cuda_host_malloc) it mmaps the whole request as
+// MAP_ANONYMOUS, prefaults every single page (MADV_POPULATE_WRITE, or a manual
+// byte-touch loop when that is unavailable), then cudaHostRegister()s the
+// result. For the DeepSeek-V4 plan on this class of machine that is 84 GiB:
+// ~22 million pages faulted in and then page-locked before the first weight is
+// read. Observed 2026-08-04 as a launch that sat at a flat 88 GB RSS with the
+// progress bar frozen -- not deadlocked, just paying that bill.
+//
+// GGML_CUDA_NO_PINNED makes ggml_cuda_host_malloc return nullptr immediately,
+// and the caller has an explicit "fallback to cpu buffer" branch
+// (ggml_backend_cuda_host_buffer_type_alloc_buffer), so the experts land in an
+// ordinary CPU buffer instead. Resident loading is preserved -- which is the
+// behaviour worth keeping, since a long one-time load beats permanently paging
+// experts off SSD -- and the placement math above it stays correct, because it
+// already budgets those bytes as resident.
+//
+// The cost is real and one-directional: pageable memory cannot use async DMA,
+// so prompt processing is slower than it would be with pinning. A server that
+// cannot finish loading has no throughput at all, so this is the right trade.
+func hostExpertPinningEnv(be *backendInfo, serverArgs []string) []string {
+	if be == nil || !be.IsIK {
+		return nil
+	}
+	if !argsOffloadExpertsToCPU(serverArgs) {
+		return nil
+	}
+	return []string{"GGML_CUDA_NO_PINNED=1"}
+}
+
+// argsOffloadExpertsToCPU reports whether the generated command line actually
+// parks expert tensors in host memory. Keyed off the emitted argv rather than
+// the strategy so it cannot drift from what the backend is really told.
+func argsOffloadExpertsToCPU(serverArgs []string) bool {
+	for i, a := range serverArgs {
+		if a == "--n-cpu-moe" && i+1 < len(serverArgs) && serverArgs[i+1] != "0" {
+			return true
+		}
+		if a == "-ot" && i+1 < len(serverArgs) && strings.Contains(strings.ToUpper(serverArgs[i+1]), "=CPU") {
+			return true
+		}
+	}
+	return false
+}
+
 func backendStartOptions(req *launchRequest, caps *detect.Capabilities, envOverrides []string) server.StartOptions {
 	memoryMaxMB := backendMemoryMaxMB(req, caps)
 	return server.StartOptions{EnvOverrides: envOverrides, MemoryHighMB: memoryMaxMB, MemoryMaxMB: memoryMaxMB}
 }
 
 func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration) (*server.Process, error) {
-	startOpts := backendStartOptions(req, caps, nil)
+	startOpts := backendStartOptions(req, caps, hostExpertPinningEnv(be, serverArgs))
 	if req.ClaudeCode {
 		// In Claude Code mode ggrun hands the terminal to the `claude` client, so
 		// the backend's ongoing per-request logs must go to a file instead of
@@ -3717,17 +3773,23 @@ func applyBackendFeatureCompatibility(req *launchRequest, model *placement.Model
 	isDeepSeek4 := model != nil && strings.EqualFold(strings.TrimSpace(model.ModelArch), "deepseek4")
 	isDeepSeek4IK := isDeepSeek4 && be.IsIK
 	if isDeepSeek4 {
+		// Both backend families are held to f16. ik_llama's loader accepts a
+		// q8_0 K-cache for deepseek4 and mainline rejects it, so the old rule
+		// read the ik acceptance as permission and promoted ik launches to q8_0.
+		// That is the one case where the backend's own answer is misleading: V4's
+		// attention weights are already FP8, and re-quantizing the K-cache to
+		// q8_0 compounds the loss into repetition loops or '='-spam that the
+		// backend never reports as an error. Correctness outranks the KV
+		// footprint saving, and an f16 promotion is the safe direction because it
+		// only ever asks placement for more room, never less.
 		if kvType, err := placement.NormalizeKVType(req.KVQuality); err == nil &&
-			((isDeepSeek4IK && kvType != "f16" && kvType != "bf16" && kvType != "q8_0") ||
-				(!isDeepSeek4IK && kvType != "f16")) {
-			target := "f16"
+			kvType != "f16" && kvType != "bf16" {
 			family := "mainline"
 			if isDeepSeek4IK {
-				target = "q8_0"
 				family = "ik_llama"
 			}
-			fmt.Printf("[launch] DeepSeek4 on %s does not support %s K-cache; promoting this launch to %s and recomputing placement.\n", family, kvType, target)
-			req.KVQuality = target
+			fmt.Printf("[launch] DeepSeek4 on %s cannot be trusted with a %s K-cache (silent output corruption); promoting this launch to f16 and recomputing placement.\n", family, kvType)
+			req.KVQuality = "f16"
 			req.KVTypeK, req.KVTypeV = "", ""
 		}
 	}
