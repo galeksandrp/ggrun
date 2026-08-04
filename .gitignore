@@ -23,6 +23,14 @@ dist/
 /go/ggrun
 /go/llm-server
 /ggrun
+/.bin
+/.config
+/.src
+/.cache
+/.logs
+/models
+/.env.sh
+/.env.*
 /llm-server-go
 /llm-server-bash
 /llama-server

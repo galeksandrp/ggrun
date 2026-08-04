@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/raketenkater/ggrun/pkg/advisor"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/placement"
 )
@@ -118,12 +119,51 @@ func TestClaudeReviewerArgsUsesIsolatedDeviceAsLocalMain(t *testing.T) {
 	}
 }
 
+func TestClaudeNanoReviewerArgsUsesQ4KV(t *testing.T) {
+	args := claudeReviewerArgsWithKV(
+		"server", "nanbeige.gguf", 1234, "CUDA0",
+		"--cache-type-k TYPE --cache-type-v TYPE", "q4_0", true,
+	)
+	for _, flag := range []string{"--cache-type-k", "--cache-type-v"} {
+		if !hasArgValue(args, flag, "q4_0") {
+			t.Fatalf("expected %s q4_0 in %v", flag, args)
+		}
+	}
+}
+
 func TestClaudeReviewerArgsKeepsOlderBackendCompatibility(t *testing.T) {
 	args := claudeReviewerArgs("server", "reviewer.gguf", 1234, "", "--reasoning ARG")
 	for _, unsupported := range []string{"--cache-type-k", "--cache-type-v"} {
 		if hasArg(args, unsupported) {
 			t.Fatalf("unexpected unsupported %q in %v", unsupported, args)
 		}
+	}
+}
+
+func TestClaudeNanoReviewerArgsOverridesNanbeigeTemplate(t *testing.T) {
+	root := t.TempDir()
+	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
+	if err := os.MkdirAll(filepath.Dir(template), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(template, []byte("template"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(root, "build-cuda", "bin", "llama-server")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	args := claudeReviewerArgsWithKV(
+		bin, "nanbeige.gguf", 1234, "CUDA0",
+		"--cache-type-k TYPE --cache-type-v TYPE --reasoning ARG", "q4_0", true,
+	)
+	if !hasArgValue(args, "--chat-template-file", template) {
+		t.Fatalf("nanbeige reviewer args must include --chat-template-file %s, got %v", template, args)
+	}
+	// The non-nanbeige reviewer (noJinja=false) must not receive the override.
+	plain := claudeReviewerArgs(bin, "reviewer.gguf", 1234, "", "--reasoning ARG")
+	if hasArg(plain, "--chat-template-file") {
+		t.Fatalf("non-nanbeige reviewer must not receive template override, got %v", plain)
 	}
 }
 
@@ -231,6 +271,13 @@ func TestClaudeAutoReviewerNeededDefaultsOnForAuto(t *testing.T) {
 	if claudeAutoReviewerNeeded(nil) {
 		t.Fatal("non-Auto permission mode should not spend memory on a reviewer")
 	}
+	if !claudeCompanionNeeded(nil) {
+		t.Fatal("non-Auto permission mode still needs the cheap-tier worker")
+	}
+	t.Setenv("GGRUN_CLAUDE_AUTO_REVIEWER", "off")
+	if claudeCompanionNeeded(nil) {
+		t.Fatal("the explicit companion disable switch must remain authoritative")
+	}
 }
 
 func TestClaudeReviewerReservationBuildsCompanion(t *testing.T) {
@@ -250,12 +297,81 @@ func TestClaudeReviewerReservationBuildsCompanion(t *testing.T) {
 	if res.VRAMMB <= 0 {
 		t.Fatalf("reservation must carry a positive VRAM footprint, got %d", res.VRAMMB)
 	}
-	if !res.AllowCPU {
-		t.Fatal("a full-GPU host must keep fail-closed Auto working via CPU")
+	if res.AllowCPU {
+		t.Fatal("companion CPU fallback must not bypass the placement RAM ledger")
 	}
 	// Preference order mirrors the legacy walk: slow GPU first, main last.
 	if len(res.GPUPreference) != 2 || res.GPUPreference[0] != 1 || res.GPUPreference[1] != 0 {
 		t.Fatalf("GPU preference = %v, want [1 0]", res.GPUPreference)
+	}
+}
+
+func TestClaudeCompanionPrefersVerifiedNanoAndFreezesChoice(t *testing.T) {
+	cacheDir := t.TempDir()
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(path string) bool {
+		return path == advisor.DefaultModelPath(cacheDir)
+	}
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	req := &launchRequest{AppHome: t.TempDir()}
+	profile := resolveClaudeCompanionProfile(req, cacheDir)
+	if !profile.NanoBeige || profile.Name != claudeNanoCompanionName || profile.BackendPath == "" || profile.KVType != "q4_0" {
+		t.Fatalf("verified NanoBeige pair was not selected: %+v", profile)
+	}
+	if profile.companionMeasurementKey() == profile.Name {
+		t.Fatal("NanoBeige Q4 profile reused the historical Q8 VRAM measurement key")
+	}
+	// State appearing or disappearing after placement must not change the seat.
+	claudeNanoArtifactReady = func(string) bool { return false }
+	if again := resolveClaudeCompanionProfile(req, cacheDir); again != profile {
+		t.Fatalf("companion changed after launch choice: before=%p after=%p", profile, again)
+	}
+}
+
+func TestClaudeCompanionRejectsCPUOnlyNanoBackend(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return false }
+	profile := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir()}, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("CPU-only helper backend received a GPU worker profile: %+v", profile)
+	}
+}
+
+func TestClaudeCompanionExplicitModelOverrideWinsNano(t *testing.T) {
+	custom := filepath.Join(t.TempDir(), "custom.gguf")
+	t.Setenv("GGRUN_CLAUDE_REVIEWER_MODEL", custom)
+	restoreReady, restoreBackend := claudeNanoArtifactReady, claudeNanoBackend
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend = restoreReady, restoreBackend
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	profile := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir()}, t.TempDir())
+	if profile.NanoBeige || profile.ModelPath != custom || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("explicit reviewer override lost to automatic Nano selection: %+v", profile)
+	}
+}
+
+func TestClaudeCompanionExplicitBackendOverrideWinsNano(t *testing.T) {
+	t.Setenv("GGRUN_CLAUDE_REVIEWER_BIN", filepath.Join(t.TempDir(), "custom-server"))
+	restoreReady, restoreBackend := claudeNanoArtifactReady, claudeNanoBackend
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend = restoreReady, restoreBackend
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	profile := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir()}, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("explicit reviewer backend lost to automatic Nano selection: %+v", profile)
 	}
 }
 
@@ -271,6 +387,16 @@ func TestClaudeReviewerReservationSkipsNonClaudeAndCPU(t *testing.T) {
 	}
 	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true}, &detect.Capabilities{}, ""); res != nil {
 		t.Fatal("GPU-less host must not reserve GPU VRAM for the reviewer")
+	}
+	if res := claudeReviewerReservation(&launchRequest{ClaudeCode: true, ClaudeReviewerDisabled: true}, caps, ""); res != nil {
+		t.Fatal("main-model review fallback must not reserve a separate reviewer")
+	}
+}
+
+func TestStartClaudeReviewerSkipsMainModelFallback(t *testing.T) {
+	runtime, err := startClaudeAutoReviewer(&launchRequest{ClaudeCode: true, ClaudeReviewerDisabled: true}, nil, nil, nil)
+	if err != nil || runtime != nil {
+		t.Fatalf("main-model review fallback started a separate reviewer: runtime=%#v err=%v", runtime, err)
 	}
 }
 
@@ -290,7 +416,7 @@ func TestReviewerReservationIsNotChargedTwice(t *testing.T) {
 	defer func() { residentReviewerVRAM = restore }()
 
 	// Nothing resident: the full bound is reserved.
-	residentReviewerVRAM = func() int { return 0 }
+	residentReviewerVRAM = func(string) int { return 0 }
 	got := claudeReviewerReservation(req, caps, "")
 	if got == nil || got.VRAMMB != claudeReviewerReservationVRAMMB {
 		t.Fatalf("with no reviewer running, reservation = %+v, want %d MiB", got, claudeReviewerReservationVRAMMB)
@@ -306,12 +432,12 @@ func TestReviewerReservationIsNotChargedTwice(t *testing.T) {
 	}
 
 	// A leftover reviewer already occupies that VRAM, so nothing more is owed.
-	residentReviewerVRAM = func() int { return 2096 }
+	residentReviewerVRAM = func(string) int { return 2096 }
 	if got := claudeReviewerReservation(req, caps, dir); got != nil {
 		t.Errorf("reservation = %+v, want none: the seat is already occupied", got)
 	}
 	// A partially covered seat reserves only the difference.
-	residentReviewerVRAM = func() int { return 1500 }
+	residentReviewerVRAM = func(string) int { return 1500 }
 	if got := claudeReviewerReservation(req, caps, dir); got == nil || got.VRAMMB != 596 {
 		t.Errorf("reservation = %+v, want the uncovered 596 MiB", got)
 	}

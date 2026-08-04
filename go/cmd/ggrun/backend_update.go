@@ -17,9 +17,9 @@ import (
 // at all.
 //
 // So an update preserves the build it replaces instead of overwriting it. The
-// old tree is renamed aside before the new one is built, which is a rename on
-// the same filesystem rather than a copy of several hundred megabytes, and the
-// registration only moves once the new build has produced a binary.
+// candidate is compiled and conformance-tested in a sibling directory while
+// the active tree remains untouched. Only then does a same-filesystem rename
+// promote it and retain the previous tree for rollback.
 //
 // Nothing here is specific to a model or a fork: the source directory,
 // accelerator and pin all come from the backend's own record, so any registered
@@ -94,27 +94,42 @@ func pruneBuildDir(path string) error {
 	return os.RemoveAll(path)
 }
 
-// cmdBackendUpdate rebuilds a backend at the newest revision of its recipe (or
-// its recorded branch), keeping the current build so the change is reversible.
+func pruneCandidateBuildDir(path, activeBuildDir string) error {
+	if path == "" || activeBuildDir == "" || filepath.Dir(path) != filepath.Dir(activeBuildDir) ||
+		!strings.HasPrefix(filepath.Base(path), filepath.Base(activeBuildDir)+"-candidate-") {
+		return fmt.Errorf("refusing to remove %q: not a staged candidate beside %s", path, activeBuildDir)
+	}
+	return os.RemoveAll(path)
+}
+
+// cmdBackendUpdate rebuilds one named fork. The reusable core returns errors so
+// ggrun update can continue through every registered backend instead of the
+// first failure terminating the entire process via os.Exit.
 func cmdBackendUpdate(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "update needs a backend tag; see: ggrun backend list")
 		os.Exit(2)
 	}
-	tag := args[0]
+	if err := updateRegisteredBackend(args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot update backend %q: %v\n", args[0], err)
+		os.Exit(1)
+	}
+}
+
+// updateRegisteredBackend updates one manifest backend while preserving its
+// prior build. It never exits the process, which lets update-all isolate errors
+// and produce a complete per-fork summary.
+func updateRegisteredBackend(tag string) error {
 	be := backends.ByTag(tag)
 	if be == nil {
-		fmt.Fprintf(os.Stderr, "unknown backend %q; see: ggrun backend list\n", tag)
-		os.Exit(2)
+		return fmt.Errorf("unknown backend; see: ggrun backend list")
 	}
 	layout, err := backendLayoutFor(*be)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot update: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	if _, err := os.Stat(layout.srcDir); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot update: source checkout %s is gone; reinstall instead\n", layout.srcDir)
-		os.Exit(1)
+		return fmt.Errorf("source checkout %s is gone; reinstall instead", layout.srcDir)
 	}
 
 	// A recipe is the authority on where a backend should be: it carries the
@@ -122,57 +137,93 @@ func cmdBackendUpdate(args []string) {
 	// branch keeps hand-added forks updatable too.
 	recipe := backends.RecipeByName(tag)
 	branch, commit := be.Branch, be.Commit
+	forceRebuild := false
 	if recipe != nil {
 		branch, commit = recipe.Branch, recipe.Commit
-		if commit != "" && strings.EqualFold(commit, be.Commit) {
-			fmt.Printf("[backend] %s is already at the reviewed commit %s; nothing to update.\n", tag, shortCommit(commit))
-			return
+		if commit != "" && strings.EqualFold(commit, be.Commit) &&
+			sameStrings(recipe.PatchNames(), be.AppliedPatches) {
+			if validateErr := validateBackendCandidate(be.Path, be.RouteArch, layout.accel); validateErr == nil {
+				// Persist catalog policy even when no source rebuild is needed.
+				// This migrates manifests written before helper_only existed.
+				*be = backends.ApplyBuiltinPolicy(*be)
+				if err := backends.Upsert(*be); err != nil {
+					return fmt.Errorf("persist reviewed backend policy: %w", err)
+				}
+				fmt.Printf("[backend] %s is already at the reviewed commit %s and passes conformance; nothing to update.\n", tag, shortCommit(commit))
+				return nil
+			} else {
+				forceRebuild = true
+				fmt.Printf("[backend] %s is current but failed conformance (%v); rebuilding the pinned source.\n", tag, validateErr)
+			}
 		}
 	} else if commit != "" {
 		// A hand-pinned backend has nothing to advance to. Tracking the branch
-		// instead would silently discard the pin the user chose.
-		fmt.Printf("[backend] %s is pinned to commit %s with no recipe to advance it.\n", tag, shortCommit(commit))
-		fmt.Println("[backend] re-add it with a new --commit to move the pin.")
-		return
+		// instead would silently discard the pin the user chose. It may still
+		// need a same-commit rebuild when its active binary is damaged.
+		if validateErr := validateBackendCandidate(be.Path, be.RouteArch, layout.accel); validateErr == nil {
+			fmt.Printf("[backend] %s is pinned to commit %s with no recipe to advance it and passes conformance.\n", tag, shortCommit(commit))
+			fmt.Println("[backend] re-add it with a new --commit to move the pin.")
+			return nil
+		} else {
+			forceRebuild = true
+			fmt.Printf("[backend] %s pinned binary failed conformance (%v); rebuilding the same commit.\n", tag, validateErr)
+		}
 	}
 
 	fmt.Printf("[backend] updating %s (%s)\n", tag, layout.srcDir)
 	if err := prepareForkCheckoutRecipe(layout.srcDir, branch, commit, recipe); err != nil {
-		fmt.Fprintf(os.Stderr, "source checkout failed: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("source checkout failed: %w", err)
 	}
 	newCommit, _ := gitOutput(layout.srcDir, "rev-parse", "HEAD")
 	newCommit = strings.TrimSpace(newCommit)
-	if newCommit != "" && strings.EqualFold(newCommit, be.Commit) {
+	patchesCurrent := recipe == nil || sameStrings(recipe.PatchNames(), be.AppliedPatches)
+	if newCommit != "" && strings.EqualFold(newCommit, be.Commit) && patchesCurrent && !forceRebuild {
 		fmt.Printf("[backend] %s already at %s; nothing to rebuild.\n", tag, shortCommit(newCommit))
-		return
+		return nil
 	}
+
+	candidateBuildDir := fmt.Sprintf("%s-candidate-%s-%d", layout.buildDir, shortCommit(newCommit), time.Now().UnixNano())
+	promoted := false
+	defer func() {
+		if !promoted {
+			_ = pruneCandidateBuildDir(candidateBuildDir, layout.buildDir)
+		}
+	}()
+	fmt.Printf("[backend] building isolated candidate (%s)… this can take 30–60 min\n", layout.accel)
+	candidateBin, err := buildLlamaForkAt(layout.srcDir, candidateBuildDir, layout.accel, "")
+	if err != nil {
+		return fmt.Errorf("build failed: %w", err)
+	}
+	if err := validateBackendCandidate(candidateBin, be.RouteArch, layout.accel); err != nil {
+		return fmt.Errorf("candidate conformance failed; active backend unchanged: %w", err)
+	}
+	fmt.Printf("[backend] candidate passed server/architecture/accelerator conformance: %s\n", candidateBin)
 
 	archived := ""
 	if _, err := os.Stat(layout.buildDir); err == nil {
 		archived, err = archiveBuildDir(layout.buildDir, be.Commit)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
+			return err
 		}
 		fmt.Printf("[backend] previous build kept at %s\n", archived)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect active build: %w", err)
 	}
-
-	fmt.Printf("[backend] building (%s)… this can take 30–60 min\n", layout.accel)
-	bin, err := buildLlamaFork(layout.srcDir, layout.accel, "")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "build failed: %v\n", err)
-		// The registration still points at the archived build, so restoring it
-		// leaves the machine exactly as the update found it.
+	if err := os.Rename(candidateBuildDir, layout.buildDir); err != nil {
 		if archived != "" {
-			if rerr := os.Rename(archived, layout.buildDir); rerr == nil {
-				fmt.Fprintf(os.Stderr, "[backend] restored previous build; %s still works.\n", tag)
-			} else {
-				fmt.Fprintf(os.Stderr, "[backend] could not restore previous build: %v\n", rerr)
-				fmt.Fprintf(os.Stderr, "[backend] it is intact at %s\n", archived)
-			}
+			_ = os.Rename(archived, layout.buildDir)
 		}
-		os.Exit(1)
+		return fmt.Errorf("activate conformance-tested candidate: %w", err)
+	}
+	promoted = true
+	bin := filepath.Join(layout.buildDir, "bin", filepath.Base(be.Path))
+	if err := validateBackendCandidate(bin, be.RouteArch, layout.accel); err != nil {
+		failed := layout.buildDir + "-candidate-invalid-" + shortCommit(newCommit)
+		_ = os.Rename(layout.buildDir, failed)
+		if archived != "" {
+			_ = os.Rename(archived, layout.buildDir)
+		}
+		return fmt.Errorf("promoted candidate changed behavior; previous build restored, candidate at %s: %w", failed, err)
 	}
 
 	prev := &backends.BackendVersion{
@@ -190,14 +241,23 @@ func cmdBackendUpdate(args []string) {
 	updated.Previous = prev
 	if recipe != nil {
 		updated.AppliedPatches = recipe.PatchNames()
+		updated.HelperOnly = recipe.HelperOnly
+		updated.RouteArch = recipe.RouteArch
 		if recipe.GitURL != "" {
 			updated.GitURL = recipe.GitURL
 		}
 		updated.Branch = recipe.Branch
 	}
 	if err := backends.Upsert(updated); err != nil {
-		fmt.Fprintf(os.Stderr, "register failed: %v\n", err)
-		os.Exit(1)
+		if archived != "" {
+			unregistered := layout.buildDir + "-unregistered-" + shortCommit(newCommit)
+			if renameErr := os.Rename(layout.buildDir, unregistered); renameErr == nil {
+				if restoreErr := os.Rename(archived, layout.buildDir); restoreErr == nil {
+					return fmt.Errorf("register failed: %w (previous build restored; new build preserved at %s)", err, unregistered)
+				}
+			}
+		}
+		return fmt.Errorf("register failed: %w", err)
 	}
 	// Retention is one level, so the tree this update pushed out of history is
 	// now unreachable and would otherwise accumulate a compiled checkout per
@@ -212,6 +272,19 @@ func cmdBackendUpdate(args []string) {
 	if prev != nil {
 		fmt.Printf("Roll back with: ggrun backend rollback %s\n", tag)
 	}
+	return nil
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // cmdBackendRollback re-points a backend at the build it replaced.
@@ -221,35 +294,9 @@ func cmdBackendRollback(args []string) {
 		os.Exit(2)
 	}
 	tag := args[0]
-	be := backends.ByTag(tag)
-	if be == nil {
-		fmt.Fprintf(os.Stderr, "unknown backend %q; see: ggrun backend list\n", tag)
-		os.Exit(2)
-	}
-	if be.Previous == nil || be.Previous.Path == "" {
-		fmt.Fprintf(os.Stderr, "no previous build recorded for %q; nothing to roll back to.\n", tag)
-		os.Exit(1)
-	}
-	if _, err := os.Stat(be.Previous.Path); err != nil {
-		fmt.Fprintf(os.Stderr, "previous build for %q is gone (%s); reinstall instead.\n", tag, be.Previous.Path)
-		os.Exit(1)
-	}
-
-	// The swap is symmetric so a rollback can itself be undone: someone who
-	// rolls back to escape one failure and meets a worse one can get back.
-	current := &backends.BackendVersion{
-		Path:           be.Path,
-		Commit:         be.Commit,
-		AppliedPatches: be.AppliedPatches,
-		ReplacedAt:     time.Now().UTC().Format(time.RFC3339),
-	}
-	restored := *be
-	restored.Path = be.Previous.Path
-	restored.Commit = be.Previous.Commit
-	restored.AppliedPatches = be.Previous.AppliedPatches
-	restored.Previous = current
-	if err := backends.Upsert(restored); err != nil {
-		fmt.Fprintf(os.Stderr, "register failed: %v\n", err)
+	restored, err := rollbackRegisteredBackend(tag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rollback backend %q: %v\n", tag, err)
 		os.Exit(1)
 	}
 	fmt.Printf("Rolled back backend %q → %s\n", tag, restored.Path)
@@ -257,6 +304,79 @@ func cmdBackendRollback(args []string) {
 		fmt.Printf("  commit: %s\n", shortCommit(restored.Commit))
 	}
 	fmt.Printf("Undo with: ggrun backend rollback %s\n", tag)
+}
+
+// rollbackRegisteredBackend physically swaps the active and archived build
+// trees while keeping the manifest path canonical (build-<accel>/bin). Merely
+// pointing Path into build-cuda-prev-* makes the next update parse the
+// accelerator as "cuda-prev-*" and leaves the backend permanently unupdatable.
+func rollbackRegisteredBackend(tag string) (backends.Backend, error) {
+	be := backends.ByTag(tag)
+	if be == nil {
+		return backends.Backend{}, fmt.Errorf("unknown backend; see: ggrun backend list")
+	}
+	if be.Previous == nil || be.Previous.Path == "" {
+		return backends.Backend{}, fmt.Errorf("no previous build recorded")
+	}
+	if _, err := os.Stat(be.Previous.Path); err != nil {
+		return backends.Backend{}, fmt.Errorf("previous build is gone (%s); reinstall instead", be.Previous.Path)
+	}
+	layout, err := backendLayoutFor(*be)
+	if err != nil {
+		return backends.Backend{}, err
+	}
+	previousBuildDir := filepath.Dir(filepath.Dir(be.Previous.Path))
+	if filepath.Dir(previousBuildDir) != filepath.Dir(layout.buildDir) ||
+		!strings.HasPrefix(filepath.Base(previousBuildDir), filepath.Base(layout.buildDir)+"-prev-") {
+		return backends.Backend{}, fmt.Errorf("previous build path %s is not a managed archive beside %s", previousBuildDir, layout.buildDir)
+	}
+	if err := swapBackendBuildDirs(layout.buildDir, previousBuildDir); err != nil {
+		return backends.Backend{}, err
+	}
+	revert := func() { _ = swapBackendBuildDirs(layout.buildDir, previousBuildDir) }
+
+	canonicalBin := filepath.Join(layout.buildDir, "bin", filepath.Base(be.Path))
+	archivedBin := filepath.Join(previousBuildDir, "bin", filepath.Base(be.Path))
+	if err := validateBackendCandidate(canonicalBin, be.RouteArch, layout.accel); err != nil {
+		revert()
+		return backends.Backend{}, fmt.Errorf("restored build failed conformance; active build put back: %w", err)
+	}
+	current := &backends.BackendVersion{
+		Path:           archivedBin,
+		Commit:         be.Commit,
+		AppliedPatches: be.AppliedPatches,
+		ReplacedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	restored := *be
+	restored.Path = canonicalBin
+	restored.Commit = be.Previous.Commit
+	restored.AppliedPatches = be.Previous.AppliedPatches
+	restored.Previous = current
+	if err := backends.Upsert(restored); err != nil {
+		revert()
+		return backends.Backend{}, fmt.Errorf("register rollback failed; active build put back: %w", err)
+	}
+	return restored, nil
+}
+
+func swapBackendBuildDirs(left, right string) error {
+	if left == "" || right == "" || left == right || filepath.Dir(left) != filepath.Dir(right) {
+		return fmt.Errorf("refusing unsafe backend build swap %q <-> %q", left, right)
+	}
+	tmp := left + fmt.Sprintf("-rollback-swap-%d", time.Now().UnixNano())
+	if err := os.Rename(left, tmp); err != nil {
+		return fmt.Errorf("stage current build for swap: %w", err)
+	}
+	if err := os.Rename(right, left); err != nil {
+		_ = os.Rename(tmp, left)
+		return fmt.Errorf("move previous build to canonical path: %w", err)
+	}
+	if err := os.Rename(tmp, right); err != nil {
+		_ = os.Rename(left, right)
+		_ = os.Rename(tmp, left)
+		return fmt.Errorf("archive replaced build after swap: %w", err)
+	}
+	return nil
 }
 
 func shortCommit(c string) string {

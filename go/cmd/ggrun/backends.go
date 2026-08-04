@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 )
@@ -20,6 +22,9 @@ func fmtCustomBackend(b backends.Backend) string {
 	status := "ok"
 	if _, err := os.Stat(b.Path); err != nil {
 		status = "MISSING BINARY"
+	}
+	if b.HelperOnly {
+		status += ", helper-only"
 	}
 	return fmt.Sprintf("  %-12s [%s] %s\n    route-arch: %s   src: %s @ %s", b.Tag, status, b.Path, route, b.GitURL, b.Branch)
 }
@@ -38,6 +43,7 @@ add/register flags:
   --tag <name>          Selection name (default: derived from URL)
   --route-arch <arch>   Auto-select this backend for models of this architecture
                         (e.g. custommoe), so it "just works" with no --backend
+  --helper-only         Verify --route-arch but never auto-route main models
   --branch <branch>     Git branch to clone (add only; default: default branch)
   --commit <sha>        Pin the exact source commit (add only; recipes always pin)
   --accel cuda|vulkan|cpu   Build accelerator (add only; default: cuda if nvcc present)
@@ -113,6 +119,9 @@ func cmdBackendInstall(args []string) {
 		"--commit", recipe.Commit,
 		"--route-arch", recipe.RouteArch,
 	}
+	if recipe.HelperOnly {
+		generated = append(generated, "--helper-only")
+	}
 	if recipe.Accel != "" {
 		generated = append(generated, "--accel", recipe.Accel)
 	}
@@ -163,11 +172,12 @@ func parseBackendFlags(args []string) (positional string, flags map[string]strin
 func cmdBackendRegister(args []string) {
 	_, f := parseBackendFlags(args)
 	be := backends.Backend{
-		Tag:       f["tag"],
-		Path:      f["path"],
-		RouteArch: f["route-arch"],
-		GitURL:    f["git-url"],
-		Branch:    f["branch"],
+		Tag:        f["tag"],
+		Path:       f["path"],
+		RouteArch:  f["route-arch"],
+		GitURL:     f["git-url"],
+		Branch:     f["branch"],
+		HelperOnly: strings.EqualFold(f["helper-only"], "true"),
 	}
 	if be.Tag == "" || be.Path == "" {
 		fmt.Fprintln(os.Stderr, "register needs --tag and --path")
@@ -175,6 +185,10 @@ func cmdBackendRegister(args []string) {
 	}
 	if _, err := os.Stat(be.Path); err != nil {
 		fmt.Fprintf(os.Stderr, "binary not found: %s\n", be.Path)
+		os.Exit(1)
+	}
+	if err := validateBackendCandidate(be.Path, be.RouteArch, ""); err != nil {
+		fmt.Fprintf(os.Stderr, "backend conformance failed: %v\n", err)
 		os.Exit(1)
 	}
 	if err := backends.Upsert(be); err != nil {
@@ -254,9 +268,13 @@ func cmdBackendAddRecipe(args []string, recipe *backends.Recipe) {
 		fmt.Fprintf(os.Stderr, "build failed: %v\n", err)
 		os.Exit(1)
 	}
+	if err := validateBackendCandidate(bin, f["route-arch"], accel); err != nil {
+		fmt.Fprintf(os.Stderr, "backend conformance failed; refusing registration: %v\n", err)
+		os.Exit(1)
+	}
 
 	actualCommit, _ := gitOutput(srcDir, "rev-parse", "HEAD")
-	be := backends.Backend{Tag: tag, Path: bin, RouteArch: f["route-arch"], GitURL: url, Branch: branch, Commit: strings.TrimSpace(actualCommit)}
+	be := backends.Backend{Tag: tag, Path: bin, RouteArch: f["route-arch"], GitURL: url, Branch: branch, Commit: strings.TrimSpace(actualCommit), HelperOnly: strings.EqualFold(f["helper-only"], "true")}
 	if recipe != nil {
 		be.AppliedPatches = recipe.PatchNames()
 	}
@@ -271,8 +289,10 @@ func cmdBackendAddRecipe(args []string, recipe *backends.Recipe) {
 		fmt.Printf("[backend] linked %s\n", link)
 	}
 	fmt.Printf("Registered backend %q → %s\n", tag, bin)
-	if be.RouteArch != "" {
+	if be.RouteArch != "" && !be.HelperOnly {
 		fmt.Printf("Models with arch %q will now use this backend automatically.\n", be.RouteArch)
+	} else if be.RouteArch != "" {
+		fmt.Printf("Architecture %q verified for helper use; main-model auto-routing remains unchanged.\n", be.RouteArch)
 	}
 }
 
@@ -301,6 +321,9 @@ func prepareForkCheckoutRecipe(srcDir, branch, commit string, recipe *backends.R
 	}
 	if strings.TrimSpace(dirty) != "" {
 		return fmt.Errorf("%s has local changes; commit/stash them or use a different recipe tag", srcDir)
+	}
+	if err := ensureRecipeOrigin(srcDir, recipe); err != nil {
+		return err
 	}
 	ref := commit
 	if ref == "" {
@@ -334,6 +357,32 @@ func prepareForkCheckoutRecipe(srcDir, branch, commit string, recipe *backends.R
 			return err
 		}
 	}
+	return nil
+}
+
+func ensureRecipeOrigin(srcDir string, recipe *backends.Recipe) error {
+	if recipe == nil || strings.TrimSpace(recipe.GitURL) == "" {
+		return nil
+	}
+	want := strings.TrimSpace(recipe.GitURL)
+	got, err := gitOutput(srcDir, "remote", "get-url", "origin")
+	if err != nil {
+		return fmt.Errorf("inspect recipe origin: %w", err)
+	}
+	if strings.TrimSpace(got) == want {
+		return nil
+	}
+	if err := runStreamed(srcDir, "git", "remote", "set-url", "origin", want); err != nil {
+		return fmt.Errorf("migrate recipe origin to %s: %w", want, err)
+	}
+	verified, err := gitOutput(srcDir, "remote", "get-url", "origin")
+	if err != nil || strings.TrimSpace(verified) != want {
+		if err == nil {
+			err = fmt.Errorf("got %q", strings.TrimSpace(verified))
+		}
+		return fmt.Errorf("verify migrated recipe origin: %w", err)
+	}
+	fmt.Printf("[backend] recipe source migrated to %s\n", want)
 	return nil
 }
 
@@ -393,6 +442,12 @@ func defaultAccel() string {
 // accelerator. Returns the built binary path.
 func buildLlamaFork(srcDir, accel, cudaArch string) (string, error) {
 	buildDir := filepath.Join(srcDir, "build-"+accel)
+	return buildLlamaForkAt(srcDir, buildDir, accel, cudaArch)
+}
+
+// buildLlamaForkAt allows updates to compile beside the active build. Callers
+// must run validateBackendCandidate before atomically promoting that directory.
+func buildLlamaForkAt(srcDir, buildDir, accel, cudaArch string) (string, error) {
 	cfg := []string{
 		"-B", buildDir,
 		"-DCMAKE_BUILD_TYPE=Release",
@@ -424,6 +479,63 @@ func buildLlamaFork(srcDir, accel, cudaArch string) (string, error) {
 		return "", fmt.Errorf("build produced no binary at %s", bin)
 	}
 	return bin, nil
+}
+
+// validateBackendCandidate is the activation gate shared by fresh installs and
+// staged updates. A successful compile is insufficient: the binary must behave
+// like llama-server, expose the launch surface ggrun relies on, prove its
+// declared model architecture, and retain the requested accelerator.
+func validateBackendCandidate(binary, routeArch, accel string) error {
+	info, err := os.Stat(binary)
+	if err != nil || info.IsDir() {
+		return fmt.Errorf("backend binary missing: %s", binary)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("backend binary is not executable: %s", binary)
+	}
+	run := func(flag string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		out, runErr := exec.CommandContext(ctx, binary, flag).CombinedOutput()
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("%s timed out", flag)
+		}
+		if runErr != nil {
+			return string(out), fmt.Errorf("%s failed: %w", flag, runErr)
+		}
+		return string(out), nil
+	}
+	if _, err := run("--version"); err != nil {
+		return err
+	}
+	help, err := run("--help")
+	if err != nil {
+		return err
+	}
+	for _, required := range []string{"--model", "--ctx-size", "--host", "--port"} {
+		if !strings.Contains(help, required) {
+			return fmt.Errorf("--help does not expose required server option %s", required)
+		}
+	}
+	if arch := strings.TrimSpace(routeArch); arch != "" {
+		supported, probed := backends.BackendSupportsArch(binary, arch)
+		if !probed {
+			return fmt.Errorf("could not verify declared architecture %q", arch)
+		}
+		if !supported {
+			return fmt.Errorf("binary does not contain declared architecture %q", arch)
+		}
+	}
+	if accel == "cuda" || accel == "vulkan" {
+		capable, probed := backendGPUCapable(binary)
+		if !probed {
+			return fmt.Errorf("could not verify %s device support", accel)
+		}
+		if !capable {
+			return fmt.Errorf("requested %s build reports no supported GPU devices", accel)
+		}
+	}
+	return nil
 }
 
 func backendBuildJobs(accel string, cpuCount int) int {

@@ -91,6 +91,25 @@ func TestBackendSupportsArchCannotProbe(t *testing.T) {
 	}
 }
 
+func TestMainRouteCatalogExcludesHelperOnlyNanoBeige(t *testing.T) {
+	if got := RecipesForArch("nanbeige"); len(got) != 0 {
+		t.Fatalf("helper-only NanoBeige recipe was offered as a main-model route: %#v", got)
+	}
+	if got := RecipesForArch("laguna"); len(got) == 0 {
+		t.Fatal("main-routable recipes disappeared while filtering helpers")
+	}
+
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	if err := Save([]Backend{{Tag: "helper", RouteArch: "nanbeige", HelperOnly: true}, {Tag: "main", RouteArch: "nanbeige"}}); err != nil {
+		t.Fatal(err)
+	}
+	got := RegisteredForArch("nanbeige")
+	if len(got) != 1 || got[0].Tag != "main" {
+		t.Fatalf("registered main route catalog leaked helper: %#v", got)
+	}
+}
+
 func TestFindLibInBuildTree(t *testing.T) {
 	// The ik_llama layout: llama-server in build/bin, libllama.so in build/src.
 	root := t.TempDir()

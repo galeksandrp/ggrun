@@ -1,8 +1,11 @@
 package main
 
 import (
+	"math"
 	"testing"
+	"time"
 
+	"github.com/raketenkater/ggrun/pkg/benchmark"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/placement"
@@ -28,11 +31,11 @@ func calibrateTestSetup(sizeMB int) (*launchRequest, *config.Config, *placement.
 	return req, cfg, model, be, caps
 }
 
-func TestCalibrationPlanSkipsLargeModelInAuto(t *testing.T) {
+func TestCalibrationPlanIncludesOneBoundedLargeModelChallengerInAuto(t *testing.T) {
 	req, cfg, model, be, caps := calibrateTestSetup(60 * 1024) // 60 GB MoE
 	strategy := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu", NCPUMoE: 40}
-	if got := calibrationPlan(req, cfg, model, be, caps, strategy); got != nil {
-		t.Fatalf("auto calibration must skip a 60GB MoE (restart too costly), got %d candidates", len(got))
+	if got := calibrationPlan(req, cfg, model, be, caps, strategy); len(got) != calibrationAutoMaxCandidates {
+		t.Fatalf("auto calibration must retain one challenger regardless of size, got %d candidates", len(got))
 	}
 }
 
@@ -42,6 +45,47 @@ func TestCalibrationPlanForcedOnIgnoresSizeGate(t *testing.T) {
 	strategy := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu", NCPUMoE: 40}
 	if got := calibrationPlan(req, cfg, model, be, caps, strategy); len(got) < 2 {
 		t.Fatalf("forced calibration must run on a big MoE, got %d candidates", len(got))
+	}
+}
+
+func TestCalibrationBudgetsAreFinite(t *testing.T) {
+	auto := calibrationBudgetFor(calibrateAuto)
+	forced := calibrationBudgetFor(calibrateOn)
+	if auto.MaxCandidates != 2 || auto.MaxFailures != 1 || auto.MaxElapsed != 20*time.Minute {
+		t.Fatalf("unexpected automatic budget: %#v", auto)
+	}
+	if forced.MaxCandidates < auto.MaxCandidates || forced.MaxFailures < auto.MaxFailures || forced.MaxElapsed <= auto.MaxElapsed {
+		t.Fatalf("forced budget must remain finite but larger: auto=%#v forced=%#v", auto, forced)
+	}
+}
+
+func TestCalibrationScoreBalancesDecodeAndPrefill(t *testing.T) {
+	baseline := &benchmark.Result{GenTPS: 10, PromptTPS: 100, GenTokens: 256, PromptTokens: 100}
+	decodeHeavy := &benchmark.Result{GenTPS: 12, PromptTPS: 80, GenTokens: 256, PromptTokens: 100}
+	if got := calibrationScore(decodeHeavy, baseline); math.Abs(got-1.1) > 1e-9 {
+		t.Fatalf("balanced score = %v, want 1.1", got)
+	}
+	invalid := &benchmark.Result{GenTPS: 100, PromptTPS: 0, GenTokens: 256, PromptTokens: 100}
+	if got := calibrationScore(invalid, baseline); got != 0 {
+		t.Fatalf("incomplete candidate received score %v", got)
+	}
+}
+
+func TestCalibrationAdvisorIncidentOffersOnlyMeasuredCandidates(t *testing.T) {
+	req, _, model, be, caps := calibrateTestSetup(60 * 1024)
+	result := &benchmark.Result{GenTPS: 10, PromptTPS: 100, GenTokens: 256, PromptTokens: 100}
+	measurements := []calibrationMeasurement{
+		{Name: "default", Strategy: &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu"}, Result: result, Score: 1},
+		{Name: "kv-alternate", Strategy: &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "gpu"}, Result: result, Score: 1.02},
+	}
+	incident := calibrationAdvisorIncident(req, model, be, caps, "scope", measurements)
+	if incident.Mode != "optimizer" || len(incident.Candidates) != 2 || len(incident.AllowedActions) != 2 {
+		t.Fatalf("unexpected optimizer incident: %#v", incident)
+	}
+	for _, candidate := range incident.Candidates {
+		if !candidate.Verified || candidate.Metrics["decode_tps"] <= 0 || candidate.Metrics["balanced_score"] <= 0 {
+			t.Fatalf("unverified/incomplete candidate leaked into incident: %#v", candidate)
+		}
 	}
 }
 

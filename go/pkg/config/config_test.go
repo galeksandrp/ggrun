@@ -21,6 +21,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.RAMLimitPercent != 95 {
 		t.Fatalf("expected default RAM limit 95%%, got %d", cfg.RAMLimitPercent)
 	}
+	if cfg.SWAFull {
+		t.Fatal("full SWA cache should default off")
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -31,6 +34,7 @@ CTX_SIZE=8192
 MODEL_DIR="/models"
 BACKEND=ik_llama
 KV_PLACEMENT=gpu
+SWA_FULL=true
 VISION=true
 `
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -57,6 +61,9 @@ VISION=true
 	if cfg.KVPlacement != "gpu" {
 		t.Fatalf("expected gpu, got %s", cfg.KVPlacement)
 	}
+	if !cfg.SWAFull {
+		t.Fatal("expected full SWA cache true")
+	}
 	if !cfg.Vision {
 		t.Fatalf("expected vision true")
 	}
@@ -76,6 +83,7 @@ func TestSaveAndLoad(t *testing.T) {
 		Backend:         "llama",
 		KVPlacement:     "cpu",
 		KVQuality:       "high",
+		SWAFull:         true,
 		TuneRounds:      3,
 		Vision:          true,
 		Parallel:        2,
@@ -112,12 +120,15 @@ func TestSaveAndLoad(t *testing.T) {
 	if loaded.RAMLimitPercent != 87 {
 		t.Fatalf("RAM limit percent mismatch: %d", loaded.RAMLimitPercent)
 	}
+	if !loaded.SWAFull {
+		t.Fatal("full SWA cache mismatch")
+	}
 
 	data, err := os.ReadFile(Path())
 	if err != nil {
 		t.Fatalf("read saved config: %v", err)
 	}
-	for _, want := range []string{"LLM_PORT=", "LLM_CTX_SIZE=", "LLM_KV_QUALITY=", "LLM_RAM_LIMIT_PERCENT=87", "LLM_SPEC="} {
+	for _, want := range []string{"LLM_PORT=", "LLM_CTX_SIZE=", "LLM_KV_QUALITY=", "LLM_SWA_FULL=true", "LLM_RAM_LIMIT_PERCENT=87", "LLM_SPEC="} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("saved config missing %s:\n%s", want, string(data))
 		}
@@ -132,6 +143,7 @@ LLM_CTX_SIZE=fit
 LLM_MODEL_DIR="/models-v3"
 LLM_KV_PLACEMENT=cpu
 LLM_KV_QUALITY=low
+LLM_SWA_FULL=1
 LLM_SPEC=ngram
 LLM_TUNE_ROUNDS=7
 LLM_HOST="127.0.0.1"
@@ -155,6 +167,9 @@ LLM_HOST="127.0.0.1"
 	}
 	if cfg.KVPlacement != "cpu" || cfg.KVQuality != "low" {
 		t.Fatalf("kv config mismatch: %s/%s", cfg.KVPlacement, cfg.KVQuality)
+	}
+	if !cfg.SWAFull {
+		t.Fatal("full SWA cache was not loaded")
 	}
 	if cfg.Spec != "ngram" || cfg.TuneRounds != 7 || cfg.Host != "127.0.0.1" {
 		t.Fatalf("new config keys mismatch: spec=%s rounds=%d host=%s", cfg.Spec, cfg.TuneRounds, cfg.Host)
@@ -199,6 +214,7 @@ func TestShowReportsEachSettingSource(t *testing.T) {
 	}
 	t.Setenv("LLM_CONFIG", path)
 	t.Setenv("LLM_MODEL_DIR", "/from-env")
+	t.Setenv("LLM_SWA_FULL", "true")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -212,8 +228,11 @@ func TestShowReportsEachSettingSource(t *testing.T) {
 	if got := cfg.sources["CACHE_DIR"]; got != "default" {
 		t.Fatalf("CACHE_DIR source = %q, want default", got)
 	}
+	if !cfg.SWAFull || !cfg.IsExplicit("SWA_FULL") || !cfg.IsExplicit("LLM_SWA_FULL") || !cfg.IsExplicit("port") || cfg.IsExplicit("CACHE_DIR") {
+		t.Fatalf("explicit source reporting is wrong: swa=%v sources=%v", cfg.SWAFull, cfg.sources)
+	}
 	show := cfg.Show()
-	for _, want := range []string{"9090                 (file)", "/from-env            (env)", "(default)"} {
+	for _, want := range []string{"9090                 (file)", "/from-env            (env)", "true                 (env)", "(default)"} {
 		if !strings.Contains(show, want) {
 			t.Fatalf("show missing %q:\n%s", want, show)
 		}
@@ -271,7 +290,7 @@ func TestPathPrefersAnExistingUserConfigOverAnEmptyAppHome(t *testing.T) {
 // A genuine self-contained install keeps its config beside backends.json.
 func TestPathHonoursARealAppHome(t *testing.T) {
 	home := t.TempDir()
-	appHome := filepath.Join(home, "ggrun-productions")
+	appHome := filepath.Join(home, "ggrun")
 	t.Setenv("HOME", home)
 	t.Setenv("LLM_CONFIG", "")
 	t.Setenv("LLM_APP_HOME", appHome)

@@ -775,7 +775,7 @@ func TestComputeDeepSeekV4FlashFirstLaunchExactBudget(t *testing.T) {
 // back to formula charged 16.4 GiB instead of the measured 6.9 GiB; legacy
 // startup-OOM probes then charged compute a second time as runtime growth. The
 // solver rejected a model that fits, before preflight could correct anything.
-func TestComputeDeepSeekV4FullContextMigratesExactMeasurements(t *testing.T) {
+func TestComputeDeepSeekV4DoesNotUseLegacyGlobalKVToForceFullContext(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	cacheDir := filepath.Join(t.TempDir(), "app-cache")
@@ -859,14 +859,17 @@ func TestComputeDeepSeekV4FullContextMigratesExactMeasurements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("full-context placement should fit: %v", err)
 	}
-	if strat.ContextSize != 1048576 {
-		t.Fatalf("context was lowered to %d; want the full 1048576", strat.ContextSize)
+	if strat.ContextSize >= 1048576 {
+		t.Fatalf("legacy model-wide KV rate forced unsafe full context: %d", strat.ContextSize)
 	}
 	if strat.KVPlacement != "gpu" || strat.KVType != "f16" {
 		t.Fatalf("mainline DeepSeek4 must keep f16 KV on GPU, got placement=%s type=%s", strat.KVPlacement, strat.KVType)
 	}
 	if got := model.MeasuredKVBytesPerTok["f16"]; got != 6912.25 {
 		t.Fatalf("exact KV measurement was not migrated, got %.2f", got)
+	}
+	if strat.ContextAllocationEvidence != "" {
+		t.Fatalf("legacy rate was mislabeled as exact allocation evidence: %q", strat.ContextAllocationEvidence)
 	}
 	if len(strat.TensorSplit) != 3 || strat.TensorSplit[1] != 0 {
 		t.Fatalf("slow CUDA1 must remain expert-only, split=%v", strat.TensorSplit)
@@ -909,6 +912,12 @@ func TestComputeDeepSeekV4Parallel4UsesMeasuredStableWholeLayerPlan(t *testing.T
 	if err := os.WriteFile(filepath.Join(cacheDir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(caps.GPUs))), []byte(systemData), 0644); err != nil {
 		t.Fatal(err)
 	}
+	for _, ubatch := range []int{512, 256, 128, 64} {
+		if err := RecordMeasuredAllocation(cacheDir, model, 1048576, ubatch, "high", "gpu", "llama", caps.GPUs, 4,
+			MeasuredAllocation{Evidence: "fit-params", ContextTotalMB: 7012}); err != nil {
+			t.Fatalf("seed exact allocation ubatch=%d: %v", ubatch, err)
+		}
+	}
 
 	strat, err := Compute(caps, model, Options{
 		ContextSize: 1048576, KVPlacement: "gpu", KVQuality: "high",
@@ -937,11 +946,10 @@ func TestComputeDeepSeekV4Parallel4UsesMeasuredStableWholeLayerPlan(t *testing.T
 	}
 }
 
-// A DeepSeek4 split owner must stay expert-free until ggrun has durable
-// long-context evidence. The known stable layout keeps CUDA0 dense/KV-only and
-// uses the x4/x1 cards as storage. A startup compute-buffer probe is not proof
-// that the deferred graph state exercised by a long request fits.
-func TestComputeDeepSeekV4SplitOwnerStaysExpertFreeAfterStartupProbe(t *testing.T) {
+// MoE capacity is geometry-driven for every architecture. DeepSeek4 must use
+// the same split-owner packing path as an ordinary MoE instead of losing an
+// entire GPU to an architecture-name policy.
+func TestComputeDeepSeekV4SplitOwnerUsesGenericMeasuredCapacity(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
 			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
@@ -972,8 +980,8 @@ func TestComputeDeepSeekV4SplitOwnerStaysExpertFreeAfterStartupProbe(t *testing.
 		t.Fatalf("cold placement: %v", err)
 	}
 	coldLayers := parseOTLayersByDevice(t, cold.OTString)
-	if got := len(coldLayers[0]); got != 0 {
-		t.Fatalf("cold V4 plan pinned %d CUDA0 expert layer(s), want none: %s", got, cold.OTString)
+	if got := len(coldLayers[0]); got == 0 {
+		t.Fatalf("cold V4 plan left the CUDA0 split owner empty: %s", cold.OTString)
 	}
 	if len(coldLayers[1])+len(coldLayers[2]) == 0 {
 		t.Fatalf("cold V4 plan failed to use secondary expert storage: %s", cold.OTString)
@@ -989,55 +997,26 @@ func TestComputeDeepSeekV4SplitOwnerStaysExpertFreeAfterStartupProbe(t *testing.
 	if err != nil {
 		t.Fatalf("placement with mismatched probe: %v", err)
 	}
-	if got := len(parseOTLayersByDevice(t, wrongShape.OTString)[0]); got != 0 {
-		t.Fatalf("parallel-4 probe incorrectly promoted CUDA0 for parallel-1: %s", wrongShape.OTString)
+	if got, want := len(parseOTLayersByDevice(t, wrongShape.OTString)[0]), len(coldLayers[0]); got != want {
+		t.Fatalf("parallel-4 probe changed parallel-1 CUDA0 capacity: got %d layers, want %d (%s)", got, want, wrongShape.OTString)
 	}
 
-	// Even an exact startup probe does not remove the gate: it measures loading,
-	// not a 60k-token request with the final runtime graph shape.
+	// An exact measurement refines the generic capacity calculation directly;
+	// no architecture-specific validation token is required.
 	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1,
 		map[int]int{0: 2048, 1: 128, 2: 128}, nil, nil, 0); err != nil {
 		t.Fatalf("write exact probe: %v", err)
 	}
-	stillConservative, err := Compute(caps, model, opts)
+	measured, err := Compute(caps, model, opts)
 	if err != nil {
 		t.Fatalf("placement with exact probe: %v", err)
 	}
-	if got := len(parseOTLayersByDevice(t, stillConservative.OTString)[0]); got != 0 {
-		t.Fatalf("startup CUDA0 probe incorrectly promoted split-owner experts: %s", stillConservative.OTString)
-	}
-
-	if err := RecordLongContextValidation(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1, 60000, map[int]int{0: 18000, 1: 9000, 2: 9000}); err != nil {
-		t.Fatalf("record long-context validation: %v", err)
-	}
-	validated, err := Compute(caps, model, opts)
-	if err != nil {
-		t.Fatalf("placement with long-context validation: %v", err)
-	}
-	if got := len(parseOTLayersByDevice(t, validated.OTString)[0]); got == 0 {
-		t.Fatalf("long-context validation did not unlock measured split-owner packing: %s", validated.OTString)
+	if got := len(parseOTLayersByDevice(t, measured.OTString)[0]); got == 0 {
+		t.Fatalf("exact measurement left CUDA0 empty: %s", measured.OTString)
 	}
 }
 
-func TestLongContextValidationIsScopedByParallel(t *testing.T) {
-	gpus := []detect.GPU{{Index: 0, Name: "RTX", VRAMTotalMB: 24576}}
-	model := &ModelProfile{Path: "DeepSeek-V4.gguf", NumLayers: 43, NumExperts: 256, EmbeddingLength: 4096}
-	dir := t.TempDir()
-	if err := RecordLongContextValidation(dir, model, 1048576, 256, "high", "gpu", "llama", gpus, 4, 60000, map[int]int{0: 18000}); err != nil {
-		t.Fatalf("record validation: %v", err)
-	}
-	if !HasLongContextValidation(dir, model, 1048576, 256, "high", "gpu", "llama", gpus, 4, 60000) {
-		t.Fatal("expected exact parallel-4 validation hit")
-	}
-	if HasLongContextValidation(dir, model, 1048576, 256, "high", "gpu", "llama", gpus, 1, 60000) {
-		t.Fatal("parallel-4 validation must not validate a serial launch")
-	}
-	if HasLongContextValidation(dir, model, 1048576, 256, "high", "gpu", "llama", gpus, 4, 70000) {
-		t.Fatal("60k validation must not satisfy a higher prompt-token floor")
-	}
-}
-
-func TestComputeHybridMoEProtectsEverySplitOwner(t *testing.T) {
+func TestComputeHybridMoEPacksEverySplitOwnerByCapacity(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
 			{Index: 0, Name: "GPU A", VRAMTotalMB: 24564, BandwidthMBps: 15754},
@@ -1056,9 +1035,6 @@ func TestComputeHybridMoEProtectsEverySplitOwner(t *testing.T) {
 		HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
 		ModelArch: "deepseek4", MeasuredKVBytesPerTok: map[string]float64{"f16": 4096},
 	}
-	if !RequiresConservativeSplitOwnerProtection(model) {
-		t.Fatal("hybrid test model must exercise split-owner protection")
-	}
 	cacheDir := t.TempDir()
 	opts := Options{
 		ContextSize: 65536, KVPlacement: "gpu", KVQuality: "high",
@@ -1073,8 +1049,8 @@ func TestComputeHybridMoEProtectsEverySplitOwner(t *testing.T) {
 		t.Fatalf("expected two regular split owners, got split=%v", strategy.TensorSplit)
 	}
 	layers := parseOTLayersByDevice(t, strategy.OTString)
-	if len(layers[0]) != 0 || len(layers[1]) != 0 {
-		t.Fatalf("cold hybrid plan pinned experts on split owners: %s", strategy.OTString)
+	if len(layers[0]) == 0 || len(layers[1]) == 0 {
+		t.Fatalf("cold hybrid plan failed to use both split owners: %s", strategy.OTString)
 	}
 
 	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1,
@@ -1086,8 +1062,8 @@ func TestComputeHybridMoEProtectsEverySplitOwner(t *testing.T) {
 		t.Fatalf("placement with startup probe: %v", err)
 	}
 	layers = parseOTLayersByDevice(t, strategy.OTString)
-	if len(layers[0]) != 0 || len(layers[1]) != 0 {
-		t.Fatalf("startup probe promoted one of two split owners: %s", strategy.OTString)
+	if len(layers[0]) == 0 || len(layers[1]) == 0 {
+		t.Fatalf("measured hybrid plan failed to use both split owners: %s", strategy.OTString)
 	}
 }
 
@@ -1125,6 +1101,30 @@ func TestResolveKVQualityDeepSeekV4MainlineRequiresF16(t *testing.T) {
 	got, err = resolveKVQuality(&ModelProfile{ModelArch: "qwen3"}, "auto", "llama")
 	if err != nil || got != "mid" {
 		t.Fatalf("generic auto KV quality = %q, %v; want mid", got, err)
+	}
+}
+
+func TestResolveKVQualityDeepSeekV4IKRejectsUnsupportedKCache(t *testing.T) {
+	model := &ModelProfile{ModelArch: "deepseek4"}
+	for _, supported := range []string{"auto", "mid", "q8_0", "high", "f16", "bf16"} {
+		if _, err := resolveKVQuality(model, supported, "ik_llama"); err != nil {
+			t.Errorf("supported IK V4 KV type %q rejected: %v", supported, err)
+		}
+	}
+	for _, unsupported := range []string{"low", "q4_0", "q5_1"} {
+		if _, err := resolveKVQuality(model, unsupported, "ik_llama"); err == nil || !strings.Contains(err.Error(), "supports only") {
+			t.Errorf("unsupported IK V4 KV type %q accepted: %v", unsupported, err)
+		}
+	}
+}
+
+func TestResolveKVQualityDeepSeekV4VulkanUsesMainlineSafetyRule(t *testing.T) {
+	model := &ModelProfile{ModelArch: "deepseek4"}
+	if _, err := resolveKVQuality(model, "q8_0", "vulkan"); err == nil || !strings.Contains(err.Error(), "requires f16 KV") {
+		t.Fatalf("Vulkan mainline accepted compressed DeepSeek4 KV: %v", err)
+	}
+	if got, err := resolveKVQuality(model, "f16", "vulkan"); err != nil || got != "high" {
+		t.Fatalf("Vulkan f16 DeepSeek4 KV = %q, %v", got, err)
 	}
 }
 
@@ -1193,6 +1193,10 @@ func TestMaximizeMoEGPUFitByUBatchRescuesZeroExpertPlacement(t *testing.T) {
 		if err := writeProbeCacheForModel(cacheDir, model, 1048576, ub, "high", "gpu", "llama", gpus, 4, byGPU, nil, nil, 0); err != nil {
 			t.Fatalf("seed probe cache ubatch=%d: %v", ub, err)
 		}
+		if err := RecordMeasuredAllocation(cacheDir, model, 1048576, ub, "high", "gpu", "llama", gpus, 4,
+			MeasuredAllocation{Evidence: "fit-params", ContextTotalMB: 13012}); err != nil {
+			t.Fatalf("seed exact context ubatch=%d: %v", ub, err)
+		}
 	}
 
 	strat, err := Compute(caps, model, Options{
@@ -1222,7 +1226,7 @@ func TestMaximizeMoEGPUFitByUBatchRescuesZeroExpertPlacement(t *testing.T) {
 	}
 }
 
-// TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint is the end-to-end
+// TestComputeDeepSeekV4KeepsBoundedRecurrentCheckpoints is the end-to-end
 // version of the bounded hybrid policy: runs the real
 // Compute() -> computeCRAM -> Args() pipeline against the exact hardware and
 // model shape used for 128GB DeepSeek-V4.
@@ -1232,8 +1236,8 @@ func TestMaximizeMoEGPUFitByUBatchRescuesZeroExpertPlacement(t *testing.T) {
 // RAM, and this fixture keeps roughly 37 GiB free after the weights load. The
 // old expectation disabled caching precisely on the models whose re-prefill
 // costs the most. The bounded-checkpoint property the test is named for is
-// unchanged -- one recurrent checkpoint, never the backend default of 32.
-func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
+// unchanged -- a bounded 4..16 set, never the backend default of 32.
+func TestComputeDeepSeekV4KeepsBoundedRecurrentCheckpoints(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
 			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
@@ -1273,7 +1277,8 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compute failed: %v", err)
 	}
-	// The prompt cache is host RAM, so a VRAM-saturated model still gets one.
+	// The prompt cache is host RAM, so a VRAM-saturated model still gets a
+	// branch-capable bounded set.
 	if strat.CRAM < minCramMB {
 		t.Fatalf("expected a host-RAM prompt cache, got CRAM=%d", strat.CRAM)
 	}
@@ -1284,8 +1289,8 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	if budget := 37623 * 2 / 3; strat.CRAM > budget {
 		t.Fatalf("prompt cache %d MiB exceeds the host RAM budget %d after load", strat.CRAM, budget)
 	}
-	if strat.MaxCheckpoints != 1 {
-		t.Fatalf("expected one bounded recurrent checkpoint, got MaxCheckpoints=%d", strat.MaxCheckpoints)
+	if strat.MaxCheckpoints < hybridCheckpointMinimum || strat.MaxCheckpoints > hybridCheckpointMaximum {
+		t.Fatalf("expected bounded recurrent checkpoints, got MaxCheckpoints=%d", strat.MaxCheckpoints)
 	}
 	if strat.TensorSplit[1] != 0 {
 		t.Fatalf("expected x1 GPU to be expert-only with zero tensor split, got %v", strat.TensorSplit)
@@ -1297,8 +1302,8 @@ func TestComputeDeepSeekV4KeepsOneRecurrentCheckpoint(t *testing.T) {
 	if hasAdjacentArgPlacement(args, "-cram", "0") {
 		t.Fatalf("prompt cache disabled despite ample host RAM, got %v", args)
 	}
-	if !hasAdjacentArgPlacement(args, "--ctx-checkpoints", "1") {
-		t.Fatalf("expected explicit '--ctx-checkpoints 1' in emitted args, got %v", args)
+	if !hasAdjacentArgPlacement(args, "--ctx-checkpoints", strconv.Itoa(strat.MaxCheckpoints)) {
+		t.Fatalf("expected explicit bounded checkpoint count in emitted args, got %v", args)
 	}
 	if !contains(args, "--no-context-shift") {
 		t.Fatalf("expected DeepSeek4 recurrent context shifting to be disabled, got %v", args)
@@ -1383,7 +1388,7 @@ func TestMaximizeMoEGPUFitByUBatchRescuesExcludedGPU(t *testing.T) {
 	if strat.Type != MoEOffload {
 		t.Fatalf("expected MoE offload, got %s", strat.Type)
 	}
-	if excluded := numGPUsExcluded(strat, caps.GPUs); excluded > 0 {
+	if excluded := numGPUsExcluded(strat, caps.GPUs, model.NumLayers); excluded > 0 {
 		t.Fatalf("expected the ladder to rescue every GPU into the split, got %d excluded (ubatch=%d, split=%v)",
 			excluded, strat.UBatchSize, strat.TensorSplit)
 	}
@@ -1431,7 +1436,7 @@ func TestComputeMoEUsesSlowPCIeGPUAsExpertOnly(t *testing.T) {
 	if strat.TensorSplit[2] != 0 || !otStringUsesDevice(strat.OTString, 2) {
 		t.Fatalf("expected x4 GPU to be whole-expert storage too, split=%v OT=%s", strat.TensorSplit, strat.OTString)
 	}
-	if excluded := numGPUsExcluded(strat, caps.GPUs); excluded != 0 {
+	if excluded := numGPUsExcluded(strat, caps.GPUs, model.NumLayers); excluded != 0 {
 		t.Fatalf("expert-only GPU must count as used, got excluded=%d split=%v ot=%s", excluded, strat.TensorSplit, strat.OTString)
 	}
 	for _, part := range strings.Split(strat.OTString, ",") {
@@ -1556,7 +1561,7 @@ func TestExpertOnlyRetrofitAfterSplitElimination(t *testing.T) {
 	if strat.TensorSplit[2] <= 0 && !otStringUsesDevice(strat.OTString, 2) {
 		t.Fatalf("GPU2 stranded: split=%v and not in OT %s", strat.TensorSplit, strat.OTString)
 	}
-	if excluded := numGPUsExcluded(strat, caps.GPUs); excluded != 0 {
+	if excluded := numGPUsExcluded(strat, caps.GPUs, model.NumLayers); excluded != 0 {
 		t.Fatalf("no GPU should be excluded, got excluded=%d split=%v ot=%s", excluded, strat.TensorSplit, strat.OTString)
 	}
 }
@@ -1606,13 +1611,20 @@ func TestArgsOmitFlashAttentionWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestFlashAttentionFollowsKVPlacement(t *testing.T) {
-	m := &ModelProfile{ModelArch: "deepseek4"}
+func TestDeepSeekV4KeepsGPUKVAndFlashAttention(t *testing.T) {
+	m := &ModelProfile{ModelArch: "deepseek4", IsMoE: true}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}}}
+	if got := resolveAutoKVPlacement(caps, m, 120000, 4096, 1024); got != "gpu" {
+		t.Fatalf("DeepSeek-V4 auto KV placement = %q, want gpu so flash attention remains available", got)
+	}
 	if defaultFlashAttention(m, Options{BackendTag: "llama"}, "cpu") {
 		t.Fatal("KV on CPU auto-disables flash attention; claiming it is on would emit a self-contradicting --flash-attn on --no-kv-offload command")
 	}
 	if !defaultFlashAttention(m, Options{BackendTag: "llama"}, "gpu") {
 		t.Fatal("mainline deepseek4 with KV on GPU must default flash attention on (bounds the compute buffer; see Task #10)")
+	}
+	if !defaultFlashAttention(m, Options{BackendTag: "ik_llama"}, "gpu") {
+		t.Fatal("ik_llama deepseek4 with KV on GPU must emit --flash-attn on")
 	}
 }
 
@@ -2087,10 +2099,13 @@ func TestCachedHybridPlacementRecomputesRuntimeCheckpointPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strategy.MaxCheckpoints != 1 {
-		t.Fatalf("cached hybrid placement checkpoints=%d, want one", strategy.MaxCheckpoints)
+	if !strategy.PlacementCacheHit {
+		t.Fatal("validated placement cache load was not marked as a cache hit")
 	}
-	if args := strategy.Args(model.Path, 8081); !hasAdjacentArgPlacement(args, "--ctx-checkpoints", "1") {
+	if strategy.MaxCheckpoints < hybridCheckpointMinimum || strategy.MaxCheckpoints > hybridCheckpointMaximum {
+		t.Fatalf("cached hybrid placement checkpoints=%d, want %d..%d", strategy.MaxCheckpoints, hybridCheckpointMinimum, hybridCheckpointMaximum)
+	}
+	if args := strategy.Args(model.Path, 8081); !hasAdjacentArgPlacement(args, "--ctx-checkpoints", strconv.Itoa(strategy.MaxCheckpoints)) {
 		t.Fatalf("cached hybrid placement did not emit checkpoint policy: %v", args)
 	}
 }
@@ -2128,6 +2143,9 @@ func TestDerateCUDAOOMArgsMovesExpertLayersToCPU(t *testing.T) {
 	}
 	if entry == nil || len(entry.GPUAssignments) != 2 || entry.NCPUMoE != 50 || len(entry.TensorSplit) != 2 {
 		t.Fatalf("unexpected cache entry: %+v", entry)
+	}
+	if entry.OTString != newOT {
+		t.Fatalf("derated cache OT = %q, want exact live argv %q", entry.OTString, newOT)
 	}
 }
 
@@ -2936,15 +2954,15 @@ func TestArgsEmitsExplicitZeroCacheAndCheckpoints(t *testing.T) {
 	}
 }
 
-func TestHybridPromptCacheKeepsOneBoundedCheckpoint(t *testing.T) {
+func TestHybridPromptCacheKeepsBranchCapableBoundedCheckpoints(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},
 		RAM:  detect.RAMInfo{TotalMB: 8192, FreeMB: 8192},
 	}
 	s := &Strategy{Type: SingleGPU, HasSSM: true, Parallel: 2}
 	cram, checkpoints := computeCRAM(caps, &ModelProfile{HasSSM: 1}, s, 4096, 256)
-	if checkpoints != 1 {
-		t.Fatalf("hybrid model checkpoints=%d, want one rolling checkpoint; cram=%d", checkpoints, cram)
+	if checkpoints < hybridCheckpointMinimum || checkpoints > hybridCheckpointMaximum {
+		t.Fatalf("hybrid model checkpoints=%d, want %d..%d; cram=%d", checkpoints, hybridCheckpointMinimum, hybridCheckpointMaximum, cram)
 	}
 	s.CRAM = cram
 	s.MaxCheckpoints = checkpoints
@@ -2954,8 +2972,56 @@ func TestHybridPromptCacheKeepsOneBoundedCheckpoint(t *testing.T) {
 	s.ThreadsBatch = 8
 	s.BatchSize = 512
 	s.UBatchSize = 128
-	if args := s.Args("model.gguf", 8081); !hasAdjacentArgPlacement(args, "--ctx-checkpoints", "1") {
+	if args := s.Args("model.gguf", 8081); !hasAdjacentArgPlacement(args, "--ctx-checkpoints", strconv.Itoa(checkpoints)) {
 		t.Fatalf("hybrid strategy did not emit its bounded checkpoint: %v", args)
+	}
+}
+
+func TestCheckpointSpacingFlagFollowsBackendHelpDialect(t *testing.T) {
+	cases := []struct {
+		name string
+		help string
+		tag  string
+		want string
+	}{
+		{name: "mainline", help: "  --checkpoint-min-step N", tag: "llama", want: "--checkpoint-min-step"},
+		{name: "ik", help: "  --ctx-checkpoints-interval N", tag: "ik_llama", want: "--ctx-checkpoints-interval"},
+		{name: "known unsupported", help: "llama-server options", tag: "llama", want: "-"},
+		{name: "legacy ik fallback", tag: "ik_llama", want: "--ctx-checkpoints-interval"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := backendCheckpointMinStepFlag(tc.help, tc.tag); got != tc.want {
+				t.Fatalf("flag = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestArgsUsesIKCheckpointIntervalInsteadOfMainlineFlag(t *testing.T) {
+	s := &Strategy{
+		Type:                         SingleGPU,
+		ContextSize:                  131072,
+		KVQuality:                    "mid",
+		KVType:                       "q8_0",
+		Threads:                      8,
+		ThreadsBatch:                 8,
+		BatchSize:                    128,
+		UBatchSize:                   512,
+		CRAM:                         4096,
+		MaxCheckpoints:               1,
+		CheckpointMinStep:            512,
+		BackendTag:                   "ik_llama",
+		BackendCheckpointMinStepFlag: "--ctx-checkpoints-interval",
+	}
+	args := s.Args("model.gguf", 8081)
+	if !hasAdjacentArgPlacement(args, "--ctx-checkpoints-interval", "512") {
+		t.Fatalf("ik checkpoint interval missing: %v", args)
+	}
+	for _, arg := range args {
+		if arg == "--checkpoint-min-step" {
+			t.Fatalf("mainline-only checkpoint flag leaked into ik argv: %v", args)
+		}
 	}
 }
 
@@ -3667,4 +3733,130 @@ func TestCacheRAMOverrideBeatsDerivedBudget(t *testing.T) {
 	if zero.CRAM != derived.CRAM {
 		t.Errorf("CRAM with 0 = %d, want the derived %d", zero.CRAM, derived.CRAM)
 	}
+}
+
+// growthCarryFixture is the real rig: a split-owner 3090 Ti plus two 12 GB
+// expert-only cards. Runtime growth was measured on the split owner only, which
+// is what makes the per-device rule load-bearing.
+func growthCarryFixture() ([]detect.GPU, *ModelProfile) {
+	gpus := []detect.GPU{
+		{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+		{Index: 1, Name: "RTX 3060 x1", VRAMTotalMB: 12288, BandwidthMBps: 985},
+		{Index: 2, Name: "RTX 4070 x4", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+	}
+	model := &ModelProfile{
+		Path:      "/models/DeepSeek-V4-Flash-UD-Q3_K_XL-00001-of-00004.gguf",
+		NumLayers: 43, IsMoE: true, NumExperts: 256, ModelArch: "deepseek4",
+	}
+	return gpus, model
+}
+
+// Runtime graph growth cannot be measured before a request exists, so a cold
+// ctx/ubatch key would budget 0 and OOM on its first real request. The carry
+// takes a MEASURED value from a related key of the same model and applies it
+// only to the device that actually carried it. Charging the split owner's
+// 5504 MiB to the 12 GB expert-only cards would budget them negative.
+func TestRelatedModelRuntimeGraphGrowthCarriesMeasuredValuePerDevice(t *testing.T) {
+	cacheDir := t.TempDir()
+	gpus, model := growthCarryFixture()
+
+	// A related key: same model/GPUs/parallel, different ctx and ubatch.
+	if err := writeProbeCacheForModel(cacheDir, model, 131072, 512, "high", "gpu", "llama", gpus, 1,
+		map[int]int{0: 1391}, map[int]int{0: 5504}, nil, 0); err != nil {
+		t.Fatalf("write related probe: %v", err)
+	}
+
+	related := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama")
+	if related == nil {
+		t.Fatal("cold key got no carry from a measured related key")
+	}
+	if got := related[0]; got != 5504 {
+		t.Fatalf("CUDA0 carry = %d, want the measured 5504", got)
+	}
+	for _, dev := range []int{1, 2} {
+		if got := related[dev]; got != 0 {
+			t.Fatalf("split-owner growth charged to expert-only CUDA%d: %d MiB", dev, got)
+		}
+	}
+}
+
+// The carry takes the largest measured value across related keys: growth scales
+// with model graph shape, so the biggest observation for this model is the one
+// the cold key must survive.
+func TestRelatedModelRuntimeGraphGrowthTakesPerDeviceMaximum(t *testing.T) {
+	cacheDir := t.TempDir()
+	gpus, model := growthCarryFixture()
+
+	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1,
+		nil, map[int]int{0: 2457}, nil, 0); err != nil {
+		t.Fatalf("write first related probe: %v", err)
+	}
+	if err := writeProbeCacheForModel(cacheDir, model, 131072, 1024, "high", "gpu", "llama", gpus, 1,
+		nil, map[int]int{0: 5504}, nil, 0); err != nil {
+		t.Fatalf("write second related probe: %v", err)
+	}
+
+	if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama")[0]; got != 5504 {
+		t.Fatalf("carry = %d, want the larger measured 5504", got)
+	}
+}
+
+// What is NOT evidence for a carry. Each of these was a correction from the
+// adversarial verify of the design; relaxing any of them either launders a guess
+// into a reserve or breaks the cross-parallel contract.
+func TestRelatedModelRuntimeGraphGrowthRejectsNonEvidence(t *testing.T) {
+	gpus, model := growthCarryFixture()
+
+	t.Run("estimated growth is not a measurement", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		if err := writeProbeCacheForModel(cacheDir, model, 131072, 512, "high", "gpu", "llama", gpus, 1,
+			nil, map[int]int{0: 5504}, map[int]bool{0: true}, 0); err != nil {
+			t.Fatalf("write estimated probe: %v", err)
+		}
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama"); got[0] != 0 {
+			t.Fatalf("estimated growth carried as measured evidence: %d MiB", got[0])
+		}
+	})
+
+	t.Run("a different parallel is not evidence", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		if err := writeProbeCacheForModel(cacheDir, model, 131072, 512, "high", "gpu", "llama", gpus, 4,
+			nil, map[int]int{0: 5504}, nil, 0); err != nil {
+			t.Fatalf("write parallel-4 probe: %v", err)
+		}
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama"); got[0] != 0 {
+			t.Fatalf("parallel-4 measurement carried into a parallel-1 launch: %d MiB", got[0])
+		}
+	})
+
+	t.Run("a different model is not evidence", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		other := *model
+		other.Path = "/models/Laguna-120B-Q4_K_M.gguf"
+		if err := writeProbeCacheForModel(cacheDir, &other, 131072, 512, "high", "gpu", "llama", gpus, 1,
+			nil, map[int]int{0: 4914}, nil, 0); err != nil {
+			t.Fatalf("write foreign-model probe: %v", err)
+		}
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama"); got[0] != 0 {
+			t.Fatalf("another model's growth carried: %d MiB", got[0])
+		}
+	})
+
+	t.Run("a different GPU set is not evidence", func(t *testing.T) {
+		cacheDir := t.TempDir()
+		otherGPUs := []detect.GPU{{Index: 0, Name: "RTX 4090", VRAMTotalMB: 24564, BandwidthMBps: 20000}}
+		if err := writeProbeCacheForModel(cacheDir, model, 131072, 512, "high", "gpu", "llama", otherGPUs, 1,
+			nil, map[int]int{0: 5504}, nil, 0); err != nil {
+			t.Fatalf("write foreign-hardware probe: %v", err)
+		}
+		if got := RelatedModelRuntimeGraphGrowth(cacheDir, model, gpus, 1, "llama"); got[0] != 0 {
+			t.Fatalf("another rig's growth carried: %d MiB", got[0])
+		}
+	})
+
+	t.Run("an empty cache yields no carry", func(t *testing.T) {
+		if got := RelatedModelRuntimeGraphGrowth(t.TempDir(), model, gpus, 1, "llama"); got != nil {
+			t.Fatalf("empty cache produced a carry: %v", got)
+		}
+	})
 }

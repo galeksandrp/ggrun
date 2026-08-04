@@ -209,7 +209,12 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 	var logFile *os.File
 	var err error
 	if l.LogPath != "" {
-		logFile, err = os.Create(l.LogPath)
+		// Append, never truncate. Every attempt in one launch scope shares this
+		// path, so os.Create destroyed the failing attempt's log at the exact
+		// moment the retry started — leaving "why did it fail" unanswerable
+		// precisely when it mattered. Observed 2026-08-02: the first attempt of
+		// scope 31fc7719 (--n-cpu-moe 33) was overwritten by its own retry.
+		logFile, err = os.OpenFile(l.LogPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 	} else {
 		logFile, err = os.CreateTemp("", "ggrun-launch-*.log")
 	}
@@ -217,6 +222,9 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 		return err
 	}
 	defer logFile.Close()
+	if restartCount > 0 {
+		fmt.Fprintf(logFile, "\n[ggrun] ==== attempt %d ====\n", restartCount+1)
+	}
 	logPath := logFile.Name()
 	// Remember our own log so failure parsing never reads a log written by a
 	// concurrently running instance.

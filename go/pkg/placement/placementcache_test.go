@@ -86,6 +86,33 @@ func TestPlacementCachePathFor_KeyedByKVAndCtx(t *testing.T) {
 	}
 }
 
+func TestPlacementAndProbeCachesIncludeEveryShardIdentity(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "model-00001-of-00002.gguf")
+	second := filepath.Join(dir, "model-00002-of-00002.gguf")
+	if err := os.WriteFile(first, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("second"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	model := &ModelProfile{Path: first, SizeBytes: 11, TotalSizeMB: 1, NumLayers: 4, NumExperts: 8, EmbeddingLength: 16}
+	gpus := []detect.GPU{{Index: 0, Name: "GPU", VRAMTotalMB: 12000}}
+	placeBefore := PlacementCachePathFor(dir, model, 4096, 128, "q8_0", "gpu", "build", gpus, 1, "", false)
+	probeBefore := probeCachePath(dir, model, 4096, 128, "q8_0", "gpu", "build", gpus, 1)
+
+	// Only the second shard changes. First-shard-only keys would incorrectly
+	// reuse the old exact tensor placement and allocation measurement.
+	if err := os.WriteFile(second, []byte("second shard replaced"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	placeAfter := PlacementCachePathFor(dir, model, 4096, 128, "q8_0", "gpu", "build", gpus, 1, "", false)
+	probeAfter := probeCachePath(dir, model, 4096, 128, "q8_0", "gpu", "build", gpus, 1)
+	if placeBefore == placeAfter || probeBefore == probeAfter {
+		t.Fatalf("second-shard replacement reused evidence: place %q/%q probe %q/%q", placeBefore, placeAfter, probeBefore, probeAfter)
+	}
+}
+
 func TestWorkloadProfileScopesPlacementAndProbeCacheIdentity(t *testing.T) {
 	model := &ModelProfile{Path: "model.gguf", NumLayers: 43, NumExperts: 256, EmbeddingLength: 4096}
 	gpus := []detect.GPU{{Index: 0, Name: "3090 Ti"}}

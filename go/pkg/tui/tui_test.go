@@ -6,12 +6,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/config"
+	modelstore "github.com/raketenkater/ggrun/pkg/models"
+	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/recommend"
 )
 
@@ -142,6 +145,163 @@ func TestDiscoverModelsKeepsSameBasenameInDifferentDirectories(t *testing.T) {
 	}
 }
 
+func TestModelScanActionIsVisibleOnMainAndFirstRun(t *testing.T) {
+	main := newMainList(nil)
+	found := false
+	for _, raw := range main.Items() {
+		item, ok := raw.(mainItem)
+		if ok && item.action == "scan" {
+			found = true
+			if !strings.Contains(item.title, "Scan computer") {
+				t.Fatalf("scan action title = %q", item.title)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("main menu does not expose the computer model scan")
+	}
+
+	found = false
+	for _, action := range firstRunActions() {
+		if action == "scan" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("first-run menu does not expose the computer model scan")
+	}
+}
+
+func TestModelScanCompletionMergesExternalModelAndLeavesFirstRun(t *testing.T) {
+	primary := t.TempDir()
+	externalDir := t.TempDir()
+	externalPath := filepath.Join(externalDir, "found-Q4_K_M.gguf")
+	if err := os.WriteFile(externalPath, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := Model{
+		screen:         ScreenFirstRun,
+		modelDir:       primary,
+		cacheDir:       t.TempDir(),
+		backend:        "auto",
+		mainList:       newMainList(nil),
+		scanningModels: true,
+	}
+	m.input = textinput.New()
+
+	next, cmd := m.Update(modelScanFinishedMsg{result: modelstore.ScanResult{
+		Paths:    []string{externalPath},
+		Duration: 1250 * time.Millisecond,
+	}})
+	m = next.(Model)
+	if cmd != nil {
+		t.Fatal("scan completion should not quit or launch another command")
+	}
+	if m.scanningModels {
+		t.Fatal("scan completion did not clear scanning state")
+	}
+	if m.screen != ScreenMain {
+		t.Fatalf("screen = %v, want Main after finding a model", m.screen)
+	}
+	if len(m.models) != 1 || !m.models[0].External || m.models[0].Path != externalPath {
+		t.Fatalf("recognized models = %#v", m.models)
+	}
+	if !strings.Contains(m.message, "1 outside") {
+		t.Fatalf("completion message = %q", m.message)
+	}
+}
+
+func TestModelScanCompletionPreservesActiveModelByPath(t *testing.T) {
+	primary := t.TempDir()
+	externalDir := t.TempDir()
+	activePath := filepath.Join(primary, "zeta.gguf")
+	newPath := filepath.Join(externalDir, "alpha.gguf")
+	for _, path := range []string{activePath, newPath} {
+		if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	models := loadModels(primary, t.TempDir(), "auto", nil)
+	m := Model{
+		screen:        ScreenModelConfig,
+		modelDir:      primary,
+		cacheDir:      t.TempDir(),
+		backend:       "auto",
+		models:        models,
+		selectedModel: 0,
+		mainList:      newMainList(models),
+	}
+	m.mainList.Select(3)
+
+	next, _ := m.Update(modelScanFinishedMsg{result: modelstore.ScanResult{Paths: []string{newPath}}})
+	m = next.(Model)
+	if got := m.models[m.selectedModel].Path; got != activePath {
+		t.Fatalf("active model changed under an open config screen: got %q, want %q", got, activePath)
+	}
+	selected, ok := m.mainList.SelectedItem().(mainItem)
+	if !ok || !selected.isModel || m.models[selected.index].Path != activePath {
+		t.Fatalf("Main-list focus was not preserved on %q: %#v", activePath, selected)
+	}
+}
+
+func TestLoadRecognizedModelsDeduplicatesPrimaryAndCachedPaths(t *testing.T) {
+	primary := t.TempDir()
+	externalDir := t.TempDir()
+	cacheDir := t.TempDir()
+	primaryPath := filepath.Join(primary, "primary.gguf")
+	externalPath := filepath.Join(externalDir, "elsewhere.gguf")
+	for _, path := range []string{primaryPath, externalPath} {
+		if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := modelstore.SaveDiscoveredPaths(cacheDir, []string{primaryPath, externalPath}); err != nil {
+		t.Fatal(err)
+	}
+
+	models := loadRecognizedModels(primary, cacheDir, "auto", nil)
+	if len(models) != 2 {
+		t.Fatalf("recognized models = %#v, want two unique paths", models)
+	}
+	byPath := make(map[string]ModelItem)
+	for _, model := range models {
+		byPath[model.Path] = model
+	}
+	if byPath[primaryPath].External {
+		t.Fatal("a cached path inside the primary directory must remain a primary model")
+	}
+	if !byPath[externalPath].External {
+		t.Fatal("cached path outside the primary directory must be marked discovered")
+	}
+}
+
+func TestExternalDiscoveredModelCannotBeDeletedThroughTUI(t *testing.T) {
+	externalDir := t.TempDir()
+	path := filepath.Join(externalDir, "external.gguf")
+	if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _, ok := modelItemFromPath(path, info, true)
+	if !ok {
+		t.Fatal("test external GGUF was not recognized")
+	}
+	m := Model{screen: ScreenMain, modelDir: t.TempDir(), models: []ModelItem{item}}
+
+	m.openRemoveModelChoice(0)
+	if m.screen != ScreenMain || m.messageType != "warning" {
+		t.Fatalf("external delete should stay on Main with a warning, screen=%v type=%q", m.screen, m.messageType)
+	}
+	m.removeModelAt(0) // the lower-level path is guarded too
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("external model was touched: %v", err)
+	}
+}
+
 func TestDeleteModelKeyOpensConfirmDefaultedToCancel(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "test-Q4_K_M.gguf"), []byte("GGUF"), 0o644); err != nil {
@@ -150,7 +310,7 @@ func TestDeleteModelKeyOpensConfirmDefaultedToCancel(t *testing.T) {
 	models := discoverModels(dir)
 	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
 	m.input = textinput.New()
-	m.mainList.Select(1) // list index 0 is the "Recommended downloads" row
+	m.mainList.Select(3) // rows 0-2 are Recommended, Latest, and Scan computer
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	m = nm.(Model)
@@ -174,7 +334,7 @@ func TestDeleteModelConfirmRemovesFileWithoutQuitting(t *testing.T) {
 	models := discoverModels(dir)
 	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
 	m.input = textinput.New()
-	m.mainList.Select(1)
+	m.mainList.Select(3)
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	m = nm.(Model)
@@ -213,7 +373,7 @@ func TestDeleteModelCancelLeavesFileInPlace(t *testing.T) {
 	models := discoverModels(dir)
 	m := Model{screen: ScreenMain, modelDir: dir, models: models, mainList: newMainList(models)}
 	m.input = textinput.New()
-	m.mainList.Select(1)
+	m.mainList.Select(3)
 
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	m = nm.(Model)
@@ -492,6 +652,23 @@ func TestDiscoverModelsHidesAuxiliaryArtifacts(t *testing.T) {
 	}
 }
 
+func TestDiscoverModelsHidesIncompleteShardSet(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"complete.gguf",
+		"partial-00001-of-00003.gguf",
+		"partial-00002-of-00003.gguf",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	models := discoverModels(dir)
+	if len(models) != 1 || models[0].Name != "complete.gguf" {
+		t.Fatalf("incomplete sharded download was presented as runnable: %#v", models)
+	}
+}
+
 func TestAuxiliaryArchitectureIsHiddenWithNeutralFilename(t *testing.T) {
 	if !isAuxiliaryModel("small-helper.gguf", "dflash") {
 		t.Fatal("dflash architecture must be hidden even without a filename marker")
@@ -553,6 +730,151 @@ func TestBuildLaunchRequestCarriesSelectedBackend(t *testing.T) {
 	}
 }
 
+func TestBuildLaunchRequestUsesStandardFitPolicy(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{{Name: "Laguna", Path: "/models/laguna.gguf"}},
+		selectedModel: 0,
+		backend:       "auto",
+		ctxMode:       "fit",
+		ctxSize:       "fit",
+		kvPlacement:   "gpu",
+		kvQuality:     "q4_0",
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || req.CtxFlag != "fit" || req.CtxSize != 0 {
+		t.Fatalf("fit mode must reach the standard placement ladder unchanged: %#v", req)
+	}
+	joined := strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(joined, "--ctx-size fit") || strings.Contains(joined, "132222") {
+		t.Fatalf("TUI emitted an ad-hoc context instead of fit: %q", joined)
+	}
+}
+
+func TestBuildLaunchRequestAutoSelectsInstalledModelRoute(t *testing.T) {
+	m := Model{
+		models: []ModelItem{{
+			Name:         "MiniMax-M3.gguf",
+			Path:         "/models/minimax.gguf",
+			Architecture: "minimax-m3",
+			AutoBackend:  "minimax-m3",
+		}},
+		selectedModel: 0,
+		backend:       "ik_llama",
+		kvPlacement:   "auto",
+		ctxMode:       "fit",
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || req.Backend != "minimax-m3" {
+		t.Fatalf("installed architecture route was not selected over the default backend: %#v", req)
+	}
+	if view := m.viewModelConfig(); !strings.Contains(view, "auto-selected for minimax-m3") {
+		t.Fatalf("model config does not disclose its effective backend: %q", view)
+	}
+}
+
+func TestMissingModelBackendRecipeConfirmsInstallAndCarriesLaunch(t *testing.T) {
+	m := Model{
+		screen: ScreenModelConfig,
+		models: []ModelItem{{
+			Name:          "MiniMax-M3.gguf",
+			Path:          "/models/minimax.gguf",
+			Architecture:  "minimax-m3",
+			Arch:          "minimax-m3 · MoE",
+			BackendRecipe: "minimax-m3",
+		}},
+		selectedModel: 0,
+		backend:       "ik_llama",
+		kvPlacement:   "auto",
+		kvQuality:     "high",
+		ctxMode:       "fit",
+	}
+	m.input = textinput.New()
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'L'}})
+	m = next.(Model)
+	if cmd != nil || m.screen != ScreenChoice || m.choiceCursor != 0 {
+		t.Fatalf("launch must stop at a cancel-first install confirmation: screen=%v cursor=%d cmd=%v", m.screen, m.choiceCursor, cmd)
+	}
+	joined := strings.Join(m.choiceOptions, "\n")
+	if !strings.Contains(joined, "Install minimax-m3 and select it") || !strings.Contains(joined, "Continue once with ik_llama") {
+		t.Fatalf("backend confirmation is incomplete: %q", joined)
+	}
+
+	m.choiceCursor = 1
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("confirmed backend installation must quit to the CLI installer")
+	}
+	if m.launchRequest == nil || strings.Join(m.launchRequest.BackendArgs, " ") != "install minimax-m3" {
+		t.Fatalf("unexpected backend install request: %#v", m.launchRequest)
+	}
+	if m.launchRequest.ModelPath != "/models/minimax.gguf" || m.launchRequest.Backend != "minimax-m3" || m.launchRequest.KVQuality != "high" {
+		t.Fatalf("post-install review did not retain model settings and selected recipe: %#v", m.launchRequest)
+	}
+}
+
+func TestMissingModelBackendRecipeCanBeBypassedOnce(t *testing.T) {
+	m := Model{
+		screen: ScreenModelConfig,
+		models: []ModelItem{{
+			Name:          "MiniMax-M3.gguf",
+			Path:          "/models/minimax.gguf",
+			Architecture:  "minimax-m3",
+			BackendRecipe: "minimax-m3",
+		}},
+		selectedModel: 0,
+		backend:       "ik_llama",
+		ctxMode:       "fit",
+	}
+	m.input = textinput.New()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m = next.(Model)
+	m.choiceCursor = 2
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil || m.screen != ScreenPrelaunch || !m.backendRouteBypass {
+		t.Fatalf("continue-once did not reach pre-launch: screen=%v bypass=%v cmd=%v", m.screen, m.backendRouteBypass, cmd)
+	}
+	if m.effectiveBackend() != "ik_llama" || m.selectedBackendRecipe() != nil {
+		t.Fatalf("continue-once did not preserve the selected backend for this attempt: backend=%q recipe=%#v", m.effectiveBackend(), m.selectedBackendRecipe())
+	}
+	if view := m.viewPrelaunch(); !strings.Contains(view, "model may fail") {
+		t.Fatalf("pre-launch did not disclose the unsupported-backend bypass: %q", view)
+	}
+}
+
+func TestMissingIKOnlyRecipeBypassOverridesAutoBackend(t *testing.T) {
+	m := Model{
+		screen: ScreenModelConfig,
+		models: []ModelItem{{
+			Name:          "MiniMax-M3.gguf",
+			Path:          "/models/minimax.gguf",
+			Architecture:  "minimax-m3",
+			Arch:          "minimax-m3 · MoE",
+			BackendRecipe: "minimax-m3",
+		}},
+		selectedModel: 0,
+		backend:       "auto",
+		ctxMode:       "fit",
+	}
+	m.input = textinput.New()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	m = next.(Model)
+	if got := strings.Join(m.choiceOptions, "\n"); !strings.Contains(got, "Continue once with ik_llama") {
+		t.Fatalf("IK-only architecture offered an incompatible auto bypass: %q", got)
+	}
+	m.choiceCursor = 2
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil || m.effectiveBackend() != "ik_llama" {
+		t.Fatalf("IK-only bypass backend = %q, cmd=%v; want ik_llama", m.effectiveBackend(), cmd)
+	}
+	if req := m.buildLaunchRequest(); req == nil || req.Backend != "ik_llama" {
+		t.Fatalf("IK-only bypass launch request = %#v, want explicit ik_llama", req)
+	}
+}
+
 func TestBuildArgsUsesPlannerDryRunCommand(t *testing.T) {
 	m := Model{
 		models:        []ModelItem{{Name: "DeepSeek", Path: "/models/deepseek.gguf"}},
@@ -588,6 +910,91 @@ func TestLaunchArgsCarriesAITuneRounds(t *testing.T) {
 	joined := strings.Join(req.LaunchArgs(), " ")
 	if !strings.Contains(joined, "--rounds 11") {
 		t.Fatalf("TUI AI tune rounds must reach cmdTune: %q", joined)
+	}
+}
+
+func TestLaunchArgsCarriesExplicitSWAChoice(t *testing.T) {
+	on := &LaunchRequest{ModelPath: "/models/test.gguf", SWAFull: true, SWAFullSet: true}
+	if joined := strings.Join(on.LaunchArgs(), " "); !strings.Contains(joined, "--swa-full") || strings.Contains(joined, "--no-swa-full") {
+		t.Fatalf("enabled full SWA choice was not emitted correctly: %q", joined)
+	}
+	off := &LaunchRequest{ModelPath: "/models/test.gguf", SWAFullSet: true}
+	if joined := strings.Join(off.LaunchArgs(), " "); !strings.Contains(joined, "--no-swa-full") || strings.Contains(joined, " --swa-full") {
+		t.Fatalf("disabled full SWA choice was not emitted correctly: %q", joined)
+	}
+	inherit := &LaunchRequest{ModelPath: "/models/test.gguf"}
+	if joined := strings.Join(inherit.LaunchArgs(), " "); strings.Contains(joined, "swa-full") {
+		t.Fatalf("unset legacy request unexpectedly overrode SWA policy: %q", joined)
+	}
+}
+
+func TestLaunchArgsCarriesExactSupportPolicy(t *testing.T) {
+	req := &LaunchRequest{
+		ModelPath:     "/models/test.gguf",
+		SupportExpert: "auto",
+		SupportOnline: true,
+		SupportSet:    true,
+	}
+	joined := strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(joined, "--support-expert auto") || !strings.Contains(joined, "--support-online") || strings.Contains(joined, "--no-support-online") {
+		t.Fatalf("support policy was not emitted exactly: %q", joined)
+	}
+	req.SupportOnline = false
+	joined = strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(joined, "--no-support-online") || strings.Contains(joined, " --support-online") {
+		t.Fatalf("disabled online policy was not emitted exactly: %q", joined)
+	}
+}
+
+func TestModelConfigTogglesAndDisplaysFullSWA(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{{Name: "Laguna", Path: "/models/laguna.gguf"}},
+		selectedModel: 0,
+		backend:       "auto",
+		ctxMode:       "manual",
+		ctxSize:       "131072",
+		kvPlacement:   "gpu",
+		kvQuality:     "q4_0",
+	}
+	if view := m.viewModelConfig(); !strings.Contains(view, "Full SWA cache") || !strings.Contains(view, "off (smaller KV cache)") {
+		t.Fatalf("disabled full SWA state is missing from model config: %q", view)
+	}
+	m.cycleCfgRow("swa", 1)
+	if view := m.viewModelConfig(); !strings.Contains(view, "on (more cache hits; memory estimate after dry run)") {
+		t.Fatalf("enabled full SWA state is missing from model config: %q", view)
+	}
+	if req := m.buildLaunchRequest(); req == nil || !req.SWAFull || !req.SWAFullSet {
+		t.Fatalf("full SWA toggle did not reach launch request: %#v", req)
+	}
+}
+
+func TestModelConfigShowsFullSWAKVMemoryDelta(t *testing.T) {
+	m := Model{
+		models: []ModelItem{{
+			Name: "windowed.gguf",
+			KVProfile: &placement.ModelProfile{
+				NumLayers:     48,
+				HeadCountKV:   8,
+				KeyLength:     128,
+				ValueLength:   128,
+				SlidingWindow: 4096,
+				ModelArch:     "laguna",
+			},
+		}},
+		ctxSize:   "131072",
+		ctxMode:   "manual",
+		kvQuality: "q4_0",
+	}
+	if delta := m.swaExtraKVMB(m.models[0]); delta <= 0 {
+		t.Fatalf("Full SWA delta = %d MiB, want a positive estimate", delta)
+	}
+	view := m.viewModelConfig()
+	if !strings.Contains(view, "Full SWA cache") || !strings.Contains(view, "+") || !strings.Contains(view, "GiB KV") {
+		t.Fatalf("Full SWA row does not show its KV cost: %s", view)
+	}
+	m.swaFull = true
+	if view := m.viewPrelaunch(); !strings.Contains(view, "more cache hits") || !strings.Contains(view, "GiB KV") {
+		t.Fatalf("pre-launch summary lost Full SWA cost: %s", view)
 	}
 }
 
@@ -634,13 +1041,13 @@ func TestLaunchArgsCarriesClaudeProfileOnlyForClaudeCode(t *testing.T) {
 func TestRunModesAreMutuallyExclusive(t *testing.T) {
 	m := Model{screen: ScreenModelConfig, models: []ModelItem{{Name: "test.gguf"}}, kvPlacement: "auto", ctxMode: "fit", ctxSize: "fit"}
 	m.input = textinput.New()
-	m.cfgCursor = 4 // AI tune
+	m.cfgCursor = indexOf(m.cfgRows(), "aitune")
 	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = nm.(Model)
 	if !m.aitune || m.benchmark {
 		t.Fatal("AI tune should enable itself and disable benchmark")
 	}
-	m.cfgCursor = 8 // benchmark after AI tune adds the rounds row
+	m.cfgCursor = indexOf(m.cfgRows(), "benchmark")
 	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = nm.(Model)
 	if !m.benchmark || m.aitune {
@@ -716,18 +1123,33 @@ func TestInitialModelUsesConfigPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(cfgDir, "config")
-	doc := "MODEL_DIR=\"" + modelDir + "\"\nCACHE_DIR=\"" + cacheDir + "\"\nBACKEND=\"vulkan\"\nKV_PLACEMENT=\"gpu\"\nCTX_SIZE=\"max\"\nPARALLEL=\"3\"\nPORT=\"9091\"\nVISION=\"1\"\nTUNE_ROUNDS=\"9\"\n"
+	doc := "MODEL_DIR=\"" + modelDir + "\"\nCACHE_DIR=\"" + cacheDir + "\"\nBACKEND=\"vulkan\"\nKV_PLACEMENT=\"gpu\"\nKV_QUALITY=\"q4_0\"\nSWA_FULL=\"1\"\nCTX_SIZE=\"131072\"\nPARALLEL=\"3\"\nPORT=\"9091\"\nVISION=\"1\"\nTUNE_ROUNDS=\"9\"\n"
 	if err := os.WriteFile(cfgPath, []byte(doc), 0644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("LLM_CONFIG", cfgPath)
 	t.Setenv("LLM_APP_HOME", appHome)
 	m := InitialModel()
-	if m.modelDir != modelDir || m.cacheDir != cacheDir || m.backend != "vulkan" || m.kvPlacement != "gpu" || m.aituneRounds != 9 || m.ctxMode != "max" || m.parallel != "3" || m.port != 9091 || !m.vision {
-		t.Fatalf("config not restored: modelDir=%q cacheDir=%q backend=%q kv=%q rounds=%d ctx=%q parallel=%q port=%d vision=%v", m.modelDir, m.cacheDir, m.backend, m.kvPlacement, m.aituneRounds, m.ctxMode, m.parallel, m.port, m.vision)
+	if m.modelDir != modelDir || m.cacheDir != cacheDir || m.backend != "vulkan" || m.kvPlacement != "gpu" || m.kvQuality != "q4_0" || !m.swaFull || m.aituneRounds != 9 || m.ctxMode != "manual" || m.ctxSize != "131072" || m.parallel != "3" || m.port != 9091 || !m.vision {
+		t.Fatalf("config not restored: modelDir=%q cacheDir=%q backend=%q kv=%q/%q swa=%v rounds=%d ctx=%q/%q parallel=%q port=%d vision=%v", m.modelDir, m.cacheDir, m.backend, m.kvPlacement, m.kvQuality, m.swaFull, m.aituneRounds, m.ctxMode, m.ctxSize, m.parallel, m.port, m.vision)
 	}
-	if m.parallelSet {
-		t.Fatal("a config parallel value is policy input, not an explicit per-launch override")
+	if !m.parallelSet {
+		t.Fatal("an explicitly configured parallel value must remain authoritative for the launch")
+	}
+	m.models = []ModelItem{{Name: "Laguna", Path: filepath.Join(modelDir, "laguna.gguf")}}
+	m.selectedModel = 0
+	req := m.buildLaunchRequest()
+	// SWAFullSet is deliberately NOT asserted here. A saved setting reaches the
+	// launch through config, not as a command-line override: emitting it as a
+	// typed flag made it inviolable (userExplicitBackendFlag reads OriginalArgs),
+	// which locked the recovery ladder and the support expert out of withdrawing
+	// a --swa-full that was costing 5.3 GiB of KV and buying no prefix reuse.
+	// The value must still arrive; only its provenance changed.
+	if req == nil || req.CtxFlag != "131072" || !req.ParallelSet || !req.SWAFull {
+		t.Fatalf("standard optimal config did not reach launch request: %#v", req)
+	}
+	if req.SWAFullSet {
+		t.Fatalf("an inherited setting must not be emitted as an explicit flag: %#v", req)
 	}
 }
 
@@ -760,11 +1182,15 @@ func TestInitialModelDefaultsKVQualityToAuto(t *testing.T) {
 	if m.kvQuality != "auto" {
 		t.Fatalf("TUI default KV quality must be model-aware auto, got %q", m.kvQuality)
 	}
+	if m.supportExpert != "auto" || m.supportOnline {
+		t.Fatalf("TUI support defaults = %q online=%v, want auto/off", m.supportExpert, m.supportOnline)
+	}
 }
 
 // Changing KV settings in the Settings screen must apply to the live session,
 // not only to the next TUI start.
 func TestApplySettingSyncsKVIntoLiveSession(t *testing.T) {
+	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "config"))
 	t.Setenv("LLM_APP_HOME", t.TempDir())
 	m := Model{settingsCfg: config.Defaults(), kvQuality: "mid", kvPlacement: "auto"}
 	var qRow, pRow settingRow
@@ -790,27 +1216,31 @@ func TestApplySettingSyncsKVIntoLiveSession(t *testing.T) {
 }
 
 func TestApplySettingSyncsLaunchCriticalValues(t *testing.T) {
+	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "config"))
 	t.Setenv("LLM_APP_HOME", t.TempDir())
 	m := Model{settingsCfg: config.Defaults(), ctxMode: "fit", ctxSize: "fit", port: 8081, parallel: "1", aituneRounds: 8}
 	rows := map[string]settingRow{}
 	for _, row := range settingRows() {
 		rows[row.label] = row
 	}
-	for _, label := range []string{"Context", "Vision", "Port", "Parallel", "AI-tune rounds"} {
+	for _, label := range []string{"Context", "Full SWA cache", "Support expert / optimizer", "Support online research", "Vision", "Port", "Parallel", "AI-tune rounds"} {
 		if rows[label].label == "" {
 			t.Fatalf("settings row %q not found", label)
 		}
 	}
 	m.applySetting(rows["Context"], "max")
+	m.applySetting(rows["Full SWA cache"], "on")
+	m.applySetting(rows["Support expert / optimizer"], "on")
+	m.applySetting(rows["Support online research"], "on")
 	m.applySetting(rows["Vision"], "on")
 	m.applySetting(rows["Port"], "9099")
 	m.applySetting(rows["Parallel"], "3")
 	m.applySetting(rows["AI-tune rounds"], "12")
-	if m.ctxMode != "max" || !m.vision || m.port != 9099 || m.parallel != "3" || m.aituneRounds != 12 {
-		t.Fatalf("launch settings not synced: ctx=%q vision=%v port=%d parallel=%q rounds=%d", m.ctxMode, m.vision, m.port, m.parallel, m.aituneRounds)
+	if m.ctxMode != "max" || !m.swaFull || m.supportExpert != "on" || !m.supportOnline || !m.vision || m.port != 9099 || m.parallel != "3" || m.aituneRounds != 12 {
+		t.Fatalf("launch settings not synced: ctx=%q swa=%v support=%q online=%v vision=%v port=%d parallel=%q rounds=%d", m.ctxMode, m.swaFull, m.supportExpert, m.supportOnline, m.vision, m.port, m.parallel, m.aituneRounds)
 	}
-	if m.parallelSet {
-		t.Fatal("Settings parallel value must still allow Claude mode to apply its minimum slot policy")
+	if !m.parallelSet {
+		t.Fatal("a parallel value explicitly entered in Settings must remain authoritative")
 	}
 }
 

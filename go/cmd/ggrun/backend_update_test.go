@@ -35,6 +35,27 @@ func TestBackendLayoutFor(t *testing.T) {
 	}
 }
 
+func TestEnsureRecipeOriginMigratesLegacyFork(t *testing.T) {
+	repo := t.TempDir()
+	if _, err := gitOutput(repo, "init"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitOutput(repo, "remote", "add", "origin", "https://github.com/legacy/fork.git"); err != nil {
+		t.Fatal(err)
+	}
+	recipe := &backends.Recipe{GitURL: "https://github.com/ggml-org/llama.cpp.git"}
+	if err := ensureRecipeOrigin(repo, recipe); err != nil {
+		t.Fatal(err)
+	}
+	got, err := gitOutput(repo, "remote", "get-url", "origin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(got) != recipe.GitURL {
+		t.Fatalf("origin=%q, want %q", strings.TrimSpace(got), recipe.GitURL)
+	}
+}
+
 func TestArchiveBuildDirPreservesAndDoesNotCollide(t *testing.T) {
 	root := t.TempDir()
 	build := filepath.Join(root, "build-cuda")
@@ -127,6 +148,111 @@ func TestPruneBuildDirRefusesNonArchives(t *testing.T) {
 	}
 	if _, err := os.Stat(archive); !os.IsNotExist(err) {
 		t.Error("archive still present after prune")
+	}
+}
+
+func TestPruneCandidateBuildDirIsScopedBesideActive(t *testing.T) {
+	root := t.TempDir()
+	active := filepath.Join(root, "build-cuda")
+	candidate := active + "-candidate-abc-1"
+	if err := os.MkdirAll(candidate, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneCandidateBuildDir(candidate, active); err != nil {
+		t.Fatalf("valid candidate cleanup: %v", err)
+	}
+	if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+		t.Fatal("candidate was not removed")
+	}
+	if err := os.MkdirAll(active, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := pruneCandidateBuildDir(active, active); err == nil {
+		t.Fatal("active build was accepted as candidate cleanup target")
+	}
+	if _, err := os.Stat(active); err != nil {
+		t.Fatal("active build was removed")
+	}
+}
+
+func TestValidateBackendCandidateChecksServerSurfaceAndAccelerator(t *testing.T) {
+	write := func(name, help, devices string) string {
+		path := filepath.Join(t.TempDir(), name)
+		body := "#!/bin/sh\ncase \"$1\" in\n" +
+			"  --version) echo 'llama-server test' ;;\n" +
+			"  --help) echo '" + help + "' ;;\n" +
+			"  --list-devices) echo 'Available devices:'; echo '" + devices + "' ;;\n" +
+			"  *) exit 1 ;;\nesac\n"
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	good := write("good-server", "--model --ctx-size --host --port", "CUDA0: test")
+	if err := validateBackendCandidate(good, "", "cuda"); err != nil {
+		t.Fatalf("valid staged backend rejected: %v", err)
+	}
+	missing := write("missing-server", "--model --host --port", "CUDA0: test")
+	if err := validateBackendCandidate(missing, "", "cpu"); err == nil || !strings.Contains(err.Error(), "--ctx-size") {
+		t.Fatalf("missing launch option accepted: %v", err)
+	}
+	cpuOnly := write("cpu-server", "--model --ctx-size --host --port", "CPU")
+	if err := validateBackendCandidate(cpuOnly, "", "cuda"); err == nil || !strings.Contains(err.Error(), "no supported GPU") {
+		t.Fatalf("CPU-only binary accepted for CUDA activation: %v", err)
+	}
+}
+
+func TestRollbackKeepsCanonicalLayoutForNextUpdate(t *testing.T) {
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	src := filepath.Join(appHome, ".src", "fork-test")
+	activeDir := filepath.Join(src, "build-cpu")
+	previousDir := activeDir + "-prev-old"
+	writeServer := func(dir, version string) string {
+		if err := os.MkdirAll(filepath.Join(dir, "bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, "bin", "llama-server")
+		body := "#!/bin/sh\ncase \"$1\" in\n" +
+			"  --version) echo '" + version + "' ;;\n" +
+			"  --help) echo '--model --ctx-size --host --port' ;;\n" +
+			"  *) exit 1 ;;\nesac\n"
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	active := writeServer(activeDir, "current")
+	previous := writeServer(previousDir, "previous")
+	if err := backends.Save([]backends.Backend{{
+		Tag: "test", Path: active, Commit: "new",
+		Previous: &backends.BackendVersion{Path: previous, Commit: "old"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := rollbackRegisteredBackend("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Path != active {
+		t.Fatalf("rollback pointed manifest into archive: %s", restored.Path)
+	}
+	if layout, err := backendLayoutFor(restored); err != nil || layout.accel != "cpu" || layout.buildDir != activeDir {
+		t.Fatalf("rolled-back backend is not updateable: layout=%+v err=%v", layout, err)
+	}
+	data, _ := os.ReadFile(active)
+	if !strings.Contains(string(data), "previous") {
+		t.Fatalf("canonical tree did not receive previous build: %s", data)
+	}
+
+	// Rollback is symmetric and must remain canonical when used as undo.
+	undone, err := rollbackRegisteredBackend("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if undone.Path != active {
+		t.Fatalf("rollback undo left canonical path: %s", undone.Path)
 	}
 }
 

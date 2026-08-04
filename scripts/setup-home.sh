@@ -123,6 +123,9 @@ elif [[ "$backend_config" == "cuda" ]]; then
     backend_config="ik_llama"
 elif [[ "$backend_config" == "cpu" || "$backend_config" == "metal" ]]; then
     backend_config="llama"
+elif [[ "$backend_config" == "skip" ]]; then
+    # "skip" controls installation only; it is not a runtime backend tag.
+    backend_config="auto"
 fi
 
 cat >"$APP_CONFIG/config" <<EOF

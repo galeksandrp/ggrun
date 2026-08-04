@@ -206,10 +206,17 @@ func StartWithTimeoutToOptions(args []string, port int, timeout time.Duration, t
 	tty := stdoutIsTTY()
 	streamFromStart := streamLogsFromStart(tty, termOut, termErr)
 	logStartupEvents := dedicatedLogWriter(termOut, termErr)
+	// os/exec may copy stdout and stderr concurrently while the readiness loop
+	// emits health-check events. Callers are allowed to pass the same writer for
+	// both streams (for example, a bytes.Buffer or one log file), so serialize
+	// every terminal/log write through one shared lock.
+	termMu := &sync.Mutex{}
+	safeTermOut := &lockedWriter{mu: termMu, dst: termOut}
+	safeTermErr := &lockedWriter{mu: termMu, dst: termErr}
 	live := &atomic.Bool{}
 	live.Store(streamFromStart)
-	cmd.Stdout = &gatedWriter{buf: logBuf, term: termOut, live: live}
-	cmd.Stderr = &gatedWriter{buf: logBuf, term: termErr, live: live}
+	cmd.Stdout = &gatedWriter{buf: logBuf, term: safeTermOut, live: live}
+	cmd.Stderr = &gatedWriter{buf: logBuf, term: safeTermErr, live: live}
 
 	cmd.Env = OverrideEnv(ChildEnv(os.Environ(), args), outerEnvOverrides)
 
@@ -231,7 +238,7 @@ func StartWithTimeoutToOptions(args []string, port int, timeout time.Duration, t
 	}()
 
 	start := time.Now()
-	logStartupEvent(logStartupEvents, termErr, "[launch] health check: polling http://127.0.0.1:%d/health then /v1/models (timeout %s)", port, timeout)
+	logStartupEvent(logStartupEvents, safeTermErr, "[launch] health check: polling http://127.0.0.1:%d/health then /v1/models (timeout %s)", port, timeout)
 	var stopSpin chan struct{}
 	if tty {
 		stopSpin = make(chan struct{})
@@ -243,7 +250,7 @@ func StartWithTimeoutToOptions(args []string, port int, timeout time.Duration, t
 		fmt.Fprint(os.Stderr, "\r\033[K") // clear the spinner line
 	}
 	if err != nil {
-		logStartupEvent(logStartupEvents, termErr, "[launch] health check failed after %s: %v", time.Since(start).Round(time.Second), err)
+		logStartupEvent(logStartupEvents, safeTermErr, "[launch] health check failed after %s: %v", time.Since(start).Round(time.Second), err)
 		if tty {
 			fmt.Fprintln(os.Stderr, "[launch] backend failed to start; last output:")
 			fmt.Fprintln(os.Stderr, tailLines(logBuf.String(), 20))
@@ -252,7 +259,7 @@ func StartWithTimeoutToOptions(args []string, port int, timeout time.Duration, t
 		return p, fmt.Errorf("server not ready: %w", err)
 	}
 	live.Store(true) // backend is up — stream its logs from here on
-	logStartupEvent(logStartupEvents, termErr, "[launch] health check OK after %s", time.Since(start).Round(time.Second))
+	logStartupEvent(logStartupEvents, safeTermErr, "[launch] health check OK after %s", time.Since(start).Round(time.Second))
 	if tty {
 		fmt.Fprintf(os.Stderr, "[launch] model loaded - server ready in %s\n", time.Since(start).Round(time.Second))
 	}
@@ -328,7 +335,11 @@ func hasMultiGPUSplit(args []string) bool {
 
 func (p *Process) waitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
-	url := fmt.Sprintf("http://localhost:%d/health", p.Port)
+	client := &http.Client{}
+	urls := []string{
+		fmt.Sprintf("http://localhost:%d/health", p.Port),
+		fmt.Sprintf("http://localhost:%d/v1/models", p.Port),
+	}
 	for time.Now().Before(deadline) {
 		// Fail fast when the process dies during startup instead of polling
 		// the health endpoint until the full (model-size-scaled) timeout.
@@ -341,22 +352,43 @@ func (p *Process) waitReady(timeout time.Duration) error {
 			return fmt.Errorf("server process exited during startup")
 		default:
 		}
-		resp, err := http.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
+		for _, url := range urls {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
 			}
-		}
-		// Fallback: try /v1/models as well
-		resp, err = http.Get(fmt.Sprintf("http://localhost:%d/v1/models", p.Port))
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
+			requestTimeout := min(2*time.Second, remaining)
+			ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+			request, requestErr := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+			if requestErr != nil {
+				cancel()
+				return requestErr
 			}
+			resp, requestErr := client.Do(request)
+			if requestErr == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					cancel()
+					return nil
+				}
+			}
+			cancel()
 		}
-		time.Sleep(500 * time.Millisecond)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		timer := time.NewTimer(min(500*time.Millisecond, remaining))
+		select {
+		case <-p.done:
+			timer.Stop()
+			err := p.waitResult()
+			if err != nil {
+				return fmt.Errorf("server process exited during startup: %v", err)
+			}
+			return fmt.Errorf("server process exited during startup")
+		case <-timer.C:
+		}
 	}
 	return fmt.Errorf("timeout waiting for server on port %d", p.Port)
 }
@@ -370,14 +402,25 @@ func (p *Process) Stop() error {
 		defer close(p.stopDone)
 		p.captureMemoryStats()
 		var scopeErr error
+		scopeStopped := false
 		if p.scopeUnit != "" {
 			scopeErr = stopScopeUnit(p.scopeUnit)
+			scopeStopped = scopeErr == nil || !scopeUnitActive(p.scopeUnit)
+			if scopeStopped {
+				scopeErr = nil
+			}
 		}
-		if p.cancel != nil {
-			p.cancel()
-		}
-		if p.Cmd != nil && p.Cmd.Process != nil {
-			killProcessTree(p.Cmd.Process.Pid)
+		// systemd already terminates every process in a scoped cgroup. Sending a
+		// second process-group SIGTERM made llama-server abort its otherwise
+		// clean shutdown ("Received second interrupt"). Use the direct fallback
+		// only when no scope was stopped.
+		if !scopeStopped {
+			if p.cancel != nil {
+				p.cancel()
+			}
+			if p.Cmd != nil && p.Cmd.Process != nil {
+				killProcessTree(p.Cmd.Process.Pid)
+			}
 		}
 		// Wait with timeout — don't block forever if process hangs during cleanup.
 		select {
@@ -393,7 +436,18 @@ func (p *Process) Stop() error {
 				p.stopErr = err
 			}
 		case <-time.After(15 * time.Second):
+			if p.cancel != nil {
+				p.cancel()
+			}
+			if p.Cmd != nil && p.Cmd.Process != nil {
+				killProcessTree(p.Cmd.Process.Pid)
+			}
 			p.stopErr = fmt.Errorf("process did not exit within 15s")
+		}
+		if scopeStopped && p.cancel != nil {
+			// Release the command context only after systemd has reaped the
+			// process, so cancellation cannot become a duplicate signal.
+			p.cancel()
 		}
 		if p.scopeUnit != "" {
 			if err := stopScopeUnit(p.scopeUnit); err != nil && scopeErr == nil {
@@ -494,6 +548,22 @@ func logStartupEvent(enabled bool, w io.Writer, format string, args ...any) {
 func sameFileWriter(w io.Writer, f *os.File) bool {
 	of, ok := w.(*os.File)
 	return ok && of == f
+}
+
+// lockedWriter serializes access to a destination that may be shared by
+// multiple os/exec copy goroutines and startup-status reporting.
+type lockedWriter struct {
+	mu  *sync.Mutex
+	dst io.Writer
+}
+
+func (w *lockedWriter) Write(p []byte) (int, error) {
+	if w == nil || w.dst == nil {
+		return len(p), nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dst.Write(p)
 }
 
 // gatedWriter always captures to buf; it forwards to term only once live is set,

@@ -229,7 +229,7 @@ func SavePlacementCache(cachePath string, entry *CacheEntry) error {
 		}
 		parts = append(parts, fmt.Sprintf("CACHED_PLAN_FREEVRAM=\"%s\"", strings.Join(tokens, " ")))
 	}
-	return os.WriteFile(cachePath, []byte(strings.Join(parts, "\n")+"\n"), 0644)
+	return atomicWriteFile(cachePath, []byte(strings.Join(parts, "\n")+"\n"), 0o644)
 }
 
 // snapshotPlanFreeVRAM captures the planning view of free VRAM so it can be

@@ -25,6 +25,9 @@ import (
 // backend ggrun already runs.
 const UtilityAlias = "local-fast"
 
+// MainAlias is the alias ggrun advertises on the primary llama-server.
+const MainAlias = "local"
+
 // routeUtility labels the lane a request should take.
 const routeUtility = "utility"
 

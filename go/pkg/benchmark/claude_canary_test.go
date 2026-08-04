@@ -1,0 +1,68 @@
+package benchmark
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestClaudeRouterCanaryExercisesAnthropicEndpointAndTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Fatalf("canary path = %s", r.URL.Path)
+		}
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := body["tools"]; !ok {
+			t.Fatal("Claude canary omitted tool schema")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": []map[string]string{{"type": "text", "text": "GGRUN_OK"}},
+		})
+	}))
+	defer server.Close()
+	if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeRouterCanary(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The Anthropic path shares validCanaryOutput, so it inherits the same bar: a
+// thinking model that answers in prose has routed correctly through /v1/messages
+// and must not be reported as a broken gateway.
+func TestClaudeRouterCanaryAcceptsBoundedThinkingPreamble(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": []map[string]string{{"type": "text", "text": "The user asks for a deterministic verification token."}},
+		})
+	}))
+	defer server.Close()
+	if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeRouterCanary(); err != nil {
+		t.Fatalf("bounded thinking-model answer rejected: %v", err)
+	}
+}
+
+func TestClaudeRouterCanaryRejectsEmptyOrUnboundedOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{"empty", ""},
+		{"unbounded", strings.TrimSpace(strings.Repeat("rambling ", maxFunctionalCanaryFields+1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"content": []map[string]string{{"type": "text", "text": tc.text}},
+				})
+			}))
+			defer server.Close()
+			if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeRouterCanary(); err == nil {
+				t.Fatalf("%s Anthropic completion activated Claude workload profile", tc.name)
+			}
+		})
+	}
+}

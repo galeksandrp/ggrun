@@ -3,6 +3,10 @@ package server
 import (
 	"bytes"
 	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -120,7 +124,7 @@ func TestScopedCommandArgsWrapsMemoryMax(t *testing.T) {
 		t.Fatalf("scopedCommandArgs: %v", err)
 	}
 	joined := strings.Join(got, " ")
-	for _, want := range []string{systemdRun, "--user", "--scope", "MemoryAccounting=yes", "MemoryMax=64000M", "MemorySwapMax=0", "OOMPolicy=kill", "KillMode=control-group", "llama-server"} {
+	for _, want := range []string{systemdRun, "--user", "--scope", "MemoryAccounting=yes", "MemoryMax=64000M", "MemorySwapMax=0", "OOMPolicy=kill", "KillMode=mixed", "llama-server"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("scoped argv %q missing %q", joined, want)
 		}
@@ -247,6 +251,33 @@ func TestWaitReadyTimeout(t *testing.T) {
 	err := p.waitReady(100 * time.Millisecond)
 	if err == nil {
 		t.Fatalf("expected timeout")
+	}
+}
+
+func TestWaitReadyBoundsStalledHTTPRequests(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Process{Port: port, done: make(chan struct{})}
+	started := time.Now()
+	if err := p.waitReady(150 * time.Millisecond); err == nil {
+		t.Fatal("expected timeout from stalled HTTP server")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stalled health request exceeded the startup deadline: %v", elapsed)
 	}
 }
 

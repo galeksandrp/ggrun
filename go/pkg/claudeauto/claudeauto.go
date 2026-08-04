@@ -353,8 +353,31 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 			r.ContentLength = int64(len(body))
 		}
 		if IsClassifierRequest(body) {
+			alias := MainAlias
+			if router.utilityEnabled() {
+				alias = router.companionAlias
+			}
+			body = retargetModel(body, alias)
+			r.Body = io.NopCloser(bodyReader(body))
+			r.ContentLength = int64(len(body))
 			router.serve(w, r, reviewerProxy, routeReviewer, body)
 			return
+		}
+		// Decide the cheap-tier destination before injecting any main-backend
+		// metadata. A companion has a different template and must never receive
+		// message delimiters parsed from the main model. With no companion, rewrite
+		// local-fast back to the actual main alias before forwarding.
+		if IsUtilityRequest(body) {
+			if router.utilityEnabled() {
+				body = utilityBody(body, router.companionAlias)
+				r.Body = io.NopCloser(bodyReader(body))
+				r.ContentLength = int64(len(body))
+				router.serve(w, r, reviewerProxy, routeUtility, body)
+				return
+			}
+			body = utilityBody(body, MainAlias)
+			r.Body = io.NopCloser(bodyReader(body))
+			r.ContentLength = int64(len(body))
 		}
 		// Main-model work only: the reviewer is a different model with its own
 		// template, and its conversations are short enough that a missing
@@ -365,17 +388,6 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 				r.Body = io.NopCloser(bodyReader(body))
 				r.ContentLength = int64(len(body))
 			}
-		}
-		// Claude Code's cheap tiers address the utility alias. Send that work
-		// to the companion backend instead of the main model, rewriting the
-		// model field to the alias the companion was launched with so it does
-		// not need to know ggrun's routing labels.
-		if router.utilityEnabled() && IsUtilityRequest(body) {
-			body = utilityBody(body, router.companionAlias)
-			r.Body = io.NopCloser(bodyReader(body))
-			r.ContentLength = int64(len(body))
-			router.serve(w, r, reviewerProxy, routeUtility, body)
-			return
 		}
 		router.serve(w, r, mainProxy, routeMain, body)
 	})

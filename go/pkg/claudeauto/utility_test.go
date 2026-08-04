@@ -2,6 +2,7 @@ package claudeauto
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,8 +61,14 @@ func TestRetargetModelRewritesOnlyTheModelField(t *testing.T) {
 // cheap-tier work would be routed into a lane that loops to the same server.
 func TestUtilityLaneDisabledWithoutACompanion(t *testing.T) {
 	var gotMain, gotCompanion int
-	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var mainModel string
+	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMain++
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		mainModel = payload.Model
 		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
 	defer main.Close()
@@ -85,6 +92,9 @@ func TestUtilityLaneDisabledWithoutACompanion(t *testing.T) {
 	if gotMain != 1 || gotCompanion != 0 {
 		t.Errorf("with no companion: main=%d companion=%d, want 1/0", gotMain, gotCompanion)
 	}
+	if mainModel != MainAlias {
+		t.Errorf("main fallback saw model %q, want %q", mainModel, MainAlias)
+	}
 
 	gotMain, gotCompanion = 0, 0
 	on, err := StartRouter(main.URL, companion.URL, true, 1)
@@ -98,6 +108,33 @@ func TestUtilityLaneDisabledWithoutACompanion(t *testing.T) {
 	_ = on.Close()
 	if gotCompanion != 1 || gotMain != 0 {
 		t.Errorf("with a companion: main=%d companion=%d, want 0/1", gotMain, gotCompanion)
+	}
+}
+
+func TestUtilityCompanionDoesNotReceiveMainMessageDelimiters(t *testing.T) {
+	var companionBody []byte
+	companion := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		companionBody, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer companion.Close()
+	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer main.Close()
+
+	router, err := StartRouter(main.URL, companion.URL, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	router.SetCompanion(MainAlias, true)
+	router.SetMessageDelimiters([]MessageDelimiter{{Role: "user", Delimiter: "<main-user>"}})
+	if err := postErr(router, `{"model":"`+UtilityAlias+`","messages":[]}`); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(companionBody), "message_delimiters") {
+		t.Fatalf("main-model delimiters leaked into companion request: %s", companionBody)
 	}
 }
 
@@ -138,6 +175,30 @@ func TestClassifierStillWinsOverUtility(t *testing.T) {
 	body := `{"model":"` + UtilityAlias + `","system":[{"type":"text","text":"` + ClassifierMarker + `"}],"messages":[]}`
 	if !IsClassifierRequest([]byte(body)) {
 		t.Fatal("classifier marker not detected when the cheap alias is also set")
+	}
+	var seen string
+	companion := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		seen = payload.Model
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer companion.Close()
+	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{}`)) }))
+	defer main.Close()
+	router, err := StartRouter(main.URL, companion.URL, true, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer router.Close()
+	router.SetCompanion(MainAlias, true)
+	if err := postErr(router, body); err != nil {
+		t.Fatal(err)
+	}
+	if seen != MainAlias {
+		t.Fatalf("classifier companion saw model %q, want %q", seen, MainAlias)
 	}
 }
 

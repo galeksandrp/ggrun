@@ -53,7 +53,7 @@ func runProbeReset(args []string) error {
 	}
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		return fmt.Errorf("no llama-server binary found; the probe scope is keyed by backend identity")
+		return fmt.Errorf("backend resolution: %s; the probe scope is keyed by backend identity", backendUnavailableMessage(req))
 	}
 
 	// The signature must match the launch whose reserve is being cleared, so

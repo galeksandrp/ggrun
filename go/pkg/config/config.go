@@ -31,6 +31,7 @@ type Config struct {
 	RAMHeadroom     string `json:"ram_headroom"`      // system RAM to hold back, e.g. "8G"
 	KVPlacement     string `json:"kv_placement"`
 	KVQuality       string `json:"kv_quality"`
+	SWAFull         bool   `json:"swa_full"`
 	AssumeYes       bool   `json:"assume_yes"`
 	Backend         string `json:"backend"`
 	LlamaServer     string `json:"llama_server"`
@@ -39,7 +40,10 @@ type Config struct {
 	Vision          bool   `json:"vision"`
 	Parallel        int    `json:"parallel"`
 	Host            string `json:"host"`
-	Spec            string `json:"spec"` // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
+	Spec            string `json:"spec"`           // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
+	SupportExpert   string `json:"support_expert"` // off, auto (installed-only), on
+	SupportOnline   bool   `json:"support_online"` // official llama.cpp research only
+	SupportModel    string `json:"support_model"`  // optional verified local artifact override
 
 	// sources is populated by Load and intentionally not serialized. Keeping
 	// provenance next to the merged value lets `config show` report the source
@@ -51,10 +55,11 @@ type Config struct {
 var DefaultKeys = []string{
 	"PORT", "CTX_SIZE", "MAX_RESTARTS", "KEEP_ALIVE", "HEALTH_TIMEOUT",
 	"MODEL_DIR", "CACHE_DIR", "LOG_DIR",
-	"RAM_BUDGET", "RAM_LIMIT_PERCENT", "VRAM_HEADROOM", "RAM_HEADROOM", "KV_PLACEMENT", "KV_QUALITY",
+	"RAM_BUDGET", "RAM_LIMIT_PERCENT", "VRAM_HEADROOM", "RAM_HEADROOM", "KV_PLACEMENT", "KV_QUALITY", "SWA_FULL",
 	"ASSUME_YES",
 	"BACKEND", "LLAMA_SERVER", "APP_HOME",
 	"TUNE_ROUNDS", "VISION", "PARALLEL", "HOST", "SPEC",
+	"SUPPORT_EXPERT", "SUPPORT_ONLINE", "SUPPORT_MODEL",
 }
 
 // Defaults returns the built-in defaults.
@@ -75,6 +80,7 @@ func Defaults() *Config {
 		RAMHeadroom:     "",
 		KVPlacement:     "auto",
 		KVQuality:       "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
+		SWAFull:         false,
 		AssumeYes:       false,
 		Backend:         "",
 		LlamaServer:     "",
@@ -84,6 +90,9 @@ func Defaults() *Config {
 		Parallel:        1,
 		Host:            "127.0.0.1",
 		Spec:            "off",
+		SupportExpert:   "auto",
+		SupportOnline:   false,
+		SupportModel:    "",
 		sources:         defaultSources(),
 	}
 }
@@ -147,6 +156,19 @@ func defaultSources() map[string]string {
 		sources[key] = "default"
 	}
 	return sources
+}
+
+// IsExplicit reports whether a setting came from the config file or the
+// environment instead of a built-in default. Callers use this to distinguish
+// policy defaults from values the user deliberately pinned.
+func (c *Config) IsExplicit(key string) bool {
+	if c == nil || c.sources == nil {
+		return false
+	}
+	key = strings.ToUpper(strings.TrimSpace(key))
+	key = strings.TrimPrefix(key, "LLM_")
+	source := c.sources[key]
+	return source != "" && source != "default"
 }
 
 // Path returns the canonical config file path. A self-contained ggrun install
@@ -224,9 +246,10 @@ func snapshotEnv() map[string]string {
 	for _, k := range []string{
 		"LLM_PORT", "LLM_CTX_SIZE", "LLM_MAX_RESTARTS", "LLM_KEEP_ALIVE",
 		"LLM_HEALTH_TIMEOUT", "LLM_MODEL_DIR", "LLM_CACHE_DIR", "LLM_LOG_DIR",
-		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_ASSUME_YES",
+		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_SWA_FULL", "LLM_ASSUME_YES",
 		"LLM_BACKEND", "LLAMA_SERVER", "LLM_APP_HOME", "LLM_TUNE_ROUNDS",
 		"LLM_VISION", "LLM_PARALLEL", "LLM_HOST", "LLM_SPEC",
+		"LLM_SUPPORT_EXPERT", "LLM_SUPPORT_ONLINE", "LLM_SUPPORT_MODEL",
 	} {
 		if v := os.Getenv(k); v != "" {
 			m[k] = v
@@ -336,6 +359,8 @@ func setConfigValue(cfg *Config, key, raw, source string) error {
 		cfg.KVPlacement = val
 	case "KV_QUALITY":
 		cfg.KVQuality = val
+	case "SWA_FULL":
+		cfg.SWAFull = parseBool(val)
 	case "ASSUME_YES":
 		cfg.AssumeYes = parseBool(val)
 	case "BACKEND":
@@ -362,6 +387,16 @@ func setConfigValue(cfg *Config, key, raw, source string) error {
 		cfg.Host = val
 	case "SPEC":
 		cfg.Spec = val
+	case "SUPPORT_EXPERT":
+		mode, err := NormalizeSupportExpert(val)
+		if err != nil {
+			return err
+		}
+		cfg.SupportExpert = mode
+	case "SUPPORT_ONLINE":
+		cfg.SupportOnline = parseBool(val)
+	case "SUPPORT_MODEL":
+		cfg.SupportModel = val
 	default:
 		return nil
 	}
@@ -431,6 +466,24 @@ func parseBool(v string) bool {
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
+// NormalizeSupportExpert validates the optional in-controller advisor policy.
+// Auto never downloads or starts a model proactively: it uses an already
+// verified artifact only after deterministic recovery or during an explicit
+// calibration window. On makes a missing/incompatible artifact visible as a
+// diagnostic; off keeps the controller fully deterministic and offline.
+func NormalizeSupportExpert(value string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	if mode == "" {
+		mode = "auto"
+	}
+	switch mode {
+	case "off", "auto", "on":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("must be off, auto, or on")
+	}
+}
+
 // Save writes the config to the canonical config file.
 func (c *Config) Save() error {
 	if _, err := ParsePort(strconv.Itoa(c.Port)); err != nil {
@@ -467,6 +520,11 @@ func (c *Config) Save() error {
 	if _, err := ParseRAMLimitPercent(strconv.Itoa(c.RAMLimitPercent)); err != nil {
 		return fmt.Errorf("RAM_LIMIT_PERCENT: %w", err)
 	}
+	supportMode, err := NormalizeSupportExpert(c.SupportExpert)
+	if err != nil {
+		return fmt.Errorf("SUPPORT_EXPERT: %w", err)
+	}
+	c.SupportExpert = supportMode
 	path := Path()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -494,6 +552,7 @@ func (c *Config) Save() error {
 	fmt.Fprintf(f, "LLM_RAM_HEADROOM=%q\n", c.RAMHeadroom)
 	fmt.Fprintf(f, "LLM_KV_PLACEMENT=%q\n", c.KVPlacement)
 	fmt.Fprintf(f, "LLM_KV_QUALITY=%q\n", c.KVQuality)
+	fmt.Fprintf(f, "LLM_SWA_FULL=%v\n", c.SWAFull)
 	fmt.Fprintf(f, "LLM_ASSUME_YES=%v\n", c.AssumeYes)
 	fmt.Fprintf(f, "LLM_BACKEND=%q\n", c.Backend)
 	fmt.Fprintf(f, "LLAMA_SERVER=%q\n", c.LlamaServer)
@@ -503,6 +562,9 @@ func (c *Config) Save() error {
 	fmt.Fprintf(f, "LLM_PARALLEL=%d\n", c.Parallel)
 	fmt.Fprintf(f, "LLM_HOST=%q\n", c.Host)
 	fmt.Fprintf(f, "LLM_SPEC=%q\n", c.Spec)
+	fmt.Fprintf(f, "LLM_SUPPORT_EXPERT=%q\n", c.SupportExpert)
+	fmt.Fprintf(f, "LLM_SUPPORT_ONLINE=%v\n", c.SupportOnline)
+	fmt.Fprintf(f, "LLM_SUPPORT_MODEL=%q\n", c.SupportModel)
 	return nil
 }
 
@@ -542,6 +604,8 @@ func (c *Config) Show() string {
 			val = c.KVPlacement
 		case "KV_QUALITY":
 			val = c.KVQuality
+		case "SWA_FULL":
+			val = strconv.FormatBool(c.SWAFull)
 		case "ASSUME_YES":
 			val = strconv.FormatBool(c.AssumeYes)
 		case "BACKEND":
@@ -560,6 +624,12 @@ func (c *Config) Show() string {
 			val = c.Host
 		case "SPEC":
 			val = c.Spec
+		case "SUPPORT_EXPERT":
+			val = c.SupportExpert
+		case "SUPPORT_ONLINE":
+			val = strconv.FormatBool(c.SupportOnline)
+		case "SUPPORT_MODEL":
+			val = c.SupportModel
 		}
 		if val == "" {
 			val = "(empty)"

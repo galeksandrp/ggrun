@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -25,11 +26,13 @@ import (
 	"github.com/raketenkater/ggrun/pkg/benchmark"
 	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/config"
+	"github.com/raketenkater/ggrun/pkg/controller"
 	"github.com/raketenkater/ggrun/pkg/daemon"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/download"
 	"github.com/raketenkater/ggrun/pkg/gguf"
 	"github.com/raketenkater/ggrun/pkg/libhub"
+	modelstore "github.com/raketenkater/ggrun/pkg/models"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/probe"
 	"github.com/raketenkater/ggrun/pkg/recommend"
@@ -65,7 +68,7 @@ func main() {
 	// PromptOnStartup already declines on non-interactive shells, on repeat
 	// runs, and under LLM_SERVER_NO_UPDATE_CHECK, so scripts and CI never block.
 	if promptsForUpdates(args) {
-		update.PromptOnStartup()
+		update.PromptOnStartupWithBackendUpdater(updateAllBackends)
 	}
 
 	switch args[0] {
@@ -102,8 +105,6 @@ func main() {
 		cmdKVProbe(args[1:])
 	case "probe-reset":
 		cmdProbeReset(args[1:])
-	case "record-longctx-validation":
-		cmdRecordLongContextValidation(args[1:])
 	case "download":
 		cmdDownload(args[1:])
 	case "tune":
@@ -112,6 +113,8 @@ func main() {
 		cmdSpecTest(args[1:])
 	case "recommend":
 		cmdRecommend(args[1:])
+	case "support", "advisor":
+		cmdSupport(args[1:])
 	case "models":
 		cmdModels(args[1:])
 	case "claude":
@@ -123,7 +126,7 @@ func main() {
 	case "backend", "backends":
 		cmdBackend(args[1:])
 	case "update", "--update":
-		cmdUpdate()
+		cmdUpdate(args[1:])
 	default:
 		usage()
 		os.Exit(2)
@@ -146,6 +149,7 @@ Commands:
   download <repo/name> Download from HuggingFace
   tune <model.gguf>    AI-tune model for best performance
   recommend [-n N]     Rank models that fit this machine (intelligence x speed)
+  support              Native optional support expert / optimizer (status, install, doctor)
   models [list|browse|path|rm] List, browse, locate, or safely remove GGUF models
   config [show|edit|path|reset]  Manage settings
   backend [list|add|register|remove]  Manage custom llama.cpp backends and
@@ -162,9 +166,6 @@ Diagnostics (advanced):
                        (e.g. after an unrelated OOM); measured compute/KV probes are kept
   kv-probe <model>     Measure exact KV cache size for compressed-attention models; only needed
                        if launches undersize context
-  record-longctx-validation <model> --prompt-tokens N
-                       Confirm a manually verified long-context launch, so future auto-placement
-                       trusts that context size
   spec-test <model>    Verify speculative-decoding (MTP) ceilings 1-4 against a target-only
                        baseline; only relevant with --spec mtp
 
@@ -189,6 +190,8 @@ Launch flags:
                        0 removes the limit, and it is capped at --parallel
   --mmap               Explicitly approve file-backed mmap when placement needs it
   --no-mmap            Require fully resident model weights
+  --swa-full           Keep the full sliding-window KV cache for more prompt-cache hits
+  --no-swa-full        Disable full SWA cache even when enabled in config
   --ram-limit-percent int  Maximum whole-host RAM utilisation (default 95)
   --vram-headroom str  Reserve VRAM the recommender/placement won't use, e.g. 2G
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
@@ -201,13 +204,17 @@ Launch flags:
   --claude-resume-force  Resume even though the backend shape changed (unsafe)
   --calibrate str      First-launch placement calibration: auto|on|off (default auto;
                        measures alternative placements once per model/hardware/workload)
+  --worker-benchmark   Load once, measure throughput plus typed support/reviewer decisions,
+                       print JSON, and stop
+  --support-expert str Optional native expert/optimizer: off|auto|on (default auto)
+  --support-online     Allow typed official llama.cpp research for support incidents
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
 `)
 }
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "record-longctx-validation", "download", "tune", "spec-test", "recommend", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
+	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "download", "tune", "spec-test", "recommend", "support", "advisor", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
 		return true
 	default:
 		return false
@@ -302,6 +309,25 @@ func shellQuote(arg string) string {
 func hasArg(args []string, want string) bool {
 	for _, a := range args {
 		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+// userExplicitBackendFlag distinguishes command-line intent from a generated
+// or config-default optimization already materialized in ExtraArgs. Recovery
+// may remove the latter after measured rejection, but must fail closed rather
+// than silently changing the former.
+func userExplicitBackendFlag(req *launchRequest, flag string) bool {
+	if req == nil || strings.TrimSpace(flag) == "" {
+		return false
+	}
+	for _, arg := range req.OriginalArgs {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+		if flag == "--swa-full" && (arg == "--no-swa-full" || strings.HasPrefix(arg, "--no-swa-full=")) {
 			return true
 		}
 	}
@@ -473,7 +499,7 @@ func firstPositional(args []string) string {
 		if strings.HasPrefix(a, "-") {
 			// Must stay in sync with the value-taking flags in parseLaunchArgs.
 			switch a {
-			case "--model", "-m", "--port", "-port", "--ctx", "-ctx", "--ctx-size", "-c", "--kv", "-kv", "--kv-placement", "--kv-quality", "--gpus", "--host", "--server-bin", "--mmproj", "--backend", "--tune-cache", "--rounds", "--ram-budget", "--ram-limit-percent", "--vram-headroom", "--ram-headroom", "--spec", "--parallel", "--claude-profile", "--lib-path", "--threads", "-t", "--cache-ram", "-cram", "--batch-size", "-b", "--ubatch-size", "-ub":
+			case "--model", "-m", "--port", "-port", "--ctx", "-ctx", "--ctx-size", "-c", "--kv", "-kv", "--kv-placement", "--kv-quality", "--gpus", "--host", "--server-bin", "--mmproj", "--backend", "--tune-cache", "--rounds", "--ram-budget", "--ram-limit-percent", "--vram-headroom", "--ram-headroom", "--spec", "--parallel", "--claude-profile", "--lib-path", "--threads", "-t", "--cache-ram", "-cram", "--batch-size", "-b", "--ubatch-size", "-ub", "--support-expert":
 				skip = true
 			}
 			continue
@@ -512,6 +538,7 @@ type launchRequest struct {
 	MMProjPath           string
 	ServerBin            string
 	ServerBinExplicit    bool
+	AppHome              string
 	Backend              string
 	BackendExplicit      bool
 	TuneCache            string
@@ -535,20 +562,56 @@ type launchRequest struct {
 	UBatchSize           int
 	UBatchSizeSet        bool
 	Benchmark            bool
+	WorkerBenchmark      bool // task-specific support/reviewer quality plus throughput
 	ClaudeCode           bool
-	ClaudeProfile        string   // agent-interactive avoids the automatic parallel-4 floor
-	ClaudeResume         string   // session id or "latest": reopen a recorded Claude session
-	ClaudeResumeForce    bool     // accept a resume whose backend shape no longer matches
-	OriginalArgs         []string // launch argv as given, so a resume can reproduce it exactly
-	Calibrate            string   // "auto" (default: calibrate unproven small models), "on" (force), "off"
-	EmitServerArgvJSON   bool     // dry-run machine interface for reproducible benchmark harnesses
-	SpecDraftMax         int      // internal spec-test ceiling; not a public launch override
-	ExtraArgs            []string
+	// ClaudeReviewerDisabled is set only after the user accepts the resident
+	// fallback that routes Auto reviews through the main model. It is runtime
+	// state, not a placement-policy flag exposed on the command line.
+	ClaudeReviewerDisabled bool
+	ClaudeProfile          string   // agent-interactive avoids the automatic parallel-4 floor
+	ClaudeResume           string   // session id or "latest": reopen a recorded Claude session
+	ClaudeResumeForce      bool     // accept a resume whose backend shape no longer matches
+	OriginalArgs           []string // launch argv as given, so a resume can reproduce it exactly
+	Calibrate              string   // "auto" (default: calibrate unproven small models), "on" (force), "off"
+	SupportExpert          string   // off, auto (installed-only), on
+	SupportOnline          bool     // typed official llama.cpp research only
+	// SupportOnlineSet is true when the user named --support-online or
+	// --no-support-online on the command line. The default (and the config) leave
+	// it false, which lets an escalated launch force online research — the advisor
+	// is at its best when it can cite official sources for a novel failure. An
+	// explicit --no-support-online is a user instruction and is honored even on
+	// escalation.
+	SupportOnlineSet bool
+	// ProfilePolicyIdentity is captured after the GGUF is parsed but before
+	// backend/advisor recovery mutates the request. It groups alternative
+	// measured argv under one last-known-good family while keeping genuinely
+	// different user workload/quality policies isolated.
+	ProfilePolicyIdentity string
+	EmitServerArgvJSON    bool // dry-run machine interface for reproducible benchmark harnesses
+	SpecDraftMax          int  // internal spec-test ceiling; not a public launch override
+	ExtraArgs             []string
+	// DisabledBackendFlags records generated optimizations that this exact
+	// model/backend pairing is known (or measured) not to support. It is launch
+	// state rather than configuration: applying it after every argument rebuild
+	// keeps placement and calibration retries from reintroducing a bad flag.
+	DisabledBackendFlags map[string]string
+	// DisabledBackendFlagValues marks rejected generated options that consume
+	// the following argv token, so filtering cannot leave an orphan value.
+	DisabledBackendFlagValues map[string]bool
 	// ReviewerReservation holds the Claude Auto reviewer's placement companion
 	// for the whole launch. placementOptionsFromRequest attaches it to every
 	// Compute — including OOM/preflight/spec re-plans — so the reviewer's VRAM
 	// stays reserved no matter which path recomputes the strategy.
 	ReviewerReservation *placement.CompanionReservation
+	// ReviewerProfile freezes the verified worker/model/backend choice before
+	// placement so downloads or backend updates cannot change seats mid-launch.
+	ReviewerProfile *claudeCompanionProfile
+	// AdvisorVRAMPenaltyMB shrinks a device's usable VRAM for the next re-plan.
+	// It is how a bounded move_expert_layer decision reaches the packer: the
+	// advisor names a device and a layer count, and the deterministic planner
+	// re-packs every GPU around the reduced budget. No model-produced value ever
+	// becomes argv — only this integer, and only after ValidateDecision.
+	AdvisorVRAMPenaltyMB map[int]int
 }
 
 const (
@@ -571,6 +634,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		Host:            cfg.Host,
 		VisionAuto:      cfg.Vision,
 		ServerBin:       cfg.LlamaServer,
+		AppHome:         cfg.AppHome,
 		Backend:         cfg.Backend,
 		BackendExplicit: backendExplicit,
 		SpecMode:        cfg.Spec,
@@ -580,6 +644,11 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
 		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
 		OriginalArgs:    originalArgs,
+		SupportExpert:   cfg.SupportExpert,
+		SupportOnline:   cfg.SupportOnline,
+	}
+	if cfg.SWAFull {
+		req.ExtraArgs = append(req.ExtraArgs, "--swa-full")
 	}
 	if req.Port == 0 {
 		req.Port = 8081
@@ -603,6 +672,21 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			switch key {
 			case "--allow-live-memory-probe":
 				req.AllowLiveMemoryProbe = val == "" || parseBoolFlag(val)
+				continue
+			case "--support-expert":
+				mode, err := config.NormalizeSupportExpert(val)
+				if err != nil {
+					return nil, fmt.Errorf("%s: %w", key, err)
+				}
+				req.SupportExpert = mode
+				continue
+			case "--support-online":
+				req.SupportOnline = val == "" || parseBoolFlag(val)
+				req.SupportOnlineSet = true
+				continue
+			case "--no-support-online":
+				req.SupportOnline = !(val == "" || parseBoolFlag(val))
+				req.SupportOnlineSet = true
 				continue
 			case "--model", "-m":
 				req.ModelPath = val
@@ -689,6 +773,13 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 					req.ForceMMap = false
 				}
 				continue
+			case "--swa-full":
+				req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", val == "" || parseBoolFlag(val))
+				continue
+			case "--no-swa-full":
+				disabled := val == "" || parseBoolFlag(val)
+				req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", !disabled)
+				continue
 			case "--mmap":
 				req.ForceMMap = val == "" || parseBoolFlag(val)
 				if req.ForceMMap {
@@ -765,8 +856,30 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		case "--allow-live-memory-probe":
 			req.AllowLiveMemoryProbe = true
 			continue
+		case "--support-online":
+			req.SupportOnline = true
+			req.SupportOnlineSet = true
+			continue
+		case "--no-support-online":
+			req.SupportOnline = false
+			req.SupportOnlineSet = true
+			continue
+		case "--support-expert":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			mode, err := config.NormalizeSupportExpert(v)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", a, err)
+			}
+			req.SupportExpert = mode
+			continue
 		case "--benchmark":
 			req.Benchmark = true
+			continue
+		case "--worker-benchmark":
+			req.WorkerBenchmark = true
 			continue
 		case "--calibrate":
 			v, err := next()
@@ -870,6 +983,10 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		case "--no-mmap":
 			req.NoMMap = true
 			req.ForceMMap = false
+		case "--swa-full":
+			req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", true)
+		case "--no-swa-full":
+			req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", false)
 		case "--mmap":
 			req.ForceMMap = true
 			req.NoMMap = false
@@ -1123,7 +1240,8 @@ func evidenceBackendCacheTag(be *backendInfo) string {
 }
 
 func scopedProbeBackendTag(req *launchRequest, model *placement.ModelProfile, be *backendInfo) string {
-	return placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), requestWorkloadProfile(req, model))
+	tag := placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), requestWorkloadProfile(req, model))
+	return placement.ScopedBackendFeatureTag(tag, req != nil && hasArg(req.ExtraArgs, "--swa-full"))
 }
 
 func scopedProbeBackendTagForStrategy(req *launchRequest, model *placement.ModelProfile, be *backendInfo, strategy *placement.Strategy) string {
@@ -1131,7 +1249,12 @@ func scopedProbeBackendTagForStrategy(req *launchRequest, model *placement.Model
 	if strategy != nil {
 		workload = placement.SpecWorkloadProfile(workload, strategy.Draft)
 	}
-	return placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), workload)
+	tag := placement.ScopedBackendCacheTag(evidenceBackendCacheTag(be), workload)
+	swaFull := req != nil && hasArg(req.ExtraArgs, "--swa-full")
+	if strategy != nil {
+		swaFull = strategy.SWAFull
+	}
+	return placement.ScopedBackendFeatureTag(tag, swaFull)
 }
 
 // resolveKVCacheTypeFlags turns llama.cpp's direct K/V flags into one planned
@@ -1201,13 +1324,48 @@ func parseBoolFlag(raw string) bool {
 	}
 }
 
+// setPassthroughBoolFlag keeps a single canonical positive backend flag. The
+// CLI accepts positive and negative overrides, but llama-server only sees the
+// positive form when enabled.
+func setPassthroughBoolFlag(args []string, flag string, enabled bool) []string {
+	out := make([]string, 0, len(args)+1)
+	for _, arg := range args {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	if enabled {
+		out = append(out, flag)
+	}
+	return out
+}
+
 func normalizePlacementAwareExtraArgs(req *launchRequest, args []string) []string {
 	if req == nil || len(args) == 0 {
 		return args
 	}
 	out := args[:0]
+	swaSet := false
+	swaFull := false
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--swa-full" {
+			swaSet, swaFull = true, true
+			continue
+		}
+		if key, val, ok := strings.Cut(a, "="); ok && key == "--swa-full" {
+			swaSet, swaFull = true, val == "" || parseBoolFlag(val)
+			continue
+		}
+		if a == "--no-swa-full" {
+			swaSet, swaFull = true, false
+			continue
+		}
+		if key, val, ok := strings.Cut(a, "="); ok && key == "--no-swa-full" {
+			swaSet, swaFull = true, !(val == "" || parseBoolFlag(val))
+			continue
+		}
 		if a == "--no-mmap" {
 			req.NoMMap = true
 			req.ForceMMap = false
@@ -1230,6 +1388,9 @@ func normalizePlacementAwareExtraArgs(req *launchRequest, args []string) []strin
 			continue
 		}
 		out = append(out, a)
+	}
+	if swaSet && swaFull {
+		out = append(out, "--swa-full")
 	}
 	return out
 }
@@ -1337,6 +1498,44 @@ func runtimeGPUCapabilities(caps *detect.Capabilities, req *launchRequest) (*det
 	return &filtered, visibleToPhysical
 }
 
+// runtimeVRAMUsedMB is indirected so the launch admission boundary can be
+// tested without consulting the developer machine's GPUs.
+var runtimeVRAMUsedMB = placement.QueryVRAMUsed
+
+// runtimeGPUCapabilitiesForLaunch returns the capacity the main backend can use
+// after a separately launched companion has occupied its planned seat. The
+// original hardware snapshot predates companion startup; using it directly in
+// backend preflight can approve an allocation that no longer fits. Keep the
+// stricter of the deterministic reservation and a fresh whole-device reading,
+// which also catches unrelated workloads that appeared after placement.
+func runtimeGPUCapabilitiesForLaunch(caps *detect.Capabilities, req *launchRequest, strategy *placement.Strategy) (*detect.Capabilities, map[int]int) {
+	runtimeCaps, visibleToPhysical := runtimeGPUCapabilities(caps, req)
+	if runtimeCaps == nil {
+		return nil, visibleToPhysical
+	}
+	adjusted := *runtimeCaps
+	adjusted.GPUs = append([]detect.GPU(nil), runtimeCaps.GPUs...)
+
+	plannedByPhysical := map[int]int{}
+	if req != nil && req.ReviewerReservation != nil && strategy != nil {
+		for _, companion := range strategy.CompanionPlacements {
+			if companion.Name == req.ReviewerReservation.Name && companion.GPU >= 0 {
+				plannedByPhysical[companion.GPU] += req.ReviewerReservation.VRAMMB
+			}
+		}
+	}
+
+	for i := range adjusted.GPUs {
+		physical := physicalGPUIndex(adjusted.GPUs[i].Index, visibleToPhysical)
+		usedFloor := adjusted.GPUs[i].VRAMUsedMB + plannedByPhysical[physical]
+		if liveUsed := runtimeVRAMUsedMB(physical); liveUsed > usedFloor {
+			usedFloor = liveUsed
+		}
+		adjusted.GPUs[i].VRAMUsedMB = usedFloor
+	}
+	return &adjusted, visibleToPhysical
+}
+
 func physicalGPUIndex(visible int, visibleToPhysical map[int]int) int {
 	if physical, ok := visibleToPhysical[visible]; ok {
 		return physical
@@ -1365,12 +1564,31 @@ func parseBudgetMB(s string) int { return config.ParseBudgetMB(s) }
 
 func configuredBackendExplicit(backend string) bool {
 	backend = strings.TrimSpace(backend)
-	return backend != "" && !strings.EqualFold(backend, "auto")
+	// "skip" is an installer-only choice used by older launcher-only app homes;
+	// it never named a runnable backend. Treat those persisted configs as auto,
+	// while a literal CLI --backend skip remains explicit and fails clearly.
+	return backend != "" && !strings.EqualFold(backend, "auto") && !strings.EqualFold(backend, "skip")
+}
+
+func requestedBackendName(req *launchRequest) string {
+	if req == nil {
+		return ""
+	}
+	want := strings.TrimSpace(req.Backend)
+	if !req.BackendExplicit && strings.EqualFold(want, "skip") {
+		return "auto"
+	}
+	return want
 }
 
 func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
-	want := strings.TrimSpace(req.Backend)
-	useExplicitServerBin := req.ServerBin != "" && (req.ServerBinExplicit || !req.BackendExplicit || want == "" || want == "auto")
+	want := requestedBackendName(req)
+	// Only --server-bin is an unconditional binary selection. LLAMA_SERVER from
+	// config is an auto-selection candidate: treating it as authoritative made a
+	// stale ~/.local/bin symlink beat the canonical app-home backend even after
+	// the GGUF had identified an architecture that another installed build
+	// supported better.
+	useExplicitServerBin := req.ServerBin != "" && req.ServerBinExplicit
 	if useExplicitServerBin {
 		if _, err := os.Stat(req.ServerBin); err == nil {
 			return detectBackend(req.ServerBin)
@@ -1378,21 +1596,28 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 		fmt.Fprintf(os.Stderr, "Warning: server binary not found: %s\n", req.ServerBin)
 	}
 	if want != "" && want != "auto" {
-		for _, b := range caps.Backends {
-			info := detectBackend(b.Path)
-			if backendMatches(info, b.Name, want) {
+		seen := make(map[string]bool)
+		try := func(path, name string) *backendInfo {
+			path = strings.TrimSpace(path)
+			if path == "" || seen[path] {
+				return nil
+			}
+			seen[path] = true
+			if _, err := os.Stat(path); err != nil {
+				return nil
+			}
+			info := detectBackend(path)
+			if backendMatches(info, name, want) {
 				return info
 			}
+			return nil
 		}
-		for _, p := range backendSearchPaths() {
-			if p == "" {
-				continue
-			}
-			if _, err := os.Stat(p); err == nil {
-				info := detectBackend(p)
-				if backendMatches(info, filepath.Base(p), want) {
-					return info
-				}
+		// A configured LLAMA_SERVER may live outside every standard app-home
+		// path. It is eligible only when it actually matches the named backend;
+		// a stale mainline path must never override an explicit ik_llama choice.
+		if !useExplicitServerBin {
+			if info := try(req.ServerBin, filepath.Base(req.ServerBin)); info != nil {
+				return info
 			}
 		}
 		// A registered fork backend selected by its manifest tag (--backend <tag>).
@@ -1402,6 +1627,25 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 			}
 			fmt.Fprintf(os.Stderr, "Warning: registered backend %q binary not found: %s\n", cb.Tag, cb.Path)
 		}
+		// A self-contained APP_HOME is the user's chosen installation. Prefer its
+		// matching backend over a same-dialect binary discovered globally (for
+		// example ~/.local/bin/llama-server pointing at another IK checkout).
+		for _, p := range backendSearchPaths(req.AppHome) {
+			if info := try(p, filepath.Base(p)); info != nil {
+				return info
+			}
+		}
+		if caps != nil {
+			for _, b := range caps.Backends {
+				if info := try(b.Path, b.Name); info != nil {
+					return info
+				}
+			}
+		}
+		// A named backend is an explicit compatibility requirement. Falling back
+		// to some other binary makes the TUI claim it honored the selection and
+		// then produces a misleading architecture error later.
+		return nil
 	}
 	if req.ServerBin != "" && !useExplicitServerBin {
 		if _, err := os.Stat(req.ServerBin); err == nil {
@@ -1409,7 +1653,247 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 		}
 		fmt.Fprintf(os.Stderr, "Warning: server binary not found: %s\n", req.ServerBin)
 	}
-	return findBackend(caps)
+	return findBackend(caps, req.AppHome)
+}
+
+type autoBackendCandidate struct {
+	info         *backendInfo
+	canonical    bool
+	incompatible bool
+}
+
+// autoBackendCandidates enumerates every generic backend available to this
+// installation. Canonical means the path itself lives under APP_HOME; a
+// symlink there remains canonical even when its build tree is stored elsewhere.
+// The distinction is a tie-breaker only: proven architecture support always
+// beats installation locality.
+func autoBackendCandidates(caps *detect.Capabilities, req *launchRequest) []autoBackendCandidate {
+	if req == nil {
+		return nil
+	}
+	appHome := strings.TrimSpace(req.AppHome)
+	if appHome == "" {
+		appHome = backends.AppHome()
+	}
+	seen := make(map[string]bool)
+	var out []autoBackendCandidate
+	add := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		if st, err := os.Stat(path); err != nil || st.IsDir() {
+			return
+		}
+		out = append(out, autoBackendCandidate{
+			info:      detectBackend(path),
+			canonical: pathInsideDir(path, appHome),
+		})
+	}
+
+	// APP_HOME paths come first for deterministic tie-breaking. ServerBin and
+	// detection still participate, but neither can short-circuit the comparison.
+	for _, path := range backendSearchPaths(appHome) {
+		add(path)
+	}
+	add(req.ServerBin)
+	if caps != nil {
+		for _, backend := range caps.Backends {
+			add(backend.Path)
+		}
+	}
+	return out
+}
+
+func pathInsideDir(path, dir string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(dir) == "" {
+		return false
+	}
+	absPath, errPath := filepath.Abs(filepath.Clean(path))
+	absDir, errDir := filepath.Abs(filepath.Clean(dir))
+	if errPath != nil || errDir != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+type backendArchProbe func(binaryPath, arch string) (supported, probed bool)
+
+// chooseAutoBackend ranks candidates using facts from the parsed GGUF. A
+// proven-supporting backend wins over an unprobeable one, which wins over a
+// proven-unsupported backend. Within the same support class the canonical
+// production path wins, then discovery order keeps the result stable.
+func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe backendArchProbe) *backendInfo {
+	arch = strings.ToLower(strings.TrimSpace(arch))
+	required := backends.RequiredBackendForArch(arch)
+	recipeBacked := len(backends.RecipesForArch(arch)) > 0
+	bestIndex, bestSupport, bestCanonical := -1, -1, false
+	for i, candidate := range candidates {
+		if candidate.info == nil {
+			continue
+		}
+		support := 1 // unknown/unprobeable remains launchable
+		if candidate.incompatible {
+			support = -1
+		} else if required == "ik_llama" && !candidate.info.IsIK {
+			support = 0
+		} else if arch != "" && probe != nil {
+			if supported, probed := probe(candidate.info.Path, arch); probed {
+				if supported {
+					// Generic ik binaries can contain architecture names only as
+					// tokenizer/template literals (observed with Laguna). A reviewed
+					// registered route is handled before this generic ranking; do not
+					// treat an unregistered IK string hit as loader conformance.
+					if candidate.info.IsIK && recipeBacked {
+						support = 1
+					} else {
+						support = 2
+					}
+				} else {
+					support = 0
+				}
+			}
+		}
+		if bestIndex < 0 || support > bestSupport ||
+			(support == bestSupport && candidate.canonical && !bestCanonical) {
+			bestIndex, bestSupport, bestCanonical = i, support, candidate.canonical
+		}
+	}
+	if bestIndex < 0 {
+		return nil
+	}
+	return candidates[bestIndex].info
+}
+
+func reviewedRecipeRequiredForMain(arch string, be *backendInfo) *backends.Recipe {
+	recipes := backends.RecipesForArch(arch)
+	if len(recipes) == 0 || backends.ForArch(arch) != nil {
+		return nil
+	}
+	if be != nil && be.Path != "" {
+		supported, probed := backends.BackendSupportsArch(be.Path, arch)
+		if probed && supported && !be.IsIK {
+			return nil
+		}
+		if !probed && !be.IsIK {
+			// Static probing is intentionally conservative on platforms whose
+			// architecture table lives in a DLL. Preserve the explicit warning
+			// path rather than forcing a fork over an unknown canonical backend.
+			return nil
+		}
+	}
+	return &recipes[0]
+}
+
+func confirmReviewedBackendInstall(recipe *backends.Recipe, arch string, assumeYes bool, in io.Reader, out io.Writer, terminal bool) bool {
+	if recipe == nil {
+		return false
+	}
+	if assumeYes {
+		return true
+	}
+	if !terminal {
+		return false
+	}
+	fmt.Fprintf(out, "Model architecture %q needs reviewed backend %q (%s). Install/build it now? [y/N] ", arch, recipe.Name, recipe.Description)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	return answer == "y" || answer == "yes"
+}
+
+func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model *placement.ModelProfile) *backendInfo {
+	if req == nil {
+		return nil
+	}
+	// Explicit CLI choices and named configured backends are compatibility
+	// contracts, not hints. Auto-routing must never replace them.
+	if req.ServerBinExplicit || req.BackendExplicit {
+		return selectBackend(caps, req)
+	}
+	arch := ""
+	if model != nil {
+		arch = model.ModelArch
+		// A registered route is more specific than any generic architecture
+		// probe. It represents a reviewed or user-installed fork for this exact
+		// GGUF architecture.
+		if routed := backends.ForArch(arch); routed != nil {
+			fmt.Printf("[launch] %s runs on fork backend %q — routing to %s\n", arch, routed.Tag, routed.Path)
+			return detectRegisteredBackend(routed)
+		}
+		// ForArch skips helper-only forks: they retain architecture metadata
+		// without globally routing main-model launches. But a model whose arch
+		// is served ONLY by a helper-only fork (Nanbeige's "nanbeige" arch is
+		// the one case) has no canonical backend that can load it — mainline
+		// aborts with "unknown model architecture". When the helper fork is the
+		// sole registered backend for this exact arch, routing to it is the only
+		// way the model can run at all, so prefer it over mainline.
+		if soleHelper := backends.SoleHelperForArch(arch); soleHelper != nil {
+			fmt.Printf("[launch] %s runs on sole helper backend %q — routing to %s\n", arch, soleHelper.Tag, soleHelper.Path)
+			return detectRegisteredBackend(soleHelper)
+		}
+	}
+	// Backend ranking happens before the chosen backend's feature normalization.
+	// DeepSeek4's best compressed common denominator is q8_0: ik supports it,
+	// while mainline families are then correctly rejected by their stricter f16
+	// rule. Leaving q4 here marks the valid ik candidate incompatible and can
+	// accidentally route a CUDA launch to an unrelated canonical backend.
+	normalizeDeepSeek4AutoKVRequest(req, model)
+	candidates := autoBackendCandidates(caps, req)
+	if model != nil {
+		for i := range candidates {
+			if candidates[i].info == nil {
+				continue
+			}
+			_, err := placement.ResolveKVQuality(model, req.KVQuality, backendDialect(candidates[i].info))
+			candidates[i].incompatible = err != nil
+		}
+	}
+	chosen := chooseAutoBackend(candidates, arch, backends.BackendSupportsArch)
+	if chosen != nil {
+		hasCanonical, chosenCanonical := false, false
+		for _, candidate := range candidates {
+			if candidate.canonical {
+				hasCanonical = true
+				if candidate.info != nil && candidate.info.Path == chosen.Path {
+					chosenCanonical = true
+				}
+			}
+		}
+		if hasCanonical && !chosenCanonical && arch != "" {
+			fmt.Printf("[launch] auto selected %s outside APP_HOME because canonical backends cannot satisfy architecture/profile %s with KV %s.\n",
+				chosen.Path, arch, req.KVQuality)
+		}
+	}
+	return chosen
+}
+
+func normalizeDeepSeek4AutoKVRequest(req *launchRequest, model *placement.ModelProfile) {
+	if req == nil || model == nil || !strings.EqualFold(strings.TrimSpace(model.ModelArch), "deepseek4") {
+		return
+	}
+	kvType, err := placement.NormalizeKVType(req.KVQuality)
+	if err != nil || kvType == "f16" || kvType == "bf16" || kvType == "q8_0" {
+		return
+	}
+	fmt.Printf("[launch] DeepSeek4 does not support %s K-cache on the preferred ik backend; using q8_0 for backend selection and placement.\n", kvType)
+	req.KVQuality = "q8_0"
+	req.KVTypeK, req.KVTypeV = "", ""
+}
+
+func backendUnavailableMessage(req *launchRequest) string {
+	if req != nil {
+		want := requestedBackendName(req)
+		if want != "" && !strings.EqualFold(want, "auto") {
+			where := strings.TrimSpace(req.AppHome)
+			if where == "" {
+				where = backends.AppHome()
+			}
+			return fmt.Sprintf("selected backend %q was not found under APP_HOME %q or the registered backend paths; install/build it or choose backend auto", want, where)
+		}
+	}
+	return "no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)"
 }
 
 // routeArchBackend redirects to a registered fork backend when the model's
@@ -1417,7 +1901,7 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 // implicit/auto. A configured or CLI-selected backend must keep its actual
 // backend instead of being hijacked by a fork route.
 func routeArchBackend(be *backendInfo, model *placement.ModelProfile, req *launchRequest) *backendInfo {
-	if req.BackendExplicit || model == nil {
+	if req.BackendExplicit || req.ServerBinExplicit || model == nil {
 		return be
 	}
 	if cb := backends.ForArch(model.ModelArch); cb != nil {
@@ -1505,7 +1989,7 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		SpecMode:               req.SpecMode,
 		ForceSpecMoE:           req.ForceSpecMoE,
 		BackendHelp:            be.Help,
-		SpecCandidateValidator: backendSpecCandidateValidator(be),
+		SpecCandidateValidator: backendSpecCandidateValidator(be, model.ModelArch),
 		CacheFile:              req.TuneCache,
 		Parallel:               req.Parallel,
 		Threads:                req.Threads,
@@ -1519,7 +2003,7 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		UBatchSize: req.UBatchSize,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
 		// normal launch keeps reasoning on so tools like Claude Code can think.
-		ReasoningOff: req.Benchmark,
+		ReasoningOff: req.Benchmark || req.WorkerBenchmark,
 	}
 	if req.GPUsFlag != "" {
 		if indices, err := parseGPUIndices(req.GPUsFlag); err == nil {
@@ -1531,8 +2015,37 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 	if req.ReviewerReservation != nil {
 		opts.Companions = []placement.CompanionReservation{*req.ReviewerReservation}
 	}
-	opts.Parallel = claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile)
+	opts.Parallel = claudeCodeSlotsForPlacement(
+		claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile),
+		opts.ContextSize, req.ClaudeCode, req.ParallelSet,
+	)
 	return opts
+}
+
+// claudeCodeSlotsForPlacement applies the same context-driven slot clamp that
+// claudeCodeSlotAdjust applies to the finished strategy, so the plan is computed
+// for the slot count the server will actually run with.
+//
+// Without it the two disagreed, and the disagreement was silent and total:
+// placement asked for 4 slots while the launch ran 2, and every probe/placement
+// key embeds the slot count (probeParallelKey). Measured 2026-08-03 on
+// DeepSeek-V4-Flash UD-Q3_K_XL — the planner looked up evidence at parallel=4,
+// the preflight recorded it at parallel<=2, so a measured 9501 MiB compute
+// buffer sat on disk and was never read. The planner charged 0 MiB for compute,
+// over-packed CUDA0, and the load died asking for 9307 MiB. Evidence that is
+// written under one key and read under another is evidence that does not exist.
+func claudeCodeSlotsForPlacement(parallel, contextSize int, claudeCode, parallelExplicit bool) int {
+	if !claudeCode || parallelExplicit || contextSize <= 0 || parallel <= 1 {
+		return parallel
+	}
+	slots := contextSize / claudeSlotTarget
+	if slots < 1 {
+		slots = 1
+	}
+	if slots < parallel {
+		return slots
+	}
+	return parallel
 }
 
 func requestSamplingProfile(req *launchRequest, model *placement.ModelProfile) string {
@@ -1656,6 +2169,7 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 	serverArgs := append([]string{be.Path}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, hy3CompatibilityArgs(req.ExtraArgs, model, be)...)
 	serverArgs = append(serverArgs, hy3TemplateArgs(req.ExtraArgs, be)...)
+	serverArgs = append(serverArgs, nanbeigeTemplateArgs(req.ExtraArgs, be)...)
 	serverArgs = append(serverArgs, req.ExtraArgs...)
 	serverArgs = applyTuneCache(req, serverArgs, cfg.CacheDir, be.Tag, strategy.MMProjPath != "", caps)
 	serverArgs = claudeCodeAliasArgs(serverArgs, req.ClaudeCode)
@@ -1663,7 +2177,66 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 	serverArgs = claudeCodeCacheArgs(serverArgs, req.ClaudeCode, be.Help, claudeCodeShiftableContext(model, strategy))
 	serverArgs = claudeCodeProgressServerArgs(serverArgs, req.ClaudeCode, be.Help)
 	serverArgs = backendVerbosityArgs(serverArgs, be.Help)
-	return serverArgs
+	return applyRequestDisabledBackendFlags(serverArgs, req)
+}
+
+func disableBackendFlag(req *launchRequest, flag, reason string) bool {
+	return disableBackendFlagWithArity(req, flag, reason, false)
+}
+
+func disableBackendFlagWithArity(req *launchRequest, flag, reason string, hasValue bool) bool {
+	if req == nil || strings.TrimSpace(flag) == "" {
+		return false
+	}
+	if req.DisabledBackendFlags == nil {
+		req.DisabledBackendFlags = make(map[string]string)
+	}
+	if _, exists := req.DisabledBackendFlags[flag]; exists {
+		return false
+	}
+	req.DisabledBackendFlags[flag] = reason
+	if hasValue {
+		if req.DisabledBackendFlagValues == nil {
+			req.DisabledBackendFlagValues = make(map[string]bool)
+		}
+		req.DisabledBackendFlagValues[flag] = true
+	}
+	return true
+}
+
+func applyDisabledBackendFlags(args []string, disabled map[string]string) []string {
+	if len(args) == 0 || len(disabled) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if _, remove := disabled[arg]; remove {
+			// The arity map belongs to the request, but this function is retained as
+			// the boolean-only compatibility helper for existing call sites.
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func applyRequestDisabledBackendFlags(args []string, req *launchRequest) []string {
+	if req == nil || len(req.DisabledBackendFlags) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if _, remove := req.DisabledBackendFlags[arg]; remove {
+			if req.DisabledBackendFlagValues[arg] && index+1 < len(args) {
+				index++
+			}
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 // backendVerbosityArgs raises the backend's log level to trace, because ggrun's
@@ -1682,8 +2255,9 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 //   - the per-checkpoint search decisions that explain a reuse miss.
 //
 // Trace, not debug: level 5 adds per-token output that makes a multi-hour agent
-// log unusable, while level 4 adds only these decision points. An explicit -lv
-// or --verbosity, or LLAMA_ARG_LOG_VERBOSITY in the environment, still wins.
+// log unusable, while level 4 adds only these decision points. An explicit
+// backend-supported verbosity flag, or LLAMA_ARG_LOG_VERBOSITY in the
+// environment, still wins.
 func backendVerbosityArgs(args []string, backendHelp string) []string {
 	if os.Getenv("LLAMA_ARG_LOG_VERBOSITY") != "" {
 		return args
@@ -1695,10 +2269,128 @@ func backendVerbosityArgs(args []string, backendHelp string) []string {
 			return args
 		}
 	}
-	if backendHelp != "" && !strings.Contains(backendHelp, "-lv") && !strings.Contains(backendHelp, "--verbosity") {
+	// Backend forks do not share one spelling. Recent ik_llama advertises only
+	// --verbosity, while mainline/older forks may advertise -lv as an alias.
+	// Merely finding the long spelling and then emitting the short one caused the
+	// entire V4 command to abort in argument parsing before model load. Select an
+	// exact advertised spelling and make an unavailable help surface mean "do not
+	// assume" rather than guessing a flag.
+	flag := ""
+	switch {
+	case helpHasExactFlag(backendHelp, "-lv"):
+		flag = "-lv"
+	case helpHasExactFlag(backendHelp, "--verbosity"):
+		flag = "--verbosity"
+	case helpHasExactFlag(backendHelp, "--log-verbosity"):
+		flag = "--log-verbosity"
+	}
+	if flag == "" {
 		return args
 	}
-	return append(args, "-lv", strconv.Itoa(backendTraceVerbosity))
+	return append(args, flag, strconv.Itoa(backendTraceVerbosity))
+}
+
+// validateBackendLaunchArgs makes backend compatibility a launch invariant,
+// not something discovered after a helper or a 100+ GB model has started. Both
+// maintained llama-server families parse every preceding option before handling
+// a trailing --version. That gives us an exact, no-weight-load parser probe of
+// the final argv, including tune-cache and backend-dialect additions.
+func validateBackendLaunchArgs(be *backendInfo, args []string) error {
+	if be == nil || len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return fmt.Errorf("cannot validate an empty backend launch command")
+	}
+	probeFlag := ""
+	switch {
+	case helpHasExactFlag(be.Help, "--version"):
+		probeFlag = "--version"
+	case helpHasExactFlag(be.Help, "--help"):
+		probeFlag = "--help"
+	default:
+		return fmt.Errorf("backend %s exposes neither --version nor --help, so ggrun cannot validate its launch dialect safely", be.Path)
+	}
+
+	probeArgs := append([]string(nil), args[1:]...)
+	probeArgs = append(probeArgs, probeFlag)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, args[0], probeArgs...)
+	cmd.Env = server.ChildEnv(os.Environ(), args)
+	if hubDir, ok, err := libhub.Setup(be.Path); err != nil {
+		return fmt.Errorf("prepare backend libraries for argument validation: %w", err)
+	} else if ok {
+		defer libhub.Cleanup(hubDir)
+		cmd.Env = libhub.ApplyHubToChildEnv(cmd.Env, hubDir)
+	}
+	out, runErr := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("backend %s argument validation timed out before any model load", be.Path)
+	}
+	if diagnostic := backendArgumentDiagnostic(string(out)); diagnostic != "" {
+		return &backendArgValidationError{Backend: be.Path, Flag: rejectedBackendFlag(diagnostic), Diagnostic: diagnostic}
+	}
+	if runErr == nil {
+		return nil
+	}
+	// Some older llama-server builds deliberately return non-zero for --help.
+	// A real usage page proves the parser reached the requested help action; a
+	// loader crash or missing shared library does not.
+	if probeFlag == "--help" && strings.Contains(strings.ToLower(string(out)), "usage:") {
+		return nil
+	}
+	detail := strings.TrimSpace(firstNonEmptyLine(string(out)))
+	if detail == "" {
+		detail = runErr.Error()
+	}
+	return fmt.Errorf("backend %s could not validate the generated launch command before model load: %s", be.Path, detail)
+}
+
+type backendArgValidationError struct {
+	Backend    string
+	Flag       string
+	Diagnostic string
+}
+
+func (e *backendArgValidationError) Error() string {
+	return fmt.Sprintf("backend %s rejected the generated launch command before model load: %s", e.Backend, e.Diagnostic)
+}
+
+func rejectedBackendFlag(diagnostic string) string {
+	for _, field := range strings.Fields(diagnostic) {
+		candidate := strings.Trim(field, "'\"`:,;()[]{}")
+		if strings.HasPrefix(candidate, "--") && len(candidate) > 2 {
+			return candidate
+		}
+		if strings.HasPrefix(candidate, "-") && len(candidate) > 1 {
+			if _, err := strconv.ParseFloat(candidate, 64); err != nil {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func backendArgumentDiagnostic(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.Contains(lower, "unknown argument") ||
+			strings.Contains(lower, "unrecognized argument") ||
+			strings.Contains(lower, "invalid argument") ||
+			strings.Contains(lower, "unrecognized option") ||
+			strings.Contains(lower, "invalid option") {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func firstNonEmptyLine(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // backendTraceVerbosity is llama.cpp's LOG_LEVEL_TRACE.
@@ -1762,6 +2454,44 @@ func hasChatTemplateOverride(args []string) bool {
 		}
 	}
 	return false
+}
+
+// nanbeigeTemplateArgs overrides the GGUF's embedded chat template with the
+// corrected copy shipped by the reviewed nanbeige42 backend. The embedded
+// template contains a Jinja `raise_exception('System message must be at the
+// beginning.')` guard that fires when a system message is not the first message
+// (llama.cpp appends its own tool-instruction system message during tool-call
+// parser generation), 400ing every such request under --jinja with "Unable to
+// generate parser for this template." Tool calls REQUIRE --jinja, so the fix is
+// to keep --jinja and serve the corrected template instead of dropping the flag.
+// Deliberately recipe-scoped and never overrides a user's explicit chat template
+// choice.
+func nanbeigeTemplateArgs(extra []string, be *backendInfo) []string {
+	if be == nil || !strings.EqualFold(be.Tag, "nanbeige42") || hasChatTemplateOverride(extra) {
+		return nil
+	}
+	if tpl := nanbeigeTemplatePath(be.Path); tpl != "" {
+		return []string{"--chat-template-file", tpl}
+	}
+	return nil
+}
+
+// nanbeigeTemplatePath resolves the corrected chat template shipped by the
+// reviewed nanbeige42 backend for a given backend binary path, or "" when the
+// binary's tree does not carry it. The backend is built into
+// <fork-root>/build-cuda/bin/llama-server, so three directory hops up from the
+// binary lands on <fork-root>, whose models/templates mirrors llama.cpp's own
+// layout (same convention as hy3TemplateArgs/Hy3.jinja).
+func nanbeigeTemplatePath(binary string) string {
+	if strings.TrimSpace(binary) == "" {
+		return ""
+	}
+	root := filepath.Dir(filepath.Dir(filepath.Dir(binary)))
+	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
+	if info, err := os.Stat(template); err != nil || info.IsDir() {
+		return ""
+	}
+	return template
 }
 
 // specLaunchIdentity fingerprints the final runtime argv after tune caches,
@@ -1883,6 +2613,8 @@ func validateHostMemoryContainment(req *launchRequest, caps *detect.Capabilities
 	return nil
 }
 
+var errMMapDeclined = errors.New("mmap declined; use --no-mmap with a placement that fits resident RAM")
+
 func confirmRequiredMMap(req *launchRequest, strategy *placement.Strategy, input io.Reader, output io.Writer, interactive bool) error {
 	if req == nil || strategy == nil || !strategy.MMapRequired || req.ForceMMap {
 		return nil
@@ -1901,8 +2633,65 @@ func confirmRequiredMMap(req *launchRequest, strategy *placement.Strategy, input
 		req.NoMMap = false
 		return nil
 	default:
-		return fmt.Errorf("mmap declined; use --no-mmap with a placement that fits resident RAM")
+		// A negative answer is a policy choice, not a terminal placement error.
+		// The launcher catches the sentinel and recomputes through the normal
+		// placement engine with strict resident accounting.
+		req.NoMMap = true
+		req.ForceMMap = false
+		return errMMapDeclined
 	}
+}
+
+func confirmMainModelReviewerFallback(input io.Reader, output io.Writer, interactive bool) error {
+	if !interactive {
+		return fmt.Errorf("resident placement fits only without the separate Claude Auto reviewer; set GGRUN_CLAUDE_AUTO_REVIEWER=off to choose that mode explicitly")
+	}
+	fmt.Fprint(output, "Resident placement fits without the separate Claude Auto reviewer. Continue with Auto reviews routed through the main model? [y/N] ")
+	answer, err := bufio.NewReader(input).ReadString('\n')
+	if err != nil && len(answer) == 0 {
+		return fmt.Errorf("read reviewer fallback confirmation: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	default:
+		return fmt.Errorf("main-model reviewer fallback declined")
+	}
+}
+
+// tryResidentWithoutClaudeReviewer is the last safe resident fallback for a
+// Claude Code launch. It never weakens the placement engine's RAM checks: it
+// asks that same engine whether removing only the optional helper reservation
+// creates a valid --no-mmap plan, then asks before adopting it. The gateway
+// remains active and routes Auto review requests through the main model.
+func tryResidentWithoutClaudeReviewer(
+	req *launchRequest,
+	originalErr error,
+	input io.Reader,
+	output io.Writer,
+	interactive bool,
+	compute func(*launchRequest) (*placement.Strategy, error),
+) (*placement.Strategy, error) {
+	if req == nil || !req.ClaudeCode || !req.NoMMap || req.ClaudeReviewerDisabled || req.ReviewerReservation == nil || compute == nil {
+		return nil, originalErr
+	}
+	candidateReq := *req
+	candidateReq.ReviewerReservation = nil
+	candidateReq.ClaudeReviewerDisabled = true
+	candidate, err := compute(&candidateReq)
+	if err != nil || candidate == nil || candidate.MMapRequired {
+		return nil, originalErr
+	}
+	if err := confirmMainModelReviewerFallback(input, output, interactive); err != nil {
+		if !interactive {
+			return nil, fmt.Errorf("%w\n%v", originalErr, err)
+		}
+		return nil, originalErr
+	}
+	req.ReviewerReservation = nil
+	req.ClaudeReviewerDisabled = true
+	fmt.Fprintln(output, "[launch] separate Auto reviewer disabled; Auto reviews will use the main model")
+	return candidate, nil
 }
 
 func confirmLiveMemoryProbe(req *launchRequest, reason string, input io.Reader, output io.Writer, interactive bool) error {
@@ -1947,7 +2736,13 @@ func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement
 		// bleeding into Claude Code's UI.
 		scope := claudeLaunchLogScope(req, model, be, serverArgs)
 		logPath := claudeServerLogPath(cfg, req.Port, scope)
-		if lf, ferr := os.Create(logPath); ferr == nil {
+		// Append, never truncate. The scope is a hash of the launch shape, not of
+		// one invocation, so every launch and every retry that lands on the same
+		// shape shares this path — and os.Create erased the previous attempt at
+		// the moment the next one started. That is the second of two truncation
+		// sites (pkg/recovery/recovery.go runOnce is the other); fixing only one
+		// still lost the history, as the 2026-08-02 23:11 relaunch showed.
+		if lf, ferr := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644); ferr == nil {
 			_, _ = fmt.Fprintf(lf, "[ggrun] launch-scope: %s\n", scope)
 			// The scope is a hash, so a mismatch between two runs is invisible
 			// from the filenames alone -- diagnosing one cost an afternoon.
@@ -2019,6 +2814,108 @@ func serverProcessPID(p *server.Process) int {
 	return p.Cmd.Process.Pid
 }
 
+const (
+	failedLaunchRAMReleaseToleranceMB = 1024
+	failedLaunchGPUReleaseToleranceMB = 64
+)
+
+// stopFailedLaunchBeforeAdvisor is the boundary between a failed main-model
+// start and the optional support model. StartWithTimeoutToOptions performs its
+// own best-effort teardown, but its caller must not assume that succeeded: a
+// stubborn loader could otherwise overlap a 100+ GiB allocation with the
+// helper. Re-stop the process, require it to be gone, and wait for RAM/VRAM to
+// settle back to the hardware snapshot taken before companion/main startup.
+func stopFailedLaunchBeforeAdvisor(process *server.Process, baseline *detect.Capabilities, timeout time.Duration) error {
+	var stopErr error
+	if process != nil {
+		stopErr = process.Stop()
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		processGone := process == nil || !process.IsRunning()
+		if processGone && launchResourcesAtBaseline(baseline) {
+			if stopErr != nil {
+				return fmt.Errorf("failed main-model teardown returned an error despite released resources: %w", stopErr)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("failed main-model process/resources did not return to baseline within %s; refusing to start support expert", timeout)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func launchResourcesAtBaseline(baseline *detect.Capabilities) bool {
+	if baseline == nil {
+		return true
+	}
+	currentGPU := make(map[int]int, len(baseline.GPUs))
+	for _, gpu := range baseline.GPUs {
+		currentGPU[gpu.Index] = placement.QueryVRAMUsed(gpu.Index)
+	}
+	return releaseReadingsAtBaseline(baseline, currentAvailableRAMMB(), currentGPU)
+}
+
+// captureLaunchResourceBaseline snapshots the host after companions are live
+// but before the main backend starts. Calibration/promotion transitions compare
+// against this point, not the earlier hardware discovery snapshot; otherwise a
+// legitimate worker looked like leaked VRAM, while a just-stopped main process
+// could still be occupying memory when the next preflight sampled the cards.
+func captureLaunchResourceBaseline(caps *detect.Capabilities) *detect.Capabilities {
+	if caps == nil {
+		return nil
+	}
+	baseline := *caps
+	baseline.GPUs = append([]detect.GPU(nil), caps.GPUs...)
+	baseline.RAM.FreeMB = currentAvailableRAMMB()
+	for i := range baseline.GPUs {
+		baseline.GPUs[i].VRAMUsedMB = placement.QueryVRAMUsed(baseline.GPUs[i].Index)
+	}
+	return &baseline
+}
+
+func releaseReadingsAtBaseline(baseline *detect.Capabilities, availableRAMMB int, gpuUsedMB map[int]int) bool {
+	if baseline == nil {
+		return true
+	}
+	if baseline.RAM.FreeMB > 0 && availableRAMMB > 0 &&
+		availableRAMMB < baseline.RAM.FreeMB-failedLaunchRAMReleaseToleranceMB {
+		return false
+	}
+	for _, gpu := range baseline.GPUs {
+		if used := gpuUsedMB[gpu.Index]; used > gpu.VRAMUsedMB+failedLaunchGPUReleaseToleranceMB {
+			return false
+		}
+	}
+	return true
+}
+
+func currentAvailableRAMMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "MemAvailable:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0
+		}
+		kb, err := strconv.Atoi(fields[1])
+		if err != nil {
+			return 0
+		}
+		return kb / 1024
+	}
+	return 0
+}
+
 func claudeServerLogPath(cfg *config.Config, port int, scope string) string {
 	logDir := ""
 	if cfg != nil {
@@ -2051,11 +2948,25 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 		return nil
 	}
 	if model.IsMoE && len(gpus) > 0 {
-		placement.RunPostLaunchProbe(cfg.CacheDir, gpus, serverLog, serverPID)
+		// Build the per-GPU companion VRAM map so the system probe can net it
+		// out of the breakdown table's unaccounted column. Without this the
+		// reviewer/worker seated on a card shows up as permanent CUDA overhead
+		// and latches there (the 2916 MiB bug).
+		companionVRAMByGPU := map[int]int{}
+		for _, cp := range strategy.CompanionPlacements {
+			if cp.GPU < 0 {
+				continue
+			}
+			if mb := placement.MeasuredCompanionVRAMMB(cfg.CacheDir, cp.Name); mb > 0 {
+				companionVRAMByGPU[cp.GPU] += mb
+			}
+		}
+		placement.RunPostLaunchProbe(cfg.CacheDir, gpus, serverLog, serverPID, companionVRAMByGPU)
 		placement.RunPostLaunchModelProbeVRAMDelta(cfg.CacheDir, model, strategy, cacheBackendTag, gpus, baselineVRAMByGPU)
 	}
 	computeByGPU := placement.ParseComputeBuffersByGPU(serverLog)
 	probeWritten := placement.RunPostLaunchModelProbe(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, gpus, strategy.Parallel, serverLog)
+	placement.RecordPostLaunchContextAllocation(cfg.CacheDir, model, strategy, cacheBackendTag, gpus, serverLog)
 	placement.RunPostLaunchKVProbe(cfg.CacheDir, model, strategy.ContextSize, strategy.KVType, serverLog)
 	if !probeWritten {
 		return nil
@@ -2069,15 +2980,18 @@ func measuredPromotionOptions(req *launchRequest, model *placement.ModelProfile,
 	return opts
 }
 
-func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, current *placement.Strategy, currentArgs []string) (*placement.Strategy, []string, bool) {
+func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, current *placement.Strategy, currentArgs []string, memoryRecovery *launchMemoryRecovery) (*placement.Strategy, []string, bool) {
 	if req == nil || cfg == nil || be == nil || caps == nil || model == nil || current == nil || !model.IsMoE || len(caps.GPUs) == 0 {
 		return nil, nil, false
 	}
-	if placement.RequiresConservativeSplitOwnerProtection(model) && !placement.HasLongContextValidation(cfg.CacheDir, model, current.ContextSize, current.UBatchSize, current.KVQuality, current.KVPlacement, scopedProbeBackendTagForStrategy(req, model, be, current), caps.GPUs, current.Parallel, placement.LongContextValidationMinTokens) {
-		// A load-time probe and health check do not validate the deferred graph
-		// allocations exercised by a long hybrid-MoE request. Keep this automatic
-		// calibration from undoing the conservative split-owner placement until a
-		// durable, scoped long-context validation record exists.
+	if req.Calibrate == calibrateOff {
+		return nil, nil, false
+	}
+	// A validated .place entry is already the lifecycle winner for this exact
+	// launch shape. Auto mode may consume new measurements for the next planner
+	// pass, but must not stop that server to challenge it with an unproven denser
+	// layout. --calibrate on remains the explicit opt-in to do so.
+	if current.PlacementCacheHit && req.Calibrate != calibrateOn {
 		return nil, nil, false
 	}
 	// A measured KV probe may have been written after the first load. Force the
@@ -2087,6 +3001,7 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 	// This was especially visible when the Claude reviewer changed the baseline:
 	// a safe but sparse five-block cache kept winning even when six blocks fit.
 	model.MeasuredKVBytesPerTok = nil
+	model.MeasuredKVGeometry = nil
 	opts := measuredPromotionOptions(req, model, be, cfg.CacheDir)
 	next, err := placement.Compute(caps, model, opts)
 	if err != nil {
@@ -2101,18 +3016,45 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 	if formatCommand(nextArgs) == formatCommand(currentArgs) {
 		return nil, nil, false
 	}
+	if memoryRecovery.isRejected(nextArgs) {
+		fmt.Fprintln(os.Stderr, "[launch] allocation measurement proposed an argv already rejected by this launch; retaining the proven-safe placement")
+		return nil, nil, false
+	}
 	return next, nextArgs, true
 }
 
+// retainProvenSafeAfterRecovery keeps automatic optimization monotonic. Once
+// this lifecycle has needed memory recovery, the first server that actually
+// reaches health is the baseline to serve and verify. Measurements remain on
+// disk for the next launch; only an explicit --calibrate on may stop the good
+// server and challenge it immediately.
+func retainProvenSafeAfterRecovery(req *launchRequest, memoryRecovery *launchMemoryRecovery) bool {
+	if memoryRecovery == nil || !memoryRecovery.hasRejections() {
+		return false
+	}
+	return req == nil || req.Calibrate != calibrateOn
+}
+
 func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration) (*server.Process, *placement.Strategy, []string, error) {
+	return startLaunchWithCUDAOOMRecoveryState(req, cfg, model, strategy, be, caps, serverArgs, timeout, newLaunchMemoryRecovery())
+}
+
+// startLaunchWithCUDAOOMRecoveryState is the sole production start boundary.
+// The caller owns memoryRecovery for the complete launch lifecycle so initial
+// load, measured promotion, calibration, restoration, and runtime recovery can
+// never forget an argv that an earlier phase disproved.
+func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
 	const maxRetries = 2
 	const maxPreflightReplans = 5
 	retries := 0
 	preflightReplans := 0
 	oomPenalty := map[int]int{}
+	if memoryRecovery == nil {
+		memoryRecovery = newLaunchMemoryRecovery()
+	}
 	specDisabled := false
 	measuredProductionArgs := ""
-	runtimeCaps, visibleToPhysical := runtimeGPUCapabilities(caps, req)
+	runtimeCaps, visibleToPhysical := runtimeGPUCapabilitiesForLaunch(caps, req, strategy)
 	placementOpts := func() placement.Options {
 		opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
 		if specDisabled {
@@ -2121,6 +3063,9 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 		return opts
 	}
 	for {
+		if memoryRecovery.isRejected(serverArgs) {
+			return nil, strategy, serverArgs, fmt.Errorf("refusing to retry a memory configuration rejected earlier in this launch lifecycle")
+		}
 		if !specDisabled && strings.EqualFold(strings.TrimSpace(req.SpecMode), "auto") && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
 			verified := strategy.Draft.VerifiedLaunchIdentity
 			if verified == "" || verified != specLaunchIdentity(serverArgs) {
@@ -2145,6 +3090,117 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 		// here, so every retry is re-gated too.
 		if strategy != nil {
 			preflight := preflightPlacement(req, be, &configForPreflight{CacheDir: cfg.CacheDir}, runtimeCaps, model, strategy, serverArgs)
+			if adjustment := preflight.BackendAdjustment; adjustment != nil {
+				if preflightReplans >= maxPreflightReplans {
+					return nil, strategy, serverArgs, fmt.Errorf("backend compatibility adjustment did not converge after %d retries", maxPreflightReplans)
+				}
+				switch {
+				case adjustment.RemoveFlag != "":
+					if userExplicitBackendFlag(req, adjustment.RemoveFlag) {
+						// Advisory adjustments never reach here: preflight
+						// resolves the user-explicit case itself, since the
+						// backend started and there is nothing to fail closed on.
+						return nil, strategy, serverArgs, fmt.Errorf(
+							"backend rejected explicitly supplied %s: %s; refusing to change a user-supplied backend flag",
+							adjustment.RemoveFlag, adjustment.Reason,
+						)
+					}
+					if !hasArg(serverArgs, adjustment.RemoveFlag) {
+						return nil, strategy, serverArgs, fmt.Errorf(
+							"backend requested removal of %s, but that flag is not present in the launch",
+							adjustment.RemoveFlag,
+						)
+					}
+					if persistErr := persistBackendCapability(cfg.CacheDir, model, be, adjustment.RemoveFlag, adjustment.Reason, false); persistErr != nil {
+						fmt.Fprintf(os.Stderr, "[launch] warning: could not persist measured backend capability: %v\n", persistErr)
+					}
+					if !disableBackendFlag(req, adjustment.RemoveFlag, adjustment.Reason) {
+						return nil, strategy, serverArgs, fmt.Errorf(
+							"backend compatibility adjustment for %s repeated without changing the launch",
+							adjustment.RemoveFlag,
+						)
+					}
+					if adjustment.RemoveFlag == "--swa-full" {
+						req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", false)
+					}
+					if adjustment.RequireReplan {
+						opts := placementOpts()
+						opts.SkipPlacementCache = true
+						next, replanErr := placement.Compute(caps, model, opts)
+						if replanErr != nil || next == nil {
+							if replanErr != nil {
+								return nil, strategy, serverArgs, fmt.Errorf("backend feature re-plan failed: %w", replanErr)
+							}
+							return nil, strategy, serverArgs, fmt.Errorf("backend feature re-plan returned no strategy")
+						}
+						claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+						nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
+						if formatCommand(nextArgs) == formatCommand(serverArgs) {
+							return nil, strategy, serverArgs, fmt.Errorf("backend feature re-plan for %s produced no argument change", adjustment.RemoveFlag)
+						}
+						if validateErr := validateBackendLaunchArgs(be, nextArgs); validateErr != nil {
+							return nil, strategy, serverArgs, validateErr
+						}
+						preflightReplans++
+						strategy, serverArgs = next, nextArgs
+						fmt.Fprintf(os.Stderr,
+							"[launch] backend/model compatibility: %s; disabling %s, fully recomputing placement, and retrying\n",
+							adjustment.Reason, adjustment.RemoveFlag,
+						)
+						continue
+					}
+					nextArgs := applyRequestDisabledBackendFlags(serverArgs, req)
+					if formatCommand(nextArgs) == formatCommand(serverArgs) {
+						return nil, strategy, serverArgs, fmt.Errorf(
+							"backend compatibility adjustment for %s produced no argument change",
+							adjustment.RemoveFlag,
+						)
+					}
+					preflightReplans++
+					serverArgs = nextArgs
+					fmt.Fprintf(os.Stderr,
+						"[launch] backend/model compatibility: %s; disabling %s and retrying the measured placement\n",
+						adjustment.Reason, adjustment.RemoveFlag,
+					)
+					continue
+
+				case adjustment.KVQuality != "":
+					targetKV, kvErr := placement.NormalizeKVType(adjustment.KVQuality)
+					if kvErr != nil {
+						return nil, strategy, serverArgs, fmt.Errorf("backend requested invalid KV compatibility type %q: %w", adjustment.KVQuality, kvErr)
+					}
+					if currentKV, _ := placement.NormalizeKVType(req.KVQuality); currentKV == targetKV {
+						return nil, strategy, serverArgs, fmt.Errorf("backend compatibility adjustment repeated for KV type %s without changing the launch", targetKV)
+					}
+					previousKV := strategy.KVType
+					req.KVQuality = targetKV
+					req.KVTypeK, req.KVTypeV = "", ""
+					next, replanErr := placement.Compute(caps, model, placementOpts())
+					if replanErr != nil || next == nil {
+						if replanErr != nil {
+							return nil, strategy, serverArgs, fmt.Errorf("backend-compatible KV re-plan failed: %w", replanErr)
+						}
+						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible KV re-plan returned no strategy")
+					}
+					claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+					nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
+					if formatCommand(nextArgs) == formatCommand(serverArgs) {
+						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible KV re-plan produced no argument change")
+					}
+					if validateErr := validateBackendLaunchArgs(be, nextArgs); validateErr != nil {
+						return nil, strategy, serverArgs, validateErr
+					}
+					preflightReplans++
+					strategy, serverArgs = next, nextArgs
+					fmt.Fprintf(os.Stderr,
+						"[launch] backend/model compatibility: %s; changing KV %s -> %s, recomputing placement, and retrying\n",
+						adjustment.Reason, previousKV, targetKV,
+					)
+					continue
+				default:
+					return nil, strategy, serverArgs, fmt.Errorf("backend compatibility adjustment had no supported action: %s", adjustment.Reason)
+				}
+			}
 			if preflight.Err != nil {
 				if consent, ok := preflight.Err.(*liveMemoryProbeConsentError); ok {
 					if err := confirmLiveMemoryProbe(req, consent.Reason, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
@@ -2174,6 +3230,7 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 				continue
 			}
 			if preflight.DoesNotFit {
+				memoryRecovery.reject(serverArgs)
 				if preflightReplans >= maxPreflightReplans {
 					return nil, strategy, serverArgs, fmt.Errorf("memory preflight did not converge after %d re-plans; refusing a real model load", maxPreflightReplans)
 				}
@@ -2204,23 +3261,27 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 				}
 				claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 				nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
-				if formatCommand(nextArgs) != formatCommand(serverArgs) {
-					strategy = next
-					serverArgs = nextArgs
-					if preflight.Evidence.Level == memoryEvidenceAllocated {
-						// The disposable live probe has already been stopped. Its
-						// complete allocator evidence is enough to choose the measured
-						// plan; start that plan once as the contained production server
-						// instead of paying for another disposable full model load.
-						fmt.Fprintln(os.Stderr, "[launch] allocation probe complete; starting a fresh server with the backend-measured configuration")
-						measuredProductionArgs = formatCommand(serverArgs)
+				if changed, rejected := memoryRecovery.recomputeDecision(serverArgs, nextArgs); changed {
+					if rejected {
+						fmt.Fprintln(os.Stderr, "[launch] backend-measured recompute reproduced an argv rejected by this launch's memory checks; retaining the verified-safe placement")
 					} else {
-						if preflightReplans >= maxPreflightReplans {
-							return nil, strategy, serverArgs, fmt.Errorf("backend memory plan did not reach a fixed point after %d re-plans; refusing a real model load", maxPreflightReplans)
+						strategy = next
+						serverArgs = nextArgs
+						if preflight.Evidence.Level == memoryEvidenceAllocated {
+							// The disposable live probe has already been stopped. Its
+							// complete allocator evidence is enough to choose the measured
+							// plan; start that plan once as the contained production server
+							// instead of paying for another disposable full model load.
+							fmt.Fprintln(os.Stderr, "[launch] allocation probe complete; starting a fresh server with the backend-measured configuration")
+							measuredProductionArgs = formatCommand(serverArgs)
+						} else {
+							if preflightReplans >= maxPreflightReplans {
+								return nil, strategy, serverArgs, fmt.Errorf("backend memory plan did not reach a fixed point after %d re-plans; refusing a real model load", maxPreflightReplans)
+							}
+							preflightReplans++
+							fmt.Fprintf(os.Stderr, "[launch] backend-measured memory re-plan %d/%d; verifying the new placement\n", preflightReplans, maxPreflightReplans)
+							continue
 						}
-						preflightReplans++
-						fmt.Fprintf(os.Stderr, "[launch] backend-measured memory re-plan %d/%d; verifying the new placement\n", preflightReplans, maxPreflightReplans)
-						continue
 					}
 				} else {
 					fmt.Fprintf(os.Stderr, "[launch] memory plan stable at %s evidence\n", preflight.Evidence.Level)
@@ -2241,12 +3302,9 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 			if measuredProductionArgs != "" && measuredProductionArgs == formatCommand(serverArgs) {
 				fmt.Fprintln(os.Stderr, "[launch] backend-measured configuration loaded and passed health check")
 			}
-			// Persist the placement that actually loaded and passed the health
-			// check — and only that. Overwrite unconditionally: after an OOM
-			// re-plan the file on disk still holds the plan that just failed.
-			if strategy != nil && strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
-				_ = placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy))
-			}
+			// Do not persist a reusable placement here. HTTP health proves only
+			// that the loader reached the network loop; the profile controller
+			// promotes and writes it after functional/cache/performance canaries.
 			return p, strategy, serverArgs, nil
 		}
 
@@ -2274,6 +3332,7 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 		if !ok {
 			return p, strategy, serverArgs, err
 		}
+		memoryRecovery.reject(serverArgs)
 
 		// Re-plan with the failed card penalized by its overshoot: the real packer
 		// refits it with partial gate+up chunks and reclaims stranded VRAM on the
@@ -2300,23 +3359,39 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 			oomPenalty[physicalDevice] += oomOvershoot(caps, physicalDevice, allocMB)
 			s, rerr = placement.ReplanAfterOOM(caps, model, placementOpts(), oomPenalty)
 		}
-		if rerr == nil && s != nil && s.OTString != "" {
-			if isComputeBuffer && computeMeasuredOnFailedGPU {
-				fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d (%d MiB); measured compute buffer and re-planned (n-cpu-moe=%d) without a duplicate penalty\n", device, allocMB, s.NCPUMoE)
-			} else {
-				fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d (%d MiB, over ~%d MiB); re-planned (n-cpu-moe=%d) and retrying\n", device, allocMB, oomPenalty[device], s.NCPUMoE)
-			}
-			serverArgs = patchPlacementArgs(serverArgs, s)
-			strategy = s
-		} else {
-			nextArgs, entry, derated := placement.DerateCUDAOOMArgs(serverArgs, model, runtimeCaps, device, allocMB, isComputeBuffer)
-			if !derated {
-				return p, strategy, serverArgs, err
-			}
-			fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d allocating %d MiB; moving expert layer(s) to CPU and retrying\n", device, allocMB)
-			applyDeratedPlacementEntry(strategy, entry)
-			serverArgs = nextArgs
+		if rerr != nil || s == nil || s.OTString == "" {
+			s = nil
 		}
+		// Apply the same monotonic policy as contained preflight recovery. A
+		// measured packer result may move weights at the current ubatch, but a
+		// smaller ubatch is not adopted until the failed GPU has first lost one
+		// routed expert layer. For a real allocator OOM the exact overshoot is not
+		// known, so one layer is the smallest useful black-box experiment.
+		nextStrategy, nextArgs, method, changed := applyMemoryRecoverySelection(
+			req, strategy, serverArgs, s, model, runtimeCaps,
+			preflightOutcome{Device: device, AllocMB: allocMB, AllocMBMeasured: allocMB > 0, DeficitMB: 1, IsComputeBuffer: isComputeBuffer},
+		)
+		if !changed {
+			return p, strategy, serverArgs, err
+		}
+		switch method {
+		case "replanned":
+			if isComputeBuffer && computeMeasuredOnFailedGPU {
+				fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d (%d MiB); measured compute buffer and re-planned (n-cpu-moe=%d) without a duplicate penalty\n", device, allocMB, nextStrategy.NCPUMoE)
+			} else {
+				fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d (%d MiB, over ~%d MiB); re-planned (n-cpu-moe=%d) and retrying\n", device, allocMB, oomPenalty[physicalDevice], nextStrategy.NCPUMoE)
+			}
+		case "swa-full-withdrawn":
+			fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d allocating %d MiB; withdrawing --swa-full (a full-context KV cache this model does not reuse) before touching placement\n", device, allocMB)
+		case "expert-derate":
+			fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d allocating %d MiB; moving one expert layer off the failed GPU before lowering ubatch\n", device, allocMB)
+		case "ubatch-derate":
+			fmt.Fprintf(os.Stderr, "[launch] CUDA OOM on device %d allocating %d MiB; no movable expert remains, lowering ubatch to %d\n", device, allocMB, nextStrategy.UBatchSize)
+		default:
+			return p, strategy, serverArgs, fmt.Errorf("unsupported CUDA OOM recovery method %q", method)
+		}
+		strategy = nextStrategy
+		serverArgs = nextArgs
 		retries++
 		printVRAMLedger(strategy)
 		fmt.Printf("[launch] %s\n", formatCommand(serverArgs))
@@ -2337,7 +3412,7 @@ func oomOvershoot(caps *detect.Capabilities, device, allocMB int) int {
 			}
 		}
 	}
-	if over <= 0 {
+	if over < 512 {
 		over = 512
 	}
 	return over
@@ -2626,13 +3701,325 @@ func shouldPromoteMoEPlacement(current, next *placement.Strategy) bool {
 // architecture routing, and preflights the arch. This step is identical across
 // every launch path (CLI, TUI, dry-run). Returns nil if no backend is available.
 func resolveLaunchBackend(req *launchRequest, model *placement.ModelProfile, caps *detect.Capabilities) *backendInfo {
-	be := selectBackend(caps, req)
+	be := selectBackendForModel(caps, req, model)
 	if be == nil {
 		return nil
 	}
-	be = routeArchBackend(be, model, req)
-	preflightBackendArch(model, be, caps)
+	applyBackendFeatureCompatibility(req, model, be)
+	preflightBackendArch(model, be, caps, req.AppHome)
 	return be
+}
+
+func applyBackendFeatureCompatibility(req *launchRequest, model *placement.ModelProfile, be *backendInfo) {
+	if req == nil || be == nil {
+		return
+	}
+	isDeepSeek4 := model != nil && strings.EqualFold(strings.TrimSpace(model.ModelArch), "deepseek4")
+	isDeepSeek4IK := isDeepSeek4 && be.IsIK
+	if isDeepSeek4 {
+		if kvType, err := placement.NormalizeKVType(req.KVQuality); err == nil &&
+			((isDeepSeek4IK && kvType != "f16" && kvType != "bf16" && kvType != "q8_0") ||
+				(!isDeepSeek4IK && kvType != "f16")) {
+			target := "f16"
+			family := "mainline"
+			if isDeepSeek4IK {
+				target = "q8_0"
+				family = "ik_llama"
+			}
+			fmt.Printf("[launch] DeepSeek4 on %s does not support %s K-cache; promoting this launch to %s and recomputing placement.\n", family, kvType, target)
+			req.KVQuality = target
+			req.KVTypeK, req.KVTypeV = "", ""
+		}
+	}
+	// ik_llama accepts -khad during argument parsing, but DeepSeek4 rejects it
+	// only after loading the weights and creating the context. Avoid paying for
+	// that known-bad load. An explicit passthrough -khad remains authoritative
+	// and will fail closed rather than being silently changed.
+	if isDeepSeek4IK && !hasArg(req.ExtraArgs, "-khad") {
+		const reason = "DeepSeek4 has no K-cache Hadamard implementation in ik_llama"
+		if disableBackendFlag(req, "-khad", reason) {
+			fmt.Printf("[launch] %s; disabling -khad for this model/backend profile.\n", reason)
+		}
+	}
+	if !hasArg(req.ExtraArgs, "--swa-full") {
+		return
+	}
+	// An empty help surface is unknown, not unsupported. With a real help probe,
+	// however, passing an absent option is guaranteed to abort argument parsing.
+	if strings.TrimSpace(be.Help) == "" || strings.Contains(be.Help, "--swa-full") {
+		return
+	}
+	if userExplicitBackendFlag(req, "--swa-full") {
+		fmt.Printf("[launch] backend %s does not advertise --swa-full; preserving the explicit user request so validation fails closed.\n", be.Path)
+		return
+	}
+	req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", false)
+	arch := "this model"
+	if model != nil && strings.TrimSpace(model.ModelArch) != "" {
+		arch = model.ModelArch
+	}
+	fmt.Printf("[launch] Full SWA cache is unavailable for %s on backend %s; disabling it for this launch.\n", arch, be.Path)
+}
+
+func launchHardwareIdentity(caps *detect.Capabilities) string {
+	if caps == nil {
+		return "unknown"
+	}
+	parts := make([]string, 0, len(caps.GPUs)+2)
+	for _, gpu := range caps.GPUs {
+		parts = append(parts, fmt.Sprintf("gpu%d:%s:%d:%s:%s:gen%dx%d:bw%d",
+			gpu.Index, gpu.Name, gpu.VRAMTotalMB, gpu.Driver, gpu.PCIBusID,
+			gpu.PCIGen, gpu.PCILanes, gpu.BandwidthMBps))
+	}
+	sort.Strings(parts)
+	parts = append(parts, fmt.Sprintf("ram:%d", caps.RAM.TotalMB), fmt.Sprintf("cpu:%s:%d", caps.CPU.Model, caps.CPU.Cores))
+	return controller.ScopeKey(parts...)
+}
+
+// verifyAndActivateLaunch is the promotion boundary between "the HTTP listener
+// came up" and "this profile may be reused automatically". A cache regression
+// leaves the server available in a clearly reported degraded state, but it does
+// not overwrite the last-known-good placement.
+func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *placement.ModelProfile,
+	be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, serverArgs []string, claudeRouterURL string,
+) error {
+	if req == nil || cfg == nil || model == nil || be == nil || strategy == nil {
+		return errors.New("incomplete launch profile")
+	}
+	hardware := launchHardwareIdentity(caps)
+	argsHash := controller.HashArgs(serverArgs)
+	scope := launchProfileScope(req, model, be, caps)
+	store := controller.Store{CacheDir: cfg.CacheDir}
+	if store.IsActive(scope, argsHash) {
+		if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+			_ = placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy))
+		}
+		fmt.Fprintln(os.Stderr, "[verify] exact launch profile is already active; reusing its canary result")
+		return nil
+	}
+
+	profile, err := store.Begin(controller.Profile{
+		Scope:            scope,
+		ModelIdentity:    placement.SpecTargetIdentity(model),
+		BackendIdentity:  be.Identity,
+		HardwareIdentity: hardware,
+		ArgsHash:         argsHash,
+		Properties: map[string]string{
+			"context":      strconv.Itoa(strategy.ContextSize),
+			"ubatch":       strconv.Itoa(strategy.UBatchSize),
+			"parallel":     strconv.Itoa(strategy.Parallel),
+			"kv_type":      strategy.KVType,
+			"kv_placement": strategy.KVPlacement,
+			"swa_full":     strconv.FormatBool(strategy.SWAFull),
+			"checkpoints":  strconv.Itoa(strategy.MaxCheckpoints),
+		},
+	})
+	if err != nil {
+		return err
+	}
+	tag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
+	allocationEvidence := "live-server-load"
+	var profileGPUs []detect.GPU
+	if caps != nil {
+		profileGPUs = caps.GPUs
+	}
+	if allocation, ok := placement.LoadMeasuredAllocation(cfg.CacheDir, model, strategy.ContextSize,
+		strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, tag, profileGPUs, strategy.Parallel); ok {
+		allocationEvidence = allocation.Evidence
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StateAllocationVerified,
+		"backend allocation accepted", allocationEvidence); err != nil {
+		return err
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StateLoadHealthy,
+		"server passed health and model-list checks", "health"); err != nil {
+		return err
+	}
+
+	runner := &benchmark.Runner{
+		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", req.Port),
+		Model:   filepath.Base(model.Path),
+		Timeout: 20 * time.Minute,
+	}
+	canary, canaryErr := runner.RunCacheCanary()
+	if canaryErr != nil || canary == nil || !canary.Functional {
+		reason := "functional canary failed"
+		if canaryErr != nil {
+			reason += ": " + canaryErr.Error()
+		} else if canary != nil && canary.Reason != "" {
+			reason += ": " + canary.Reason
+		}
+		_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "cache-canary")
+		return errors.New(reason)
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StateFunctionalVerified,
+		"deterministic completion endpoint responded", "cache-canary"); err != nil {
+		return err
+	}
+	metrics := []controller.Metric{
+		{Name: "cold_prompt_tokens", Value: float64(canary.ColdPromptTokens), Unit: "tokens", Source: "cache-canary"},
+		{Name: "append_cached_tokens", Value: float64(canary.AppendCachedTokens), Unit: "tokens", Source: "cache-canary"},
+		{Name: "branch_cached_tokens", Value: float64(canary.BranchCachedTokens), Unit: "tokens", Source: "cache-canary"},
+		{Name: "cold_prompt_tps", Value: canary.ColdPromptTPS, Unit: "tokens/s", Source: "cache-canary"},
+	}
+	if !canary.Passed {
+		reason := canary.Reason
+		if reason == "" {
+			reason = "prefix-cache canary did not meet reuse thresholds"
+		}
+		_, _ = store.Transition(scope, profile.ID, controller.StateDegraded, reason, "cache-canary", metrics...)
+		fmt.Fprintf(os.Stderr, "[verify] degraded profile: %s; placement will not be promoted and the support expert may analyze it during a maintenance window\n", reason)
+		return nil
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StateCacheVerified,
+		"strict extension, older branch, and replay restored prefix state", "cache-canary", metrics...); err != nil {
+		return err
+	}
+	if req.ClaudeCode {
+		if strings.TrimSpace(claudeRouterURL) == "" {
+			reason := "Claude workload profile has no running Anthropic router to verify"
+			_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "claude-router-canary")
+			return errors.New(reason)
+		}
+		claudeRunner := &benchmark.Runner{
+			BaseURL: claudeRouterURL,
+			Model:   "local",
+			Timeout: 20 * time.Minute,
+		}
+		if routerErr := claudeRunner.RunClaudeRouterCanary(); routerErr != nil {
+			reason := "Claude Anthropic-router canary failed: " + routerErr.Error()
+			_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "claude-router-canary")
+			return errors.New(reason)
+		}
+		if req.ReviewerProfile != nil && !req.ClaudeReviewerDisabled && claudeCompanionNeeded(nil) {
+			workerRunner := &benchmark.Runner{
+				BaseURL: claudeRouterURL,
+				Model:   claudeauto.UtilityAlias,
+				Timeout: 20 * time.Minute,
+			}
+			if workerErr := workerRunner.RunClaudeRouterCanary(); workerErr != nil {
+				reason := "Claude worker-route canary failed: " + workerErr.Error()
+				_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "claude-worker-canary")
+				return errors.New(reason)
+			}
+		}
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StatePerformanceVerified,
+		"cache canary recorded prefill performance and workload gateway passed", "cache-canary+workload-canary"); err != nil {
+		return err
+	}
+	if _, err = store.Transition(scope, profile.ID, controller.StateActive,
+		"all required launch checks passed", "profile-controller"); err != nil {
+		return err
+	}
+	if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+		if err := placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy)); err != nil {
+			return fmt.Errorf("persist verified placement: %w", err)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "[verify] active profile: append cache=%d, branch cache=%d tokens\n",
+		canary.AppendCachedTokens, canary.BranchCachedTokens)
+	return nil
+}
+
+func requestedLaunchPolicyIdentity(req *launchRequest, model *placement.ModelProfile) string {
+	if req == nil {
+		return "default"
+	}
+	values := []string{
+		"ctx=" + req.CtxFlag,
+		"kv-placement=" + req.KVPlacement,
+		"kv-quality=" + req.KVQuality,
+		"kv-k=" + req.KVTypeK,
+		"kv-v=" + req.KVTypeV,
+		"cpu=" + strconv.FormatBool(req.CPUMode),
+		"gpus=" + req.GPUsFlag,
+		"vision=" + strconv.FormatBool(req.VisionAuto),
+		"mmproj=" + req.MMProjPath,
+		"tune=" + req.TuneCache,
+		"spec=" + req.SpecMode,
+		"force-spec-moe=" + strconv.FormatBool(req.ForceSpecMoE),
+		"ram-budget=" + strconv.Itoa(req.RamBudgetMB),
+		"ram-limit=" + strconv.Itoa(req.RAMLimitPercent),
+		"vram-headroom=" + strconv.Itoa(req.VRAMHeadroomMB),
+		"ram-headroom=" + strconv.Itoa(req.RAMHeadroomMB),
+		"no-mmap=" + strconv.FormatBool(req.NoMMap),
+		"force-mmap=" + strconv.FormatBool(req.ForceMMap),
+		"parallel=" + strconv.Itoa(req.Parallel),
+		"parallel-explicit=" + strconv.FormatBool(req.ParallelSet),
+		"threads=" + strconv.Itoa(req.Threads),
+		"cache-ram=" + strconv.Itoa(req.CacheRAMMB),
+		"claude-max-active=" + strconv.Itoa(req.ClaudeMaxActive),
+		"batch=" + strconv.Itoa(req.BatchSize),
+		"batch-explicit=" + strconv.FormatBool(req.BatchSizeSet),
+		"ubatch=" + strconv.Itoa(req.UBatchSize),
+		"ubatch-explicit=" + strconv.FormatBool(req.UBatchSizeSet),
+		"benchmark=" + strconv.FormatBool(req.Benchmark),
+		"worker-benchmark=" + strconv.FormatBool(req.WorkerBenchmark),
+		"workload=" + requestWorkloadProfile(req, model),
+	}
+	return controller.ScopeKey(values...)
+}
+
+func launchModelFamilyIdentity(model *placement.ModelProfile) string {
+	if model == nil {
+		return ""
+	}
+	name := strings.TrimSpace(model.Name)
+	if name == "" {
+		name = strings.TrimSpace(model.Basename)
+	}
+	if name == "" {
+		name = filepath.Base(model.Path)
+	}
+	return controller.ScopeKey(
+		strings.ToLower(name), strings.ToLower(model.ModelArch),
+		strconv.Itoa(model.NumLayers), strconv.FormatInt(model.NumParams, 10),
+		strconv.Itoa(model.ContextSize), strings.ToLower(model.TokenizerHash),
+	)
+}
+
+func launchBackendFamilyIdentity(be *backendInfo) string {
+	if be == nil {
+		return ""
+	}
+	tag := strings.TrimSpace(be.Tag)
+	if tag == "" {
+		tag = strings.TrimSpace(be.Dialect)
+	}
+	if tag == "" {
+		tag = filepath.Base(be.Path)
+	}
+	return strings.ToLower(tag)
+}
+
+func launchProfileScope(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) string {
+	if model == nil || be == nil {
+		return ""
+	}
+	policy := "default"
+	if req != nil {
+		policy = req.ProfilePolicyIdentity
+		if policy == "" {
+			policy = requestedLaunchPolicyIdentity(req, model)
+		}
+	}
+	return controller.ScopeKey(launchModelFamilyIdentity(model), launchBackendFamilyIdentity(be),
+		launchHardwareIdentity(caps), policy, claudeCompanionLifecycleIdentity(req))
+}
+
+func claudeCompanionLifecycleIdentity(req *launchRequest) string {
+	if req == nil || !req.ClaudeCode {
+		return "no-claude-companion"
+	}
+	if req.ClaudeReviewerDisabled || !claudeCompanionNeeded(nil) {
+		return "main-model-fallback"
+	}
+	if req.ReviewerProfile == nil {
+		return "companion-unresolved"
+	}
+	p := req.ReviewerProfile
+	return controller.ScopeKey("separate-companion", p.Name, p.ModelPath, p.BackendPath, p.KVType)
 }
 
 func cmdLaunch(args []string) {
@@ -2673,12 +4060,26 @@ func cmdLaunch(args []string) {
 		os.Exit(1)
 	}
 	warnModelCompatibility(model)
+	// Freeze the user's requested serving policy before backend compatibility,
+	// placement recovery, or the support controller adjusts generated knobs.
+	// Those adjusted argv are candidates within this family, not new families.
+	req.ProfilePolicyIdentity = requestedLaunchPolicyIdentity(req, model)
 
 	be := resolveLaunchBackend(req, model, caps)
+	if recipe := reviewedRecipeRequiredForMain(model.ModelArch, be); recipe != nil {
+		if !confirmReviewedBackendInstall(recipe, model.ModelArch, cfg.AssumeYes, os.Stdin, os.Stderr, stdinIsTerminal()) {
+			fmt.Fprintf(os.Stderr, "Error: no proven main-model backend for architecture %q; install the reviewed backend with: ggrun backend install %s\n", model.ModelArch, recipe.Name)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "[launch] installing reviewed backend %q before model placement\n", recipe.Name)
+		cmdBackendInstall([]string{recipe.Name})
+		be = resolveLaunchBackend(req, model, caps)
+	}
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
 		os.Exit(1)
 	}
+	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
 		fmt.Printf("[launch] GPU restriction: %s\n", env)
 	}
@@ -2696,35 +4097,67 @@ func cmdLaunch(args []string) {
 	// keeps the reviewer's VRAM accounted.
 	req.ReviewerReservation = claudeReviewerReservation(req, caps, cfg.CacheDir)
 
-	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
-		os.Exit(1)
+	computeStrategy := func(candidateReq *launchRequest) (*placement.Strategy, error) {
+		candidate, computeErr := placement.Compute(caps, model, placementOptionsFromRequest(candidateReq, model, be, cfg.CacheDir))
+		if computeErr != nil {
+			return nil, computeErr
+		}
+		// A prior calibration for this exact model/hardware/workload scope already
+		// measured the fastest placement; apply it instead of the estimate.
+		return applyCalibrationDecision(candidateReq, cfg, model, be, caps, candidate), nil
 	}
-	// A prior calibration for this exact model/hardware/workload scope already
-	// measured the fastest placement; apply it instead of the estimate.
-	strategy = applyCalibrationDecision(req, cfg, model, be, caps, strategy)
+
+	strategy, err := computeStrategy(req)
+	if err != nil {
+		strategy, err = tryResidentWithoutClaudeReviewer(req, err, os.Stdin, os.Stderr, stdinIsTerminal(), computeStrategy)
+		if err != nil {
+			// Layer-1 deterministic replan before any Layer-2 escalation. The
+			// first Compute may have consumed a poisoned .place cache; recompute
+			// with the cache bypassed (and any derated ubatch preserved), then
+			// let the advisor decide only if that deterministic replan also
+			// fails. Compute already walks UBatchFitLadder internally, so the
+			// replan's only knob beyond SkipPlacementCache is clearing the cache
+			// file and preserving a prior derate.
+			firstCode := classifyAdvisorFailure(err)
+			if replanned, replanErr := deterministicReplanOnPlacementFailure(req, model, be, cfg, caps, nil); replanErr == nil {
+				strategy, err = replanned, nil
+			} else {
+				// Layer-2/Layer-3 boundary: escalate only a genuinely novel failure
+				// (or a classified class that recurred after the deterministic
+				// budget), and only after the user consents to the consultation.
+				// Every declined/absent path returns the ORIGINAL replan error.
+				strategy, err = escalatePlacementFailure(req, cfg, model, be, caps, firstCode, replanErr, computeStrategy)
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
+				os.Exit(1)
+			}
+		}
+	}
 	if err := confirmRequiredMMap(req, strategy, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		if !errors.Is(err, errMMapDeclined) {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Fprintln(os.Stderr, "[placement] mmap declined; recomputing a fully resident placement")
+		strategy, err = computeStrategy(req)
+		if err != nil {
+			strategy, err = tryResidentWithoutClaudeReviewer(req, err, os.Stdin, os.Stderr, stdinIsTerminal(), computeStrategy)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error computing resident placement: %s\n", placementErrorMessage(err))
+			os.Exit(1)
+		}
 	}
 	if err := validateHostMemoryContainment(req, caps, strategy); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Start the reviewer on the GPU the planner chose (CPU when it placed -1).
-	claudeAuto, err := startClaudeAutoReviewer(req, cfg, caps, strategy.CompanionPlacements)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	// The gateway also owns model-aware agent admission. Keep it available when
-	// the user selected a non-Auto Claude permission mode and no reviewer is
-	// needed, so host-offloaded models still avoid destructive decode interleave.
-	if req.ClaudeCode && claudeAuto == nil {
-		claudeAuto = &claudeAutoRuntime{reviewerGPU: -1}
-	}
+	// Finalize and parser-check the exact backend command before starting any
+	// companion or model process. A ggrun-generated dialect mismatch must be a
+	// cheap, explicit pre-launch error, never a reviewer load followed by a giant
+	// backend help dump from the contained memory probe.
 	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 	var preRecoveryStrategy *placement.Strategy
 	var serverArgs []string
@@ -2736,10 +4169,30 @@ func cmdLaunch(args []string) {
 		serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
 		strategy, err = recoverPreviousClaudeRuntimeOOM(req, cfg, model, strategy, be, caps, serverArgs)
 		if err != nil {
-			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+	}
+	if serverArgs == nil || strategy != preRecoveryStrategy {
+		serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
+	}
+	strategy, serverArgs, err = validateAndRepairBackendArgs(req, cfg, model, be, caps, strategy, serverArgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Start the reviewer on the GPU the final plan chose (CPU when it placed -1).
+	claudeAuto, err := startClaudeAutoReviewer(req, cfg, caps, strategy.CompanionPlacements)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	// The gateway also owns model-aware agent admission. Keep it available when
+	// the user selected a non-Auto Claude permission mode and no reviewer is
+	// needed, so host-offloaded models still avoid destructive decode interleave.
+	if req.ClaudeCode && claudeAuto == nil {
+		claudeAuto = &claudeAutoRuntime{reviewerGPU: -1}
 	}
 
 	if len(caps.GPUs) > 0 {
@@ -2753,9 +4206,6 @@ func cmdLaunch(args []string) {
 		}
 	}
 
-	if serverArgs == nil || strategy != preRecoveryStrategy {
-		serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
-	}
 	fmt.Printf("[launch] %s\n", formatCommand(serverArgs))
 	if memMax := backendMemoryMaxMB(req, caps); memMax > 0 {
 		fmt.Printf("[launch] backend memory scope: MemoryMax=%d MiB\n", memMax)
@@ -2779,29 +4229,80 @@ func cmdLaunch(args []string) {
 	// can measure the real compute-buffer allocation.
 	runtimeCaps, visibleToPhysical := runtimeGPUCapabilities(caps, req)
 	baselineVRAM := map[int]int{}
-	if model.IsMoE && runtimeCaps != nil && len(runtimeCaps.GPUs) > 0 {
+	if runtimeCaps != nil && len(runtimeCaps.GPUs) > 0 {
 		for _, g := range runtimeCaps.GPUs {
 			baselineVRAM[g.Index] = placement.QueryVRAMUsed(physicalGPUIndex(g.Index, visibleToPhysical))
 		}
 	}
 
-	p, strategy, serverArgs, err := startLaunchWithCUDAOOMRecovery(req, cfg, model, strategy, be, caps, serverArgs, timeout)
+	// Companions are now resident. This is the resource floor every later
+	// promotion/calibration transition must return to before another main-model
+	// process may start.
+	resourceBaseline := captureLaunchResourceBaseline(caps)
+	launchRecovery := newLaunchMemoryRecovery()
+	p, strategy, serverArgs, err := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, strategy, be, caps, serverArgs, timeout, launchRecovery)
 	if err != nil {
 		claudeAuto.stop()
-		fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
-		os.Exit(1)
+		if releaseErr := stopFailedLaunchBeforeAdvisor(p, caps, 30*time.Second); releaseErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", releaseErr)
+			os.Exit(1)
+		}
+		p, strategy, serverArgs, claudeAuto, err = retryStartWithAdvisor(req, cfg, model, be, caps, strategy, err, timeout, launchRecovery)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error starting server: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 	if p.LogBuf != nil {
 		recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
 	}
-	// First-launch calibration: measure alternative placements for this exact
-	// model/hardware/workload scope and switch to the fastest, then never pay
-	// the restart cost again. Runs before the MoE promote-restart so the
-	// promoted strategy is itself the calibrated winner.
-	if len(calibrationPlan(req, cfg, model, be, caps, strategy)) >= 2 {
-		p, strategy, serverArgs = runCalibration(req, cfg, model, be, caps, strategy, serverArgs, timeout, p)
+	// Consume allocation measurements before performance calibration. A plan
+	// with fewer CPU experts is only a new baseline candidate until benchmarked;
+	// promoting it after calibration would replace the measured winner with an
+	// unbenchmarked strategy and could undo a faster KV alternate.
+	if p.LogBuf != nil {
+		if retainProvenSafeAfterRecovery(req, launchRecovery) {
+			fmt.Printf("[launch] retaining the first proven-safe placement after %d rejected memory configuration(s); measurements will seed the next launch\n", launchRecovery.rejectionCount())
+		} else if nextStrategy, nextArgs, ok := maybePromoteMeasuredPlacement(req, cfg, be, caps, model, strategy, serverArgs, launchRecovery); ok {
+			fmt.Printf("[launch] allocation measurement fits more GPU experts (%d CPU MoE -> %d); establishing the calibrated baseline\n", strategy.NCPUMoE, nextStrategy.NCPUMoE)
+			oldStrategy, oldArgs := strategy, append([]string(nil), serverArgs...)
+			if !stopCalibrationProcessAndWait(p, "measured baseline promotion", resourceBaseline, 30*time.Second) {
+				claudeAuto.stop()
+				fmt.Fprintln(os.Stderr, "Error: current server/resources did not release before measured baseline promotion")
+				os.Exit(1)
+			}
+			fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
+			promotedP, promotedStrategy, promotedArgs, promoteErr := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout, launchRecovery)
+			if promoteErr != nil {
+				if !stopCalibrationProcessAndWait(promotedP, "failed measured baseline", resourceBaseline, 30*time.Second) {
+					claudeAuto.stop()
+					fmt.Fprintln(os.Stderr, "Error: failed measured baseline did not release resources; refusing an overlapping restore")
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "[launch] measured baseline failed (%v); restoring the previously loaded placement\n", promoteErr)
+				p, strategy, serverArgs, err = startLaunchWithCUDAOOMRecoveryState(req, cfg, model, oldStrategy, be, caps, oldArgs, timeout, launchRecovery)
+				if err != nil {
+					claudeAuto.stop()
+					fmt.Fprintf(os.Stderr, "Error restoring previous loaded placement: %v\n", err)
+					os.Exit(1)
+				}
+			} else {
+				p, strategy, serverArgs = promotedP, promotedStrategy, promotedArgs
+			}
+			fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
+			if p.LogBuf != nil {
+				recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
+			}
+		}
+	}
+	// First-launch calibration now measures alternatives against the final
+	// allocation-informed baseline. Its returned decision remains provisional
+	// until the winner passes lifecycle and cache verification below.
+	var pendingCalibration *placement.CalibrationDecision
+	if !retainProvenSafeAfterRecovery(req, launchRecovery) && len(calibrationPlan(req, cfg, model, be, caps, strategy)) >= 2 {
+		p, strategy, serverArgs, pendingCalibration = runCalibration(req, cfg, model, be, caps, strategy, serverArgs, timeout, p, launchRecovery, resourceBaseline)
 		if p == nil {
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error: calibration left no running server\n")
@@ -2809,56 +4310,69 @@ func cmdLaunch(args []string) {
 		}
 		fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 	}
-	if p.LogBuf != nil {
-		if nextStrategy, nextArgs, ok := maybePromoteMeasuredPlacement(req, cfg, be, caps, model, strategy, serverArgs); ok {
-			fmt.Printf("[launch] calibration: measured placement fits more GPU experts (%d CPU MoE -> %d); restarting once\n", strategy.NCPUMoE, nextStrategy.NCPUMoE)
-			_ = p.Stop()
-			fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
-			p, nextStrategy, nextArgs, err = startLaunchWithCUDAOOMRecovery(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout)
-			if err != nil {
-				claudeAuto.stop()
-				fmt.Fprintf(os.Stderr, "Error starting promoted server: %v\n", err)
-				os.Exit(1)
-			}
-			strategy = nextStrategy
-			serverArgs = nextArgs
-			fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
-			if p.LogBuf != nil {
-				go recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
-			}
-		}
-	}
-	// A benchmarked Claude profile measures the exact Claude placement policy
-	// (reviewer reservation, slots, batch, sampling) without opening the
-	// interactive Claude client. This keeps calibration runs unattended and
-	// guarantees the measured server is stopped when the one-shot probe ends.
-	if req.Benchmark {
-		runOneShotBenchmark(req.Port, filepath.Base(req.ModelPath))
-		if err := p.Stop(); err != nil {
-			fmt.Fprintf(os.Stderr, "[launch] stop after benchmark: %v\n", err)
-		}
-		claudeAuto.stop()
-		return
-	}
-	claudeClientPort := req.Port
-	if claudeAuto != nil {
+	// A Claude profile is not verified by llama's OpenAI endpoint alone. Bring
+	// up the actual Anthropic gateway first, including admission and chat-role
+	// delimiter transforms, so lifecycle activation can canary /v1/messages.
+	claudeRouterURL := ""
+	if req.ClaudeCode && claudeAuto != nil {
 		if err := claudeAuto.startRouter(cfg, req.Host, req.Port, hasArg(serverArgs, "--mmproj"), claudeMainMaxActive(req, strategy), serverArgs); err != nil {
 			_ = p.Stop()
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error starting Claude Auto router: %v\n", err)
 			os.Exit(1)
 		}
-		// Read the backend's own rendered chat template and hand the role
-		// markers to the router. llama.cpp places context checkpoints at
-		// user-message boundaries it can find, and it finds them by matching
-		// these delimiters; a fork whose template its autoparser does not cover
-		// otherwise ships none.
 		if p.LogBuf != nil {
 			if delims := claudeauto.ParseChatMessageDelimiters(p.LogBuf.String()); len(delims) > 0 {
 				claudeAuto.setMessageDelimiters(delims)
 				fmt.Printf("[claude-code] chat delimiters read from the backend: %s\n", formatMessageDelimiters(delims))
 			}
 		}
+		if claudeAuto.router != nil {
+			claudeRouterURL = claudeAuto.router.URL()
+		}
+	}
+	if err := verifyAndActivateLaunch(req, cfg, model, be, runtimeCaps, strategy, serverArgs, claudeRouterURL); err != nil {
+		_ = p.Stop()
+		claudeAuto.stop()
+		fmt.Fprintf(os.Stderr, "Error verifying server profile: %v\n", err)
+		os.Exit(1)
+	}
+	if pendingCalibration != nil {
+		scope := launchProfileScope(req, model, be, runtimeCaps)
+		active := controller.Store{CacheDir: cfg.CacheDir}.IsActive(scope, controller.HashArgs(serverArgs))
+		if !active {
+			fmt.Fprintf(os.Stderr, "[calibrate] provisional winner was not promoted to an active profile; decision not cached\n")
+		} else if path, saveErr := placement.SaveCalibrationDecision(cfg.CacheDir, *pendingCalibration); saveErr != nil {
+			fmt.Fprintf(os.Stderr, "[calibrate] active winner verified but decision cache failed: %v\n", saveErr)
+		} else {
+			fmt.Printf("[calibrate] active winner %s verified and cached %s\n", pendingCalibration.Winner, path)
+		}
+	}
+	// A benchmarked Claude profile measures the exact Claude placement policy
+	// (reviewer reservation, slots, batch, sampling) without opening the
+	// interactive Claude client. This keeps calibration runs unattended and
+	// guarantees the measured server is stopped when the one-shot probe ends.
+	if req.Benchmark || req.WorkerBenchmark {
+		var benchmarkErr error
+		if req.WorkerBenchmark {
+			usedVRAMMB := measuredLaunchVRAMMB(runtimeCaps, visibleToPhysical, baselineVRAM)
+			benchmarkErr = runOneShotWorkerBenchmark(req.Port, filepath.Base(req.ModelPath), usedVRAMMB)
+		} else {
+			benchmarkErr = runOneShotBenchmark(req.Port, filepath.Base(req.ModelPath))
+		}
+		stopErr := p.Stop()
+		if stopErr != nil {
+			fmt.Fprintf(os.Stderr, "[launch] stop after benchmark: %v\n", stopErr)
+		}
+		claudeAuto.stop()
+		if benchmarkErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", benchmarkErr)
+			os.Exit(1)
+		}
+		return
+	}
+	claudeClientPort := req.Port
+	if claudeAuto != nil {
 		claudeClientPort = claudeAuto.clientPort(req.Port)
 	}
 	if req.ClaudeCode {
@@ -2988,18 +4502,30 @@ func cmdLaunch(args []string) {
 		cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 		prior := placement.RuntimeGraphGrowthByGPU(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel)
 		device, allocMB, estimated, ok := runtimeLogCUDAOOM(logData, caps, model, prior)
-		if !ok || runtimeOOMRetries >= maxRuntimeOOMRetries {
+		if !ok {
 			claudeAuto.stop()
-			if ok {
-				fmt.Fprintf(os.Stderr, "[launch] server crashed (CUDA OOM on device %d, %d MiB) after %d recovery attempt(s) — giving up. Try again; the deficit already recorded should reduce it next time.\n", device, allocMB, runtimeOOMRetries)
-			} else {
-				fmt.Fprintln(os.Stderr, "[launch] server exited unexpectedly (not a recognized CUDA OOM) — see the log for details.")
-			}
+			fmt.Fprintln(os.Stderr, "[launch] server exited unexpectedly (not a recognized CUDA OOM) — see the log for details.")
+			os.Exit(1)
+		}
+
+		reason := fmt.Sprintf("CUDA OOM on device %d after health verification", device)
+		if err := invalidateRuntimeOOMLaunch(req, cfg, model, be, runtimeCaps, strategy, serverArgs, reason); err != nil {
+			claudeAuto.stop()
+			fmt.Fprintf(os.Stderr, "[launch] cannot invalidate runtime-failed profile: %v\n", err)
+			os.Exit(1)
+		}
+		if err := placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, allocMB, estimated); err != nil {
+			claudeAuto.stop()
+			fmt.Fprintf(os.Stderr, "[launch] cannot persist runtime OOM evidence: %v\n", err)
+			os.Exit(1)
+		}
+		if runtimeOOMRetries >= maxRuntimeOOMRetries {
+			claudeAuto.stop()
+			fmt.Fprintf(os.Stderr, "[launch] server crashed (CUDA OOM on device %d, %d MiB) after %d recovery attempt(s) — giving up. The failed profile and placement cache were revoked; the recorded deficit will drive the next launch.\n", device, allocMB, runtimeOOMRetries)
 			os.Exit(1)
 		}
 
 		runtimeOOMRetries++
-		_ = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, device, allocMB, estimated)
 		if estimated {
 			fmt.Fprintf(os.Stderr, "[launch] server crashed after health check: CUDA VMM OOM on device %d omitted its allocation size — reserving %d MiB, re-planning and relaunching (attempt %d/%d)...\n",
 				device, allocMB, runtimeOOMRetries, maxRuntimeOOMRetries)
@@ -3024,10 +4550,19 @@ func cmdLaunch(args []string) {
 		claudeCodeSlotAdjust(nextStrategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 		nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, nextStrategy)
 		fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
-		newP, newStrategy, newArgs, err := startLaunchWithCUDAOOMRecovery(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout)
+		newP, newStrategy, newArgs, err := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout, launchRecovery)
 		if err != nil {
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "[launch] relaunch after runtime OOM failed: %v\n", err)
+			os.Exit(1)
+		}
+		if newP.LogBuf != nil {
+			recordMeasuredLaunchProbes(req, cfg, model, newStrategy, be, runtimeCaps, newP.LogBuf.String(), baselineVRAM, serverProcessPID(newP))
+		}
+		if err := verifyAndActivateLaunch(req, cfg, model, be, runtimeCaps, newStrategy, newArgs, claudeRouterURL); err != nil {
+			_ = newP.Stop()
+			claudeAuto.stop()
+			fmt.Fprintf(os.Stderr, "[launch] recovered placement failed lifecycle verification: %v\n", err)
 			os.Exit(1)
 		}
 		p, strategy, serverArgs = newP, newStrategy, newArgs
@@ -3050,6 +4585,25 @@ func cmdLaunch(args []string) {
 		p.Kill()
 	}
 	claudeAuto.stop()
+}
+
+func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *placement.ModelProfile,
+	be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, serverArgs []string, reason string,
+) error {
+	if req == nil || cfg == nil || model == nil || be == nil || strategy == nil {
+		return errors.New("incomplete runtime OOM profile")
+	}
+	scope := launchProfileScope(req, model, be, caps)
+	store := controller.Store{CacheDir: cfg.CacheDir}
+	if _, err := store.RejectActiveIfMatch(scope, controller.HashArgs(serverArgs), reason, "runtime-oom"); err != nil {
+		return fmt.Errorf("revoke active profile: %w", err)
+	}
+	if path := strings.TrimSpace(strategy.PlacementCachePath); path != "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale placement cache: %w", err)
+		}
+	}
+	return nil
 }
 
 // waitForShutdownOrCrash blocks until either a shutdown signal arrives
@@ -3440,13 +4994,17 @@ func cmdKVProbe(args []string) {
 		fmt.Fprintf(os.Stderr, "Error parsing model: %v\n", err)
 		os.Exit(1)
 	}
-	be := selectBackend(caps, req)
+	be := resolveLaunchBackend(req, model, caps)
 	binPath := "llama-server"
 	if be != nil {
 		binPath = be.Path
+	} else if req.BackendExplicit {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
+		os.Exit(1)
 	} else {
 		be = &backendInfo{Path: binPath, Tag: "llama"}
 	}
+	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
@@ -3482,45 +5040,71 @@ func tuiLaunchArgs(req *tui.LaunchRequest, cfg *config.Config) []string {
 
 func cmdGUI() {
 	go recommend.MaybeRefresh() // refresh catalog in the background; TUI uses cache-or-embedded
-	req, err := tui.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-	if req == nil {
-		return
-	}
-	if req.Update {
-		cmdUpdate()
-		return
-	}
-	if len(req.BackendArgs) > 0 {
-		cmdBackend(req.BackendArgs)
-		return
-	}
-
-	cfg := loadConfigOrExit()
-
-	if req.DownloadRepo != "" {
-		caps, err := detect.Detect()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
-			os.Exit(1)
+	var pendingReview *tui.LaunchRequest
+	for {
+		var (
+			req *tui.LaunchRequest
+			err error
+		)
+		if pendingReview != nil {
+			req, err = tui.RunAfterBackendInstall(pendingReview)
+			pendingReview = nil
+		} else {
+			req, err = tui.Run()
 		}
-		d := download.New(cfg.ModelDir, cfg.CacheDir, cfg.AppHome)
-		if err := d.RunQuant(req.DownloadRepo, req.DownloadQuant, caps); err != nil {
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		return
-	}
+		if req == nil {
+			return
+		}
+		if req.Update {
+			cmdUpdate(nil)
+			return
+		}
+		if len(req.BackendArgs) > 0 {
+			cmdBackend(req.BackendArgs)
+			if req.ModelPath != "" {
+				// A model-aware install carries the current launch settings. Once
+				// the recipe registers its architecture route, return to a review
+				// screen with that route selected instead of making the user find
+				// and configure the model again.
+				copyReq := *req
+				copyReq.BackendArgs = nil
+				pendingReview = &copyReq
+				continue
+			}
+			return
+		}
 
-	launchArgs := tuiLaunchArgs(req, cfg)
-	if req.AITune {
-		cmdTune(launchArgs)
+		cfg := loadConfigOrExit()
+
+		if req.DownloadRepo != "" {
+			caps, err := detect.Detect()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
+				os.Exit(1)
+			}
+			d := download.New(cfg.ModelDir, cfg.CacheDir, cfg.AppHome)
+			if err := d.RunQuant(req.DownloadRepo, req.DownloadQuant, caps); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		launchArgs := tuiLaunchArgs(req, cfg)
+		if err := tui.SaveLatestLaunch(cfg.CacheDir, req); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not save latest TUI launch configuration: %v\n", err)
+		}
+		if req.AITune {
+			cmdTune(launchArgs)
+			return
+		}
+		cmdLaunch(launchArgs)
 		return
 	}
-	cmdLaunch(launchArgs)
 }
 
 func cmdDryRun(args []string) {
@@ -3552,9 +5136,14 @@ func cmdDryRun(args []string) {
 
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
 		os.Exit(1)
 	}
+	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
+	// Match cmdLaunch exactly: Claude Auto's helper consumes VRAM before the
+	// main model is packed. Without this reservation a dry-run can claim one
+	// additional expert layer fits and disagree with the real launch.
+	req.ReviewerReservation = claudeReviewerReservation(req, caps, cfg.CacheDir)
 
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
 	if err != nil {
@@ -3562,6 +5151,11 @@ func cmdDryRun(args []string) {
 		os.Exit(1)
 	}
 	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+
+	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
+		printVRAMLedger(strategy)
+		fmt.Printf("[trace] NCPUMoE=%d OT=%s\n", strategy.NCPUMoE, strategy.OTString)
+	}
 
 	serverArgs := buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
 	envPrefix := applyGPUVisibility(req, backendDialect(be))
@@ -3606,136 +5200,6 @@ func cmdDryRun(args []string) {
 	if req.ClaudeCode {
 		fmt.Println("[claude-code] A real launch also starts the local Auto reviewer/router and then opens Claude Code.")
 	}
-}
-
-func cmdRecordLongContextValidation(args []string) {
-	promptTokens, gpuUsed, launchArgs, err := parseLongContextValidationArgs(args)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(2)
-	}
-	if promptTokens <= 0 {
-		fmt.Fprintln(os.Stderr, "Usage: ggrun record-longctx-validation <model.gguf> --prompt-tokens N [launch flags]")
-		os.Exit(2)
-	}
-	req, err := parseLaunchArgs(launchArgs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(2)
-	}
-	if req.ModelPath == "" {
-		fmt.Fprintln(os.Stderr, "Usage: ggrun record-longctx-validation <model.gguf> --prompt-tokens N [launch flags]")
-		os.Exit(2)
-	}
-	caps, err := detect.Detect()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
-		os.Exit(1)
-	}
-	cfg := loadConfigOrExit()
-	req.ModelPath = resolveModelPath(req.ModelPath, cfg.ModelDir)
-	model, err := parseModel(req.ModelPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing model: %v\n", err)
-		os.Exit(1)
-	}
-	be := resolveLaunchBackend(req, model, caps)
-	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
-		os.Exit(1)
-	}
-	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
-		os.Exit(1)
-	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
-	if len(gpuUsed) == 0 {
-		gpuUsed = map[int]int{}
-		for _, g := range caps.GPUs {
-			if used := placement.QueryVRAMUsed(g.Index); used > 0 {
-				gpuUsed[g.Index] = used
-			}
-		}
-	}
-	cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
-	if err := placement.RecordLongContextValidation(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel, promptTokens, gpuUsed); err != nil {
-		fmt.Fprintf(os.Stderr, "Error recording validation: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("[validation] recorded long-context placement validation: tokens=%d ctx=%d ubatch=%d parallel=%d\n", promptTokens, strategy.ContextSize, strategy.UBatchSize, strategy.Parallel)
-}
-
-func parseLongContextValidationArgs(args []string) (int, map[int]int, []string, error) {
-	promptTokens := 0
-	gpuUsed := map[int]int{}
-	launchArgs := make([]string, 0, len(args))
-	for i := 0; i < len(args); i++ {
-		a := args[i]
-		if a == "--prompt-tokens" {
-			if i+1 >= len(args) {
-				return 0, nil, nil, fmt.Errorf("--prompt-tokens needs a value")
-			}
-			v, err := strconv.Atoi(args[i+1])
-			if err != nil || v <= 0 {
-				return 0, nil, nil, fmt.Errorf("--prompt-tokens must be positive")
-			}
-			promptTokens = v
-			i++
-			continue
-		}
-		if strings.HasPrefix(a, "--prompt-tokens=") {
-			v, err := strconv.Atoi(strings.TrimPrefix(a, "--prompt-tokens="))
-			if err != nil || v <= 0 {
-				return 0, nil, nil, fmt.Errorf("--prompt-tokens must be positive")
-			}
-			promptTokens = v
-			continue
-		}
-		if a == "--gpu-used" {
-			if i+1 >= len(args) {
-				return 0, nil, nil, fmt.Errorf("--gpu-used needs a value")
-			}
-			parsed, err := parseGPUUsedMB(args[i+1])
-			if err != nil {
-				return 0, nil, nil, err
-			}
-			gpuUsed = parsed
-			i++
-			continue
-		}
-		if strings.HasPrefix(a, "--gpu-used=") {
-			parsed, err := parseGPUUsedMB(strings.TrimPrefix(a, "--gpu-used="))
-			if err != nil {
-				return 0, nil, nil, err
-			}
-			gpuUsed = parsed
-			continue
-		}
-		launchArgs = append(launchArgs, a)
-	}
-	return promptTokens, gpuUsed, launchArgs, nil
-}
-
-func parseGPUUsedMB(value string) (map[int]int, error) {
-	out := map[int]int{}
-	for _, part := range strings.Split(value, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		fields := strings.SplitN(part, ":", 2)
-		if len(fields) != 2 {
-			return nil, fmt.Errorf("--gpu-used entries must be CUDA_INDEX:USED_MB")
-		}
-		idx, idxErr := strconv.Atoi(strings.TrimSpace(fields[0]))
-		used, usedErr := strconv.Atoi(strings.TrimSpace(fields[1]))
-		if idxErr != nil || usedErr != nil || idx < 0 || used <= 0 {
-			return nil, fmt.Errorf("--gpu-used entries must be CUDA_INDEX:USED_MB")
-		}
-		out[idx] = used
-	}
-	return out, nil
 }
 
 // launchPlanEnvironment exports the process settings that ggrun's real server
@@ -3790,16 +5254,16 @@ func printClaudeCodeRecipe(host string, port int, serverArgs []string) {
 		}
 		slot = fmt.Sprintf(" (~%dk per slot at --parallel %d)", ctx/par/1000, par)
 	}
-	// Every inference tier maps to local so foreground and background model work
-	// stays on this server rather than leaking to api.anthropic.com.
+	// Foreground tiers use the main alias; Claude's cheap tier uses the router's
+	// local-fast label so it reaches the verified worker without leaving ggrun.
 	fmt.Println()
 	fmt.Println("[claude-code] In another terminal:")
 	// Match claudeCodeEnv: drop any real key so the dummy token + local base URL win,
 	// otherwise Claude Code prefers the real key and routes to api.anthropic.com.
 	fmt.Println("  unset ANTHROPIC_API_KEY")
 	fmt.Printf("  export ANTHROPIC_BASE_URL=http://%s:%d ANTHROPIC_AUTH_TOKEN=ggrun\n", clientHost, port)
-	fmt.Println("  export ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local")
-	fmt.Println("  export ANTHROPIC_DEFAULT_HAIKU_MODEL=local ANTHROPIC_DEFAULT_SONNET_MODEL=local ANTHROPIC_DEFAULT_OPUS_MODEL=local")
+	fmt.Printf("  export ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=%s\n", claudeauto.UtilityAlias)
+	fmt.Printf("  export ANTHROPIC_DEFAULT_HAIKU_MODEL=%s ANTHROPIC_DEFAULT_SONNET_MODEL=local ANTHROPIC_DEFAULT_OPUS_MODEL=local\n", claudeauto.UtilityAlias)
 	fmt.Printf("  export CLAUDE_CODE_EFFORT_LEVEL=%s  # xhigh is the agentic default; set max for one demanding session\n", envOr("CLAUDE_CODE_EFFORT_LEVEL", "xhigh"))
 	fmt.Printf("  export API_TIMEOUT_MS=%d  # maximum safe timer: no practical local-inference deadline\n", claudeNoTimeoutMS)
 	fmt.Printf("  export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d  # background agents may be quiet during local prefill\n", claudeNoTimeoutMS)
@@ -3821,9 +5285,9 @@ func printClaudeCodeRecipe(host string, port int, serverArgs []string) {
 }
 
 // claudeCodeEnv returns the child environment that points Claude Code at the
-// locally-served model. Every inference tier maps to "local" so background work
-// stays on the local server; ANTHROPIC_API_KEY is dropped so the dummy auth token
-// + base URL take effect.
+// locally-served models. Foreground tiers map to "local" and the cheap tier to
+// local-fast; ANTHROPIC_API_KEY is dropped so the dummy auth token + base URL
+// take effect.
 func claudeCodeEnv(host string, port int, serverArgs []string) []string {
 	clientHost := host
 	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
@@ -4471,11 +5935,12 @@ func cmdTune(args []string) {
 	}
 	warnModelCompatibility(model)
 
-	be := selectBackend(caps, req)
+	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
 		os.Exit(1)
 	}
+	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
 		fmt.Printf("[tune] GPU restriction: %s\n", env)
 	}
@@ -4514,6 +5979,7 @@ func cmdTune(args []string) {
 
 	serverArgs := append([]string{be.Path}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, req.ExtraArgs...)
+	serverArgs = applyRequestDisabledBackendFlags(serverArgs, req)
 	if memMax := backendMemoryMaxMB(req, caps); memMax > 0 {
 		fmt.Printf("[tune] backend memory scope: MemoryMax=%d MiB\n", memMax)
 	}
@@ -4588,21 +6054,62 @@ func cmdBenchmark(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: --port %v\n", err)
 		os.Exit(2)
 	}
-	runOneShotBenchmark(*port, *model)
+	if err := runOneShotBenchmark(*port, *model); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
 }
 
-func runOneShotBenchmark(port int, model string) {
+func runOneShotBenchmark(port int, model string) error {
 	runner := &benchmark.Runner{
 		BaseURL: fmt.Sprintf("http://localhost:%d", port),
 		Model:   model,
 	}
 	res, err := runner.Run()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	data, _ := json.MarshalIndent(res, "", "  ")
 	fmt.Println(string(data))
+	return nil
+}
+
+func runOneShotWorkerBenchmark(port int, model string, peakVRAMMB int) error {
+	runner := &benchmark.Runner{
+		BaseURL: fmt.Sprintf("http://localhost:%d", port),
+		Model:   model,
+	}
+	throughput, err := runner.Run()
+	if err != nil {
+		return fmt.Errorf("throughput benchmark: %w", err)
+	}
+	throughput.PeakVRAMMB = peakVRAMMB
+	worker, err := runner.RunWorkerSuite()
+	if err != nil {
+		return fmt.Errorf("worker benchmark: %w", err)
+	}
+	report := struct {
+		Throughput *benchmark.Result            `json:"throughput"`
+		Worker     *benchmark.WorkerSuiteResult `json:"worker"`
+	}{Throughput: throughput, Worker: worker}
+	data, _ := json.MarshalIndent(report, "", "  ")
+	fmt.Println(string(data))
+	return nil
+}
+
+func measuredLaunchVRAMMB(caps *detect.Capabilities, visibleToPhysical map[int]int, baseline map[int]int) int {
+	if caps == nil {
+		return 0
+	}
+	total := 0
+	for _, gpu := range caps.GPUs {
+		physical := physicalGPUIndex(gpu.Index, visibleToPhysical)
+		used := placement.QueryVRAMUsed(physical) - baseline[gpu.Index]
+		if used > 0 {
+			total += used
+		}
+	}
+	return total
 }
 
 // computeServerArgs runs hardware detection + placement for a model and
@@ -4625,14 +6132,26 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 	// Find the backend FIRST so its tag feeds placement — otherwise the
 	// split-mode/flag selection can't tell ik_llama from mainline and emits
 	// flags the backend rejects (e.g. `--split-mode row`, unsupported by ik).
-	be := selectBackend(caps, &launchRequest{ServerBin: cfg.LlamaServer, Backend: cfg.Backend})
-	if be == nil {
-		return nil, fmt.Errorf("no llama-server binary found. Install one with: ggrun backend install <recipe>  (see: ggrun backend recipes)")
+	backendReq := &launchRequest{
+		ServerBin:       cfg.LlamaServer,
+		AppHome:         cfg.AppHome,
+		Backend:         cfg.Backend,
+		BackendExplicit: configuredBackendExplicit(cfg.Backend),
 	}
+	if cfg.SWAFull {
+		backendReq.ExtraArgs = append(backendReq.ExtraArgs, "--swa-full")
+	}
+	be := selectBackendForModel(caps, backendReq, model)
+	if be == nil {
+		return nil, errors.New(backendUnavailableMessage(backendReq))
+	}
+	applyBackendFeatureCompatibility(backendReq, model, be)
+	applyCachedBackendCapabilities(backendReq, cfg.CacheDir, model, be)
 	opts := placement.Options{
 		ContextSize:     resolveCtxFlag(cfg.CtxValue(), model.CTXTrain),
 		KVPlacement:     cfg.KVPlacement,
 		KVQuality:       cfg.KVQuality,
+		SWAFull:         hasArg(backendReq.ExtraArgs, "--swa-full"),
 		RamBudgetMB:     parseBudgetMB(cfg.RamBudget),
 		RAMLimitPercent: cfg.RAMLimitPercent,
 		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
@@ -4642,6 +6161,7 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 		BackendTag:      backendDialect(be),
 		BackendCacheTag: evidenceBackendCacheTag(be),
 		BackendIdentity: be.Identity,
+		BackendHelp:     be.Help,
 		VisionAuto:      cfg.Vision,
 		SpecMode:        cfg.Spec,
 	}
@@ -4650,7 +6170,11 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 		return nil, fmt.Errorf("compute placement: %w", err)
 	}
 	strategy.BackendTag = backendDialect(be)
-	return append([]string{be.Path}, strategy.Args(modelPath, port)...), nil
+	serverArgs := append([]string{be.Path}, strategy.Args(modelPath, port)...)
+	if hasArg(backendReq.ExtraArgs, "--swa-full") {
+		serverArgs = append(serverArgs, "--swa-full")
+	}
+	return serverArgs, nil
 }
 
 func cmdDaemon(args []string) {
@@ -4784,7 +6308,18 @@ func cmdConfig(args []string) {
 	}
 }
 
-func cmdUpdate() {
+func cmdUpdate(args []string) {
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help", "help":
+			printUpdateScope()
+			return
+		default:
+			fmt.Fprintf(os.Stderr, "unknown update option %q\n", arg)
+			fmt.Fprintln(os.Stderr, "Usage: ggrun update [--help]")
+			os.Exit(2)
+		}
+	}
 	// Self-update ggrun
 	if err := update.SelfUpdate(); err != nil {
 		fmt.Fprintf(os.Stderr, "Self-update: %v\n", err)
@@ -4792,8 +6327,8 @@ func cmdUpdate() {
 	if runtime.GOOS == "windows" {
 		fmt.Println("Backend updates are handled by the native Windows release bundle.")
 	} else {
-		// Update source-built backends
-		if err := update.UpdateBackends(); err != nil {
+		// Update every active generic backend plus every registered fork.
+		if err := updateAllBackends(); err != nil {
 			fmt.Fprintf(os.Stderr, "Backend update: %v\n", err)
 		}
 	}
@@ -4812,21 +6347,75 @@ func cmdUpdate() {
 	}
 }
 
+func printUpdateScope() {
+	appHome := backends.AppHome()
+	fmt.Println("Usage: ggrun update")
+	fmt.Printf("\nCanonical app home: %s\n", appHome)
+	fmt.Println("\nActive generic backend builds:")
+	targets := update.BackendBuildTargetsAt(appHome)
+	if len(targets) == 0 {
+		fmt.Println("  (none found)")
+	}
+	for _, target := range targets {
+		fmt.Printf("  %-28s %s\n", target.Label, target.BuildDir)
+	}
+	fmt.Println("\nRegistered fork backends:")
+	forks := backends.Load()
+	sort.Slice(forks, func(i, j int) bool { return strings.ToLower(forks[i].Tag) < strings.ToLower(forks[j].Tag) })
+	if len(forks) == 0 {
+		fmt.Println("  (none registered)")
+	}
+	for _, fork := range forks {
+		fmt.Printf("  %-28s %s\n", fork.Tag, fork.Path)
+	}
+	fmt.Println("\nEach build is rebuilt independently. A failed build keeps the previous working binary, and remaining backends continue.")
+}
+
+func updateAllBackends() error {
+	var updateErrs []error
+	if err := update.UpdateBackendsAtAppHome(backends.AppHome()); err != nil {
+		updateErrs = append(updateErrs, err)
+	}
+
+	forks := backends.Load()
+	sort.Slice(forks, func(i, j int) bool { return strings.ToLower(forks[i].Tag) < strings.ToLower(forks[j].Tag) })
+	if len(forks) == 0 {
+		fmt.Println("\nNo registered fork backends found.")
+		return errors.Join(updateErrs...)
+	}
+	fmt.Println("\nRegistered fork update summary:")
+	updateErrs = append(updateErrs, updateRegisteredBackendList(forks, updateRegisteredBackend)...)
+	return errors.Join(updateErrs...)
+}
+
+func updateRegisteredBackendList(forks []backends.Backend, updater func(string) error) []error {
+	var updateErrs []error
+	for _, fork := range forks {
+		if err := updater(fork.Tag); err != nil {
+			fmt.Printf("  %-28s failed (kept previous build): %v\n", fork.Tag, err)
+			updateErrs = append(updateErrs, fmt.Errorf("%s: %w", fork.Tag, err))
+			continue
+		}
+		fmt.Printf("  %-28s checked\n", fork.Tag)
+	}
+	return updateErrs
+}
+
 // isIKOnlyArch reports whether a model architecture can only be loaded by
 // ik_llama.cpp; mainline llama.cpp rejects these with "unknown model architecture".
 func isIKOnlyArch(arch string) bool {
-	a := strings.ToLower(strings.TrimSpace(arch))
-	return strings.HasPrefix(a, "minimax-m") // minimax-m2, minimax-m3, ...
+	return backends.RequiredBackendForArch(arch) == "ik_llama"
 }
 
 // availableIKBinary returns the path of a detected ik_llama.cpp server binary, if any.
-func availableIKBinary(caps *detect.Capabilities) string {
+func availableIKBinary(caps *detect.Capabilities, configuredAppHome ...string) string {
 	seen := map[string]bool{}
-	cands := make([]string, 0, len(caps.Backends)+4)
-	for _, b := range caps.Backends {
-		cands = append(cands, b.Path)
+	cands := append([]string(nil), backendSearchPaths(configuredAppHome...)...)
+	if caps != nil {
+		for _, b := range caps.Backends {
+			cands = append(cands, b.Path)
+		}
 	}
-	cands = append(cands, backendSearchPaths()...)
 	for _, p := range cands {
 		if p == "" || seen[p] {
 			continue
@@ -4845,12 +6434,12 @@ func availableIKBinary(caps *detect.Capabilities) string {
 // preflightBackendArch fails fast with an actionable message when the model needs
 // ik_llama.cpp but the resolved backend is mainline llama.cpp, instead of letting
 // the backend die later with a cryptic "unknown model architecture" load error.
-func preflightBackendArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) {
+func preflightBackendArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, configuredAppHome ...string) {
 	if model == nil || be == nil {
 		return
 	}
 	if !be.IsIK && isIKOnlyArch(model.ModelArch) {
-		preflightIKOnlyArch(model, be, caps)
+		preflightIKOnlyArch(model, be, caps, configuredAppHome...)
 		return
 	}
 	suggestForkForArch(model.ModelArch, be)
@@ -4887,11 +6476,11 @@ func suggestForkForArch(arch string, be *backendInfo) {
 	fmt.Fprintln(os.Stderr, "[launch] continuing anyway; if the model fails to load, install the fork above.")
 }
 
-func preflightIKOnlyArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) {
+func preflightIKOnlyArch(model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, configuredAppHome ...string) {
 	fmt.Fprintf(os.Stderr,
 		"Error: model architecture %q needs the ik_llama.cpp backend, but the selected backend is mainline llama.cpp.\n"+
 			"  backend binary: %s\n", model.ModelArch, be.Path)
-	if ik := availableIKBinary(caps); ik != "" {
+	if ik := availableIKBinary(caps, configuredAppHome...); ik != "" {
 		fmt.Fprintf(os.Stderr,
 			"  fix: set LLAMA_SERVER=%q in your ggrun config (.config/config),\n"+
 				"       or unset LLAMA_SERVER and keep LLM_BACKEND=ik_llama.\n", ik)
@@ -5055,6 +6644,9 @@ func infoToProfile(info *gguf.Info, path string) *placement.ModelProfile {
 // parseModel calls parse_gguf.py to extract real model metadata.
 // For multi-part models, it sums all shard files for total size.
 func parseModel(path string) (*placement.ModelProfile, error) {
+	if _, _, err := modelstore.ResolveGGUFShardFiles(path); err != nil {
+		return nil, fmt.Errorf("model file %q: %w", path, err)
+	}
 	info, err := gguf.Parse(path)
 	if err != nil {
 		return nil, err
@@ -5105,58 +6697,16 @@ func scaleLayerBytes(values []int64, scale float64) {
 
 // totalModelSize returns the total bytes of a model, including all shards.
 func totalModelSize(path string) int64 {
-	dir := filepath.Dir(path)
-	base := filepath.Base(path)
-
-	// Check if this is a shard (e.g., model-00001-of-00003.gguf)
-	if !strings.Contains(base, "-of-") {
-		info, err := os.Stat(path)
-		if err == nil {
-			return info.Size()
-		}
-		return 0
-	}
-
-	// Find the prefix before the shard number
-	// e.g., "model-00001-of-00003.gguf" -> prefix "model-"
-	idx := strings.Index(base, "-000")
-	if idx < 0 {
-		info, err := os.Stat(path)
-		if err == nil {
-			return info.Size()
-		}
-		return 0
-	}
-	prefix := base[:idx]
-	ext := filepath.Ext(base)
-
-	var total int64
-	entries, err := os.ReadDir(dir)
+	files, _, err := modelstore.ResolveGGUFShardFiles(path)
 	if err != nil {
-		info, err := os.Stat(path)
-		if err == nil {
-			return info.Size()
-		}
 		return 0
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ext) && strings.Contains(name, "-of-") {
-			// os.Stat, not entry.Info(): shards may be symlinks (models dir
-			// symlinked to another disk), and entry.Info() returns the link's
-			// own ~73-byte size. That once shrank a 146GB model to 365 bytes,
-			// and the parseModel drift-rescale then crushed ExpertBytes with
-			// it — placement pinned all 43 expert layers onto one GPU.
-			fi, err := os.Stat(filepath.Join(dir, name))
-			if err == nil {
-				total += fi.Size()
-			}
-		}
-	}
-	if total == 0 {
-		info, err := os.Stat(path)
-		if err == nil {
-			return info.Size()
+	var total int64
+	for _, file := range files {
+		// os.Stat follows file symlinks. Summing lstat sizes once shrank a
+		// 146GB sharded model to a few hundred bytes and invalidated placement.
+		if info, statErr := os.Stat(file); statErr == nil {
+			total += info.Size()
 		}
 	}
 	return total
@@ -5190,14 +6740,16 @@ func resolveCtxFlag(s string, nativeCtx int) int {
 	return 0
 }
 
-func findBackend(caps *detect.Capabilities) *backendInfo {
+func findBackend(caps *detect.Capabilities, configuredAppHome ...string) *backendInfo {
 	// Try detected backends first
-	for _, b := range caps.Backends {
-		if b.Name == "llama-server" || b.Name == "ik_llama" || b.Name == "ik_llama-server" {
-			return detectBackend(b.Path)
+	if caps != nil {
+		for _, b := range caps.Backends {
+			if b.Name == "llama-server" || b.Name == "ik_llama" || b.Name == "ik_llama-server" {
+				return detectBackend(b.Path)
+			}
 		}
 	}
-	for _, p := range backendSearchPaths() {
+	for _, p := range backendSearchPaths(configuredAppHome...) {
 		if p != "" {
 			if _, err := os.Stat(p); err == nil {
 				return detectBackend(p)
@@ -5207,22 +6759,29 @@ func findBackend(caps *detect.Capabilities) *backendInfo {
 	return nil
 }
 
-func backendSearchPaths() []string {
+func backendSearchPaths(configuredAppHome ...string) []string {
 	home := os.Getenv("HOME")
 	if home == "" {
 		home, _ = os.UserHomeDir()
 	}
-	appHome := os.Getenv("LLM_APP_HOME")
-	if appHome == "" {
-		if exe, err := os.Executable(); err == nil {
-			exeDir := filepath.Dir(exe)
-			switch filepath.Base(exeDir) {
-			case ".bin", "bin":
-				appHome = filepath.Dir(exeDir)
-			}
+	appHome := ""
+	explicitAppHome := false
+	for _, candidate := range configuredAppHome {
+		if candidate = strings.TrimSpace(candidate); candidate != "" {
+			appHome = candidate
+			explicitAppHome = true
+			break
 		}
 	}
-	return []string{
+	if appHome == "" {
+		// backends.AppHome already handles LLM_APP_HOME, validated executable
+		// ancestry, the recorded app-home pointer, and bounded discovery. Using
+		// that shared resolver prevents ~/.local/bin/ggrun from incorrectly
+		// treating ~/.local as the state tree while the configured install lives
+		// elsewhere.
+		appHome = backends.AppHome()
+	}
+	paths := []string{
 		os.Getenv("LLAMA_SERVER"),
 		filepath.Join(appHome, ".bin", "llama-server-cuda"),
 		filepath.Join(appHome, ".bin", "llama-server-cuda.exe"),
@@ -5242,6 +6801,15 @@ func backendSearchPaths() []string {
 		filepath.Join(appHome, ".src", "llama.cpp", "build-vulkan", "bin", "llama-server.exe"),
 		filepath.Join(appHome, ".src", "llama.cpp", "build", "bin", "llama-server"),
 		filepath.Join(appHome, ".src", "llama.cpp", "build", "bin", "llama-server.exe"),
+	}
+	// A configured APP_HOME is an explicit installation boundary. Global
+	// detection still runs after these paths in selectBackend/findBackend, but
+	// ad-hoc source trees under $HOME must not jump ahead of that detection or
+	// override the selected production tree.
+	if explicitAppHome {
+		return paths
+	}
+	return append(paths,
 		filepath.Join(home, "ik_llama.cpp", "build", "bin", "llama-server"),
 		filepath.Join(home, "ik_llama.cpp", "build", "bin", "llama-server.exe"),
 		filepath.Join(home, "llama.cpp", "build-cuda", "bin", "llama-server"),
@@ -5252,7 +6820,7 @@ func backendSearchPaths() []string {
 		filepath.Join(home, "llama.cpp", "build", "bin", "llama-server.exe"),
 		"/usr/local/bin/llama-server",
 		"/usr/bin/llama-server",
-	}
+	)
 }
 
 // detectBackend runs --help to determine if this is ik_llama.cpp fork.

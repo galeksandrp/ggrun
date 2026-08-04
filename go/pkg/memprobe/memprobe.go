@@ -15,7 +15,10 @@ import (
 	"strings"
 )
 
-const SchemaVersion = 1
+// Version 2 invalidates probes recorded before startup-warning feature
+// rejection. A server that silently disabled a memory-shaping feature could
+// previously be cached as proof of the requested allocation shape.
+const SchemaVersion = 2
 
 type EvidenceLevel string
 
@@ -195,12 +198,36 @@ func Save(cacheDir string, plan Plan) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".memory-probe-*.tmp")
+	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
 		return "", err
+	}
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(path)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return "", err
+	}
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return path, nil
 }
@@ -267,13 +294,22 @@ func GuardEnvironment(library, logPath string, gpuLimitsMB []int, pinnedLimitMB 
 	if strings.TrimSpace(inheritedPreload) != "" {
 		preload += string(os.PathListSeparator) + inheritedPreload
 	}
-	return []string{
+	env := []string{
 		"LD_PRELOAD=" + preload,
 		"GGRUN_MEMGUARD_LOG=" + logPath,
 		"GGRUN_MEMGUARD_GPU_LIMITS_MB=" + strings.Join(limits, ","),
-		"GGRUN_MEMGUARD_PINNED_LIMIT_MB=" + strconv.Itoa(pinnedLimitMB),
-		"GGML_CUDA_NO_PINNED=1",
 	}
+	// In memguard, an explicitly configured zero is a real zero-byte ceiling:
+	// every cudaHostAlloc/cudaHostRegister call is denied. The allocation probe
+	// used to pass 0 intending "no separate pinned cap", so ik_llama allocated
+	// ~106 GiB of resident CPU experts and then failed on its final unavoidable
+	// host registration. Leave the variable absent when no independent cap was
+	// requested; the containing cgroup's MemoryMax still bounds total anonymous
+	// plus pinned host memory, while memguard continues to record the calls.
+	if pinnedLimitMB > 0 {
+		env = append(env, "GGRUN_MEMGUARD_PINNED_LIMIT_MB="+strconv.Itoa(pinnedLimitMB))
+	}
+	return append(env, "GGML_CUDA_NO_PINNED=1")
 }
 
 func regularFile(path string) bool {

@@ -16,8 +16,10 @@ if [[ ! -x "$GO_BIN" ]]; then
 fi
 TMP="$(mktemp -d -t ggrun-tests.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
+: >"$TMP/empty.conf"
 
 # Keep the regression independent of the invoking user's installed config.
+export LLM_CONFIG="$TMP/empty.conf"
 export LLM_APP_HOME="$TMP/app-home"
 export LLM_CACHE_DIR="$TMP/cache"
 export LLM_KV_PLACEMENT=auto

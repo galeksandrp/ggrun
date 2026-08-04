@@ -387,3 +387,34 @@ llama_kv_cache: size = 41472.00 MiB (524288 cells,  36 layers,  1/1 seqs), K (q4
 		t.Errorf("rate poisoned by --swa-full: %.0f B/token, want ~13864", r)
 	}
 }
+
+// Geometry is a legacy model-wide cache. Parallel launches are rejected from
+// it because the backend's meaning of cells/seqs varies across recurrent and
+// compressed-attention implementations. Their complete allocation is recorded
+// by the exact launch-scoped probe instead.
+func TestParseKVGeometryRejectsParallelEvidence(t *testing.T) {
+	single := `llama_kv_cache: size =  1728.00 MiB (131072 cells,  12 layers,  1/1 seqs), K (q4_0)
+llama_kv_cache: size =    40.50 MiB (  1024 cells,  36 layers,  1/1 seqs), K (q4_0)`
+	dual := `llama_kv_cache: size =  3456.00 MiB (131072 cells,  12 layers,  2/2 seqs), K (q4_0)
+llama_kv_cache: size =    81.00 MiB (  1024 cells,  36 layers,  2/2 seqs), K (q4_0)`
+
+	g1, ok1 := ParseKVGeometry(single)
+	_, ok2 := ParseKVGeometry(dual)
+	if !ok1 || ok2 {
+		t.Fatalf("geometry scope check failed: single=%v dual=%v", ok1, ok2)
+	}
+	if g1.BytesPerCellPerLayer != 1152 {
+		t.Errorf("single-seq width = %v, want 1152", g1.BytesPerCellPerLayer)
+	}
+	if g1.FullLayers != 12 || g1.SWALayers != 36 || g1.SWACells != 1024 {
+		t.Errorf("layer split lost: %+v", g1)
+	}
+}
+
+// Older builds printed no seqs field; those were single-sequence.
+func TestParseKVGeometryDefaultsToOneSequenceWithoutTheField(t *testing.T) {
+	g, ok := ParseKVGeometry(`llama_kv_cache: size = 1728.00 MiB (131072 cells,  12 layers)`)
+	if !ok || g.BytesPerCellPerLayer != 1152 {
+		t.Fatalf("legacy line mis-parsed: ok=%v geometry=%+v", ok, g)
+	}
+}

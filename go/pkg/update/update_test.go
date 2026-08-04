@@ -3,7 +3,9 @@ package update
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -46,6 +48,33 @@ func TestCompareVersionsWithSuffix(t *testing.T) {
 	}
 	if compareVersions("v3.1.0", "v3.0.9") <= 0 {
 		t.Fatal("expected v3.1.0 to compare newer than v3.0.9")
+	}
+}
+
+func TestSmokeBackendRequiresServerSurfaceAndConfiguredDevice(t *testing.T) {
+	write := func(name, help, devices string) string {
+		path := filepath.Join(t.TempDir(), name)
+		body := "#!/bin/sh\ncase \"$1\" in\n" +
+			"  --version) echo 'llama-server test' ;;\n" +
+			"  --help) echo '" + help + "' ;;\n" +
+			"  --list-devices) echo 'Available devices:'; echo '" + devices + "' ;;\n" +
+			"  *) exit 1 ;;\nesac\n"
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	good := write("good", "--model --ctx-size --host --port", "CUDA0: test")
+	if err := smokeBackendConfigured(good, []string{"-DGGML_CUDA=ON"}); err != nil {
+		t.Fatalf("valid configured backend rejected: %v", err)
+	}
+	bad := write("bad", "--model --host --port", "CUDA0: test")
+	if err := smokeBackend(bad); err == nil || !strings.Contains(err.Error(), "--ctx-size") {
+		t.Fatalf("incomplete server surface accepted: %v", err)
+	}
+	wrongDevice := write("wrong-device", "--model --ctx-size --host --port", "Vulkan0: test")
+	if err := smokeBackendConfigured(wrongDevice, []string{"-DGGML_CUDA=ON"}); err == nil || !strings.Contains(err.Error(), "cuda") {
+		t.Fatalf("wrong accelerator accepted: %v", err)
 	}
 }
 
@@ -128,6 +157,66 @@ func TestInstalledPathPrefersAppHomeBinary(t *testing.T) {
 	}
 }
 
+func TestSourceRepoFromExecutableResolvesCanonicalSymlink(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "ggrun")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(repo, "ggrun")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "ggrun")
+	if err := os.Symlink(binary, link); err != nil {
+		t.Fatal(err)
+	}
+	if got := sourceRepoFromExecutable(link); got != repo {
+		t.Fatalf("source repo from symlink = %q, want %q", got, repo)
+	}
+}
+
+func TestInstalledPathResolvesPATHSymlink(t *testing.T) {
+	t.Setenv("LLM_APP_HOME", "")
+	dir := t.TempDir()
+	canonical := filepath.Join(t.TempDir(), "ggrun")
+	if err := os.WriteFile(canonical, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(canonical, filepath.Join(dir, "ggrun")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if got := installedLLMServerPath(); got != canonical {
+		t.Fatalf("installed path = %q, want resolved canonical %q", got, canonical)
+	}
+}
+
+func TestSelfUpdateRefusesDirtySourceBeforeNetworkOrBuild(t *testing.T) {
+	repo := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init", "-q")
+	tracked := filepath.Join(repo, "tracked.txt")
+	if err := os.WriteFile(tracked, []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "tracked.txt")
+	run("-c", "user.name=ggrun-test", "-c", "user.email=ggrun@example.invalid", "commit", "-qm", "initial")
+	if err := os.WriteFile(tracked, []byte("two\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_SERVER_REPO", repo)
+	if err := SelfUpdate(); err == nil || !strings.Contains(err.Error(), "tracked changes") {
+		t.Fatalf("dirty self-update error = %v, want tracked-changes refusal", err)
+	}
+}
+
 func TestBackendUpdateCandidatesIncludeAppHomeSource(t *testing.T) {
 	appHome := filepath.Join(t.TempDir(), "ggrun")
 	t.Setenv("LLM_APP_HOME", appHome)
@@ -148,6 +237,84 @@ func TestBackendUpdateCandidatesIncludeAppHomeSource(t *testing.T) {
 		if !found {
 			t.Fatalf("missing backend candidate %s %s in %#v", label, dir, rows)
 		}
+	}
+}
+
+func TestBackendBuildTargetsFollowCanonicalAppHomeLinks(t *testing.T) {
+	appHome := t.TempDir()
+	binDir := filepath.Join(appHome, ".bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makeBuild := func(repoName, variant string) string {
+		repo := filepath.Join(t.TempDir(), repoName)
+		if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		binary := filepath.Join(repo, variant, "bin", "llama-server")
+		if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(binary, []byte("server"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return binary
+	}
+	mainline := makeBuild("llama.cpp", "build-cuda")
+	ik := makeBuild("ik_llama.cpp", "build")
+	if err := os.Symlink(mainline, filepath.Join(binDir, "llama-server-cuda")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ik, filepath.Join(binDir, "ik_llama-server-cuda")); err != nil {
+		t.Fatal(err)
+	}
+	// The generic link resolves to the same ik build and must be deduplicated.
+	if err := os.Symlink(ik, filepath.Join(binDir, "llama-server")); err != nil {
+		t.Fatal(err)
+	}
+
+	targets := BackendBuildTargetsAt(appHome)
+	if len(targets) != 2 {
+		t.Fatalf("canonical targets = %#v, want exactly mainline + ik", targets)
+	}
+	got := map[string]string{}
+	for _, target := range targets {
+		got[target.Label] = target.BuildDir
+	}
+	if got["llama.cpp (cuda)"] != filepath.Dir(filepath.Dir(mainline)) {
+		t.Fatalf("mainline target mismatch: %#v", got)
+	}
+	if got["ik_llama.cpp (cuda)"] != filepath.Dir(filepath.Dir(ik)) {
+		t.Fatalf("ik target mismatch: %#v", got)
+	}
+}
+
+func TestBackendUpdateGroupsContinueAfterIndependentFailure(t *testing.T) {
+	targets := []BackendBuildTarget{
+		{Label: "mainline cuda", RepoDir: "/repo/main", BuildDir: "/repo/main/build-cuda"},
+		{Label: "mainline vulkan", RepoDir: "/repo/main", BuildDir: "/repo/main/build-vulkan"},
+		{Label: "ik", RepoDir: "/repo/ik", BuildDir: "/repo/ik/build"},
+	}
+	var called []string
+	runner := func(repo string, group []BackendBuildTarget, _ int) []BackendUpdateResult {
+		called = append(called, repo)
+		results := make([]BackendUpdateResult, 0, len(group))
+		for _, target := range group {
+			result := BackendUpdateResult{Target: target, Status: "updated"}
+			if repo == "/repo/main" {
+				result.Status = "failed"
+				result.Err = errors.New("compiler failed")
+			}
+			results = append(results, result)
+		}
+		return results
+	}
+	results := updateBackendBuildTargetsWith(targets, 3, runner)
+	if len(called) != 2 || called[0] != "/repo/main" || called[1] != "/repo/ik" {
+		t.Fatalf("repo groups called = %#v, want main then ik", called)
+	}
+	if len(results) != 3 || results[0].Err == nil || results[1].Err == nil || results[2].Err != nil {
+		t.Fatalf("independent results = %#v", results)
 	}
 }
 

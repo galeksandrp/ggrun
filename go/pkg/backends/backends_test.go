@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -55,6 +56,53 @@ func TestMiniMaxM3RecipeIsPinnedAndRouted(t *testing.T) {
 	byTag := RecipeByName("MiniMax-M3")
 	if byTag == nil || byTag.Commit != recipe.Commit {
 		t.Fatal("MiniMax-M3 tag lookup did not resolve the pinned recipe")
+	}
+}
+
+func TestNanoBeigeSupportRecipeIsHelperOnly(t *testing.T) {
+	recipe := RecipeByName("nanbeige42")
+	if recipe == nil || !recipe.HelperOnly || recipe.RouteArch != "nanbeige" {
+		t.Fatalf("NanoBeige support recipe must retain conformance arch without main routing: %#v", recipe)
+	}
+	if got := recipe.PatchNames(); len(got) != 1 || got[0] != "0001-accept-loop-count-gguf-schema.patch" {
+		t.Fatalf("Nanbeige4.2 recipe lost its reviewed GGUF compatibility patch: %v", got)
+	}
+
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	binary := filepath.Join(appHome, "llama-server-cpu")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save([]Backend{{Tag: "nanbeige42", Path: binary, RouteArch: "nanbeige", HelperOnly: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ForArch("nanbeige"); got != nil {
+		t.Fatalf("helper-only CPU backend hijacked main-model routing: %#v", got)
+	}
+}
+
+func TestLegacyNanoBeigeManifestCannotRouteMainModel(t *testing.T) {
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	binary := filepath.Join(appHome, "llama-server")
+	if err := os.WriteFile(binary, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately omit HelperOnly, as manifests written before that field was
+	// introduced do.
+	if err := Save([]Backend{{Tag: "nanbeige42", Path: binary, RouteArch: "nanbeige"}}); err != nil {
+		t.Fatal(err)
+	}
+	loaded := ByTag("nanbeige42")
+	if loaded == nil || !loaded.HelperOnly {
+		t.Fatalf("builtin helper-only policy was not applied to legacy record: %#v", loaded)
+	}
+	if got := ForArch("nanbeige"); got != nil {
+		t.Fatalf("legacy helper backend hijacked main routing: %#v", got)
+	}
+	if got := RegisteredForArch("nanbeige"); len(got) != 0 {
+		t.Fatalf("legacy helper backend leaked into TUI route candidates: %#v", got)
 	}
 }
 
@@ -183,10 +231,26 @@ func TestAppHomeFromExeAcceptsARealInstall(t *testing.T) {
 	}
 }
 
-// Anything outside a bin directory says nothing about the app home.
+// A self-contained production tree may keep the binary directly in its app
+// home instead of under .bin. It must identify itself without relying on a
+// stale global pointer left by another install.
+func TestAppHomeFromExeAcceptsDirectInstallBinary(t *testing.T) {
+	install := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(install, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(install, ".config", "config"), []byte("# test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := AppHomeFromExe(filepath.Join(install, "ggrun")); got != install {
+		t.Errorf("AppHomeFromExe = %q, want direct install %q", got, install)
+	}
+}
+
 func TestAppHomeFromExeIgnoresUnrelatedLocations(t *testing.T) {
-	if got := AppHomeFromExe("/home/mik/ggrun-project/ggrun/ggrun"); got != "" {
-		t.Errorf("AppHomeFromExe = %q, want empty for a repo-local binary", got)
+	stateless := t.TempDir()
+	if got := AppHomeFromExe(filepath.Join(stateless, "ggrun")); got != "" {
+		t.Errorf("AppHomeFromExe = %q, want empty for stateless directory", got)
 	}
 	if got := AppHomeFromExe(""); got != "" {
 		t.Errorf("AppHomeFromExe(\"\") = %q, want empty", got)
@@ -212,11 +276,22 @@ func TestHasStateRecognisesRealInstallsOnly(t *testing.T) {
 	}
 }
 
+func TestRequiredBackendForArch(t *testing.T) {
+	for _, arch := range []string{"minimax-m2", "MiniMax-M3", " minimax-m4 "} {
+		if got := RequiredBackendForArch(arch); got != "ik_llama" {
+			t.Errorf("RequiredBackendForArch(%q) = %q, want ik_llama", arch, got)
+		}
+	}
+	if got := RequiredBackendForArch("laguna"); got != "" {
+		t.Errorf("RequiredBackendForArch(laguna) = %q, want no generic requirement", got)
+	}
+}
+
 // Discovery is what saves a user whose shell no longer exports LLM_APP_HOME.
 func TestDiscoverAppHomeFindsANestedInstall(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	install := filepath.Join(home, "my-project", "ggrun-productions")
+	install := filepath.Join(home, "my-project", "ggrun")
 	if err := os.MkdirAll(filepath.Join(install, ".config"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -232,8 +307,8 @@ func TestDiscoverAppHomePrefersTheConventionalLayout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	for _, dir := range []string{
-		filepath.Join(home, "ggrun-productions"),
-		filepath.Join(home, "elsewhere", "ggrun-productions"),
+		filepath.Join(home, "ggrun"),
+		filepath.Join(home, "elsewhere", "ggrun"),
 	} {
 		if err := os.MkdirAll(filepath.Join(dir, ".config"), 0o755); err != nil {
 			t.Fatal(err)
@@ -242,8 +317,8 @@ func TestDiscoverAppHomePrefersTheConventionalLayout(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := DiscoverAppHome(); got != filepath.Join(home, "ggrun-productions") {
-		t.Errorf("DiscoverAppHome() = %q, want the conventional ~/ggrun-productions", got)
+	if got := DiscoverAppHome(); got != filepath.Join(home, "ggrun") {
+		t.Errorf("DiscoverAppHome() = %q, want the conventional ~/ggrun", got)
 	}
 }
 
@@ -295,5 +370,53 @@ func TestScanIsBounded(t *testing.T) {
 	// the tree indefinitely.
 	if got := DiscoverAppHome(); got != "" {
 		t.Errorf("DiscoverAppHome() = %q, want empty", got)
+	}
+}
+
+func TestConcurrentUpsertPreservesEveryBackend(t *testing.T) {
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	const count = 24
+	errCh := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errCh <- Upsert(Backend{Tag: "fork-" + strconv.Itoa(i), Path: "/tmp/fork-" + strconv.Itoa(i)})
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent upsert: %v", err)
+		}
+	}
+	if got := len(Load()); got != count {
+		t.Fatalf("manifest lost a concurrent update: got %d entries, want %d", got, count)
+	}
+}
+
+func TestUpsertRefusesToOverwriteCorruptManifest(t *testing.T) {
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	path := ManifestPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := []byte("{not-json\n")
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := Upsert(Backend{Tag: "must-not-replace"}); err == nil {
+		t.Fatal("corrupt registry was silently treated as empty")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(original) {
+		t.Fatalf("failed mutation changed corrupt registry: %q", got)
 	}
 }

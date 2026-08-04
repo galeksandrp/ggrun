@@ -1,0 +1,38 @@
+diff --git a/src/models/nanbeige.cpp b/src/models/nanbeige.cpp
+index 3a54660..1873c61 100644
+--- a/src/models/nanbeige.cpp
++++ b/src/models/nanbeige.cpp
+@@ -3,21 +3,28 @@
+ void llama_model_nanbeige::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+ 
+-    uint32_t n_loops_u = 1;
+-    ml.get_key(LLM_KV_NUM_LOOPS, n_loops_u, false);
+-    GGML_ASSERT(n_loops_u >= 1);
++    uint32_t n_loops_u = 1;
++    // GGUFs produced by the reviewed Nanbeige4.2 converter use loop_count and
++    // store the logical block count. New upstream converters use num_loops and
++    // store the physical count. Accept both schemas without guessing.
++    const bool legacy_loop_metadata = ml.get_key("nanbeige.loop_count", n_loops_u, false);
++    if (!legacy_loop_metadata) ml.get_key(LLM_KV_NUM_LOOPS, n_loops_u, false);
++    GGML_ASSERT(n_loops_u >= 1);
+ 
+     skip_loop_final_norm = false;
+     ml.get_key(LLM_KV_SKIP_LOOP_FINAL_NORM, skip_loop_final_norm, false);
+ 
+-    n_layer_phys = (int) hparams.n_layer();
++    GGML_ASSERT(!legacy_loop_metadata || hparams.n_layer() % n_loops_u == 0);
++    n_layer_phys = legacy_loop_metadata
++        ? (int) (hparams.n_layer() / n_loops_u)
++        : (int) hparams.n_layer();
+ 
+     // Bound-check before casting: signed int mul can overflow and bypass the guard.
+     GGML_ASSERT((size_t) n_layer_phys * (size_t) n_loops_u <= (size_t) LLAMA_MAX_LAYERS);
+     n_loops = (int) n_loops_u;
+ 
+     // Expand logical layer count before load_tensors() allocates layers / KV.
+-    if (n_loops > 1) {
++    if (n_loops > 1 && !legacy_loop_metadata) {
+         for (int j = 1; j < n_loops; ++j) {
+             for (int i = 0; i < n_layer_phys; ++i) {
+                 const int dst = i + j * n_layer_phys;

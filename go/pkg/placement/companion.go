@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // A companion's VRAM footprint was a constant in the launcher: 2600 MiB for the
@@ -53,14 +54,19 @@ func RecordCompanionVRAM(cacheDir, name string, usedMB int) error {
 	if path == "" || usedMB <= 0 {
 		return nil
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	release, err := acquirePlacementLock(path+".lock", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer release()
 	if prev := MeasuredCompanionVRAMMB(cacheDir, name); prev >= usedMB {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
 	body := fmt.Sprintf("# Measured VRAM for companion %s\nCOMPANION_VRAM_MB=%d\n", name, usedMB)
-	return os.WriteFile(path, []byte(body), 0644)
+	return atomicWriteFile(path, []byte(body), 0o644)
 }
 
 // MeasuredCompanionVRAMMB returns a stored measurement, or 0 when this companion

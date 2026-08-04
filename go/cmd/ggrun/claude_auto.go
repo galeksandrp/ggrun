@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/raketenkater/ggrun/pkg/advisor"
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/config"
@@ -41,6 +42,14 @@ func claudeAutoReviewerNeeded(extraArgs []string) bool {
 	return permissionArgs == nil || (len(permissionArgs) == 2 && permissionArgs[1] == "auto")
 }
 
+// claudeCompanionNeeded includes the cheap-tier worker role. Claude Code uses
+// that lane in every permission mode, while only Auto mode emits classifier
+// requests. The existing disable switch remains authoritative for users who
+// prefer to spend no separate companion memory.
+func claudeCompanionNeeded(extraArgs []string) bool {
+	return !disabledEnv("GGRUN_CLAUDE_AUTO_REVIEWER")
+}
+
 func disabledEnv(key string) bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
 	case "0", "false", "no", "off", "disabled":
@@ -50,9 +59,33 @@ func disabledEnv(key string) bool {
 	}
 }
 
-// claudeReviewerCompanionName is the placement-ledger name of the Auto reviewer
-// reservation and its resolved seat.
+// claudeReviewerCompanionName is kept stable so existing Qwen measurements
+// remain useful when NanoBeige is not installed.
 const claudeReviewerCompanionName = "claude-auto-reviewer"
+
+const claudeNanoCompanionName = "claude-worker-nanbeige42"
+
+type claudeCompanionProfile struct {
+	Name              string
+	DisplayName       string
+	ModelPath         string
+	BackendPath       string
+	ModelMarker       string
+	MeasurementKey    string
+	KVType            string
+	ReservationVRAMMB int
+	NanoBeige         bool
+}
+
+func (p *claudeCompanionProfile) companionMeasurementKey() string {
+	if p == nil {
+		return ""
+	}
+	if key := strings.TrimSpace(p.MeasurementKey); key != "" {
+		return key
+	}
+	return p.Name
+}
 
 // claudeReviewerReservationVRAMMB is the reviewer's on-device footprint reserved
 // in the placement ledger: ~1.4 GB Q4_K_M weights + 64k Q8 KV + CUDA context and
@@ -61,13 +94,76 @@ const claudeReviewerCompanionName = "claude-auto-reviewer"
 // re-planned on every launch anyway.
 const claudeReviewerReservationVRAMMB = 2600
 
+// claudeNanoReservationVRAMMB covers the measured 8843 MiB peak for the real
+// 64k/Q8 worker profile on the RTX 3090 Ti, rounded up before per-host samples
+// replace it. Nanbeige's 44 logical KV layers make it materially larger than
+// its 2.4 GiB weight file; reserving only the weights would corrupt placement.
+const claudeNanoReservationVRAMMB = 9216
+
+var (
+	claudeNanoArtifactReady = func(path string) bool {
+		return advisor.VerifyArtifact(path, advisor.DefaultArtifact) == nil
+	}
+	claudeNanoBackend    = reviewedSupportBackend
+	claudeNanoGPUCapable = func(path string) bool {
+		_, err := claudeReviewerGPUDevice(path, claudeReviewerBackendEnv(path, nil))
+		return err == nil
+	}
+)
+
+func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeCompanionProfile {
+	if req != nil && req.ReviewerProfile != nil {
+		return req.ReviewerProfile
+	}
+	appHome := ""
+	if req != nil {
+		appHome = strings.TrimSpace(req.AppHome)
+	}
+	if appHome == "" {
+		appHome = backends.AppHome()
+	}
+
+	var profile *claudeCompanionProfile
+	// Explicit reviewer overrides retain their historical behavior and always
+	// outrank ggrun's automatic worker selection.
+	if strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) == "" &&
+		strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) == "" && cacheDir != "" {
+		modelPath := advisor.DefaultModelPath(cacheDir)
+		if claudeNanoArtifactReady(modelPath) {
+			if backendPath, err := claudeNanoBackend(); err == nil && claudeNanoGPUCapable(backendPath) {
+				profile = &claudeCompanionProfile{
+					Name: claudeNanoCompanionName, DisplayName: "Nanbeige4.2-3B",
+					ModelPath: modelPath, BackendPath: backendPath, ModelMarker: modelPath,
+					MeasurementKey:    claudeNanoCompanionName + "-ctx65536-kv-q4_0",
+					KVType:            "q4_0",
+					ReservationVRAMMB: claudeNanoReservationVRAMMB, NanoBeige: true,
+				}
+			}
+		}
+	}
+	if profile == nil {
+		modelPath := claudeauto.ReviewerModelPath(appHome)
+		profile = &claudeCompanionProfile{
+			Name: claudeReviewerCompanionName, DisplayName: claudeauto.DefaultReviewerDisplayName,
+			ModelPath: modelPath, ModelMarker: modelPath,
+			KVType:            "q8_0",
+			ReservationVRAMMB: claudeReviewerReservationVRAMMB,
+		}
+	}
+	if req != nil {
+		req.ReviewerProfile = profile
+	}
+	return profile
+}
+
 // claudeReviewerReservation builds the placement companion for the Auto reviewer
 // when the launch needs one. The GPU preference mirrors the legacy walk —
 // least-valuable (slowest-link, smallest) first, main GPU last — but expressed
 // as data so the planner owns the final seat and the main model packs around it.
-// CPU fallback stays allowed: a full-GPU host must keep fail-closed Auto working.
+// CPU fallback is deliberately disallowed here: placement has no companion-RAM
+// ledger, so a hidden 3-4 GiB CPU worker could invalidate strict no-mmap math.
 func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, cacheDir string) *placement.CompanionReservation {
-	if req == nil || !req.ClaudeCode || !claudeAutoReviewerNeeded(nil) || req.CPUMode {
+	if req == nil || !req.ClaudeCode || req.ClaudeReviewerDisabled || !claudeCompanionNeeded(nil) || req.CPUMode {
 		return nil
 	}
 	if caps == nil || len(caps.GPUs) == 0 {
@@ -77,9 +173,10 @@ func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, ca
 	// below is a conservative bound and always overshoots -- measured 2114 MiB
 	// against 2600 reserved -- and it overshoots on the least valuable GPU by
 	// design, which is where withheld VRAM is worth the most.
-	vramMB := claudeReviewerReservationVRAMMB
+	profile := resolveClaudeCompanionProfile(req, cacheDir)
+	vramMB := profile.ReservationVRAMMB
 	if cacheDir != "" {
-		if measured := placement.MeasuredCompanionVRAMMB(cacheDir, claudeReviewerCompanionName); measured > 0 {
+		if measured := placement.MeasuredCompanionVRAMMB(cacheDir, profile.companionMeasurementKey()); measured > 0 {
 			vramMB = measured
 		}
 	}
@@ -91,7 +188,7 @@ func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, ca
 	// 6. Subtracting what is already resident is safe because the reviewer is
 	// started before the main model loads, so the seat is occupied continuously
 	// whether the old process or the new one holds it.
-	if resident := residentReviewerVRAM(); resident > 0 {
+	if resident := residentReviewerVRAM(profile.ModelMarker); resident > 0 {
 		vramMB -= resident
 		if vramMB < 0 {
 			vramMB = 0
@@ -101,10 +198,10 @@ func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, ca
 		return nil
 	}
 	return &placement.CompanionReservation{
-		Name:          claudeReviewerCompanionName,
+		Name:          profile.Name,
 		VRAMMB:        vramMB,
 		GPUPreference: claudeReviewerGPUCandidates(caps, req),
-		AllowCPU:      true,
+		AllowCPU:      false,
 	}
 }
 
@@ -113,20 +210,20 @@ func claudeReviewerReservation(req *launchRequest, caps *detect.Capabilities, ca
 // when weights and the CUDA context are resident; the stored value only ever
 // grows, because a sample taken before the reviewer's KV fills would shrink the
 // reservation and overrun on the next long conversation.
-func recordReviewerVRAM(cfg *config.Config, p *server.Process) {
-	if cfg == nil || p == nil || p.Cmd == nil || p.Cmd.Process == nil {
+func recordReviewerVRAM(cfg *config.Config, p *server.Process, profile *claudeCompanionProfile) {
+	if cfg == nil || p == nil || p.Cmd == nil || p.Cmd.Process == nil || profile == nil {
 		return
 	}
 	usedMB := placement.QueryVRAMUsedByPID(p.Cmd.Process.Pid)
 	if usedMB <= 0 {
 		return
 	}
-	if err := placement.RecordCompanionVRAM(cfg.CacheDir, claudeReviewerCompanionName, usedMB); err != nil {
+	if err := placement.RecordCompanionVRAM(cfg.CacheDir, profile.companionMeasurementKey(), usedMB); err != nil {
 		return
 	}
-	if usedMB < claudeReviewerReservationVRAMMB {
+	if usedMB < profile.ReservationVRAMMB {
 		fmt.Printf("[claude-code] Auto reviewer measured at %d MiB; releasing %d MiB the %d MiB reservation withheld\n",
-			usedMB, claudeReviewerReservationVRAMMB-usedMB, claudeReviewerReservationVRAMMB)
+			usedMB, profile.ReservationVRAMMB-usedMB, profile.ReservationVRAMMB)
 	}
 }
 
@@ -141,7 +238,10 @@ func recordReviewerVRAM(cfg *config.Config, p *server.Process) {
 // depending on whatever happens to be running on the machine.
 var residentReviewerVRAM = residentReviewerVRAMMB
 
-func residentReviewerVRAMMB() int {
+func residentReviewerVRAMMB(modelMarker string) int {
+	if strings.TrimSpace(modelMarker) == "" {
+		return 0
+	}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return 0
@@ -153,18 +253,13 @@ func residentReviewerVRAMMB() int {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err != nil || !strings.Contains(string(raw), claudeReviewerModelDirMarker) {
+		if err != nil || !strings.Contains(string(raw), modelMarker) {
 			continue
 		}
 		total += placement.QueryVRAMUsedByPID(pid)
 	}
 	return total
 }
-
-// claudeReviewerModelDirMarker is the directory EnsureReviewerModel downloads
-// into. It identifies a reviewer process without depending on the model file
-// name, which changes when the reviewer model is upgraded.
-const claudeReviewerModelDirMarker = "claude-reviewer"
 
 // startClaudeAutoReviewer launches the pinned Auto reviewer on the seat the
 // placement planner returned in companionPlacements. When the planner ran, its
@@ -174,7 +269,11 @@ const claudeReviewerModelDirMarker = "claude-reviewer"
 // but no companion reservation supplied) it falls back to the legacy
 // least-valuable-GPU-first walk.
 func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detect.Capabilities, companionPlacements []placement.CompanionPlacement) (*claudeAutoRuntime, error) {
-	if req == nil || !req.ClaudeCode || !claudeAutoReviewerNeeded(nil) {
+	if req == nil || !req.ClaudeCode || req.ClaudeReviewerDisabled || !claudeCompanionNeeded(nil) {
+		return nil, nil
+	}
+	if req.CPUMode || caps == nil || len(caps.GPUs) == 0 {
+		req.ClaudeReviewerDisabled = true
 		return nil, nil
 	}
 	appHome := ""
@@ -184,13 +283,31 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 	if appHome == "" {
 		appHome = backends.AppHome()
 	}
-	modelPath, err := claudeauto.EnsureReviewerModel(context.Background(), appHome, os.Stdout)
-	if err != nil {
-		return nil, fmt.Errorf("prepare local Auto reviewer: %w", err)
+	cacheDir := ""
+	if cfg != nil {
+		cacheDir = cfg.CacheDir
 	}
-	be := findClaudeReviewerBackend(caps)
+	profile := resolveClaudeCompanionProfile(req, cacheDir)
+	modelPath := profile.ModelPath
+	if profile.NanoBeige {
+		if err := advisor.VerifyArtifact(modelPath, advisor.DefaultArtifact); err != nil {
+			return nil, fmt.Errorf("prepare local Auto worker: %w", err)
+		}
+	} else {
+		var err error
+		modelPath, err = claudeauto.EnsureReviewerModel(context.Background(), appHome, os.Stdout)
+		if err != nil {
+			return nil, fmt.Errorf("prepare local Auto reviewer: %w", err)
+		}
+	}
+	var be *backendInfo
+	if profile.BackendPath != "" {
+		be = detectBackend(profile.BackendPath)
+	} else {
+		be = findClaudeReviewerBackend(caps)
+	}
 	if be == nil {
-		return nil, fmt.Errorf("local Auto needs a current mainline llama-server; none was found")
+		return nil, fmt.Errorf("local Auto needs a compatible llama-server for %s; none was found", profile.DisplayName)
 	}
 	port, err := freeLoopbackPort()
 	if err != nil {
@@ -201,7 +318,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 	candidates := claudeReviewerGPUCandidates(caps, req)
 	planned := false
 	for _, cp := range companionPlacements {
-		if cp.Name == claudeReviewerCompanionName {
+		if cp.Name == profile.Name {
 			planned = true
 			if cp.GPU >= 0 {
 				candidates = []int{cp.GPU}
@@ -231,11 +348,11 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		// tensors live on the selected device (observed: +262 MiB on the main
 		// CUDA0 during a DeepSeek-V4 run). Ask the backend for the device name it
 		// exposes after isolation instead of assuming every fork uses CUDA0.
-		args := claudeReviewerArgs(be.Path, modelPath, port, device, be.Help)
+		args := claudeReviewerArgsWithKV(be.Path, modelPath, port, device, be.Help, profile.KVType, profile.NanoBeige)
 		p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, env)
 		if err == nil {
-			fmt.Printf("[claude-code] Auto reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, claudeauto.DefaultReviewerDisplayName)
-			recordReviewerVRAM(cfg, p)
+			fmt.Printf("[claude-code] Auto worker/reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, profile.DisplayName)
+			recordReviewerVRAM(cfg, p, profile)
 			return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: gpu}, nil
 		}
 		lastErr = err
@@ -253,7 +370,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 
 	// CPU is slower, but it preserves autonomous/fail-closed behavior on systems
 	// whose GPUs are already full. It is also the normal path on CPU-only hosts.
-	args := claudeReviewerArgs(be.Path, modelPath, port, "", be.Help)
+	args := claudeReviewerArgsWithKV(be.Path, modelPath, port, "", be.Help, profile.KVType, profile.NanoBeige)
 	p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, claudeReviewerBackendEnv(be.Path, claudeReviewerCPUEnv()))
 	if err != nil {
 		if logCloser != nil {
@@ -264,17 +381,37 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		}
 		return nil, fmt.Errorf("start local Auto reviewer: %w", err)
 	}
-	fmt.Printf("[claude-code] Auto reviewer ready on CPU (PID %d, %s, ctx 64k)\n", p.Cmd.Process.Pid, claudeauto.DefaultReviewerDisplayName)
+	fmt.Printf("[claude-code] Auto worker/reviewer ready on CPU (PID %d, %s, ctx 64k)\n", p.Cmd.Process.Pid, profile.DisplayName)
 	return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: -1}, nil
 }
 
 func claudeReviewerArgs(binary, modelPath string, port int, device, help string) []string {
+	return claudeReviewerArgsWithKV(binary, modelPath, port, device, help, "q8_0", false)
+}
+
+func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, kvType string, noJinja bool) []string {
 	args := []string{
 		binary, "-m", modelPath,
 		"--host", "127.0.0.1", "--port", strconv.Itoa(port),
 		"--ctx-size", "65536", "--parallel", "1",
-		"--alias", "local", "--jinja",
+		"--alias", "local",
 		"--temp", "0", "--presence-penalty", "0", "--repeat-penalty", "1",
+	}
+	// Nanbeige's chat template contains a Jinja `raise_exception` macro that
+	// llama.cpp's Jinja engine cannot parse ("Unable to generate parser for this
+	// template. System message must be at the beginning"), so requests against
+	// the worker/reviewer 400 under --jinja. Tool calls REQUIRE --jinja (the
+	// backend returns "tools param requires --jinja flag" without it), so the
+	// fix is NOT to drop --jinja but to override the broken template with a
+	// corrected one (see nanbeigeTemplateArgs). Keep --jinja on for tool calls.
+	args = append(args, "--jinja")
+	// The worker/reviewer never receives user chat-template overrides (its args
+	// are built from scratch here), so the nanbeige template override is applied
+	// directly whenever the NanoBeige profile selected the nanbeige42 backend.
+	if noJinja {
+		if tpl := nanbeigeTemplatePath(binary); tpl != "" {
+			args = append(args, "--chat-template-file", tpl)
+		}
 	}
 	// Exact-flag matching, not substring: mainline's --reasoning-format and
 	// --reasoning-budget both contain "--reasoning" but reject `--reasoning off`,
@@ -288,11 +425,15 @@ func claudeReviewerArgs(binary, modelPath string, port int, device, help string)
 		args = append(args, "--reasoning-budget", "0")
 	}
 	// The classifier carries a large policy prompt, so its KV cache is a
-	// meaningful part of the reviewer footprint. Q8 halves that cache versus
-	// F16 while retaining substantially more precision than Q4. Keep the
-	// compatibility guard for older user-provided llama-server binaries.
+	// meaningful part of the reviewer footprint. The small Qwen classifier keeps
+	// its established Q8 profile; Nanbeige uses Q4 because its 44 logical KV
+	// layers otherwise consume nearly nine GiB at 64k. Keep the compatibility
+	// guard for older user-provided llama-server binaries.
 	if strings.Contains(help, "--cache-type-k") && strings.Contains(help, "--cache-type-v") {
-		args = append(args, "--cache-type-k", "q8_0", "--cache-type-v", "q8_0")
+		if strings.TrimSpace(kvType) == "" {
+			kvType = "q8_0"
+		}
+		args = append(args, "--cache-type-k", kvType, "--cache-type-v", kvType)
 	}
 	if device != "" {
 		args = append(args, "--device", device, "--split-mode", "none", "-ngl", "999", "-mg", "0")

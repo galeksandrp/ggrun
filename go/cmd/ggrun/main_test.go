@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/config"
+	"github.com/raketenkater/ggrun/pkg/controller"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/server"
@@ -46,6 +49,24 @@ func TestParseLaunchArgsMMapPolicy(t *testing.T) {
 	}
 }
 
+func TestParseLaunchArgsWorkerBenchmark(t *testing.T) {
+	req, err := parseLaunchArgs([]string{"model.gguf", "--worker-benchmark"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.WorkerBenchmark || req.Benchmark {
+		t.Fatalf("worker benchmark mode not preserved: %#v", req)
+	}
+}
+
+func TestMeasuredLaunchVRAMIgnoresNegativeDeltas(t *testing.T) {
+	// No GPUs is the deterministic unit seam; physical nvidia-smi sampling is
+	// covered by the live one-shot benchmark.
+	if got := measuredLaunchVRAMMB(&detect.Capabilities{}, nil, map[int]int{0: 100}); got != 0 {
+		t.Fatalf("empty hardware reported %d MiB", got)
+	}
+}
+
 func TestConfirmRequiredMMap(t *testing.T) {
 	strategy := &placement.Strategy{MMap: true, MMapRequired: true}
 	req := &launchRequest{}
@@ -58,6 +79,79 @@ func TestConfirmRequiredMMap(t *testing.T) {
 	}
 	if err := confirmRequiredMMap(&launchRequest{}, strategy, strings.NewReader(""), &output, false); err == nil || !strings.Contains(err.Error(), "--mmap") {
 		t.Fatalf("non-interactive launch must require explicit --mmap, got %v", err)
+	}
+	declined := &launchRequest{}
+	if err := confirmRequiredMMap(declined, strategy, strings.NewReader("no\n"), &output, true); err != errMMapDeclined {
+		t.Fatalf("negative answer = %v, want mmap-declined replan signal", err)
+	}
+	if !declined.NoMMap || declined.ForceMMap {
+		t.Fatalf("negative answer did not select strict resident policy: %#v", declined)
+	}
+}
+
+func TestResidentReviewerFallbackRequiresFitAndConsent(t *testing.T) {
+	originalErr := fmt.Errorf("resident placement with reviewer does not fit")
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 2600}
+	req := &launchRequest{ClaudeCode: true, NoMMap: true, ReviewerReservation: reservation}
+	want := &placement.Strategy{Type: placement.MoEOffload, MMap: false}
+	called := 0
+	compute := func(candidateReq *launchRequest) (*placement.Strategy, error) {
+		called++
+		if candidateReq.ReviewerReservation != nil || !candidateReq.ClaudeReviewerDisabled || !candidateReq.NoMMap {
+			t.Fatalf("fallback candidate did not isolate only the reviewer: %#v", candidateReq)
+		}
+		return want, nil
+	}
+	var output bytes.Buffer
+	got, err := tryResidentWithoutClaudeReviewer(req, originalErr, strings.NewReader("yes\n"), &output, true, compute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want || called != 1 {
+		t.Fatalf("fallback result=%#v calls=%d, want %#v and one compute", got, called, want)
+	}
+	if req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
+		t.Fatalf("accepted fallback was not retained on request: %#v", req)
+	}
+	if !strings.Contains(output.String(), "routed through the main model") || !strings.Contains(output.String(), "Auto reviews will use the main model") {
+		t.Fatalf("fallback prompt/result did not explain routing: %q", output.String())
+	}
+}
+
+func TestResidentReviewerFallbackDeclinePreservesReviewer(t *testing.T) {
+	originalErr := fmt.Errorf("resident placement with reviewer does not fit")
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 2600}
+	req := &launchRequest{ClaudeCode: true, NoMMap: true, ReviewerReservation: reservation}
+	compute := func(*launchRequest) (*placement.Strategy, error) {
+		return &placement.Strategy{Type: placement.MoEOffload}, nil
+	}
+	if _, err := tryResidentWithoutClaudeReviewer(req, originalErr, strings.NewReader("no\n"), io.Discard, true, compute); err != originalErr {
+		t.Fatalf("declined fallback error=%v, want original placement error", err)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("declined fallback mutated request: %#v", req)
+	}
+}
+
+func TestResidentReviewerFallbackIsClaudeOnlyAndExplicitWhenNonInteractive(t *testing.T) {
+	originalErr := fmt.Errorf("resident placement does not fit")
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 2600}
+	called := 0
+	compute := func(*launchRequest) (*placement.Strategy, error) {
+		called++
+		return &placement.Strategy{Type: placement.MoEOffload}, nil
+	}
+	ordinary := &launchRequest{NoMMap: true, ReviewerReservation: reservation}
+	if _, err := tryResidentWithoutClaudeReviewer(ordinary, originalErr, strings.NewReader("yes\n"), io.Discard, true, compute); err != originalErr || called != 0 {
+		t.Fatalf("ordinary launch entered Claude fallback: err=%v calls=%d", err, called)
+	}
+	claude := &launchRequest{ClaudeCode: true, NoMMap: true, ReviewerReservation: reservation}
+	_, err := tryResidentWithoutClaudeReviewer(claude, originalErr, strings.NewReader(""), io.Discard, false, compute)
+	if err == nil || !strings.Contains(err.Error(), "GGRUN_CLAUDE_AUTO_REVIEWER=off") {
+		t.Fatalf("non-interactive fallback lacks explicit opt-in guidance: %v", err)
+	}
+	if claude.ReviewerReservation != reservation || claude.ClaudeReviewerDisabled {
+		t.Fatalf("non-interactive fallback mutated request: %#v", claude)
 	}
 }
 
@@ -183,9 +277,17 @@ func TestClaudeCodeParallelIsFeaturePolicyForDeepseek4(t *testing.T) {
 		t.Fatalf("explicit Claude Code context must win, got %d", got)
 	}
 	be = &backendInfo{Tag: "ik_llama"}
+	// Placement must plan for the slot count the server will actually run.
+	// A 131072 context supports two ~65k slots, so the 4-slot request is clamped
+	// here rather than by claudeCodeSlotAdjust after the plan exists. When the
+	// two disagreed the disagreement was silent and total: every probe and
+	// placement key embeds the slot count, so a plan made at parallel=4 could
+	// never read evidence the preflight had recorded at parallel=2. Measured
+	// 2026-08-03 on DeepSeek-V4-Flash — a 9501 MiB compute-buffer measurement
+	// sat unread, placement charged 0 MiB for compute, and the load OOM'd.
 	opts = placementOptionsFromRequest(req, &placement.ModelProfile{ModelArch: "qwen3moe"}, be, t.TempDir())
-	if opts.Parallel != 4 {
-		t.Fatalf("claude-code on other models initially requests 4 slots, got %d", opts.Parallel)
+	if opts.Parallel != 2 {
+		t.Fatalf("claude-code at a 131072 context plans the two slots it will run, got %d", opts.Parallel)
 	}
 	if opts.ContextSize != 131072 {
 		t.Fatalf("unknown model context should use the portable 2x64k baseline, got %d", opts.ContextSize)
@@ -293,17 +395,6 @@ func TestClaudeServerLogScopeTracksProfileBuildAndFinalArgs(t *testing.T) {
 	}
 	if previousClaudeLogMatches(log, model, strategy, "other-scope") {
 		t.Fatal("log from another final launch scope was accepted for recovery")
-	}
-}
-
-func TestHybridMoECalibrationDoesNotPromoteSplitOwnerAfterHealthCheck(t *testing.T) {
-	req := &launchRequest{ClaudeCode: true, Parallel: 1, ClaudeProfile: claudeProfileInteractive}
-	model := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true}
-	current := &placement.Strategy{Type: placement.MoEOffload}
-	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "GPU", VRAMTotalMB: 24576}}}
-	next, args, ok := maybePromoteMeasuredPlacement(req, &config.Config{}, &backendInfo{Tag: "llama", Identity: "build"}, caps, model, current, []string{"llama-server"})
-	if ok || next != nil || args != nil {
-		t.Fatalf("hybrid MoE must not auto-promote from load-time evidence: next=%v args=%v ok=%v", next, args, ok)
 	}
 }
 
@@ -510,6 +601,20 @@ func TestParseModelMissingFileReportsModelPath(t *testing.T) {
 	}
 }
 
+func TestParseModelRejectsIncompleteShardSetBeforePlacement(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "partial-00001-of-00003.gguf")
+	for _, path := range []string{first, filepath.Join(dir, "partial-00002-of-00003.gguf")} {
+		if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := parseModel(first)
+	if err == nil || !strings.Contains(err.Error(), "incomplete sharded GGUF") || !strings.Contains(err.Error(), "00003") {
+		t.Fatalf("incomplete model diagnostic = %v", err)
+	}
+}
+
 func TestShouldPromoteMoEPlacement(t *testing.T) {
 	cur := &placement.Strategy{Type: placement.MoEOffload, NCPUMoE: 37}
 	next := &placement.Strategy{Type: placement.MoEOffload, NCPUMoE: 35}
@@ -703,6 +808,41 @@ func TestHY3TemplateArgsUseBundledTemplateWithoutOverridingUser(t *testing.T) {
 	}
 }
 
+func TestNanbeigeTemplateArgsUseBundledTemplateWithoutOverridingUser(t *testing.T) {
+	root := t.TempDir()
+	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
+	if err := os.MkdirAll(filepath.Dir(template), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(template, []byte("template"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(root, "build-cuda", "bin", "llama-server")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "nanbeige42", Path: bin})
+	want := []string{"--chat-template-file", template}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("nanbeige template args = %#v, want %#v", got, want)
+	}
+	if got := nanbeigeTemplateArgs([]string{"--chat-template-file", "x.jinja"}, &backendInfo{Tag: "nanbeige42", Path: bin}); got != nil {
+		t.Fatalf("explicit user chat template must win: %#v", got)
+	}
+	// Not the nanbeige42 backend, or missing template, must be a no-op.
+	if got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "llama", Path: bin}); got != nil {
+		t.Fatalf("non-nanbeige backend must not receive template args: %#v", got)
+	}
+	emptyRoot := filepath.Join(t.TempDir(), "src", "fork")
+	if err := os.MkdirAll(filepath.Join(emptyRoot, "build-cuda", "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	emptyBin := filepath.Join(emptyRoot, "build-cuda", "bin", "llama-server")
+	if got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "nanbeige42", Path: emptyBin}); got != nil {
+		t.Fatalf("missing template must be a no-op: %#v", got)
+	}
+}
+
 func TestBackendBuildJobsCapsHeavyCompilers(t *testing.T) {
 	if got := backendBuildJobs("cuda", 256); got != 8 {
 		t.Fatalf("CUDA build jobs = %d, want 8", got)
@@ -729,8 +869,27 @@ func TestConfiguredBackendExplicit(t *testing.T) {
 	if !configuredBackendExplicit("llama") || !configuredBackendExplicit("custom") {
 		t.Fatal("named configured backends must be explicit")
 	}
-	if configuredBackendExplicit("") || configuredBackendExplicit("auto") {
-		t.Fatal("empty/auto backend must stay implicit")
+	if configuredBackendExplicit("") || configuredBackendExplicit("auto") || configuredBackendExplicit("skip") {
+		t.Fatal("empty/auto/legacy-skip backend must stay implicit")
+	}
+}
+
+func TestUpdateRegisteredBackendListContinuesAfterForkFailure(t *testing.T) {
+	forks := []backends.Backend{{Tag: "hy3"}, {Tag: "laguna"}, {Tag: "nanbeige42"}}
+	var seen []string
+	updater := func(tag string) error {
+		seen = append(seen, tag)
+		if tag == "laguna" {
+			return errors.New("build failed")
+		}
+		return nil
+	}
+	errs := updateRegisteredBackendList(forks, updater)
+	if !reflect.DeepEqual(seen, []string{"hy3", "laguna", "nanbeige42"}) {
+		t.Fatalf("fork update stopped early: %#v", seen)
+	}
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "laguna") {
+		t.Fatalf("fork errors = %#v, want isolated Laguna failure", errs)
 	}
 }
 
@@ -779,7 +938,9 @@ func isolateConfig(t *testing.T) {
 	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "missing-config"))
 	for _, k := range []string{
 		"LLM_PORT", "LLM_CTX_SIZE", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY",
+		"LLM_SWA_FULL",
 		"LLM_BACKEND", "LLAMA_SERVER", "LLM_HOST", "LLM_SPEC", "LLM_VISION",
+		"LLM_APP_HOME",
 	} {
 		t.Setenv(k, "")
 	}
@@ -824,6 +985,42 @@ func TestParseLaunchArgsDefaultKVQualityIsAuto(t *testing.T) {
 	}
 	if req.KVQuality != "auto" {
 		t.Fatalf("default KV quality must remain model-aware auto, got %q", req.KVQuality)
+	}
+}
+
+func TestParseLaunchArgsSWAFullConfigAndCLIOverrides(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("LLM_SWA_FULL", "true")
+
+	req, err := parseLaunchArgs([]string{"model.gguf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasArg(req.ExtraArgs, "--swa-full") {
+		t.Fatalf("configured full SWA cache was not retained: %v", req.ExtraArgs)
+	}
+	opts := placementOptionsFromRequest(req, &placement.ModelProfile{CTXTrain: 32768}, &backendInfo{Tag: "llama"}, t.TempDir())
+	if !opts.SWAFull {
+		t.Fatal("configured full SWA cache did not reach placement")
+	}
+
+	for _, args := range [][]string{
+		{"model.gguf", "--no-swa-full"},
+		{"model.gguf", "--swa-full=false"},
+		{"model.gguf", "--", "--no-swa-full"},
+	} {
+		req, err = parseLaunchArgs(args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", args, err)
+		}
+		if hasArg(req.ExtraArgs, "--swa-full") || hasArg(req.ExtraArgs, "--no-swa-full") {
+			t.Fatalf("disable override leaked a backend flag for %v: %v", args, req.ExtraArgs)
+		}
+	}
+
+	req, err = parseLaunchArgs([]string{"model.gguf", "--no-swa-full=false"})
+	if err != nil || !hasArg(req.ExtraArgs, "--swa-full") {
+		t.Fatalf("negative false override should enable full SWA: req=%#v err=%v", req, err)
 	}
 }
 
@@ -1022,6 +1219,7 @@ func TestSelectBackendBackendFlagOverridesConfiguredServerBin(t *testing.T) {
 	}}
 	req := &launchRequest{
 		ServerBin:       ikPath,
+		AppHome:         t.TempDir(),
 		Backend:         "vulkan",
 		BackendExplicit: true,
 	}
@@ -1054,6 +1252,204 @@ func TestSelectBackendExplicitServerBinWins(t *testing.T) {
 	be := selectBackend(caps, req)
 	if be == nil || be.Path != ikPath || be.Tag != "ik_llama" {
 		t.Fatalf("expected explicit server bin to win, got %#v", be)
+	}
+}
+
+func TestChooseAutoBackendPrefersCanonicalWhenBothSupportArchitecture(t *testing.T) {
+	canonical := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	global := &backendInfo{Path: "/home/me/.local/bin/llama-server", Tag: "ik_llama", IsIK: true}
+	probe := func(path, arch string) (bool, bool) {
+		if arch != "deepseek4" {
+			t.Fatalf("probe arch = %q, want deepseek4", arch)
+		}
+		return true, true
+	}
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: global},
+		{info: canonical, canonical: true},
+	}, "deepseek4", probe)
+	if got != canonical {
+		t.Fatalf("auto backend = %#v, want canonical %#v", got, canonical)
+	}
+}
+
+func TestChooseAutoBackendArchitectureSupportBeatsCanonicalPath(t *testing.T) {
+	canonical := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	fork := &backendInfo{Path: "/fork/build/bin/llama-server", Tag: "fork"}
+	probe := func(path, _ string) (bool, bool) {
+		return path == fork.Path, true
+	}
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: canonical, canonical: true},
+		{info: fork},
+	}, "future-arch", probe)
+	if got != fork {
+		t.Fatalf("auto backend = %#v, want supporting fork %#v", got, fork)
+	}
+}
+
+func TestChooseAutoBackendHonoursRequiredIKFamily(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", IsIK: true}
+	unknownProbe := func(string, string) (bool, bool) { return false, false }
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true},
+		{info: ik, canonical: true},
+	}, "minimax-m3", unknownProbe)
+	if got != ik {
+		t.Fatalf("auto backend = %#v, want required ik %#v", got, ik)
+	}
+}
+
+func TestChooseAutoBackendRejectsProfileIncompatibleCandidate(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", IsIK: true}
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true, incompatible: true},
+		{info: ik, canonical: true},
+	}, "deepseek4", func(string, string) (bool, bool) { return true, true })
+	if got != ik {
+		t.Fatalf("q4-compatible V4 backend = %#v, want ik %#v", got, ik)
+	}
+}
+
+func TestNormalizeDeepSeek4AutoKVRequestUsesIKCompatibleBaseline(t *testing.T) {
+	req := &launchRequest{KVQuality: "q4_0", KVTypeK: "q4_0", KVTypeV: "q4_0"}
+	normalizeDeepSeek4AutoKVRequest(req, &placement.ModelProfile{ModelArch: "deepseek4"})
+	if req.KVQuality != "q8_0" || req.KVTypeK != "" || req.KVTypeV != "" {
+		t.Fatalf("auto backend KV normalization = quality %q, K %q, V %q", req.KVQuality, req.KVTypeK, req.KVTypeV)
+	}
+}
+
+func TestBackendFeatureCompatibilityDropsUnsupportedFullSWA(t *testing.T) {
+	req := &launchRequest{ExtraArgs: []string{"--swa-full", "--metrics"}}
+	be := &backendInfo{Path: "/ik/llama-server", Help: "--ctx-checkpoints-interval N"}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
+	if hasArg(req.ExtraArgs, "--swa-full") || !hasArg(req.ExtraArgs, "--metrics") {
+		t.Fatalf("backend feature normalization = %#v", req.ExtraArgs)
+	}
+
+	supported := &launchRequest{ExtraArgs: []string{"--swa-full"}}
+	applyBackendFeatureCompatibility(supported, &placement.ModelProfile{ModelArch: "laguna"},
+		&backendInfo{Path: "/laguna/llama-server", Help: "--swa-full"})
+	if !hasArg(supported.ExtraArgs, "--swa-full") {
+		t.Fatal("supported Full SWA flag was removed")
+	}
+}
+
+func TestBackendFeatureCompatibilityDisablesGeneratedDeepSeek4KHadamard(t *testing.T) {
+	req := &launchRequest{}
+	be := &backendInfo{Path: "/ik/llama-server", IsIK: true}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
+	if reason := req.DisabledBackendFlags["-khad"]; reason == "" {
+		t.Fatal("known unsupported generated -khad was not disabled")
+	}
+	got := applyDisabledBackendFlags([]string{"llama-server", "-khad", "-muge"}, req.DisabledBackendFlags)
+	want := []string{"llama-server", "-muge"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("compatibility-filtered args = %#v, want %#v", got, want)
+	}
+}
+
+func TestBackendFeatureCompatibilityPreservesExplicitKHadamard(t *testing.T) {
+	req := &launchRequest{ExtraArgs: []string{"-khad"}}
+	be := &backendInfo{Path: "/ik/llama-server", IsIK: true}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
+	if _, disabled := req.DisabledBackendFlags["-khad"]; disabled {
+		t.Fatal("explicit user-supplied -khad was silently disabled")
+	}
+}
+
+func TestBackendFeatureCompatibilityPromotesUnsupportedDeepSeek4IKKV(t *testing.T) {
+	req := &launchRequest{KVQuality: "q4_0", KVTypeK: "q4_0", KVTypeV: "q4_0"}
+	be := &backendInfo{Path: "/ik/llama-server", IsIK: true}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "deepseek4"}, be)
+	if req.KVQuality != "q8_0" || req.KVTypeK != "" || req.KVTypeV != "" {
+		t.Fatalf("DeepSeek4 IK KV compatibility = quality %q, K %q, V %q", req.KVQuality, req.KVTypeK, req.KVTypeV)
+	}
+}
+
+func TestRouteArchBackendKeepsExplicitServerBinary(t *testing.T) {
+	explicit := &backendInfo{Path: "/chosen/llama-server", Tag: "llama"}
+	got := routeArchBackend(explicit, &placement.ModelProfile{ModelArch: "laguna"}, &launchRequest{ServerBinExplicit: true})
+	if got != explicit {
+		t.Fatalf("explicit server binary was architecture-routed: %#v", got)
+	}
+}
+
+func TestSelectBackendLegacyConfiguredSkipUsesConfiguredServerBin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake backend probe uses a shell script")
+	}
+	mainline := writeFakeBackend(t, "llama-server", "echo 'mainline llama.cpp'\n")
+	req := &launchRequest{
+		ServerBin:       mainline,
+		Backend:         "skip",
+		BackendExplicit: false,
+	}
+	be := selectBackend(&detect.Capabilities{}, req)
+	if be == nil || be.Path != mainline {
+		t.Fatalf("legacy launcher-only backend setting did not use configured server: %#v", be)
+	}
+}
+
+func TestSelectBackendUsesConfiguredAppHomeForExplicitIK(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake backend probe uses a shell script")
+	}
+	appHome := t.TempDir()
+	ikPath := filepath.Join(appHome, ".src", "ik_llama.cpp", "build", "bin", "llama-server")
+	if err := os.MkdirAll(filepath.Dir(ikPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ikPath, []byte("#!/bin/sh\necho 'ikawrakow split-mode-graph'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mainline := writeFakeBackend(t, "llama-server-cuda", "echo 'mainline llama.cpp'\n")
+	globalIK := writeFakeBackend(t, "global-ik-llama-server", "echo 'ikawrakow split-mode-graph'\n")
+	req := &launchRequest{
+		ServerBin:       mainline,
+		AppHome:         appHome,
+		Backend:         "ik_llama",
+		BackendExplicit: true,
+	}
+
+	be := selectBackend(&detect.Capabilities{Backends: []detect.Backend{{Name: "ik_llama", Path: globalIK}}}, req)
+	if be == nil || be.Path != ikPath || !be.IsIK || be.Tag != "ik_llama" {
+		t.Fatalf("configured APP_HOME IK backend was not selected: %#v", be)
+	}
+}
+
+func TestSelectBackendMissingExplicitNameNeverFallsBack(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake backend probe uses a shell script")
+	}
+	mainline := writeFakeBackend(t, "llama-server-cuda", "echo 'mainline llama.cpp'\n")
+	req := &launchRequest{
+		ServerBin:       mainline,
+		AppHome:         t.TempDir(),
+		Backend:         "missing-explicit-backend",
+		BackendExplicit: true,
+	}
+	if be := selectBackend(&detect.Capabilities{}, req); be != nil {
+		t.Fatalf("missing explicit backend silently fell back to %#v", be)
+	}
+	message := backendUnavailableMessage(req)
+	if !strings.Contains(message, req.Backend) || !strings.Contains(message, req.AppHome) {
+		t.Fatalf("explicit backend diagnostic is not actionable: %q", message)
+	}
+}
+
+func TestParseLaunchArgsCarriesConfiguredAppHome(t *testing.T) {
+	isolateConfig(t)
+	appHome := t.TempDir()
+	t.Setenv("LLM_APP_HOME", appHome)
+	req, err := parseLaunchArgs([]string{"model.gguf", "--backend", "ik_llama"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.AppHome != appHome {
+		t.Fatalf("request APP_HOME = %q, want %q", req.AppHome, appHome)
 	}
 }
 
@@ -1341,24 +1737,6 @@ func TestParseLaunchArgsRejectsInvalidSafetyFlags(t *testing.T) {
 	}
 }
 
-func TestParseLongContextValidationArgsStripsRecorderFlags(t *testing.T) {
-	tokens, gpuUsed, launchArgs, err := parseLongContextValidationArgs([]string{
-		"model.gguf", "--prompt-tokens", "60000", "--gpu-used", "0:16224,1:9059", "--parallel", "4",
-	})
-	if err != nil {
-		t.Fatalf("parse validation args: %v", err)
-	}
-	if tokens != 60000 {
-		t.Fatalf("tokens=%d, want 60000", tokens)
-	}
-	if gpuUsed[0] != 16224 || gpuUsed[1] != 9059 {
-		t.Fatalf("gpu-used=%v", gpuUsed)
-	}
-	if strings.Join(launchArgs, " ") != "model.gguf --parallel 4" {
-		t.Fatalf("launch args leaked recorder flags: %v", launchArgs)
-	}
-}
-
 func TestPlacementOptionsNeverMapsInvalidGPUToZero(t *testing.T) {
 	opts := placementOptionsFromRequest(
 		&launchRequest{GPUsFlag: "not-a-gpu"},
@@ -1411,6 +1789,137 @@ func TestRuntimeGPUCapabilitiesMatchesVisibilityRenumbering(t *testing.T) {
 	}
 	if mapping[0] != 1 || mapping[1] != 2 || physicalGPUIndex(1, mapping) != 2 {
 		t.Fatalf("visible-to-physical mapping mismatch: %#v", mapping)
+	}
+}
+
+func TestRuntimeGPUCapabilitiesForLaunchRejectsTheLiveV4WorkerOvercommit(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 0, VRAMTotalMB: 23840},
+		{Index: 1, VRAMTotalMB: 11909},
+		{Index: 2, VRAMTotalMB: 11710},
+	}}
+	req := &launchRequest{ReviewerReservation: &placement.CompanionReservation{
+		Name: claudeNanoCompanionName, VRAMMB: 8000,
+	}}
+	strategy := &placement.Strategy{CompanionPlacements: []placement.CompanionPlacement{{
+		Name: claudeNanoCompanionName, GPU: 1,
+	}}}
+	restore := runtimeVRAMUsedMB
+	defer func() { runtimeVRAMUsedMB = restore }()
+	runtimeVRAMUsedMB = func(index int) int {
+		if index == 1 {
+			return 8766
+		}
+		return 0
+	}
+
+	runtime, _ := runtimeGPUCapabilitiesForLaunch(caps, req, strategy)
+	if got := runtime.GPUs[1].VRAMFreeMB(); got != 3143 {
+		t.Fatalf("live CUDA1 free VRAM = %d MiB, want 3143", got)
+	}
+	if got := runtime.GPUs[2].VRAMFreeMB(); got != 11710 {
+		t.Fatalf("idle CUDA2 free VRAM = %d MiB, want 11710", got)
+	}
+	devs := []preflightDevice{
+		{Name: "CUDA1", ModelMB: 2925, ComputeMB: 599},
+		{Name: "CUDA2", ModelMB: 414, ComputeMB: 599},
+	}
+	device, deficit, summary := preflightWorstDeficit(devs, runtime.GPUs, nil, nil)
+	if device != 1 || deficit != 381 {
+		t.Fatalf("live V4 admission = CUDA%d deficit %d, want CUDA1 deficit 381; %s", device, deficit, summary)
+	}
+	if !strings.Contains(summary, "CUDA2 1013/11710 MiB") {
+		t.Fatalf("idle destination GPU missing from admission evidence: %s", summary)
+	}
+}
+
+func TestRuntimeGPUCapabilitiesForLaunchKeepsReservationAsFloor(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 1, VRAMTotalMB: 11909}}}
+	req := &launchRequest{ReviewerReservation: &placement.CompanionReservation{
+		Name: claudeNanoCompanionName, VRAMMB: 9216,
+	}}
+	strategy := &placement.Strategy{CompanionPlacements: []placement.CompanionPlacement{{
+		Name: claudeNanoCompanionName, GPU: 1,
+	}}}
+	restore := runtimeVRAMUsedMB
+	defer func() { runtimeVRAMUsedMB = restore }()
+	runtimeVRAMUsedMB = func(int) int { return 7000 }
+
+	runtime, _ := runtimeGPUCapabilitiesForLaunch(caps, req, strategy)
+	if got := runtime.GPUs[0].VRAMFreeMB(); got != 2693 {
+		t.Fatalf("planned reservation floor left %d MiB, want 2693", got)
+	}
+}
+
+func TestRejectedMemoryArgvIdentityBlocksOnlyTheExactFailedPlan(t *testing.T) {
+	failed := []string{"llama-server", "-m", "model.gguf", "--n-cpu-moe", "36", "--swa-full"}
+	safe := []string{"llama-server", "-m", "model.gguf", "--n-cpu-moe", "37", "--swa-full"}
+	withoutSWA := []string{"llama-server", "-m", "model.gguf", "--n-cpu-moe", "36"}
+	recovery := newLaunchMemoryRecovery()
+	recovery.reject(failed)
+	if !recovery.isRejected(failed) || recovery.isRejected(safe) {
+		t.Fatalf("rejected membership failed: failed=%v safe=%v", recovery.isRejected(failed), recovery.isRejected(safe))
+	}
+	if !recovery.hasRejections() || recovery.rejectionCount() != 1 {
+		t.Fatalf("rejection state = has %v count %d, want true/1", recovery.hasRejections(), recovery.rejectionCount())
+	}
+
+	if changed, rejected := recovery.recomputeDecision(safe, failed); !changed || !rejected {
+		t.Fatalf("exact failed argv decision = changed %v rejected %v", changed, rejected)
+	}
+	if changed, rejected := recovery.recomputeDecision(failed, safe); !changed || rejected {
+		t.Fatalf("safe layer recovery decision = changed %v rejected %v", changed, rejected)
+	}
+	if changed, rejected := recovery.recomputeDecision(failed, withoutSWA); !changed || rejected {
+		t.Fatalf("SWA-disabled recovery decision = changed %v rejected %v", changed, rejected)
+	}
+	if changed, rejected := recovery.recomputeDecision(failed, failed); changed || rejected {
+		t.Fatalf("identical argv decision = changed %v rejected %v", changed, rejected)
+	}
+}
+
+func TestRecoveredLaunchRetainsFirstSafeBaselineUnlessForced(t *testing.T) {
+	recovery := newLaunchMemoryRecovery()
+	recovery.reject([]string{"llama-server", "--n-cpu-moe", "35"})
+
+	if !retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateAuto}, recovery) {
+		t.Fatal("automatic calibration was allowed to stop a recovered live server")
+	}
+	if !retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateOff}, recovery) {
+		t.Fatal("disabled calibration was allowed to promote a recovered live server")
+	}
+	if retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateOn}, recovery) {
+		t.Fatal("explicit forced calibration was unexpectedly suppressed")
+	}
+	if retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateAuto}, newLaunchMemoryRecovery()) {
+		t.Fatal("clean launch was treated as memory-recovered")
+	}
+}
+
+func TestSharedLaunchRecoveryRefusesRejectedEntryArgv(t *testing.T) {
+	args := []string{"llama-server", "--n-cpu-moe", "35", "--swa-full"}
+	recovery := newLaunchMemoryRecovery()
+	recovery.reject(args)
+
+	_, _, _, err := startLaunchWithCUDAOOMRecoveryState(
+		nil, nil, nil, nil, nil, nil, args, time.Second, recovery,
+	)
+	if err == nil || !strings.Contains(err.Error(), "rejected earlier in this launch lifecycle") {
+		t.Fatalf("rejected lifecycle entry returned %v", err)
+	}
+}
+
+func TestOOMOvershootEnforcesDocumentedFloor(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 2, VRAMTotalMB: 12288}}}
+	if got := oomOvershoot(caps, 2, 75); got != 512 {
+		t.Fatalf("75 MiB allocation penalty = %d MiB, want 512 MiB floor", got)
+	}
+}
+
+func TestOOMOvershootKeepsLargerMeasuredDeficit(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 2, VRAMTotalMB: 12288, VRAMUsedMB: 12000}}}
+	if got := oomOvershoot(caps, 2, 1000); got != 712 {
+		t.Fatalf("1000 MiB allocation against 288 MiB free = %d MiB, want 712 MiB", got)
 	}
 }
 
@@ -1902,5 +2411,121 @@ func TestWaitForShutdownOrCrashRespondsToSignal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("waitForShutdownOrCrash did not respond to the signal in time")
+	}
+}
+
+func TestRuntimeOOMInvalidatesActiveProfileAndPlacementCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	cfg := &config.Config{CacheDir: cacheDir}
+	model := &placement.ModelProfile{Path: "/models/test.gguf", Name: "test", ModelArch: "test", SizeBytes: 1234}
+	backend := &backendInfo{Tag: "llama", Identity: "backend-build"}
+	caps := &detect.Capabilities{RAM: detect.RAMInfo{TotalMB: 128000}, CPU: detect.CPUInfo{Model: "cpu", Cores: 8}}
+	req := &launchRequest{CtxFlag: "4096", KVQuality: "q8_0", KVPlacement: "gpu", Parallel: 1}
+	req.ProfilePolicyIdentity = requestedLaunchPolicyIdentity(req, model)
+	args := []string{"llama-server", "-m", model.Path, "--ctx-size", "4096"}
+	scope := launchProfileScope(req, model, backend, caps)
+	store := controller.Store{CacheDir: cacheDir}
+	profile, err := store.Begin(controller.Profile{Scope: scope, ArgsHash: controller.HashArgs(args)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []controller.State{
+		controller.StateAllocationVerified, controller.StateLoadHealthy, controller.StateFunctionalVerified,
+		controller.StateCacheVerified, controller.StatePerformanceVerified, controller.StateActive,
+	} {
+		if _, err := store.Transition(scope, profile.ID, state, "", "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	placementPath := filepath.Join(cacheDir, "placements", "test.place")
+	strategy := &placement.Strategy{Type: placement.MoEOffload, PlacementCachePath: placementPath, NCPUMoE: 2}
+	if err := placement.SavePlacementCache(placementPath, placement.StrategyToCacheEntry(strategy)); err != nil {
+		t.Fatal(err)
+	}
+	if err := invalidateRuntimeOOMLaunch(req, cfg, model, backend, caps, strategy, args, "CUDA OOM"); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Load(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Active != nil {
+		t.Fatalf("runtime-failed argv remained active: %#v", record.Active)
+	}
+	if _, err := os.Stat(placementPath); !os.IsNotExist(err) {
+		t.Fatalf("stale placement cache survived runtime OOM: %v", err)
+	}
+}
+
+func TestLaunchProfileScopeGroupsAdjustedArgvUnderRequestedPolicy(t *testing.T) {
+	model := &placement.ModelProfile{Path: "/models/test.gguf", SizeBytes: 1234, ModelArch: "test"}
+	backend := &backendInfo{Tag: "llama", Identity: "backend-build-a"}
+	caps := &detect.Capabilities{RAM: detect.RAMInfo{TotalMB: 128000}, CPU: detect.CPUInfo{Model: "cpu", Cores: 8}}
+	req := &launchRequest{CtxFlag: "131072", KVQuality: "q8_0", KVPlacement: "gpu", Parallel: 1, UBatchSize: 512}
+	req.ProfilePolicyIdentity = requestedLaunchPolicyIdentity(req, model)
+
+	before := launchProfileScope(req, model, backend, caps)
+	// Simulate a measured/controller adjustment. Exact argv changes, but it is a
+	// candidate for the same requested serving policy and must share Active/LKG.
+	req.UBatchSize, req.UBatchSizeSet = 128, true
+	req.ExtraArgs = append(req.ExtraArgs, "--metrics")
+	after := launchProfileScope(req, model, backend, caps)
+	if before != after {
+		t.Fatalf("controller-adjusted argv changed profile family: %s != %s", before, after)
+	}
+	updatedBackend := &backendInfo{Tag: "llama", Identity: "backend-build-b"}
+	if got := launchProfileScope(req, model, updatedBackend, caps); got != before {
+		t.Fatalf("backend rebuild escaped its LKG family: %s != %s", got, before)
+	}
+	if got := launchProfileScope(req, model, &backendInfo{Tag: "ik_llama", Identity: "backend-build-c"}, caps); got == before {
+		t.Fatal("different backend family reused the same lifecycle scope")
+	}
+
+	other := &launchRequest{CtxFlag: "65536", KVQuality: "q8_0", KVPlacement: "gpu", Parallel: 1, UBatchSize: 512}
+	if launchProfileScope(other, model, backend, caps) == before {
+		t.Fatal("different requested context policy reused the same profile family")
+	}
+}
+
+func TestLaunchProfileScopeSeparatesClaudeCompanionIdentity(t *testing.T) {
+	model := &placement.ModelProfile{Path: "/models/test.gguf", SizeBytes: 1234, ModelArch: "test"}
+	backend := &backendInfo{Tag: "llama"}
+	caps := &detect.Capabilities{RAM: detect.RAMInfo{TotalMB: 128000}}
+	qwen := &launchRequest{ClaudeCode: true, ReviewerProfile: &claudeCompanionProfile{
+		Name: claudeReviewerCompanionName, ModelPath: "/models/qwen.gguf", BackendPath: "/bin/mainline",
+	}}
+	nano := &launchRequest{ClaudeCode: true, ReviewerProfile: &claudeCompanionProfile{
+		Name: claudeNanoCompanionName, ModelPath: "/models/nano.gguf", BackendPath: "/bin/nanbeige",
+	}}
+	if launchProfileScope(qwen, model, backend, caps) == launchProfileScope(nano, model, backend, caps) {
+		t.Fatal("Qwen and Nano companions reused one lifecycle scope")
+	}
+	nanoQ8 := *nano
+	nanoQ8.ReviewerProfile = &claudeCompanionProfile{
+		Name: claudeNanoCompanionName, ModelPath: "/models/nano.gguf", BackendPath: "/bin/nanbeige", KVType: "q8_0",
+	}
+	nano.ReviewerProfile.KVType = "q4_0"
+	if launchProfileScope(nano, model, backend, caps) == launchProfileScope(&nanoQ8, model, backend, caps) {
+		t.Fatal("Q4 and Q8 companion profiles reused one lifecycle scope")
+	}
+	nano.ClaudeReviewerDisabled = true
+	if launchProfileScope(qwen, model, backend, caps) == launchProfileScope(nano, model, backend, caps) {
+		t.Fatal("separate companion and main-model fallback reused one lifecycle scope")
+	}
+}
+
+func TestReleaseReadingsAtBaseline(t *testing.T) {
+	baseline := &detect.Capabilities{
+		RAM:  detect.RAMInfo{FreeMB: 100000},
+		GPUs: []detect.GPU{{Index: 0, VRAMUsedMB: 500}, {Index: 2, VRAMUsedMB: 900}},
+	}
+	if !releaseReadingsAtBaseline(baseline, 99500, map[int]int{0: 520, 2: 940}) {
+		t.Fatal("small post-stop accounting drift should be accepted")
+	}
+	if releaseReadingsAtBaseline(baseline, 98000, map[int]int{0: 500, 2: 900}) {
+		t.Fatal("unreleased main-model RAM was accepted")
+	}
+	if releaseReadingsAtBaseline(baseline, 100000, map[int]int{0: 700, 2: 900}) {
+		t.Fatal("unreleased main-model VRAM was accepted")
 	}
 }

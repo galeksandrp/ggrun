@@ -98,6 +98,13 @@ func BackendSupportsArch(binaryPath, arch string) (supported, probed bool) {
 // architecture table lives there, and following everything else would mean
 // scanning libc and the CUDA runtime to no purpose.
 func archProbeFiles(binaryPath string) []string {
+	// Resolve launcher symlinks before walking DT_NEEDED. The canonical app home
+	// deliberately links into separately stored build trees; using the link's
+	// directory as $ORIGIN finds no libllama and falsely reports every
+	// architecture as unsupported.
+	if resolved, err := filepath.EvalSymlinks(binaryPath); err == nil && resolved != "" {
+		binaryPath = resolved
+	}
 	out := []string{binaryPath}
 	seen := map[string]bool{binaryPath: true}
 
@@ -269,7 +276,7 @@ func RecipesForArch(arch string) []Recipe {
 	}
 	var out []Recipe
 	for _, r := range Recipes() {
-		if strings.EqualFold(strings.TrimSpace(r.RouteArch), arch) {
+		if !r.HelperOnly && strings.EqualFold(strings.TrimSpace(r.RouteArch), arch) {
 			out = append(out, r)
 		}
 	}
@@ -284,9 +291,50 @@ func RegisteredForArch(arch string) []Backend {
 	}
 	var out []Backend
 	for _, b := range Load() {
-		if strings.EqualFold(strings.TrimSpace(b.RouteArch), arch) {
+		if !IsHelperOnly(b) && strings.EqualFold(strings.TrimSpace(b.RouteArch), arch) {
 			out = append(out, b)
 		}
 	}
 	return out
+}
+
+// SoleHelperForArch returns a helper-only backend when it is the ONLY
+// registered backend routing an architecture, and nil otherwise.
+//
+// ForArch and RegisteredForArch deliberately skip helper-only forks so they
+// never globally route main-model launches. But a helper-only fork can be the
+// only build that knows a fork-only architecture (Nanbeige's "nanbeige" arch is
+// the one case on this project — mainline llama.cpp has no such loader). A model
+// of that arch then has no canonical backend that can load it, so the helper
+// fork is the only path. This returns it exactly in that situation: sole
+// registered backend for the arch, and the arch has no non-helper candidate at
+// all. It stays nil when a real (non-helper) backend also serves the arch, so
+// the helper fork never shadows a canonical route.
+func SoleHelperForArch(arch string) *Backend {
+	arch = strings.ToLower(strings.TrimSpace(arch))
+	if arch == "" {
+		return nil
+	}
+	var helper *Backend
+	haveNonHelper := false
+	for _, b := range Load() {
+		if !strings.EqualFold(strings.TrimSpace(b.RouteArch), arch) {
+			continue
+		}
+		if _, err := os.Stat(b.Path); err != nil {
+			continue
+		}
+		if IsHelperOnly(b) {
+			if helper == nil {
+				b := b
+				helper = &b
+			}
+			continue
+		}
+		haveNonHelper = true
+	}
+	if haveNonHelper || helper == nil {
+		return nil
+	}
+	return helper
 }

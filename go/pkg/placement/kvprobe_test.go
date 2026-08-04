@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -21,6 +22,43 @@ func TestParseKVBufferTotalMB(t *testing.T) {
 	}, "\n")
 	if got := parseKVBufferTotalMB(log); got != 3500 {
 		t.Fatalf("total KV = %.0f, want 3500", got)
+	}
+}
+
+func TestConcurrentRuntimeGrowthWritersMergeWithoutLosingMeasuredEvidence(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "/models/concurrent-moe.gguf", Basename: "concurrent-moe.gguf", TotalSizeMB: 70000}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}, {Index: 1, VRAMTotalMB: 24564}}
+	var wg sync.WaitGroup
+	errs := make(chan error, 3)
+	writes := []func() error{
+		func() error {
+			return RecordRuntimeGraphGrowthFromOOM(dir, model, 131072, 512, "q4_0", "gpu", "build-a", gpus, 1, 0, 3000, true)
+		},
+		func() error {
+			return RecordRuntimeGraphGrowthFromOOM(dir, model, 131072, 512, "q4_0", "gpu", "build-a", gpus, 1, 0, 900, false)
+		},
+		func() error {
+			return RecordRuntimeGraphGrowthFromOOM(dir, model, 131072, 512, "q4_0", "gpu", "build-a", gpus, 1, 1, 1200, false)
+		},
+	}
+	for _, write := range writes {
+		wg.Add(1)
+		go func(write func() error) {
+			defer wg.Done()
+			errs <- write()
+		}(write)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	pc := loadProbeCache(dir, model, 131072, 512, "q4_0", "gpu", "build-a", gpus, 1)
+	if pc == nil || pc.RuntimeGraphGrowthByGPU[0] != 900 || pc.RuntimeGraphGrowthEstimatedByGPU[0] || pc.RuntimeGraphGrowthByGPU[1] != 1200 {
+		t.Fatalf("concurrent merge lost or downgraded evidence: %#v", pc)
 	}
 }
 
@@ -64,7 +102,7 @@ func TestRecordMeasuredContextMBUpdatesImmediatePlacementState(t *testing.T) {
 		},
 	}
 
-	RecordMeasuredContextMB(dir, model, 524288, "f16", 3456)
+	RecordMeasuredContextMB(dir, model, 524288, "f16", 3456, false)
 	if got := model.MeasuredKVBytesPerTok["f16"]; got != 6912 {
 		t.Fatalf("in-memory f16 rate = %.2f, want 6912", got)
 	}
@@ -448,5 +486,33 @@ func TestClearRuntimeGraphGrowthKeepsComputeBuffers(t *testing.T) {
 	// The expensive measurements must survive.
 	if pc.ComputeBufByGPU[0] != 6117 || pc.KVPerLayerMB != 128 {
 		t.Errorf("clear discarded measured buffers: %#v", pc)
+	}
+}
+
+// A --swa-full preflight measures every windowed layer at full depth, so the
+// total it reports describes that launch and no other. Recorded as a plain rate
+// it makes the next launch reserve the swa-full figure: measured on Laguna,
+// 6912 MB at ctx 131072 stored 55296 B/token against a true 13864, and the
+// resulting over-reservation forced auto-fit to push KV onto the host.
+func TestRecordMeasuredContextMBRefusesSWAFullTotals(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	model := &ModelProfile{
+		Basename:              "Laguna-S-2.1",
+		SizeBytes:             73395172000,
+		SlidingWindow:         512,
+		MeasuredKVBytesPerTok: map[string]float64{"q4_0": 13864.5},
+	}
+	RecordMeasuredContextMB(dir, model, 131072, "q4_0", 6912, true)
+	if got := model.MeasuredKVBytesPerTok["q4_0"]; got != 13864.5 {
+		t.Fatalf("a swa-full total overwrote the plain rate: %.2f, want 13864.5", got)
+	}
+
+	// A model with no windowed layers cannot be distorted by the flag, so its
+	// measurement is still worth keeping.
+	dense := &ModelProfile{Basename: "Dense", SizeBytes: 1, MeasuredKVBytesPerTok: map[string]float64{}}
+	RecordMeasuredContextMB(dir, dense, 131072, "q4_0", 6912, true)
+	if got := dense.MeasuredKVBytesPerTok["q4_0"]; got != 55296 {
+		t.Fatalf("dense model rate = %.2f, want 55296 recorded normally", got)
 	}
 }

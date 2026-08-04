@@ -524,6 +524,10 @@ func QualityProtectedFlags() map[string]bool {
 	protected[canonicalFlagName("--cache-type-k")] = true
 	protected[canonicalFlagName("--cache-type-v")] = true
 	protected[canonicalFlagName("--parallel")] = true
+	// Recurrent checkpoint retention is a cache-correctness controller setting,
+	// not a throughput knob. A tuner candidate that sets it to zero can benchmark
+	// quickly while making the next real branch re-prefill from scratch.
+	protected[canonicalFlagName("--ctx-checkpoints")] = true
 	return protected
 }
 
@@ -848,12 +852,6 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 		add("moe-no-mqkv",
 			map[string]interface{}{"-mqkv": false},
 			"test disabling merged QKV on this backend")
-		add("moe-checkpoints-8",
-			map[string]interface{}{"--ctx-checkpoints": "8"},
-			"test fewer context checkpoints to reduce per-slot overhead")
-		add("moe-checkpoints-0",
-			map[string]interface{}{"--ctx-checkpoints": "0"},
-			"test disabling context checkpoints when cache RAM is not helping")
 	}
 
 	return candidates

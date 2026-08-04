@@ -128,7 +128,7 @@ func runSpecTest(args []string) error {
 	}
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		return fmt.Errorf("no llama-server binary found")
+		return fmt.Errorf("backend resolution: %s", backendUnavailableMessage(req))
 	}
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
 		fmt.Printf("[spec-test] GPU restriction: %s\n", env)

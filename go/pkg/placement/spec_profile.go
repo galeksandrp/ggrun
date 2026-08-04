@@ -197,12 +197,12 @@ func SaveSpecPerformanceProfile(cacheDir string, profile SpecPerformanceProfile)
 	if err != nil {
 		return "", err
 	}
-	tmp := path + fmt.Sprintf(".%d.tmp", os.Getpid())
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	release, err := acquirePlacementLock(path+".lock", 5*time.Second)
+	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	defer release()
+	if err := atomicWriteFile(path, append(data, '\n'), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

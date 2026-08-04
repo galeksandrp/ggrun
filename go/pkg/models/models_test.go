@@ -41,6 +41,32 @@ func TestListGroupsShardsAndSorts(t *testing.T) {
 	}
 }
 
+func TestResolveGGUFShardFilesRequiresEveryDeclaredShard(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "model-00001-of-00003.gguf")
+	writeModel(t, root, "model-00001-of-00003.gguf", 7)
+	writeModel(t, root, "model-00002-of-00003.gguf", 11)
+
+	if _, sharded, err := ResolveGGUFShardFiles(first); !sharded || err == nil {
+		t.Fatalf("incomplete shard set must fail: sharded=%v err=%v", sharded, err)
+	}
+	writeModel(t, root, "model-00003-of-00003.gguf", 13)
+	files, sharded, err := ResolveGGUFShardFiles(first)
+	if err != nil || !sharded || len(files) != 3 {
+		t.Fatalf("complete shard set = %#v, sharded=%v, err=%v", files, sharded, err)
+	}
+	if _, _, err := ResolveGGUFShardFiles(filepath.Join(root, "model-00002-of-00003.gguf")); err == nil {
+		t.Fatal("a non-first shard must not be accepted as the model entrypoint")
+	}
+
+	single := filepath.Join(root, "single.gguf")
+	writeModel(t, root, "single.gguf", 5)
+	files, sharded, err = ResolveGGUFShardFiles(single)
+	if err != nil || sharded || len(files) != 1 || files[0] != single {
+		t.Fatalf("single GGUF resolution = %#v, sharded=%v, err=%v", files, sharded, err)
+	}
+}
+
 func TestRemoveDeletesOnlySelectedShardedModel(t *testing.T) {
 	root := t.TempDir()
 	writeModel(t, root, "bundle-00001-of-00002.gguf", 7)

@@ -30,8 +30,19 @@ import (
 // kvCacheLineRe matches llama.cpp's per-cache summary:
 //
 //	llama_kv_cache: size = 13824.00 MiB (1048576 cells,  12 layers,  1/1 seqs), K (q4_0): ...
+//
+// The trailing seqs field is captured because "cells" is per sequence while
+// "size" is the total across all of them. Measured on one model at one context,
+// changing only --parallel:
+//
+//	1728.00 MiB (131072 cells, 12 layers, 1/1 seqs) -> 1152 B/cell/layer
+//	3456.00 MiB (131072 cells, 12 layers, 2/2 seqs) -> 2304 B/cell/layer
+//
+// Dividing by cells x layers alone therefore scales the recorded width by
+// n_seq_max, and the cache is keyed by model rather than by parallelism, so a
+// single --parallel 2 launch poisons every later plan for that model.
 var kvCacheLineRe = regexp.MustCompile(
-	`size\s*=\s*([0-9.]+)\s*MiB\s*\(\s*(\d+)\s*cells,\s*(\d+)\s*layers`)
+	`size\s*=\s*([0-9.]+)\s*MiB\s*\(\s*(\d+)\s*cells,\s*(\d+)\s*layers(?:,\s*(\d+)\s*/\s*\d+\s*seqs)?`)
 
 // KVGeometry is how the backend actually laid out the KV cache.
 type KVGeometry struct {
@@ -152,6 +163,7 @@ func ParseKVGeometry(logText string) (KVGeometry, bool) {
 		mib    float64
 		cells  int
 		layers int
+		seqs   int
 	}
 	var entries []entry
 	for _, line := range strings.Split(logText, "\n") {
@@ -168,10 +180,35 @@ func ParseKVGeometry(logText string) (KVGeometry, bool) {
 		if err1 != nil || err2 != nil || err3 != nil || cells <= 0 || layers <= 0 || mib <= 0 {
 			continue
 		}
-		entries = append(entries, entry{mib, cells, layers})
+		// Absent on older builds that printed no seqs field; those were always
+		// single-sequence, so one is the right default rather than a guess.
+		seqs := 1
+		if m[4] != "" {
+			if parsed, err := strconv.Atoi(m[4]); err == nil && parsed > 0 {
+				seqs = parsed
+			}
+		}
+		entries = append(entries, entry{mib, cells, layers, seqs})
 	}
 	if len(entries) == 0 {
 		return g, false
+	}
+	// The legacy geometry is deliberately limited to the uniform one- or
+	// two-region layout it can represent. Recurrent hybrids such as DeepSeek-V4
+	// print raw, CSA, HCA, and lightning-indexer regions with different depths
+	// and effective widths. Collapsing those into "full + SWA" over-counts the
+	// layer total and rescaling the result by KV quantization changes auxiliary
+	// buffers that do not use that type. Keep such observations exact-shape-only
+	// in the scoped allocation cache instead.
+	if len(entries) > 2 {
+		return KVGeometry{}, false
+	}
+	for _, e := range entries {
+		// TotalMB has no sequence dimension and this model-wide cache is not
+		// parallel-scoped. A multi-sequence observation must never be reused.
+		if e.seqs != 1 {
+			return KVGeometry{}, false
+		}
 	}
 	// The deepest cache is the full-attention one; anything shallower is
 	// windowed. Depth rather than layer count, because a model can have more
@@ -195,6 +232,15 @@ func ParseKVGeometry(logText string) (KVGeometry, bool) {
 	if len(entries) > 1 && deepest.cells == shallowest.cells {
 		return KVGeometry{}, false
 	}
+	deepestWidth := deepest.mib * 1024 * 1024 / (float64(deepest.cells) * float64(deepest.layers))
+	for _, e := range entries {
+		width := e.mib * 1024 * 1024 / (float64(e.cells) * float64(e.layers))
+		// Allow only log-rounding noise. A material difference means the two
+		// regions cannot share BytesPerCellPerLayer and must remain scoped.
+		if width < deepestWidth*0.98 || width > deepestWidth*1.02 {
+			return KVGeometry{}, false
+		}
+	}
 	for _, e := range entries {
 		if e.cells == deepest.cells {
 			g.FullLayers += e.layers
@@ -205,6 +251,6 @@ func ParseKVGeometry(logText string) (KVGeometry, bool) {
 			}
 		}
 	}
-	g.BytesPerCellPerLayer = deepest.mib * 1024 * 1024 / (float64(deepest.cells) * float64(deepest.layers))
+	g.BytesPerCellPerLayer = deepestWidth
 	return g, g.Measured()
 }

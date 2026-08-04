@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -227,6 +229,42 @@ func TestBackendVerbosityDefaultsToTrace(t *testing.T) {
 	// A backend that does not advertise the flag must not receive it.
 	if out := backendVerbosityArgs([]string{"srv"}, "--some-other-flag"); len(out) != 1 {
 		t.Errorf("added -lv to a backend that does not support it: %v", out)
+	}
+	// Current ik_llama exposes only the long spelling. Detecting that spelling
+	// but emitting -lv made its parser dump --help and abort every V4 launch.
+	longOnly := backendVerbosityArgs([]string{"srv"}, "  --verbosity N")
+	if len(longOnly) != 3 || longOnly[1] != "--verbosity" || longOnly[2] != "4" {
+		t.Errorf("long-only backend received the wrong verbosity dialect: %v", longOnly)
+	}
+	if out := backendVerbosityArgs([]string{"srv"}, ""); len(out) != 1 {
+		t.Errorf("guessed a verbosity flag without a help capability surface: %v", out)
+	}
+}
+
+func TestValidateBackendLaunchArgsRejectsUnknownGeneratedFlag(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "llama-server")
+	script := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--bad-generated\" ]; then\n    echo 'error: unknown argument: --bad-generated' >&2\n    echo 'usage: llama-server [options]' >&2\n    exit 1\n  fi\ndone\necho 'version: test'\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	be := &backendInfo{Path: bin, Help: "--version"}
+	err := validateBackendLaunchArgs(be, []string{bin, "-m", "never-loaded.gguf", "--bad-generated"})
+	if err == nil || !strings.Contains(err.Error(), "unknown argument: --bad-generated") || !strings.Contains(err.Error(), "before model load") {
+		t.Fatalf("parser validation error = %v", err)
+	}
+}
+
+func TestValidateBackendLaunchArgsAcceptsExactCommand(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "llama-server")
+	script := "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--version\" ]; then\n    echo 'version: test'\n    exit 0\n  fi\ndone\nexit 9\n"
+	if err := os.WriteFile(bin, []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	be := &backendInfo{Path: bin, Help: "--version"}
+	if err := validateBackendLaunchArgs(be, []string{bin, "-m", "never-loaded.gguf", "--verbosity", "4"}); err != nil {
+		t.Fatalf("valid exact command rejected: %v", err)
 	}
 }
 

@@ -27,7 +27,7 @@ func TestFindFitParamsDoesNotCrossCustomForksViaPATH(t *testing.T) {
 	}
 	t.Setenv("PATH", pathBin)
 	customServer := filepath.Join(dir, "custom-fork", "bin", "llama-server")
-	if got := findFitParamsBin(customServer); got != "" {
+	if got := findFitParamsBin(customServer, ""); got != "" {
 		t.Fatalf("custom fork must not use unrelated PATH fit-params: %s", got)
 	}
 }
@@ -39,7 +39,7 @@ func TestRunFitPreflightAddsSiblingLibraryDirectory(t *testing.T) {
 	if err := os.WriteFile(fit, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	devs, err := runFitPreflight(fit, []string{"llama-server", "-m", "model.gguf"})
+	devs, _, err := runFitPreflight(fit, []string{"llama-server", "-m", "model.gguf"})
 	if err != nil {
 		t.Fatalf("fit preflight did not receive sibling LD_LIBRARY_PATH: %v", err)
 	}
@@ -289,6 +289,56 @@ func TestMemoryEvidenceKeyIncludesHostAllocationFlags(t *testing.T) {
 	mapped := memoryEvidenceKey(be, model, caps, []string{"llama-server", "-m", "model.gguf", "--mmap"})
 	if resident == mapped {
 		t.Fatal("resident and mmap launches shared allocation evidence key")
+	}
+}
+
+func TestPersistFailedAllocationProbeKeepsBackendAndGuardEvidence(t *testing.T) {
+	dir := t.TempDir()
+	guard := filepath.Join(dir, "guard.jsonl")
+	if err := os.WriteFile(guard, []byte("{\"type\":\"guard\"}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := persistFailedAllocationProbe(dir, "abc123", "backend failure\n", guard)
+	if path == "" {
+		t.Fatal("failed probe evidence was not persisted")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, "backend failure") || !strings.Contains(text, "CUDA allocation firewall") || !strings.Contains(text, `"type":"guard"`) {
+		t.Fatalf("incomplete failed probe evidence: %q", text)
+	}
+}
+
+func TestBackendLoadFailureDiagnosticSkipsGenericTail(t *testing.T) {
+	log := "mmap allocation failed: Cannot allocate memory\nAdding override blk.6=CUDA_Host\nunable to load model\n"
+	if got := backendLoadFailureDiagnostic(log); !strings.Contains(got, "mmap allocation failed") {
+		t.Fatalf("diagnostic = %q", got)
+	}
+}
+
+func TestBackendAdjustmentFromLogDisablesUnsupportedKHadamard(t *testing.T) {
+	log := "DeepSeek4 K-cache Hadamard is not supported; use an untransformed K-cache\n"
+	got := backendAdjustmentFromLog(log)
+	if got == nil || got.RemoveFlag != "-khad" {
+		t.Fatalf("backend adjustment = %#v, want removal of -khad", got)
+	}
+}
+
+func TestBackendAdjustmentFromLogPromotesUnsupportedDeepSeek4KV(t *testing.T) {
+	log := "DeepSeek4 K-cache supports only F16, BF16, and Q8_0 (requested q4_0)\n"
+	got := backendAdjustmentFromLog(log)
+	if got == nil || got.KVQuality != "q8_0" || got.RemoveFlag != "" {
+		t.Fatalf("backend adjustment = %#v, want q8_0 KV promotion", got)
+	}
+}
+
+func TestBackendAdjustmentFromLogIgnoresHarmlessVCacheWarning(t *testing.T) {
+	log := "DeepSeek4 has no independent V-cache; ignoring requested V-cache type q4_0\n"
+	if got := backendAdjustmentFromLog(log); got != nil {
+		t.Fatalf("harmless warning produced adjustment: %#v", got)
 	}
 }
 

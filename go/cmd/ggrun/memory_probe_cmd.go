@@ -63,7 +63,7 @@ func cmdMemoryProbe(args []string) {
 	}
 	be := resolveLaunchBackend(req, model, caps)
 	if be == nil {
-		fmt.Fprintln(os.Stderr, "Error: no llama-server binary found")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
 		os.Exit(1)
 	}
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))

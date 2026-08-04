@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Backend is a registered fork backend.
@@ -21,9 +22,12 @@ type Backend struct {
 	Tag       string `json:"tag"`                  // selection name (--backend <tag>)
 	Path      string `json:"path"`                 // path to the built llama-server binary
 	RouteArch string `json:"route_arch,omitempty"` // auto-select for models of this arch
-	GitURL    string `json:"git_url,omitempty"`
-	Branch    string `json:"branch,omitempty"`
-	Commit    string `json:"commit,omitempty"`
+	// HelperOnly retains architecture conformance metadata without globally
+	// routing main-model launches onto a deliberately CPU-only support build.
+	HelperOnly bool   `json:"helper_only,omitempty"`
+	GitURL     string `json:"git_url,omitempty"`
+	Branch     string `json:"branch,omitempty"`
+	Commit     string `json:"commit,omitempty"`
 	// AppliedPatches identifies reviewed source fixes applied while building the
 	// backend. It makes a recipe-built binary auditable from backends.json.
 	AppliedPatches []string `json:"applied_patches,omitempty"`
@@ -63,12 +67,20 @@ type Recipe struct {
 	Branch      string        `json:"branch"`
 	Commit      string        `json:"commit"`
 	RouteArch   string        `json:"route_arch"`
+	HelperOnly  bool          `json:"helper_only,omitempty"`
 	Accel       string        `json:"accel,omitempty"`
 	Patches     []RecipePatch `json:"-"`
 }
 
 //go:embed patches/hy3/0001-fix-router-tensor-name.patch
 var hy3RouterTensorNamePatch []byte
+
+// The reviewed Nanbeige4.2 GGUF predates upstream's final metadata spelling:
+// it uses loop_count plus a logical block count, while upstream b77d646 expects
+// num_loops plus a physical block count. The loader supports both unambiguously.
+//
+//go:embed patches/nanbeige42/0001-accept-loop-count-gguf-schema.patch
+var nanbeige42LoopCountPatch []byte
 
 // common/speculative.cpp calls std::isfinite without including <cmath>. The
 // declaration reaches poolside's compiler transitively and ours not at all, so
@@ -80,6 +92,25 @@ var hy3RouterTensorNamePatch []byte
 var lagunaCmathPatch []byte
 
 var builtinRecipes = []Recipe{
+	{
+		// NanoBeige support is upstream llama.cpp, not a permanent fork. Pin the
+		// first reviewed merge commit so `ggrun support install --with-backend`
+		// can build a known architecture-capable helper backend even when the
+		// machine's normal production backend intentionally stays older.
+		Name:        "nanbeige42",
+		Description: "Upstream llama.cpp with native Nanbeige4.2 looped-transformer support",
+		Tag:         "nanbeige42",
+		GitURL:      "https://github.com/ggml-org/llama.cpp.git",
+		Branch:      "master",
+		Commit:      "b77d646751d01c0962bc203b6809e9d94f7d50b7",
+		RouteArch:   "nanbeige",
+		HelperOnly:  true,
+		Accel:       "",
+		Patches: []RecipePatch{{
+			Name:     "0001-accept-loop-count-gguf-schema.patch",
+			contents: nanbeige42LoopCountPatch,
+		}},
+	},
 	{
 		Name:        "hy3",
 		Description: "Tencent Hy3 / hy_v3 support with built-in MTP and its reviewed chat template",
@@ -255,6 +286,18 @@ func HasState(dir string) bool {
 	return false
 }
 
+// RequiredBackendForArch returns the generic backend family known to be
+// mandatory for an architecture. An empty result means either family may be
+// attempted. Keep this shared by CLI preflight and the TUI so an "auto"
+// continue-once choice cannot select a backend the CLI will immediately reject.
+func RequiredBackendForArch(arch string) string {
+	a := strings.ToLower(strings.TrimSpace(arch))
+	if strings.HasPrefix(a, "minimax-m") { // minimax-m2, minimax-m3, ...
+		return "ik_llama"
+	}
+	return ""
+}
+
 // pointerPath is where the app home pointer lives, always under the user's own
 // config directory so every binary can find it regardless of install location.
 func pointerPath() string {
@@ -302,10 +345,12 @@ const maxDiscoveryDirs = 400
 // AppHomeFromExe derives the app home from the running binary's location, or
 // returns "" when that location says nothing about it.
 //
-// The parent of a .bin/bin directory is only an app home if it actually holds
-// ggrun state. The installer's default target is ~/.local/bin, and treating
-// ~/.local as an app home made a second copy of ggrun report no models and no
-// registered backends while the real install sat untouched elsewhere.
+// A direct binary at <app-home>/ggrun identifies that directory when it holds
+// ggrun state. The parent of a .bin/bin directory is handled the same way.
+// Requiring state is important: the installer's default target is
+// ~/.local/bin, and treating a stateless ~/.local as an app home made a second
+// copy of ggrun report no models and no registered backends while the real
+// install sat untouched elsewhere.
 //
 // Split out from AppHome so it is testable: os.Executable() inside a test
 // returns the test binary, which can never exercise this path.
@@ -314,6 +359,9 @@ func AppHomeFromExe(exe string) string {
 		return ""
 	}
 	exeDir := filepath.Dir(exe)
+	if HasState(exeDir) {
+		return exeDir
+	}
 	switch filepath.Base(exeDir) {
 	case ".bin", "bin":
 		if parent := filepath.Dir(exeDir); HasState(parent) {
@@ -325,8 +373,8 @@ func AppHomeFromExe(exe string) string {
 
 // DiscoverAppHome looks for a ggrun install tree when nothing else identifies
 // one. It checks the user's home directory and one level below it, which covers
-// both ~/ggrun-productions and the common ~/<project>/ggrun-productions layout,
-// and stops at the first directory holding real ggrun state.
+// both ~/ggrun and the common ~/<project>/ggrun layout, and stops at the first
+// directory holding real ggrun state.
 //
 // This is what keeps a fresh shell, a second install, or a machine that lost an
 // exported LLM_APP_HOME from presenting an empty ggrun with no models and no
@@ -338,7 +386,7 @@ func DiscoverAppHome() string {
 	}
 	// Named layouts first: cheap, and correct in the overwhelming majority of
 	// installs.
-	for _, name := range []string{"ggrun-productions", ".ggrun", filepath.Join(".local", "share", "ggrun")} {
+	for _, name := range []string{"ggrun", ".ggrun", filepath.Join(".local", "share", "ggrun")} {
 		if dir := filepath.Join(home, name); HasState(dir) {
 			return dir
 		}
@@ -444,15 +492,29 @@ func ManifestPath() string {
 
 // Load returns the registered fork backends (empty if none/unreadable).
 func Load() []Backend {
-	data, err := os.ReadFile(ManifestPath())
+	list, err := loadManifest(ManifestPath())
 	if err != nil {
 		return nil
 	}
-	var list []Backend
-	if json.Unmarshal(data, &list) != nil {
-		return nil
+	for i := range list {
+		list[i] = ApplyBuiltinPolicy(list[i])
 	}
 	return list
+}
+
+// ApplyBuiltinPolicy makes safety attributes in the reviewed catalog
+// authoritative over legacy manifests. Older backends.json files predate
+// helper_only; interpreting an omitted false literally would route a
+// deliberately isolated helper backend as a generic main-model backend.
+func ApplyBuiltinPolicy(backend Backend) Backend {
+	if recipe := RecipeByName(backend.Tag); recipe != nil && recipe.HelperOnly {
+		backend.HelperOnly = true
+	}
+	return backend
+}
+
+func IsHelperOnly(backend Backend) bool {
+	return ApplyBuiltinPolicy(backend).HelperOnly
 }
 
 // Save writes the manifest.
@@ -461,11 +523,12 @@ func Save(list []Backend) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(list, "", "  ")
+	release, err := acquireManifestLock(p + ".lock")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(p, data, 0o644)
+	defer release()
+	return saveManifestLocked(p, list)
 }
 
 // ByTag returns the registered backend with this tag (case-insensitive), or nil.
@@ -492,6 +555,9 @@ func ForArch(arch string) *Backend {
 	}
 	list := Load()
 	for i := range list {
+		if IsHelperOnly(list[i]) {
+			continue
+		}
 		if strings.ToLower(list[i].RouteArch) != arch {
 			continue
 		}
@@ -504,19 +570,43 @@ func ForArch(arch string) *Backend {
 
 // Upsert adds or replaces a backend by tag.
 func Upsert(be Backend) error {
-	list := Load()
+	p := ManifestPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	release, err := acquireManifestLock(p + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+	list, err := loadManifestForMutation(p)
+	if err != nil {
+		return err
+	}
 	for i := range list {
 		if strings.EqualFold(list[i].Tag, be.Tag) {
 			list[i] = be
-			return Save(list)
+			return saveManifestLocked(p, list)
 		}
 	}
-	return Save(append(list, be))
+	return saveManifestLocked(p, append(list, be))
 }
 
 // Remove drops a backend by tag; returns false if not found.
 func Remove(tag string) (bool, error) {
-	list := Load()
+	p := ManifestPath()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return false, err
+	}
+	release, err := acquireManifestLock(p + ".lock")
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	list, err := loadManifestForMutation(p)
+	if err != nil {
+		return false, err
+	}
 	out := list[:0:0]
 	found := false
 	for _, b := range list {
@@ -529,7 +619,92 @@ func Remove(tag string) (bool, error) {
 	if !found {
 		return false, nil
 	}
-	return found, Save(out)
+	return found, saveManifestLocked(p, out)
+}
+
+func loadManifest(path string) ([]Backend, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var list []Backend
+	if err := json.Unmarshal(data, &list); err != nil {
+		return nil, fmt.Errorf("decode backend manifest: %w", err)
+	}
+	return list, nil
+}
+
+func loadManifestForMutation(path string) ([]Backend, error) {
+	list, err := loadManifest(path)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return list, err
+}
+
+func saveManifestLocked(path string, list []Backend) error {
+	data, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".backends-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		err = dirHandle.Sync()
+		_ = dirHandle.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func acquireManifestLock(path string) (func(), error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+			_ = file.Sync()
+			_ = file.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 2*time.Minute {
+			_ = os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for backend manifest lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // Tags returns the registered backend tags (for pickers).

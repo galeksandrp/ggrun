@@ -1,14 +1,17 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -20,6 +23,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/gguf"
 	modelstore "github.com/raketenkater/ggrun/pkg/models"
+	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/probe"
 	"github.com/raketenkater/ggrun/pkg/recommend"
 	"github.com/raketenkater/ggrun/pkg/tune"
@@ -81,6 +85,7 @@ type Model struct {
 	ctxMode        string
 	kvPlacement    string
 	kvQuality      string
+	swaFull        bool
 	vramHeadroomMB int
 	ramHeadroomMB  int
 	parallel       string
@@ -90,6 +95,8 @@ type Model struct {
 	benchmark      bool
 	vision         bool
 	claudeCode     bool
+	supportExpert  string
+	supportOnline  bool
 	// claudeProfile is deliberately per-launch: an empty value preserves the
 	// CLI default instead of writing a scheduling policy into user config.
 	claudeProfile string
@@ -105,6 +112,7 @@ type Model struct {
 
 	// Settings screen (arrow-navigable list of all config options)
 	settingsCfg     *config.Config
+	swaFullTouched  bool
 	settingsCursor  int
 	ramLimitPercent int
 
@@ -132,23 +140,53 @@ type Model struct {
 
 	// Launch request (set when user chooses to launch)
 	launchRequest *LaunchRequest
+	// replayRequest is the exact last TUI request while its pre-launch review
+	// screen is open. It is kept separate from the editable Model fields so
+	// confirming a replay cannot silently regenerate different arguments.
+	replayRequest *LaunchRequest
+	replaySavedAt time.Time
+	// backendRouteBypass is set only when the user explicitly chooses to try a
+	// model once without its reviewed architecture backend. It is per-selection
+	// runtime state and is never persisted.
+	backendRouteBypass        bool
+	backendRouteBypassBackend string
 
 	// Messages
-	message     string
-	messageType string // info, warning, error
+	message        string
+	messageType    string // info, warning, error
+	scanningModels bool
 }
 
 // ModelItem represents a discovered GGUF model.
 type ModelItem struct {
-	Name        string
-	Path        string
-	Tuned       int
-	SizeGB      float64
-	Arch        string
-	IsMoE       bool
-	AutoBackend string // registered architecture route used when backend=auto
-	MaxCtx      int    // trained max context from GGUF
-	FitCtx      int    // empirically proven fit context from probes
+	Name          string
+	Path          string
+	Tuned         int
+	SizeGB        float64
+	Arch          string
+	Architecture  string // exact GGUF architecture, without display suffixes
+	IsMoE         bool
+	AutoBackend   string                  // installed route selected for this architecture
+	BackendRecipe string                  // reviewed route recipe when no installed route exists
+	MaxCtx        int                     // trained max context from GGUF
+	FitCtx        int                     // empirically proven fit context from probes
+	External      bool                    // found outside the configured primary model directory
+	KVProfile     *placement.ModelProfile // metadata for the live Full-SWA KV estimate
+}
+
+type modelScanFinishedMsg struct {
+	result   modelstore.ScanResult
+	cacheErr error
+}
+
+func scanComputerModels(modelDir, cacheDir string) tea.Cmd {
+	return func() tea.Msg {
+		result := modelstore.ScanComputer(modelDir)
+		return modelScanFinishedMsg{
+			result:   result,
+			cacheErr: modelstore.SaveDiscoveredScan(cacheDir, result),
+		}
+	}
 }
 
 func InitialModel() Model {
@@ -183,8 +221,12 @@ func InitialModel() Model {
 		ctxMode:         ctxMode,
 		kvPlacement:     cfg.KVPlacement,
 		kvQuality:       cfg.KVQuality,
+		swaFull:         cfg.SWAFull,
 		parallel:        parallel,
+		parallelSet:     cfg.Parallel > 0 && cfg.IsExplicit("PARALLEL"),
 		vision:          cfg.Vision,
+		supportExpert:   cfg.SupportExpert,
+		supportOnline:   cfg.SupportOnline,
 		aituneRounds:    rounds,
 		ramLimitPercent: cfg.RAMLimitPercent,
 	}
@@ -208,7 +250,7 @@ func InitialModel() Model {
 	// Detect once, then reuse that result while enriching every discovered GGUF.
 	caps, _ := detect.Detect()
 	m.caps = caps
-	m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
+	m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, m.caps)
 
 	m.vramHeadroomMB = config.ParseBudgetMB(cfg.VRAMHeadroom)
 	m.ramHeadroomMB = config.ParseBudgetMB(cfg.RAMHeadroom)
@@ -238,11 +280,21 @@ func flattenRecommendationCategories(cats recommend.Categories) []recommend.Reco
 func newMainList(models []ModelItem) list.Model {
 	items := []list.Item{
 		mainItem{title: "r. Recommended downloads", desc: "Best models and quants that fit this computer", isAction: true, action: "recommend"},
+		mainItem{title: "l. Run latest configuration", desc: "Review and replay the exact previous TUI launch", isAction: true, action: "latest"},
+		mainItem{title: "p. Scan computer for models", desc: "Find GGUFs on all local disks and remember their paths", isAction: true, action: "scan"},
 	}
 	for i, m := range models {
 		desc := fmt.Sprintf("%.1fGB, %s", m.SizeGB, m.Arch)
+		if m.AutoBackend != "" {
+			desc += "  [backend: " + m.AutoBackend + "]"
+		} else if m.BackendRecipe != "" {
+			desc += "  [install backend: " + m.BackendRecipe + "]"
+		}
 		if m.Tuned > 0 {
 			desc += fmt.Sprintf("  [tuned: %d]", m.Tuned)
+		}
+		if m.External {
+			desc += "  [discovered: " + filepath.Dir(m.Path) + "]"
 		}
 		items = append(items, mainItem{
 			title:   fmt.Sprintf("%d. %s", i+1, m.Name),
@@ -367,6 +419,73 @@ func (m Model) Init() tea.Cmd {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case modelScanFinishedMsg:
+		m.scanningModels = false
+		// A scan can finish while the user is already configuring a model. Keep
+		// both that active model and the highlighted Main-menu row attached to
+		// their paths while the newly found models are merged and sorted.
+		selectedModelID := ""
+		if m.selectedModel >= 0 && m.selectedModel < len(m.models) {
+			selectedModelID = modelIdentity(m.models[m.selectedModel].Path)
+		}
+		focusedModelID, focusedAction := "", ""
+		if raw := m.mainList.SelectedItem(); raw != nil {
+			if item, ok := raw.(mainItem); ok {
+				focusedAction = item.action
+				if item.isModel && item.index >= 0 && item.index < len(m.models) {
+					focusedModelID = modelIdentity(m.models[item.index].Path)
+				}
+			}
+		}
+		// Use this scan's in-memory result even if persistence failed; a cache
+		// write problem must not discard paths we just found for this session.
+		items := mergeModelItems(discoverModels(m.modelDir), discoverModelsFromPaths(msg.result.Paths))
+		m.models = enrichModelItems(items, m.cacheDir, m.backend, m.caps)
+		m.rebuildMainList()
+		if selectedModelID != "" {
+			for i := range m.models {
+				if modelIdentity(m.models[i].Path) == selectedModelID {
+					m.selectedModel = i
+					break
+				}
+			}
+		}
+		for i, raw := range m.mainList.VisibleItems() {
+			item, ok := raw.(mainItem)
+			if !ok {
+				continue
+			}
+			if focusedModelID != "" && item.isModel && item.index >= 0 && item.index < len(m.models) && modelIdentity(m.models[item.index].Path) == focusedModelID {
+				m.mainList.Select(i)
+				break
+			}
+			if focusedModelID == "" && focusedAction != "" && item.action == focusedAction {
+				m.mainList.Select(i)
+				break
+			}
+		}
+		external := 0
+		for _, model := range m.models {
+			if model.External {
+				external++
+			}
+		}
+		seconds := msg.result.Duration.Round(100 * time.Millisecond)
+		m.message = fmt.Sprintf("Computer scan complete: %d runnable model(s), %d outside the primary directory (%s)", len(m.models), external, seconds)
+		m.messageType = "info"
+		if msg.result.Truncated {
+			m.message += "; scan limit reached, showing partial results"
+			m.messageType = "warning"
+		}
+		if msg.cacheErr != nil {
+			m.message += fmt.Sprintf("; results could not be saved: %v", msg.cacheErr)
+			m.messageType = "warning"
+		}
+		if m.screen == ScreenFirstRun && len(m.models) > 0 {
+			m.screen = ScreenMain
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -458,6 +577,10 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedRecommendation = 0
 			m.screen = ScreenRecommended
 			return m, nil
+		case "p", "P":
+			return m.startComputerModelScan()
+		case "l", "L":
+			return m.openLatestLaunch()
 		case "enter":
 			if item, ok := m.mainList.SelectedItem().(mainItem); ok {
 				if item.isModel {
@@ -466,6 +589,9 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// are pre-filled, so launching is one more keypress: press L
 					// (or Enter on the Launch row) to start.
 					m.selectedModel = item.index
+					m.backendRouteBypass = false
+					m.replayRequest = nil
+					m.replaySavedAt = time.Time{}
 					m.cfgCursor = 0
 					m.screen = ScreenModelConfig
 					return m, nil
@@ -475,6 +601,10 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedRecommendation = 0
 					m.screen = ScreenRecommended
 					return m, nil
+				case "scan":
+					return m.startComputerModelScan()
+				case "latest":
+					return m.openLatestLaunch()
 				case "download":
 					m.screen = ScreenDownload
 					m.inputMode = "download"
@@ -512,6 +642,9 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c", "C":
 			if item, ok := m.mainList.SelectedItem().(mainItem); ok && item.isModel {
 				m.selectedModel = item.index
+				m.backendRouteBypass = false
+				m.replayRequest = nil
+				m.replaySavedAt = time.Time{}
 				m.cfgCursor = 0
 				m.screen = ScreenModelConfig
 				return m, nil
@@ -529,9 +662,141 @@ func (m Model) updateMain(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) startComputerModelScan() (tea.Model, tea.Cmd) {
+	if m.scanningModels {
+		m.message = "Computer model scan is already running"
+		m.messageType = "info"
+		return m, nil
+	}
+	m.scanningModels = true
+	m.message = "Scanning local disks for GGUF models… You can keep using the TUI."
+	m.messageType = "info"
+	return m, scanComputerModels(m.modelDir, m.cacheDir)
+}
+
+// openLatestLaunch loads the last request emitted by the TUI, restores its
+// presentation fields, and opens the normal pre-launch screen. Enter then
+// returns the saved request byte-for-byte at the field level; Esc converts it
+// back into an editable configuration instead of launching anything.
+func (m Model) openLatestLaunch() (tea.Model, tea.Cmd) {
+	req, savedAt, err := LoadLatestLaunch(m.cacheDir)
+	if err != nil {
+		if errors.Is(err, ErrNoLatestLaunch) {
+			m.message = "No previous TUI launch configuration has been saved yet"
+		} else {
+			m.message = fmt.Sprintf("Could not load latest TUI configuration: %v", err)
+		}
+		m.messageType = "warning"
+		return m, nil
+	}
+	if info, err := os.Stat(req.ModelPath); err != nil || info.IsDir() {
+		m.message = fmt.Sprintf("Latest configuration is unavailable because its model is missing: %s", req.ModelPath)
+		m.messageType = "warning"
+		return m, nil
+	}
+	if req.Backend == "" {
+		m.backend = "auto"
+	} else {
+		m.backend = req.Backend
+	}
+
+	if !m.selectModelPath(req.ModelPath) {
+		m.message = fmt.Sprintf("Latest configuration model is not a runnable GGUF: %s", req.ModelPath)
+		m.messageType = "warning"
+		return m, nil
+	}
+
+	m.applyLaunchRequestFields(req)
+	m.backendRouteBypass = false
+	copyReq := *req
+	copyReq.BackendArgs = append([]string(nil), req.BackendArgs...)
+	m.replayRequest = &copyReq
+	m.replaySavedAt = savedAt
+	m.message = ""
+	m.messageType = ""
+	m.screen = ScreenPrelaunch
+	return m, nil
+}
+
+// selectModelPath attaches a request to an already recognized model or adds
+// that one existing GGUF without requiring another whole-computer scan.
+func (m *Model) selectModelPath(path string) bool {
+	want := modelIdentity(path)
+	selected := -1
+	for i := range m.models {
+		if modelIdentity(m.models[i].Path) == want {
+			selected = i
+			break
+		}
+	}
+	if selected < 0 {
+		items := mergeModelItems(m.models, discoverModelsFromPaths([]string{path}))
+		m.models = enrichModelItems(items, m.cacheDir, m.backend, m.caps)
+		m.rebuildMainList()
+		for i := range m.models {
+			if modelIdentity(m.models[i].Path) == want {
+				selected = i
+				break
+			}
+		}
+	}
+	if selected < 0 {
+		return false
+	}
+	m.selectedModel = selected
+	return true
+}
+
+func (m *Model) applyLaunchRequestFields(req *LaunchRequest) {
+	if req == nil {
+		return
+	}
+	m.port = req.Port
+	m.ctxMode, m.ctxSize = "fit", "fit"
+	ctxFlag := strings.TrimSpace(req.CtxFlag)
+	switch ctxFlag {
+	case "", "fit", "auto":
+	case "max", "native":
+		m.ctxMode, m.ctxSize = "max", "max"
+	default:
+		m.ctxMode, m.ctxSize = "manual", ctxFlag
+	}
+	if ctxFlag == "" && req.CtxSize > 0 {
+		m.ctxMode, m.ctxSize = "manual", strconv.Itoa(req.CtxSize)
+	}
+	if req.KVPlacement != "" {
+		m.kvPlacement = req.KVPlacement
+	}
+	if req.KVQuality != "" {
+		m.kvQuality = req.KVQuality
+	}
+	m.swaFull = req.SWAFull
+	m.parallel, m.parallelSet = "", req.ParallelSet
+	if req.ParallelSet && req.Parallel > 0 {
+		m.parallel = strconv.Itoa(req.Parallel)
+	}
+	m.vision = req.Vision
+	m.tunePath = req.TuneCache
+	m.aitune = req.AITune
+	m.aituneRounds = req.AITuneRounds
+	m.benchmark = req.Benchmark
+	m.claudeCode = req.ClaudeCode
+	m.claudeProfile = req.ClaudeProfile
+	if req.SupportSet || req.SupportExpert != "" {
+		m.supportExpert = req.SupportExpert
+		m.supportOnline = req.SupportOnline
+	}
+	m.resumeSession, m.resumeRun, m.resumeCached = req.ResumeSession, "", 0
+	m.refreshTunedCounts()
+}
+
 // cfgRows returns the ordered focusable rows of the Advanced config screen.
 func (m Model) cfgRows() []string {
-	rows := []string{"context", "parallel", "kv", "tuned", "aitune"}
+	rows := []string{}
+	if m.selectedBackendRecipe() != nil {
+		rows = append(rows, "backend-install")
+	}
+	rows = append(rows, "context", "parallel", "kv", "swa", "tuned", "aitune")
 	if m.aitune {
 		rows = append(rows, "rounds")
 	}
@@ -540,6 +805,86 @@ func (m Model) cfgRows() []string {
 		rows = append(rows, "claudeprofile")
 	}
 	return append(rows, "benchmark", "launch", "dryrun")
+}
+
+func (m Model) selectedBackendRecipe() *backends.Recipe {
+	if m.backendRouteBypass || m.selectedModel < 0 || m.selectedModel >= len(m.models) {
+		return nil
+	}
+	model := m.models[m.selectedModel]
+	if model.AutoBackend != "" || model.BackendRecipe == "" {
+		return nil
+	}
+	return backends.RecipeByName(model.BackendRecipe)
+}
+
+// effectiveBackend returns the model-specific installed route when one exists;
+// otherwise it preserves the configured default backend. This keeps a Laguna,
+// Hy3, or MiniMax fork scoped to the model that needs it instead of changing the
+// user's global backend setting for every model.
+func (m Model) effectiveBackend() string {
+	if m.backendRouteBypass {
+		if fallback := strings.TrimSpace(m.backendRouteBypassBackend); fallback != "" {
+			return fallback
+		}
+	}
+	if m.selectedModel >= 0 && m.selectedModel < len(m.models) {
+		if routed := strings.TrimSpace(m.models[m.selectedModel].AutoBackend); routed != "" {
+			return routed
+		}
+	}
+	return m.backend
+}
+
+// openSelectedBackendInstall asks before the network clone/build. Confirming
+// returns a normal backend CLI request carrying the model's current launch
+// settings; cmdGUI can then reopen the same model at pre-launch with the newly
+// registered route selected.
+func (m *Model) openSelectedBackendInstall() bool {
+	recipe := m.selectedBackendRecipe()
+	if recipe == nil || m.selectedModel < 0 || m.selectedModel >= len(m.models) {
+		return false
+	}
+	model := m.models[m.selectedModel]
+	arch := model.Architecture
+	if arch == "" {
+		arch = model.Arch
+	}
+	installLabel := "Install " + recipe.Name + " and select it"
+	continueBackend := strings.TrimSpace(m.backend)
+	if required := backends.RequiredBackendForArch(arch); required != "" {
+		continueBackend = required
+	}
+	if continueBackend == "" {
+		continueBackend = "auto"
+	}
+	continueLabel := "Continue once with " + continueBackend
+	m.openChoice(
+		"Backend for "+arch,
+		[]string{"Cancel", installLabel, continueLabel},
+		"Cancel",
+		ScreenModelConfig,
+		func(mm *Model, value string) {
+			switch value {
+			case installLabel:
+				req := mm.buildLaunchRequest()
+				if req == nil {
+					return
+				}
+				req.Backend = recipe.Tag
+				req.BackendArgs = []string{"install", recipe.Name}
+				mm.launchRequest = req
+			case continueLabel:
+				mm.backendRouteBypass = true
+				mm.backendRouteBypassBackend = continueBackend
+				mm.message = "Continuing once with " + continueBackend + "; the model may fail if that backend lacks " + arch
+				mm.messageType = "warning"
+				mm.loadResumableSession()
+				mm.screen = ScreenPrelaunch
+			}
+		},
+	)
+	return true
 }
 
 func (m *Model) openCfgInput(mode, val, placeholder string) {
@@ -580,6 +925,13 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 		} else {
 			m.kvPlacement = nextOption(order, m.kvPlacement)
 		}
+	case "swa":
+		m.swaFull = !m.swaFull
+		// Cycling this row is a deliberate per-launch choice, so it goes out as
+		// an explicit flag. Merely inheriting the saved setting does not: that
+		// stays in config, where ggrun still applies it but may withdraw it on a
+		// memory failure.
+		m.swaFullTouched = true
 	case "context":
 		order := []string{"fit", "max"}
 		cur := "fit"
@@ -618,12 +970,16 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 // activateCfgRow handles Enter on the focused Advanced-config row.
 func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 	switch row {
+	case "backend-install":
+		m.openSelectedBackendInstall()
 	case "context":
 		m.openCfgInput("ctx", m.ctxSize, "fit, max, or token count")
 	case "parallel":
 		m.openCfgInput("parallel", m.parallel, "Parallel slots (blank = let placement decide)")
 	case "kv":
 		m.cycleCfgRow("kv", 1)
+	case "swa":
+		m.cycleCfgRow("swa", 1)
 	case "tuned":
 		m.openTunedPicker()
 	case "rounds":
@@ -645,6 +1001,11 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 			m.aitune = false
 		}
 	case "launch":
+		if m.openSelectedBackendInstall() {
+			return m, nil
+		}
+		m.replayRequest = nil
+		m.replaySavedAt = time.Time{}
 		m.loadResumableSession()
 		m.screen = ScreenPrelaunch
 	case "dryrun":
@@ -722,6 +1083,8 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openCfgInput("parallel", m.parallel, "Parallel slots (blank = let placement decide)")
 	case "K":
 		m.cycleCfgRow("kv", 1)
+	case "w", "W":
+		m.cycleCfgRow("swa", 1)
 	case "a", "A":
 		m.aitune = !m.aitune
 		if m.aitune {
@@ -741,11 +1104,18 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "x", "X":
 		m.claudeCode = !m.claudeCode
 	case "l", "L":
+		if m.openSelectedBackendInstall() {
+			return m, nil
+		}
+		m.replayRequest = nil
+		m.replaySavedAt = time.Time{}
 		m.loadResumableSession()
 		m.screen = ScreenPrelaunch
 	case "d", "D":
 		m.message = fmt.Sprintf("Dry run: %s", strings.Join(m.buildArgs(), " "))
 		m.messageType = "info"
+	case "i", "I":
+		m.openSelectedBackendInstall()
 	case "t", "T":
 		m.openTunedPicker()
 	case "q", "Q":
@@ -755,7 +1125,7 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func firstRunActions() []string {
-	return []string{"recommend", "download", "modeldir", "backends", "update", "quit"}
+	return []string{"recommend", "latest", "scan", "download", "modeldir", "backends", "update", "quit"}
 }
 
 func (m Model) doFirstRunAction(action string) (tea.Model, tea.Cmd) {
@@ -763,6 +1133,10 @@ func (m Model) doFirstRunAction(action string) (tea.Model, tea.Cmd) {
 	case "recommend":
 		m.selectedRecommendation = 0
 		m.screen = ScreenRecommended
+	case "latest":
+		return m.openLatestLaunch()
+	case "scan":
+		return m.startComputerModelScan()
 	case "download":
 		m.screen = ScreenDownload
 		m.inputMode = "download"
@@ -808,6 +1182,10 @@ func (m Model) updateFirstRun(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.doFirstRunAction(actions[m.menuCursor])
 	case "r", "R":
 		return m.doFirstRunAction("recommend")
+	case "l", "L":
+		return m.doFirstRunAction("latest")
+	case "p", "P":
+		return m.doFirstRunAction("scan")
 	case "d", "D":
 		return m.doFirstRunAction("download")
 	case "m", "M":
@@ -840,7 +1218,7 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 			val = strings.TrimSpace(val)
 			if val != "" {
 				m.modelDir = val
-				m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
+				m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, m.caps)
 				m.rebuildMainList()
 				if err := persistConfig(func(c *config.Config) { c.ModelDir = val }); err != nil {
 					m.message = fmt.Sprintf("Warning: Using %s for this session — could not save config: %v", val, err)
@@ -915,11 +1293,18 @@ func (m Model) View() string {
 
 func (m Model) viewMain() string {
 	var b strings.Builder
+	external := 0
+	for _, model := range m.models {
+		if model.External {
+			external++
+		}
+	}
 
 	b.WriteString(titleStyle.Render("═══ ggrun ═══") + "\n")
 	b.WriteString(fmt.Sprintf("  Backend:  %s\n", m.backend))
 	b.WriteString(fmt.Sprintf("  Hardware: %s\n", hwSummary(m.caps)))
-	b.WriteString(fmt.Sprintf("  Models:   %s (%d)\n", m.modelDir, len(m.models)))
+	b.WriteString(fmt.Sprintf("  Models:   %d recognized (%d elsewhere)\n", len(m.models), external))
+	b.WriteString(fmt.Sprintf("  Primary:  %s\n", m.modelDir))
 	b.WriteString(fmt.Sprintf("  Settings: %s\n", m.settingsPath))
 	b.WriteString("\n")
 
@@ -930,7 +1315,7 @@ func (m Model) viewMain() string {
 	b.WriteString(m.mainList.View())
 
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("  Enter configure · / search · x delete · r downloads · s settings · u update · q quit"))
+	b.WriteString(mutedStyle.Render("  Enter configure · l latest · / search · p scan disks · x delete · r downloads · s settings · u update · q quit"))
 
 	if m.message != "" {
 		b.WriteString("\n")
@@ -958,6 +1343,8 @@ func (m Model) viewFirstRun() string {
 	actions := firstRunActions()
 	labels := map[string]string{
 		"recommend": "[r] Recommended downloads for this machine",
+		"latest":    "[l] Run latest saved configuration",
+		"scan":      "[p] Scan all local disks for existing GGUF models",
 		"download":  "[d] Manual Hugging Face repository",
 		"modeldir":  "[m] Point at an existing model directory",
 		"backends":  "[f] Install or manage backend forks",
@@ -970,6 +1357,17 @@ func (m Model) viewFirstRun() string {
 		} else {
 			b.WriteString("  " + labels[a] + "\n")
 		}
+	}
+	if m.message != "" {
+		b.WriteString("\n  ")
+		if m.messageType == "warning" {
+			b.WriteString(warningStyle.Render(m.message))
+		} else if m.messageType == "error" {
+			b.WriteString(errorStyle.Render(m.message))
+		} else {
+			b.WriteString(highlightStyle.Render(m.message))
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("\n" + mutedStyle.Render("  ↑/↓ move · Enter select · q quit"))
 	return b.String()
@@ -1042,11 +1440,23 @@ func (m Model) viewModelConfig() string {
 		kvQualityLabel = m.kvQuality
 	}
 
-	section("Context & memory")
+	section("Backend, context & memory")
+	switch {
+	case model.AutoBackend != "":
+		line("backend", "Backend", model.AutoBackend+" (auto-selected for "+model.Architecture+")")
+	case m.selectedBackendRecipe() != nil:
+		line("backend-install", "[i] Backend", "install "+model.BackendRecipe+" for "+model.Architecture)
+	case m.backendRouteBypass && model.BackendRecipe != "":
+		line("backend", "Backend", m.effectiveBackend()+" (unsupported-route check bypassed once)")
+	default:
+		line("backend", "Backend", m.backend)
+	}
 	line("context", "[c] Context size", ctxLabel)
 	line("parallel", "[p] Parallel slots", parallelLabel)
 	line("kv", "[K] KV placement", kvLabel)
 	line("kvq", "KV quality", kvQualityLabel+"  (change in Settings)")
+	swaLabel := m.swaLabel(model)
+	line("swa", "[w] Full SWA cache", swaLabel)
 
 	section("Tuning")
 	line("tuned", "[t] Tuned config", tuneLabel)
@@ -1100,7 +1510,13 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			m.launchRequest = m.buildLaunchRequest()
+			if m.replayRequest != nil {
+				req := *m.replayRequest
+				req.BackendArgs = append([]string(nil), m.replayRequest.BackendArgs...)
+				m.launchRequest = &req
+			} else {
+				m.launchRequest = m.buildLaunchRequest()
+			}
 			return m, tea.Quit
 		case "r", "R":
 			// Resume only makes sense in Claude Code mode with a recorded
@@ -1116,6 +1532,8 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "esc":
+			m.replayRequest = nil
+			m.replaySavedAt = time.Time{}
 			m.screen = ScreenModelConfig
 			return m, nil
 		case "q", "Q":
@@ -1172,13 +1590,27 @@ func (m Model) viewPrelaunch() string {
 	model := m.models[m.selectedModel]
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf("═══ Pre-launch: %s ═══", model.Name)) + "\n\n")
+	if m.replayRequest != nil {
+		when := m.replaySavedAt.Local().Format("2006-01-02 15:04:05 MST")
+		b.WriteString(highlightStyle.Render("  Latest saved TUI configuration") + "\n")
+		b.WriteString(fmt.Sprintf("  Saved:          %s\n", when))
+		b.WriteString("  Enter replays the exact saved request; Esc makes it editable.\n\n")
+	}
 
 	ctx := m.ctxSize
 	if m.ctxMode == "fit" {
 		ctx = "fit"
 	}
 	b.WriteString(fmt.Sprintf("  Context:        %s\n", ctx))
-	b.WriteString(fmt.Sprintf("  Backend:        %s\n", m.backend))
+	b.WriteString(fmt.Sprintf("  Model path:     %s\n", model.Path))
+	prelaunchBackend := m.effectiveBackend()
+	if m.replayRequest != nil && m.replayRequest.Backend != "" {
+		prelaunchBackend = m.replayRequest.Backend
+	}
+	b.WriteString(fmt.Sprintf("  Backend:        %s\n", prelaunchBackend))
+	if m.port > 0 {
+		b.WriteString(fmt.Sprintf("  Port:           %d\n", m.port))
+	}
 	if model.FitCtx > 0 {
 		b.WriteString(fmt.Sprintf("  Fit estimate:   ~%d tokens\n", model.FitCtx))
 	}
@@ -1187,12 +1619,16 @@ func (m Model) viewPrelaunch() string {
 	}
 	b.WriteString(fmt.Sprintf("  Parallel:       %s\n", m.prelaunchParallelLabel()))
 	b.WriteString(fmt.Sprintf("  KV placement:   %s\n", m.kvPlacement))
+	b.WriteString(fmt.Sprintf("  KV quality:     %s\n", m.kvQuality))
+	b.WriteString(fmt.Sprintf("  Full SWA cache: %s\n", m.swaLabel(model)))
 	b.WriteString(fmt.Sprintf("  AI tune:        %s\n", boolLabel(m.aitune)))
 	if m.aitune {
 		b.WriteString(fmt.Sprintf("  AI tune rounds: %d\n", m.aituneRounds))
 	}
 	b.WriteString(fmt.Sprintf("  Vision:         %s\n", boolLabel(m.vision)))
 	b.WriteString(fmt.Sprintf("  Benchmark:      %s\n", boolLabel(m.benchmark)))
+	b.WriteString(fmt.Sprintf("  Support expert: %s\n", supportExpertLabel(m.supportExpert)))
+	b.WriteString(fmt.Sprintf("  Online research: %s\n", boolLabel(m.supportOnline)))
 	b.WriteString(fmt.Sprintf("  Claude Code:    %s\n", boolLabel(m.claudeCode)))
 	if m.claudeCode {
 		b.WriteString(fmt.Sprintf("  Claude profile: %s\n", claudeProfileLabel(m.claudeProfile)))
@@ -1214,6 +1650,18 @@ func (m Model) viewPrelaunch() string {
 		b.WriteString("\n")
 	}
 	b.WriteString("  [Esc] Back to config\n")
+	if m.message != "" {
+		b.WriteString("\n  ")
+		switch m.messageType {
+		case "error":
+			b.WriteString(errorStyle.Render(m.message))
+		case "warning":
+			b.WriteString(warningStyle.Render(m.message))
+		default:
+			b.WriteString(highlightStyle.Render(m.message))
+		}
+		b.WriteString("\n")
+	}
 	return b.String()
 }
 
@@ -1690,81 +2138,130 @@ func discoverModels(dir string) []ModelItem {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		name := info.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".gguf") {
+		item, key, ok := modelItemFromPath(path, info, false)
+		if !ok || seen[key] {
 			return nil
 		}
-		// Companion artifacts are inputs to a target model, not runnable targets.
-		lower := strings.ToLower(name)
-		if strings.Contains(lower, "mmproj") || isAuxiliaryModel(name, "") {
-			return nil
-		}
-
-		// Handle multi-part models: only list -00001-of-NNNNN.gguf
-		isMultiPart := false
-		baseName := name
-		if re := strings.Index(name, "-00001-of-"); re > 0 {
-			baseName = name[:re] + ".gguf"
-			isMultiPart = true
-		} else if strings.Contains(name, "-of-") {
-			// Skip non-first parts of multi-part models
-			return nil
-		}
-
-		modelKey := filepath.Join(filepath.Dir(path), baseName)
-		if seen[modelKey] {
-			return nil
-		}
-		seen[modelKey] = true
-
-		// Sum sizes for multi-part models
-		dirPath := filepath.Dir(path)
-		var totalBytes int64
-		if isMultiPart {
-			pattern := baseName[:len(baseName)-5] + "*" // remove .gguf
-			matches, _ := filepath.Glob(filepath.Join(dirPath, pattern+"*.gguf"))
-			for _, match := range matches {
-				st, err := os.Stat(match)
-				if err == nil {
-					totalBytes += st.Size()
-				}
-			}
-		} else {
-			totalBytes = info.Size()
-		}
-
-		sizeGB := float64(totalBytes) / (1024 * 1024 * 1024)
-		arch := "dense"
-		if match := strings.Contains(name, "A") && strings.Contains(name, "B"); match {
-			// Check A[0-9]+B pattern for MoE detection
-			for i := 0; i < len(name)-1; i++ {
-				if name[i] == 'A' || name[i] == 'a' {
-					j := i + 1
-					for j < len(name) && name[j] >= '0' && name[j] <= '9' {
-						j++
-					}
-					if j < len(name) && (name[j] == 'B' || name[j] == 'b') {
-						arch = "MoE"
-						break
-					}
-				}
-			}
-		}
-
-		items = append(items, ModelItem{
-			Name:   baseName,
-			Path:   path,
-			SizeGB: sizeGB,
-			Arch:   arch,
-		})
+		seen[key] = true
+		items = append(items, item)
 		return nil
 	})
 
 	return items
 }
 
-func loadModels(dir, cacheDir, backend string, caps *detect.Capabilities) []ModelItem {
-	models := discoverModels(dir)
+func modelItemFromPath(path string, info os.FileInfo, external bool) (ModelItem, string, bool) {
+	if info == nil || info.IsDir() {
+		return ModelItem{}, "", false
+	}
+	name := info.Name()
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, ".gguf") || strings.Contains(lower, "mmproj") || isAuxiliaryModel(name, "") {
+		return ModelItem{}, "", false
+	}
+	shardFiles, isMultiPart, shardErr := modelstore.ResolveGGUFShardFiles(path)
+	if shardErr != nil {
+		return ModelItem{}, "", false
+	}
+
+	baseName := name
+	if shard := strings.Index(lower, "-00001-of-"); shard > 0 {
+		baseName = name[:shard] + ".gguf"
+	} else if strings.Contains(lower, "-of-") {
+		return ModelItem{}, "", false
+	}
+
+	dirPath := filepath.Dir(path)
+	modelKey := filepath.Join(dirPath, baseName)
+	totalBytes := info.Size()
+	if isMultiPart {
+		totalBytes = 0
+		for _, shardPath := range shardFiles {
+			if st, err := os.Stat(shardPath); err == nil {
+				totalBytes += st.Size()
+			}
+		}
+	}
+
+	arch := "dense"
+	if strings.Contains(name, "A") && strings.Contains(name, "B") {
+		// Check A[0-9]+B pattern for a cheap pre-header MoE hint.
+		for i := 0; i < len(name)-1; i++ {
+			if name[i] != 'A' && name[i] != 'a' {
+				continue
+			}
+			j := i + 1
+			for j < len(name) && name[j] >= '0' && name[j] <= '9' {
+				j++
+			}
+			if j < len(name) && (name[j] == 'B' || name[j] == 'b') {
+				arch = "MoE"
+				break
+			}
+		}
+	}
+	return ModelItem{
+		Name:     baseName,
+		Path:     filepath.Clean(path),
+		SizeGB:   float64(totalBytes) / (1024 * 1024 * 1024),
+		Arch:     arch,
+		External: external,
+	}, modelKey, true
+}
+
+func discoverModelsFromPaths(paths []string) []ModelItem {
+	items := make([]ModelItem, 0, len(paths))
+	seen := make(map[string]bool)
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		item, key, ok := modelItemFromPath(path, info, true)
+		if !ok || seen[key] {
+			continue
+		}
+		seen[key] = true
+		items = append(items, item)
+	}
+	return items
+}
+
+func modelIdentity(path string) string {
+	path = filepath.Clean(path)
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func mergeModelItems(groups ...[]ModelItem) []ModelItem {
+	seen := make(map[string]bool)
+	var merged []ModelItem
+	for _, group := range groups {
+		for _, item := range group {
+			key := modelIdentity(item.Path)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			merged = append(merged, item)
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		left, right := strings.ToLower(merged[i].Name), strings.ToLower(merged[j].Name)
+		if left != right {
+			return left < right
+		}
+		return strings.ToLower(merged[i].Path) < strings.ToLower(merged[j].Path)
+	})
+	return merged
+}
+
+func enrichModelItems(models []ModelItem, cacheDir, backend string, caps *detect.Capabilities) []ModelItem {
 	visible := models[:0]
 	totalSysMemMB := 0
 	if caps != nil {
@@ -1785,16 +2282,27 @@ func loadModels(dir, cacheDir, backend string, caps *detect.Capabilities) []Mode
 			}
 			models[i].MaxCtx = info.ContextLength
 			models[i].IsMoE = info.IsMoE
+			models[i].Architecture = info.Architecture
+			models[i].KVProfile = kvProfileFromGGUF(info)
 			if info.Architecture != "" {
 				models[i].Arch = info.Architecture
 			}
 			if info.IsMoE {
 				models[i].Arch += " · MoE"
 			}
-			if (backend == "" || backend == "auto") && info.Architecture != "" {
+			if info.Architecture != "" {
+				// Architecture routes are per-model and therefore more specific than
+				// the configured default backend. An installed reviewed/custom fork
+				// is selected for this model even when the user's default is pinned to
+				// mainline or generic ik_llama.
 				if routed := backends.ForArch(info.Architecture); routed != nil {
 					modelBackendTag = routed.Tag
 					models[i].AutoBackend = routed.Tag
+				} else if recipes := backends.RecipesForArch(info.Architecture); len(recipes) > 0 {
+					// Catalog order is preference order. For architectures with an
+					// alternative recipe (Laguna's upstream target-only fork), the first
+					// entry is the reviewed full-featured default.
+					models[i].BackendRecipe = recipes[0].Name
 				}
 			}
 			models[i].FitCtx = probe.EstimateFitCtxForInfo(models[i].Path, cacheDir, info, totalSysMemMB)
@@ -1803,6 +2311,98 @@ func loadModels(dir, cacheDir, backend string, caps *detect.Capabilities) []Mode
 		visible = append(visible, models[i])
 	}
 	return visible
+}
+
+func kvProfileFromGGUF(info *gguf.Info) *placement.ModelProfile {
+	if info == nil {
+		return nil
+	}
+	return &placement.ModelProfile{
+		NumLayers:        info.BlockCount,
+		HeadCountKV:      info.HeadCountKV,
+		KeyLength:        info.KeyLength,
+		ValueLength:      info.ValueLength,
+		KVLoraRank:       info.KVLoraRank,
+		RopeDim:          info.NRot,
+		HasSSM:           info.SSM,
+		FullAttnInterval: info.FullAttnInterval,
+		SlidingWindow:    info.SlidingWindow,
+		ModelArch:        info.Architecture,
+	}
+}
+
+func (m Model) swaEstimateContext(model ModelItem) int {
+	value := strings.TrimSpace(m.ctxSize)
+	if n, err := strconv.Atoi(value); err == nil && n > 0 {
+		return n
+	}
+	if value == "max" || value == "native" {
+		return model.MaxCtx
+	}
+	if m.claudeCode {
+		ctx := model.MaxCtx
+		if ctx > 1048576 {
+			ctx = 1048576
+		}
+		if ctx <= 0 {
+			ctx = 131072
+		}
+		return ctx
+	}
+	return model.FitCtx
+}
+
+func (m Model) swaExtraKVMB(model ModelItem) int {
+	if model.KVProfile == nil {
+		return -1
+	}
+	ctx := m.swaEstimateContext(model)
+	if ctx <= 0 {
+		return -1
+	}
+	kvType, err := placement.NormalizeKVType(m.kvQuality)
+	if err != nil {
+		return -1
+	}
+	plain := placement.EstimateKVCacheMB(model.KVProfile, ctx, kvType, false)
+	full := placement.EstimateKVCacheMB(model.KVProfile, ctx, kvType, true)
+	if full < plain {
+		return 0
+	}
+	return full - plain
+}
+
+func (m Model) swaLabel(model ModelItem) string {
+	extraMB := m.swaExtraKVMB(model)
+	if extraMB < 0 {
+		if m.swaFull {
+			return "on (more cache hits; memory estimate after dry run)"
+		}
+		return "off (smaller KV cache)"
+	}
+	if extraMB == 0 {
+		if m.swaFull {
+			return "on (no extra KV for this model)"
+		}
+		return "off (this model has no priced SWA delta)"
+	}
+	delta := fmt.Sprintf("+%.1f GiB KV", float64(extraMB)/1024.0)
+	if m.swaFull {
+		return "on (more cache hits; " + delta + ")"
+	}
+	return "off (enable cache hits; " + delta + ")"
+}
+
+func loadModels(dir, cacheDir, backend string, caps *detect.Capabilities) []ModelItem {
+	return enrichModelItems(discoverModels(dir), cacheDir, backend, caps)
+}
+
+func loadRecognizedModels(dir, cacheDir, backend string, caps *detect.Capabilities) []ModelItem {
+	items := mergeModelItems(
+		discoverModels(dir),
+		discoverModelsFromPaths(modelstore.LoadDiscoveredPaths(cacheDir)),
+	)
+	return enrichModelItems(items, cacheDir, backend, caps)
 }
 
 func (m Model) backendTag() string {
@@ -1837,7 +2437,7 @@ func (m *Model) refreshTunedCounts() {
 	tag := m.backendTag()
 	for i := range m.models {
 		modelTag := tag
-		if (m.backend == "" || m.backend == "auto") && m.models[i].AutoBackend != "" {
+		if m.models[i].AutoBackend != "" {
 			modelTag = m.models[i].AutoBackend
 		}
 		m.models[i].Tuned = tune.CountTunedConfigs(m.cacheDir, m.models[i].Name, modelTag)
@@ -1882,6 +2482,15 @@ func settingRows() []settingRow {
 		{label: "KV quality", kind: "enum", options: []string{"auto", "high", "bf16", "mid", "q8_0", "q5_1", "q5_0", "q4_1", "low", "q4_0", "iq4_nl", "f32"},
 			get: func(c *config.Config) string { return c.KVQuality },
 			set: func(c *config.Config, v string) { c.KVQuality = v }},
+		{label: "Full SWA cache", kind: "bool",
+			get: func(c *config.Config) string { return boolLabel(c.SWAFull) },
+			set: func(c *config.Config, v string) { c.SWAFull = v == "on" }},
+		{label: "Support expert / optimizer", kind: "enum", options: []string{"auto", "on", "off"},
+			get: func(c *config.Config) string { return c.SupportExpert },
+			set: func(c *config.Config, v string) { c.SupportExpert = v }},
+		{label: "Support online research", kind: "bool",
+			get: func(c *config.Config) string { return boolLabel(c.SupportOnline) },
+			set: func(c *config.Config, v string) { c.SupportOnline = v == "on" }},
 		{label: "VRAM headroom", kind: "text",
 			get: func(c *config.Config) string {
 				if strings.TrimSpace(c.VRAMHeadroom) == "" {
@@ -1949,6 +2558,12 @@ func (m *Model) applySetting(row settingRow, val string) {
 		// after a TUI restart while the current session keeps launching with
 		// the startup-time quality.
 		m.kvQuality = val
+	case "Full SWA cache":
+		m.swaFull = m.settingsCfg.SWAFull
+	case "Support expert / optimizer":
+		m.supportExpert = m.settingsCfg.SupportExpert
+	case "Support online research":
+		m.supportOnline = m.settingsCfg.SupportOnline
 	case "VRAM headroom":
 		m.vramHeadroomMB = config.ParseBudgetMB(val)
 		m.refreshRecommendations()
@@ -1963,7 +2578,7 @@ func (m *Model) applySetting(row settingRow, val string) {
 		m.refreshTunedCounts()
 	case "Model directory":
 		m.modelDir = val
-		m.models = loadModels(val, m.cacheDir, m.backend, m.caps)
+		m.models = loadRecognizedModels(val, m.cacheDir, m.backend, m.caps)
 		m.rebuildMainList()
 		if m.messageType != "warning" {
 			m.message = fmt.Sprintf("Saved: Model directory = %s (%d models)", val, len(m.models))
@@ -1974,7 +2589,7 @@ func (m *Model) applySetting(row settingRow, val string) {
 		m.port = m.settingsCfg.Port
 	case "Parallel":
 		m.parallel = ""
-		m.parallelSet = false
+		m.parallelSet = m.settingsCfg.Parallel > 0
 		if m.settingsCfg.Parallel > 0 {
 			m.parallel = strconv.Itoa(m.settingsCfg.Parallel)
 		}
@@ -2101,6 +2716,11 @@ func (m *Model) openRemoveModelChoice(idx int) {
 	if idx < 0 || idx >= len(m.models) {
 		return
 	}
+	if m.models[idx].External {
+		m.message = "Discovered models outside the primary directory are launch-only; remove the file at its source or make that directory primary first."
+		m.messageType = "warning"
+		return
+	}
 	name := m.models[idx].Name
 	m.openChoice("Delete "+name+"?", []string{"Cancel", "Confirm: delete " + name}, "Cancel", ScreenMain, func(cm *Model, confirm string) {
 		if confirm == "Cancel" {
@@ -2121,6 +2741,11 @@ func (m *Model) removeModelAt(idx int) {
 		return
 	}
 	item := m.models[idx]
+	if item.External {
+		m.message = "Discovered models outside the primary directory are launch-only; remove the file at its source or make that directory primary first."
+		m.messageType = "warning"
+		return
+	}
 	rel, err := filepath.Rel(m.modelDir, item.Path)
 	if err != nil {
 		m.message = fmt.Sprintf("Error removing %s: %v", item.Name, err)
@@ -2155,7 +2780,7 @@ matched:
 		m.messageType = "error"
 		return
 	}
-	m.models = loadModels(m.modelDir, m.cacheDir, m.backend, m.caps)
+	m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, m.caps)
 	m.rebuildMainList()
 	m.message = fmt.Sprintf("Removed %s (%.1fGB freed).", removed.Name, float64(removed.Bytes)/(1024*1024*1024))
 	m.messageType = "info"
@@ -2374,18 +2999,33 @@ func (m Model) buildLaunchRequest() *LaunchRequest {
 		// The configured KV quality, not a hardcoded default: passing a fixed
 		// "mid" here overrode the user's saved setting with --kv-quality mid
 		// on every TUI launch (settings appeared to save but never applied).
-		KVQuality:     m.kvQuality,
+		KVQuality: m.kvQuality,
+		SWAFull:   m.swaFull,
+		// Only emit --swa-full/--no-swa-full when this launch actually deviates
+		// from the saved setting. Emitting it unconditionally turned a stored
+		// preference into a command-line flag, and ggrun treats a typed flag as
+		// inviolable: userExplicitBackendFlag reads OriginalArgs, so the
+		// recovery ladder, the advisory notice and the support expert's
+		// remove_generated_feature action were all locked out of it. Measured
+		// 2026-08-03: --swa-full cost 5.3 GiB of KV on CUDA0 (6196 MiB vs 871),
+		// which is exactly what made the launch unfittable — and nothing was
+		// permitted to drop it, because the TUI had "typed" it. A setting is a
+		// preference; only a human at the command line is an instruction.
+		SWAFullSet:    m.swaFullTouched,
 		FlashAttn:     true,
 		Parallel:      parallel,
 		ParallelSet:   parallelSet,
 		Vision:        m.vision,
-		Backend:       m.backend,
+		Backend:       m.effectiveBackend(),
 		TuneCache:     m.tunePath,
 		AITune:        m.aitune,
 		AITuneRounds:  m.aituneRounds,
 		Benchmark:     m.benchmark,
 		ClaudeCode:    m.claudeCode,
 		ClaudeProfile: m.claudeProfile,
+		SupportExpert: m.supportExpert,
+		SupportOnline: m.supportOnline,
+		SupportSet:    true,
 	}
 }
 
@@ -2409,6 +3049,8 @@ type LaunchRequest struct {
 	CtxFlag       string
 	KVPlacement   string
 	KVQuality     string
+	SWAFull       bool
+	SWAFullSet    bool // TUI explicitly selected on/off; emit an override either way
 	FlashAttn     bool
 	Parallel      int
 	ParallelSet   bool // user typed a parallel value (claude-code mode must not override)
@@ -2421,6 +3063,9 @@ type LaunchRequest struct {
 	ClaudeCode    bool
 	ClaudeProfile string
 	ResumeSession string // reopen this recorded Claude Code session
+	SupportExpert string // optional native support/optimizer policy: off, auto, on
+	SupportOnline bool   // allow typed official llama.cpp research
+	SupportSet    bool   // TUI explicitly selected the support and research policy
 }
 
 func (req *LaunchRequest) LaunchArgs() []string {
@@ -2444,6 +3089,13 @@ func (req *LaunchRequest) LaunchArgs() []string {
 	if req.KVQuality != "" {
 		args = append(args, "--kv-quality", req.KVQuality)
 	}
+	if req.SWAFullSet {
+		if req.SWAFull {
+			args = append(args, "--swa-full")
+		} else {
+			args = append(args, "--no-swa-full")
+		}
+	}
 	if req.Vision {
 		args = append(args, "--vision")
 	}
@@ -2462,6 +3114,16 @@ func (req *LaunchRequest) LaunchArgs() []string {
 	if req.Benchmark {
 		args = append(args, "--benchmark")
 	}
+	if req.SupportExpert != "" {
+		args = append(args, "--support-expert", req.SupportExpert)
+	}
+	if req.SupportSet {
+		if req.SupportOnline {
+			args = append(args, "--support-online")
+		} else {
+			args = append(args, "--no-support-online")
+		}
+	}
 	if req.ClaudeCode {
 		args = append(args, "--claude-code")
 		if req.ClaudeProfile != "" {
@@ -2474,6 +3136,17 @@ func (req *LaunchRequest) LaunchArgs() []string {
 		}
 	}
 	return args
+}
+
+func supportExpertLabel(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "off":
+		return "off"
+	case "on":
+		return "on (required, ephemeral)"
+	default:
+		return "auto (installed-only, ephemeral)"
+	}
 }
 
 // claudeProfileLabel describes the selector value without converting its empty
@@ -2514,9 +3187,8 @@ func (m Model) prelaunchParallelLabel() string {
 	return m.parallel
 }
 
-// Run starts the TUI and returns a launch request if the user chose to launch.
-func Run() (*LaunchRequest, error) {
-	p := tea.NewProgram(InitialModel(), tea.WithAltScreen())
+func runModel(initial Model) (*LaunchRequest, error) {
+	p := tea.NewProgram(initial, tea.WithAltScreen())
 	m, err := p.Run()
 	if err != nil {
 		return nil, err
@@ -2525,4 +3197,37 @@ func Run() (*LaunchRequest, error) {
 		return model.launchRequest, nil
 	}
 	return nil, nil
+}
+
+// Run starts the TUI and returns a launch request if the user chose to launch.
+func Run() (*LaunchRequest, error) {
+	return runModel(InitialModel())
+}
+
+// RunAfterBackendInstall reopens the same model and settings at pre-launch
+// after a reviewed fork has built successfully. The recipe tag stays scoped to
+// this request; it does not overwrite the user's default backend for unrelated
+// models.
+func RunAfterBackendInstall(req *LaunchRequest) (*LaunchRequest, error) {
+	m := InitialModel()
+	if req == nil {
+		return runModel(m)
+	}
+	if req.Backend != "" {
+		m.backend = req.Backend
+	}
+	if !m.selectModelPath(req.ModelPath) {
+		m.message = "Backend installed, but the selected model is no longer available: " + req.ModelPath
+		m.messageType = "warning"
+		m.screen = ScreenMain
+		return runModel(m)
+	}
+	m.applyLaunchRequestFields(req)
+	m.backendRouteBypass = false
+	m.replayRequest = nil
+	m.replaySavedAt = time.Time{}
+	m.message = "Backend installed and auto-selected for this model. Review the launch, then press Enter."
+	m.messageType = "info"
+	m.screen = ScreenPrelaunch
+	return runModel(m)
 }

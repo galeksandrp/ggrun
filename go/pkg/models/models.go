@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -25,6 +26,48 @@ type Model struct {
 }
 
 var shardName = regexp.MustCompile(`(?i)^(.*)-[0-9]{5}-of-[0-9]{5}\.gguf$`)
+var shardPartsName = regexp.MustCompile(`(?i)^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$`)
+
+const maxGGUFShards = 10_000
+
+// ResolveGGUFShardFiles returns the exact files belonging to a GGUF entrypoint.
+// A split model is launchable only from shard 00001 and only after every shard
+// named by its -of-N suffix exists. Silently summing whichever shards happen to
+// be present makes an interrupted download look smaller than it is, which can
+// turn a placement plan into a host/GPU OOM.
+func ResolveGGUFShardFiles(path string) (files []string, sharded bool, err error) {
+	path = filepath.Clean(path)
+	match := shardPartsName.FindStringSubmatch(filepath.Base(path))
+	if len(match) != 4 {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return nil, false, statErr
+		}
+		if info.IsDir() {
+			return nil, false, fmt.Errorf("GGUF path is a directory: %s", path)
+		}
+		return []string{path}, false, nil
+	}
+
+	index, indexErr := strconv.Atoi(match[2])
+	total, totalErr := strconv.Atoi(match[3])
+	if indexErr != nil || totalErr != nil || index != 1 || total < 1 || total > maxGGUFShards {
+		return nil, true, fmt.Errorf("invalid sharded GGUF entrypoint %q (use shard 00001; supported shard count 1-%d)", filepath.Base(path), maxGGUFShards)
+	}
+
+	dir := filepath.Dir(path)
+	files = make([]string, 0, total)
+	for shard := 1; shard <= total; shard++ {
+		name := fmt.Sprintf("%s-%05d-of-%05d.gguf", match[1], shard, total)
+		candidate := filepath.Join(dir, name)
+		info, statErr := os.Stat(candidate)
+		if statErr != nil || info.IsDir() {
+			return nil, true, fmt.Errorf("incomplete sharded GGUF %q: missing shard %05d of %05d", match[1], shard, total)
+		}
+		files = append(files, candidate)
+	}
+	return files, true, nil
+}
 
 // List finds GGUF files below root. It follows file symlinks for their sizes
 // but never follows symlinked directories, so a model directory cannot cause a

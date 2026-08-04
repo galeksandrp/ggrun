@@ -50,12 +50,19 @@ func TestGuardEnvironment(t *testing.T) {
 	for _, want := range []string{
 		"LD_PRELOAD=/lib/guard.so" + string(os.PathListSeparator) + "/lib/existing.so",
 		"GGRUN_MEMGUARD_GPU_LIMITS_MB=100,200",
-		"GGRUN_MEMGUARD_PINNED_LIMIT_MB=0",
 		"GGML_CUDA_NO_PINNED=1",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("missing %q in %q", want, joined)
 		}
+	}
+	if strings.Contains(joined, "GGRUN_MEMGUARD_PINNED_LIMIT_MB=") {
+		t.Fatalf("zero requested no separate pinned cap but emitted a zero-byte denial: %q", joined)
+	}
+
+	limited := strings.Join(GuardEnvironment("/lib/guard.so", "/tmp/events", nil, 4096, ""), "\n")
+	if !strings.Contains(limited, "GGRUN_MEMGUARD_PINNED_LIMIT_MB=4096") {
+		t.Fatalf("positive pinned cap was not preserved: %q", limited)
 	}
 }
 

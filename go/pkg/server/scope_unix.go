@@ -90,7 +90,10 @@ func scopedCommandArgsWithLimits(args []string, memoryHighMB, memoryMaxMB int, u
 		"-p", fmt.Sprintf("MemoryMax=%dM", memoryMaxMB),
 		"-p", "MemorySwapMax=0",
 		"-p", "OOMPolicy=kill",
-		"-p", "KillMode=control-group",
+		// SIGTERM only the wrapper; its trap terminates the setsid child group
+		// once. control-group also signalled the child directly, so the wrapper's
+		// own TERM became llama-server's fatal \"second interrupt\".
+		"-p", "KillMode=mixed",
 		"--",
 	)
 	wrapper := []string{"/bin/sh", "-c", scopedParentWatchScript, "ggrun-scope-watch", strconv.Itoa(os.Getpid())}
@@ -102,7 +105,14 @@ func stopScopeUnit(unit string) error {
 	if unit == "" {
 		return nil
 	}
-	return exec.Command("systemctl", "--user", "stop", unit).Run()
+	err := exec.Command("systemctl", "--user", "stop", unit).Run()
+	// A transient scope may disappear between the activity check and stop.
+	// systemctl returns exit 5 for that already-stopped state; teardown has
+	// nevertheless achieved its only required outcome.
+	if err != nil && !scopeUnitActive(unit) {
+		return nil
+	}
+	return err
 }
 
 func resetFailedScopeUnit(unit string) error {

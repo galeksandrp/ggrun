@@ -211,7 +211,7 @@ func RecordPromptCacheObservation(cacheDir string, model *ModelProfile, ctxSize,
 	}
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
 		compute, growth, estimated, kvPerLayerMB,
-		promptCacheProbe{BytesPerToken: obs.BytesPerToken, EntryMB: obs.LargestEntryMB})
+		probeMeasurements{BytesPerToken: obs.BytesPerToken, EntryMB: obs.LargestEntryMB})
 }
 
 // RecordMeasuredPromptCache stores a per-token prompt-cache cost read from
@@ -239,7 +239,7 @@ func RecordMeasuredPromptCache(cacheDir string, model *ModelProfile, ctxSize, ub
 		kvPerLayerMB = pc.KVPerLayerMB
 	}
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
-		compute, growth, estimated, kvPerLayerMB, promptCacheProbe{BytesPerToken: bytesPerToken})
+		compute, growth, estimated, kvPerLayerMB, probeMeasurements{BytesPerToken: bytesPerToken})
 }
 
 // MeasuredPromptCacheBytesPerToken returns a stored measurement, or 0 when this

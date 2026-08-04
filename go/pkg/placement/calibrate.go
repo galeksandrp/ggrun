@@ -13,7 +13,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 2
+const CalibrationSchemaVersion = 3
 
 // CalibrationDecision records which candidate won a measured first-launch
 // calibration for one scope, with the numbers that decided it. The winner is
@@ -21,13 +21,17 @@ const CalibrationSchemaVersion = 2
 // later launches, so the full placement is reproduced exactly rather than
 // partially deserialized.
 type CalibrationDecision struct {
-	SchemaVersion int     `json:"schema_version"`
-	ScopeKey      string  `json:"scope_key"`
-	Winner        string  `json:"winner"` // candidate Name, e.g. "default" or "kv-alternate"
-	DefaultTPS    float64 `json:"default_tps"`
-	WinnerTPS     float64 `json:"winner_tps"`
-	Improvement   float64 `json:"improvement_pct"`
-	MeasuredAt    string  `json:"measured_at"`
+	SchemaVersion    int     `json:"schema_version"`
+	ScopeKey         string  `json:"scope_key"`
+	Winner           string  `json:"winner"` // candidate Name, e.g. "default" or "kv-alternate"
+	DefaultTPS       float64 `json:"default_tps"`
+	DefaultPromptTPS float64 `json:"default_prompt_tps"`
+	DefaultScore     float64 `json:"default_score"`
+	WinnerTPS        float64 `json:"winner_tps"`
+	WinnerPromptTPS  float64 `json:"winner_prompt_tps"`
+	WinnerScore      float64 `json:"winner_score"`
+	Improvement      float64 `json:"improvement_pct"`
+	MeasuredAt       string  `json:"measured_at"`
 }
 
 // CalibrationPath returns the cache file for one calibration scope.
@@ -55,12 +59,12 @@ func SaveCalibrationDecision(cacheDir string, d CalibrationDecision) (string, er
 	if err != nil {
 		return "", err
 	}
-	tmp := path + fmt.Sprintf(".%d.tmp", os.Getpid())
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	release, err := acquirePlacementLock(path+".lock", 5*time.Second)
+	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	defer release()
+	if err := atomicWriteFile(path, append(data, '\n'), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

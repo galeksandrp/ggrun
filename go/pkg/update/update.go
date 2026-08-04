@@ -34,6 +34,16 @@ var currentVersion = "v3.1.0-go"
 // whether to run the updater. It intentionally skips non-interactive shells so
 // scripts and CI never block on network or stdin.
 func PromptOnStartup() {
+	PromptOnStartupWithBackendUpdater(nil)
+}
+
+// PromptOnStartupWithBackendUpdater lets the command package extend the update
+// transaction with registered forks while this package keeps terminal/dismiss
+// policy in one place. A nil callback preserves the generic-backend behavior.
+func PromptOnStartupWithBackendUpdater(updateBackends func() error) {
+	if updateBackends == nil {
+		updateBackends = UpdateBackends
+	}
 	if os.Getenv("LLM_SERVER_UPDATE_CHECKED") != "" || os.Getenv("LLM_SERVER_NO_UPDATE_CHECK") != "" {
 		return
 	}
@@ -67,7 +77,7 @@ func PromptOnStartup() {
 			fmt.Fprintf(os.Stderr, "Self-update: %v\n", err)
 		}
 		if runtime.GOOS != "windows" {
-			if err := UpdateBackends(); err != nil {
+			if err := updateBackends(); err != nil {
 				fmt.Fprintf(os.Stderr, "Backend update: %v\n", err)
 			}
 		}
@@ -165,6 +175,9 @@ func updateRepoCandidates() []repoCandidate {
 		add("ggrun", filepath.Join(appHome, ".src", "ggrun"))
 		add("ik_llama.cpp", filepath.Join(appHome, ".src", "ik_llama.cpp"))
 		add("llama.cpp", filepath.Join(appHome, ".src", "llama.cpp"))
+		for _, target := range BackendBuildTargetsAt(appHome) {
+			add(target.Label, target.RepoDir)
+		}
 	}
 	if home != "" {
 		add("ik_llama.cpp", filepath.Join(home, "ik_llama.cpp"))
@@ -317,6 +330,9 @@ func SelfUpdate() error {
 		fmt.Printf("ggrun repo not found at %s; using latest release installer.\n", repoDir)
 		return SelfUpdateFromReleaseInstaller()
 	}
+	if dirty, _ := gitStatusPorcelain(repoDir); dirty != "" {
+		return fmt.Errorf("source checkout %s has tracked changes; commit or stash them before self-update", repoDir)
+	}
 
 	fmt.Println("═══ Updating ggrun ═══")
 	oldHash, err := gitRevParse(repoDir, "HEAD")
@@ -332,19 +348,11 @@ func SelfUpdate() error {
 	}
 
 	if out, err := gitPullFFOnly(repoDir); err != nil {
-		// Local commits on top of origin (a dev checkout) make fast-forward
-		// impossible — rebase them onto the new origin instead of failing,
-		// mirroring the backend-update path.
-		fmt.Println("  Warning: fast-forward pull failed, trying rebase...")
-		if out2, err2 := gitPullRebase(repoDir); err2 != nil {
-			if backupPath != "" {
-				os.Remove(backupPath)
-			}
-			return fmt.Errorf("git pull failed: %v\n%s\nrebase also failed: %v\n%s\nhint: your checkout has local commits that conflict with origin — resolve in %s",
-				err, strings.TrimSpace(out), err2, strings.TrimSpace(out2), repoDir)
-		} else {
-			fmt.Println(strings.TrimSpace(out2))
+		if backupPath != "" {
+			os.Remove(backupPath)
 		}
+		return fmt.Errorf("git pull --ff-only failed: %v\n%s\nhint: update or reconcile local commits in %s, then retry",
+			err, strings.TrimSpace(out), repoDir)
 	} else {
 		fmt.Println(strings.TrimSpace(out))
 	}
@@ -367,23 +375,14 @@ func SelfUpdate() error {
 		fmt.Printf("    %s\n", c)
 	}
 
-	installScript := filepath.Join(repoDir, "install.sh")
-	if _, err := os.Stat(installScript); err == nil {
-		fmt.Println("  Re-installing...")
-		cmd := exec.Command("bash", installScript)
-		cmd.Dir = repoDir
-		cmd.Env = selfUpdateInstallEnv(os.Getenv("LLM_APP_HOME"))
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			fmt.Println("  Error: Install failed. Rolling back...")
-			gitCheckout(repoDir, oldHash)
-			if backupPath != "" {
-				cp(backupPath, scriptPath)
-			}
-			os.Remove(backupPath)
-			return fmt.Errorf("install failed: %w", err)
+	if err := rebuildSelfUpdateBinary(repoDir, scriptPath); err != nil {
+		fmt.Println("  Error: Build/install failed. Rolling back...")
+		gitCheckout(repoDir, oldHash)
+		if backupPath != "" {
+			cp(backupPath, scriptPath)
 		}
-		_ = out
+		os.Remove(backupPath)
+		return err
 	}
 
 	// Self-check: can the new script run --version?
@@ -395,11 +394,6 @@ func SelfUpdate() error {
 			if backupPath != "" {
 				cp(backupPath, scriptPath)
 			}
-			if _, err := os.Stat(installScript); err == nil {
-				cmd := exec.Command("bash", installScript)
-				cmd.Env = selfUpdateInstallEnv(os.Getenv("LLM_APP_HOME"))
-				_ = cmd.Run()
-			}
 			os.Remove(backupPath)
 			return fmt.Errorf("self-check failed")
 		}
@@ -409,6 +403,36 @@ func SelfUpdate() error {
 		os.Remove(backupPath)
 	}
 	fmt.Println("  ✓ ggrun updated and verified. Restart to use the new version.")
+	return nil
+}
+
+func rebuildSelfUpdateBinary(repoDir, scriptPath string) error {
+	if strings.TrimSpace(scriptPath) == "" {
+		return fmt.Errorf("cannot resolve the active ggrun binary path")
+	}
+	goDir := filepath.Join(repoDir, "go")
+	if _, err := os.Stat(filepath.Join(goDir, "go.mod")); err != nil {
+		goDir = repoDir
+		if _, err := os.Stat(filepath.Join(goDir, "go.mod")); err != nil {
+			return fmt.Errorf("no Go module found in %s", repoDir)
+		}
+	}
+	staging := scriptPath + ".next"
+	_ = os.Remove(staging)
+	cmd := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", staging, "./cmd/ggrun")
+	cmd.Dir = goDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		_ = os.Remove(staging)
+		return fmt.Errorf("build ggrun: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	if err := exec.Command(staging, "version").Run(); err != nil {
+		_ = os.Remove(staging)
+		return fmt.Errorf("staged ggrun self-check: %w", err)
+	}
+	if err := os.Rename(staging, scriptPath); err != nil {
+		_ = os.Remove(staging)
+		return fmt.Errorf("activate rebuilt ggrun: %w", err)
+	}
 	return nil
 }
 
@@ -651,6 +675,11 @@ func installedSourceRepoDir() string {
 	if repoDir := strings.TrimSpace(os.Getenv("LLM_SERVER_REPO")); repoDir != "" {
 		return repoDir
 	}
+	if exe, err := os.Executable(); err == nil {
+		if repoDir := sourceRepoFromExecutable(exe); repoDir != "" {
+			return repoDir
+		}
+	}
 	if appHome := strings.TrimSpace(os.Getenv("LLM_APP_HOME")); appHome != "" {
 		repoDir := filepath.Join(appHome, ".src", "ggrun")
 		if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
@@ -659,6 +688,19 @@ func installedSourceRepoDir() string {
 	}
 	if home := homeDir(); home != "" {
 		return filepath.Join(home, "ggrun")
+	}
+	return ""
+}
+
+func sourceRepoFromExecutable(exe string) string {
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil && resolved != "" {
+		exe = resolved
+	}
+	dir := filepath.Dir(exe)
+	for _, candidate := range []string{dir, filepath.Dir(dir)} {
+		if _, err := os.Stat(filepath.Join(candidate, ".git")); err == nil {
+			return candidate
+		}
 	}
 	return ""
 }
@@ -679,6 +721,9 @@ func installedLLMServerPath() string {
 		}
 	}
 	if path, _ := exec.LookPath("ggrun"); path != "" {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil && resolved != "" {
+			return resolved
+		}
 		return path
 	}
 	if home := homeDir(); home != "" {
@@ -782,9 +827,13 @@ func UpdateBackend(name, repoDir string, walkback int) error {
 
 	newCommit, _ := gitRevParse(repoDir, "HEAD")
 	if oldCommit == newCommit {
-		fmt.Println("  Already up to date.")
-		os.Remove(binaryBackup)
-		return nil
+		if validateErr := smokeBackendConfigured(binary, collectCMakeFlags(buildDir)); validateErr == nil {
+			fmt.Println("  Already up to date and active backend passes conformance.")
+			os.Remove(binaryBackup)
+			return nil
+		} else {
+			fmt.Printf("  Source is current but active backend failed conformance (%v); rebuilding.\n", validateErr)
+		}
 	}
 	fmt.Printf("  Updated: %s\n", newCommit)
 
@@ -851,27 +900,289 @@ func UpdateBackend(name, repoDir string, walkback int) error {
 	return nil
 }
 
-// UpdateBackends updates both ik_llama.cpp and llama.cpp if present.
-func UpdateBackends() error {
-	found := map[string]bool{}
-	var updateErrs []error
+// BackendBuildTarget is one active, source-built generic backend. BuildDir is
+// explicit because canonical installs commonly keep CUDA and Vulkan builds in
+// build-cuda/build-vulkan rather than the legacy build directory.
+type BackendBuildTarget struct {
+	Label    string
+	RepoDir  string
+	BuildDir string
+}
+
+// BackendUpdateResult reports one independently preserved backend build.
+type BackendUpdateResult struct {
+	Target BackendBuildTarget
+	Status string // current, updated, fallback, failed
+	Err    error
+}
+
+// BackendBuildTargetsAt discovers the backends the canonical app home actually
+// launches by following its .bin symlinks. This avoids updating an unrelated
+// ~/ik_llama.cpp checkout while production points at another source tree.
+func BackendBuildTargetsAt(appHome string) []BackendBuildTarget {
+	appHome = strings.TrimSpace(appHome)
+	seen := make(map[string]bool)
+	var targets []BackendBuildTarget
+	add := func(label, binary string) {
+		binary = strings.TrimSpace(binary)
+		if binary == "" {
+			return
+		}
+		real, err := filepath.EvalSymlinks(binary)
+		if err != nil {
+			return
+		}
+		binDir := filepath.Dir(real)
+		if filepath.Base(binDir) != "bin" {
+			return
+		}
+		buildDir := filepath.Dir(binDir)
+		repoDir := filepath.Dir(buildDir)
+		if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+			return
+		}
+		key := repoDir + "\x00" + buildDir
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		if label == "" {
+			family := "llama.cpp"
+			if strings.Contains(strings.ToLower(filepath.Base(repoDir)), "ik_llama") {
+				family = "ik_llama.cpp"
+			}
+			variant := strings.TrimPrefix(filepath.Base(buildDir), "build-")
+			if variant == "build" || variant == "" {
+				label = family
+			} else {
+				label = fmt.Sprintf("%s (%s)", family, variant)
+			}
+		}
+		targets = append(targets, BackendBuildTarget{Label: label, RepoDir: repoDir, BuildDir: buildDir})
+	}
+
+	if appHome != "" {
+		for _, candidate := range []struct {
+			name  string
+			label string
+		}{
+			{name: "llama-server-cuda", label: "llama.cpp (cuda)"},
+			{name: "llama-server-vulkan", label: "llama.cpp (vulkan)"},
+			{name: "ik_llama-server-cuda", label: "ik_llama.cpp (cuda)"},
+			{name: "llama-server", label: ""},
+		} {
+			add(candidate.label, filepath.Join(appHome, ".bin", candidate.name))
+			add(candidate.label, filepath.Join(appHome, "bin", candidate.name))
+		}
+		// Source-contained installs may not use links. Include each active build
+		// variant, but only when it has both a configured cache and a server.
+		for _, family := range []string{"llama.cpp", "ik_llama.cpp"} {
+			repoDir := filepath.Join(appHome, ".src", family)
+			for _, variant := range []string{"build-cuda", "build-vulkan", "build"} {
+				buildDir := filepath.Join(repoDir, variant)
+				if _, err := os.Stat(filepath.Join(buildDir, "CMakeCache.txt")); err != nil {
+					continue
+				}
+				label := family
+				if suffix := strings.TrimPrefix(variant, "build-"); suffix != "build" && suffix != "" {
+					label += " (" + suffix + ")"
+				}
+				add(label, filepath.Join(buildDir, "bin", "llama-server"))
+			}
+		}
+		return targets
+	}
+
+	// Legacy installs with no resolved app home retain the old bounded source
+	// discovery, using whichever configured build directory is present.
 	for _, repo := range backendUpdateCandidates() {
-		if _, err := os.Stat(repo.Dir); err != nil {
+		for _, variant := range []string{"build-cuda", "build-vulkan", "build"} {
+			buildDir := filepath.Join(repo.Dir, variant)
+			if _, err := os.Stat(filepath.Join(buildDir, "CMakeCache.txt")); err == nil {
+				add(repo.Label, filepath.Join(buildDir, "bin", "llama-server"))
+			}
+		}
+	}
+	return targets
+}
+
+// UpdateBackends updates the active generic backends for a legacy/environment
+// resolved install. Command code should prefer UpdateBackendsAtAppHome so the
+// canonical production boundary is explicit.
+func UpdateBackends() error {
+	return UpdateBackendsAtAppHome(strings.TrimSpace(os.Getenv("LLM_APP_HOME")))
+}
+
+func UpdateBackendsAtAppHome(appHome string) error {
+	targets := BackendBuildTargetsAt(appHome)
+	if len(targets) == 0 {
+		fmt.Println("No active source-built generic backends found — skipping")
+		return nil
+	}
+	results := updateBackendBuildTargets(targets, 3)
+	var updateErrs []error
+	fmt.Println("\nBackend update summary:")
+	for _, result := range results {
+		if result.Err != nil {
+			fmt.Printf("  %-28s failed (kept previous build): %v\n", result.Target.Label, result.Err)
+			updateErrs = append(updateErrs, fmt.Errorf("%s: %w", result.Target.Label, result.Err))
 			continue
 		}
-		found[repo.Label] = true
-		if err := UpdateBackend(repo.Label, repo.Dir, 3); err != nil {
-			fmt.Printf("  %s update failed: %v\n", repo.Label, err)
-			updateErrs = append(updateErrs, fmt.Errorf("%s: %w", repo.Label, err))
-		}
-	}
-	if !found["ik_llama.cpp"] {
-		fmt.Println("ik_llama.cpp not found — skipping")
-	}
-	if !found["llama.cpp"] {
-		fmt.Println("llama.cpp not found — skipping")
+		fmt.Printf("  %-28s %s\n", result.Target.Label, result.Status)
 	}
 	return errors.Join(updateErrs...)
+}
+
+func updateBackendBuildTargets(targets []BackendBuildTarget, walkback int) []BackendUpdateResult {
+	return updateBackendBuildTargetsWith(targets, walkback, updateBackendBuildGroup)
+}
+
+func updateBackendBuildTargetsWith(
+	targets []BackendBuildTarget,
+	walkback int,
+	runGroup func(string, []BackendBuildTarget, int) []BackendUpdateResult,
+) []BackendUpdateResult {
+	type group struct {
+		repo    string
+		targets []BackendBuildTarget
+	}
+	var groups []group
+	groupIndex := make(map[string]int)
+	for _, target := range targets {
+		idx, ok := groupIndex[target.RepoDir]
+		if !ok {
+			idx = len(groups)
+			groupIndex[target.RepoDir] = idx
+			groups = append(groups, group{repo: target.RepoDir})
+		}
+		groups[idx].targets = append(groups[idx].targets, target)
+	}
+	var results []BackendUpdateResult
+	for _, group := range groups {
+		results = append(results, runGroup(group.repo, group.targets, walkback)...)
+	}
+	return results
+}
+
+func failedBackendResults(targets []BackendBuildTarget, err error) []BackendUpdateResult {
+	results := make([]BackendUpdateResult, 0, len(targets))
+	for _, target := range targets {
+		results = append(results, BackendUpdateResult{Target: target, Status: "failed", Err: err})
+	}
+	return results
+}
+
+func updateBackendBuildGroup(repoDir string, targets []BackendBuildTarget, walkback int) []BackendUpdateResult {
+	fmt.Printf("\n═══ Updating backend source %s ═══\n", repoDir)
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+		return failedBackendResults(targets, fmt.Errorf("not a git repo"))
+	}
+	if dirty, _ := gitStatusPorcelain(repoDir); dirty != "" {
+		return failedBackendResults(targets, fmt.Errorf("tracked working-tree changes; commit or stash them first"))
+	}
+
+	oldCommit, _ := gitRevParse(repoDir, "HEAD")
+	branch, _ := gitSymbolicRef(repoDir)
+	if branch == "" {
+		branch = "master"
+		if out, err := exec.Command("git", "-C", repoDir, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD").Output(); err == nil {
+			if value := strings.TrimPrefix(strings.TrimSpace(string(out)), "origin/"); value != "" {
+				branch = value
+			}
+		}
+		if out, err := exec.Command("git", "-C", repoDir, "checkout", branch).CombinedOutput(); err != nil {
+			return failedBackendResults(targets, fmt.Errorf("attach detached checkout to %s: %s", branch, strings.TrimSpace(string(out))))
+		}
+	}
+
+	if out, err := gitPullFFOnly(repoDir); err != nil {
+		if out2, err2 := gitPullRebase(repoDir); err2 != nil {
+			return failedBackendResults(targets, fmt.Errorf("git pull failed: %v | %v", err, err2))
+		} else if strings.TrimSpace(out2) != "" {
+			fmt.Println(strings.TrimSpace(out2))
+		}
+	} else if strings.TrimSpace(out) != "" {
+		fmt.Println(strings.TrimSpace(out))
+	}
+	newCommit, _ := gitRevParse(repoDir, "HEAD")
+	if oldCommit == newCommit {
+		results := make([]BackendUpdateResult, 0, len(targets))
+		allValid := true
+		for _, target := range targets {
+			binary := filepath.Join(target.BuildDir, "bin", "llama-server")
+			if err := smokeBackendConfigured(binary, collectCMakeFlags(target.BuildDir)); err != nil {
+				fmt.Printf("  %s source is current but active build failed conformance (%v); rebuilding.\n", target.Label, err)
+				allValid = false
+				continue
+			}
+			results = append(results, BackendUpdateResult{Target: target, Status: "current"})
+		}
+		if allValid {
+			return results
+		}
+		// Rebuild the group at the unchanged source revision. The normal staged
+		// activation below leaves every valid active binary untouched until its
+		// replacement passes the same conformance gate.
+		results = results[:0]
+	}
+
+	if walkback <= 0 {
+		walkback = 3
+	}
+	fallbackDir := filepath.Join(homeDir(), ".cache", "ggrun", "update-fallbacks")
+	_ = os.MkdirAll(fallbackDir, 0o755)
+	results := make([]BackendUpdateResult, 0, len(targets))
+	anySuccess := false
+	for _, target := range targets {
+		oldHash := md5sum(filepath.Join(target.BuildDir, "bin", "llama-server"))
+		successCommit := ""
+		for attempt := 0; attempt < walkback; attempt++ {
+			targetCommit := newCommit
+			if attempt > 0 {
+				targetCommit, _ = gitRevParse(repoDir, newCommit+"~"+strconv.Itoa(attempt))
+				if targetCommit == "" {
+					break
+				}
+			}
+			if err := gitCheckoutQuiet(repoDir, targetCommit); err != nil {
+				continue
+			}
+			fmt.Printf("  Building %s at %s (attempt %d/%d)\n", target.Label, targetCommit, attempt+1, walkback)
+			if buildAndTest(repoDir, target.BuildDir) {
+				successCommit = targetCommit
+				break
+			}
+		}
+		if successCommit == "" {
+			results = append(results, BackendUpdateResult{
+				Target: target,
+				Status: "failed",
+				Err:    fmt.Errorf("all %d build attempts failed", walkback),
+			})
+			continue
+		}
+		anySuccess = true
+		status := "updated"
+		if successCommit != newCommit {
+			status = "fallback " + successCommit
+			marker := filepath.Join(fallbackDir, strings.NewReplacer("/", "_", " ", "_").Replace(target.Label)+".env")
+			body := fmt.Sprintf("repo_dir=%q\nbranch=%q\nhead_commit=%q\nfallback_commit=%q\nrecorded_at=%q\n",
+				repoDir, branch, newCommit, successCommit, time.Now().UTC().Format(time.RFC3339))
+			_ = os.WriteFile(marker, []byte(body), 0o644)
+		}
+		newHash := md5sum(filepath.Join(target.BuildDir, "bin", "llama-server"))
+		if oldHash == newHash {
+			status += " (binary unchanged)"
+		}
+		results = append(results, BackendUpdateResult{Target: target, Status: status})
+	}
+
+	if anySuccess {
+		_ = gitCheckoutQuiet(repoDir, branch)
+	} else if oldCommit != "" {
+		_ = gitCheckoutQuiet(repoDir, oldCommit)
+	}
+	return results
 }
 
 func backendUpdateCandidates() []repoCandidate {
@@ -944,12 +1255,12 @@ func buildAndTest(repoDir, buildDir string) bool {
 	}
 
 	stagingBinary := filepath.Join(stagingDir, "bin", "llama-server")
-	if err := smokeBackend(stagingBinary); err != nil {
-		fmt.Println("  Binary crashes on --version at this commit.")
+	if err := smokeBackendConfigured(stagingBinary, cmakeFlags); err != nil {
+		fmt.Printf("  Backend conformance failed at this commit: %v\n", err)
 		return false
 	}
 	validateActive := func(activeDir string) error {
-		return smokeBackend(filepath.Join(activeDir, "bin", "llama-server"))
+		return smokeBackendConfigured(filepath.Join(activeDir, "bin", "llama-server"), cmakeFlags)
 	}
 	if err := promoteBackendBuild(buildDir, stagingDir, validateActive); err != nil {
 		fmt.Printf("  Could not activate validated build: %v\n", err)
@@ -968,8 +1279,58 @@ func smokeBackend(binary string) error {
 	if info, err := os.Stat(binary); err != nil || info.IsDir() {
 		return fmt.Errorf("backend binary missing: %s", binary)
 	}
-	if err := exec.Command(binary, "--version").Run(); err != nil {
-		return fmt.Errorf("%s --version: %w", binary, err)
+	run := func(flag string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, binary, flag).CombinedOutput()
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("%s timed out", flag)
+		}
+		if err != nil {
+			return string(out), fmt.Errorf("%s: %w", flag, err)
+		}
+		return string(out), nil
+	}
+	if _, err := run("--version"); err != nil {
+		return fmt.Errorf("%s: %w", binary, err)
+	}
+	help, err := run("--help")
+	if err != nil {
+		return fmt.Errorf("%s: %w", binary, err)
+	}
+	for _, required := range []string{"--model", "--ctx-size", "--host", "--port"} {
+		if !strings.Contains(help, required) {
+			return fmt.Errorf("%s --help lacks %s", binary, required)
+		}
+	}
+	return nil
+}
+
+func smokeBackendConfigured(binary string, cmakeFlags []string) error {
+	if err := smokeBackend(binary); err != nil {
+		return err
+	}
+	expected := ""
+	for _, flag := range cmakeFlags {
+		switch flag {
+		case "-DGGML_CUDA=ON":
+			expected = "cuda"
+		case "-DGGML_VULKAN=ON":
+			expected = "vulkan"
+		}
+	}
+	if expected == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "--list-devices").CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return fmt.Errorf("%s device probe failed: %w", expected, err)
+	}
+	text := strings.ToLower(string(out))
+	if !strings.Contains(text, "available devices") || !strings.Contains(text, expected) {
+		return fmt.Errorf("requested %s build does not report a %s device", expected, expected)
 	}
 	return nil
 }
