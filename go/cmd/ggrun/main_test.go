@@ -1316,10 +1316,10 @@ func TestChooseAutoBackendRejectsProfileIncompatibleCandidate(t *testing.T) {
 // The auto baseline is f16, NOT the q8_0 that ik_llama's loader accepts. V4's
 // attention weights are already FP8, so a q8_0 K-cache compounds the precision
 // loss into repetition loops or '='-spam that no backend reports as an error.
-func TestNormalizeDeepSeek4AutoKVRequestPinsF16(t *testing.T) {
+func TestNormalizeArchKVRequestPinsDeepSeek4ToF16(t *testing.T) {
 	for _, quality := range []string{"q4_0", "q8_0"} {
 		req := &launchRequest{KVQuality: quality, KVTypeK: quality, KVTypeV: quality}
-		normalizeDeepSeek4AutoKVRequest(req, &placement.ModelProfile{ModelArch: "deepseek4"})
+		normalizeArchKVRequest(req, &placement.ModelProfile{ModelArch: "deepseek4"})
 		if req.KVQuality != "f16" || req.KVTypeK != "" || req.KVTypeV != "" {
 			t.Fatalf("auto KV normalization from %s = quality %q, K %q, V %q", quality, req.KVQuality, req.KVTypeK, req.KVTypeV)
 		}
@@ -1327,14 +1327,14 @@ func TestNormalizeDeepSeek4AutoKVRequestPinsF16(t *testing.T) {
 
 	// bf16 carries no requantization loss, so it is left alone.
 	keep := &launchRequest{KVQuality: "bf16"}
-	normalizeDeepSeek4AutoKVRequest(keep, &placement.ModelProfile{ModelArch: "deepseek4"})
+	normalizeArchKVRequest(keep, &placement.ModelProfile{ModelArch: "deepseek4"})
 	if keep.KVQuality != "bf16" {
 		t.Fatalf("bf16 K-cache was rewritten to %q", keep.KVQuality)
 	}
 
 	// Other architectures keep whatever the user asked for.
 	other := &launchRequest{KVQuality: "q4_0"}
-	normalizeDeepSeek4AutoKVRequest(other, &placement.ModelProfile{ModelArch: "qwen3moe"})
+	normalizeArchKVRequest(other, &placement.ModelProfile{ModelArch: "qwen3moe"})
 	if other.KVQuality != "q4_0" {
 		t.Fatalf("non-deepseek4 KV quality was rewritten to %q", other.KVQuality)
 	}

@@ -1839,7 +1839,7 @@ func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model 
 	// while mainline families are then correctly rejected by their stricter f16
 	// rule. Leaving q4 here marks the valid ik candidate incompatible and can
 	// accidentally route a CUDA launch to an unrelated canonical backend.
-	normalizeDeepSeek4AutoKVRequest(req, model)
+	normalizeArchKVRequest(req, model)
 	candidates := autoBackendCandidates(caps, req)
 	if model != nil {
 		for i := range candidates {
@@ -1869,24 +1869,26 @@ func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model 
 	return chosen
 }
 
-func normalizeDeepSeek4AutoKVRequest(req *launchRequest, model *placement.ModelProfile) {
-	if req == nil || model == nil || !strings.EqualFold(strings.TrimSpace(model.ModelArch), "deepseek4") {
+// normalizeArchKVRequest applies the architecture's KV correctness rule before a
+// backend is even chosen, so selection and placement both size the cache the
+// model actually needs. The rule comes from the GGUF architecture rather than
+// from what any backend says it accepts -- see pkg/backends/archconstraints.go
+// for why those are different questions.
+func normalizeArchKVRequest(req *launchRequest, model *placement.ModelProfile) {
+	if req == nil || model == nil {
+		return
+	}
+	rule, ok := backends.KVRuleForArch(model.ModelArch)
+	if !ok {
 		return
 	}
 	kvType, err := placement.NormalizeKVType(req.KVQuality)
-	if err != nil || kvType == "f16" || kvType == "bf16" {
+	if err != nil || rule.Permits(kvType) {
 		return
 	}
-	// q8_0 is deliberately NOT accepted, even though ik_llama's loader lists it
-	// as legal ("deepseek4 k-cache supports only f16, bf16, and q8_0" -- see the
-	// classifier in preflight.go). Accepting a type is not the same as computing
-	// correctly with it: V4 ships FP8 attention weights that are already
-	// quantized, so a q8_0 KV compounds the precision loss and the model
-	// degenerates into repetition loops or '='-spam with no error from the
-	// backend at all. A silent wrong answer is the worst failure mode an agentic
-	// launcher can have, so the K-cache is pinned to f16.
-	fmt.Printf("[launch] DeepSeek4 needs an f16 K-cache for correct output (%s risks silent corruption); using f16 for backend selection and placement.\n", kvType)
-	req.KVQuality = "f16"
+	fmt.Printf("[launch] %s needs a %s K-cache: %s. Using %s for backend selection and placement.\n",
+		model.ModelArch, rule.Target(), rule.Reason, rule.Target())
+	req.KVQuality = rule.Target()
 	req.KVTypeK, req.KVTypeV = "", ""
 }
 
@@ -3770,26 +3772,25 @@ func applyBackendFeatureCompatibility(req *launchRequest, model *placement.Model
 	if req == nil || be == nil {
 		return
 	}
-	isDeepSeek4 := model != nil && strings.EqualFold(strings.TrimSpace(model.ModelArch), "deepseek4")
-	isDeepSeek4IK := isDeepSeek4 && be.IsIK
-	if isDeepSeek4 {
-		// Both backend families are held to f16. ik_llama's loader accepts a
-		// q8_0 K-cache for deepseek4 and mainline rejects it, so the old rule
-		// read the ik acceptance as permission and promoted ik launches to q8_0.
-		// That is the one case where the backend's own answer is misleading: V4's
-		// attention weights are already FP8, and re-quantizing the K-cache to
-		// q8_0 compounds the loss into repetition loops or '='-spam that the
-		// backend never reports as an error. Correctness outranks the KV
-		// footprint saving, and an f16 promotion is the safe direction because it
-		// only ever asks placement for more room, never less.
-		if kvType, err := placement.NormalizeKVType(req.KVQuality); err == nil &&
-			kvType != "f16" && kvType != "bf16" {
+	arch := ""
+	if model != nil {
+		arch = strings.TrimSpace(model.ModelArch)
+	}
+	isDeepSeek4IK := strings.EqualFold(arch, "deepseek4") && be.IsIK
+	// The architecture's KV rule is re-applied here because backend selection can
+	// land somewhere the pre-selection pass did not assume, and because a cached
+	// or resumed request can arrive with a KV type the rule forbids. Both backend
+	// families are held to the same standard: ik_llama accepting a type is not
+	// evidence the model computes correctly with it.
+	if rule, ok := backends.KVRuleForArch(arch); ok {
+		if kvType, err := placement.NormalizeKVType(req.KVQuality); err == nil && !rule.Permits(kvType) {
 			family := "mainline"
-			if isDeepSeek4IK {
+			if be.IsIK {
 				family = "ik_llama"
 			}
-			fmt.Printf("[launch] DeepSeek4 on %s cannot be trusted with a %s K-cache (silent output corruption); promoting this launch to f16 and recomputing placement.\n", family, kvType)
-			req.KVQuality = "f16"
+			fmt.Printf("[launch] %s on %s cannot be trusted with a %s K-cache (%s); promoting this launch to %s and recomputing placement.\n",
+				arch, family, kvType, rule.Reason, rule.Target())
+			req.KVQuality = rule.Target()
 			req.KVTypeK, req.KVTypeV = "", ""
 		}
 	}
@@ -3816,11 +3817,11 @@ func applyBackendFeatureCompatibility(req *launchRequest, model *placement.Model
 		return
 	}
 	req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", false)
-	arch := "this model"
-	if model != nil && strings.TrimSpace(model.ModelArch) != "" {
-		arch = model.ModelArch
+	archLabel := "this model"
+	if arch != "" {
+		archLabel = arch
 	}
-	fmt.Printf("[launch] Full SWA cache is unavailable for %s on backend %s; disabling it for this launch.\n", arch, be.Path)
+	fmt.Printf("[launch] Full SWA cache is unavailable for %s on backend %s; disabling it for this launch.\n", archLabel, be.Path)
 }
 
 func launchHardwareIdentity(caps *detect.Capabilities) string {

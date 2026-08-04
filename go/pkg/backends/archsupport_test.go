@@ -3,6 +3,7 @@ package backends
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -176,6 +177,52 @@ func TestRealBackendProbe(t *testing.T) {
 		}
 		if sup != c.want {
 			t.Errorf("%s: supported=%v, want %v", c.label, sup, c.want)
+		}
+	}
+}
+
+// The table exists because a backend accepting a setting is not evidence the
+// model computes correctly with it: ik_llama takes a q8_0 K-cache for deepseek4
+// and then produces repetition loops with no error at all.
+func TestKVRuleForArchConstrainsDeepSeek4(t *testing.T) {
+	rule, ok := KVRuleForArch("deepseek4")
+	if !ok {
+		t.Fatal("deepseek4 has no KV correctness rule")
+	}
+	if rule.Target() != "f16" {
+		t.Fatalf("promotion target = %q, want f16", rule.Target())
+	}
+	for _, correct := range []string{"f16", "bf16", "F16"} {
+		if !rule.Permits(correct) {
+			t.Fatalf("%s rejected for deepseek4", correct)
+		}
+	}
+	for _, corrupting := range []string{"q8_0", "q4_0", "q5_1"} {
+		if rule.Permits(corrupting) {
+			t.Fatalf("%s permitted for deepseek4 despite requantization loss", corrupting)
+		}
+	}
+	if strings.TrimSpace(rule.Reason) == "" {
+		t.Fatal("rule has no user-facing reason; a silent failure needs an explanation")
+	}
+}
+
+// Silence in the table means "no known constraint", never "unsafe". Inventing a
+// restriction for an architecture nobody has evidence about would break launches
+// that work today.
+func TestKVRuleForArchLeavesUnknownArchitecturesAlone(t *testing.T) {
+	for _, arch := range []string{"qwen3moe", "llama", "", "  ", "deepseek2"} {
+		if _, ok := KVRuleForArch(arch); ok {
+			t.Fatalf("architecture %q gained a KV constraint with no evidence for one", arch)
+		}
+	}
+}
+
+// Case and padding come straight from GGUF metadata, so matching must tolerate both.
+func TestKVRuleForArchNormalizesArchSpelling(t *testing.T) {
+	for _, spelling := range []string{"DeepSeek4", " deepseek4 ", "DEEPSEEK4"} {
+		if _, ok := KVRuleForArch(spelling); !ok {
+			t.Fatalf("architecture spelling %q did not match the table", spelling)
 		}
 	}
 }
