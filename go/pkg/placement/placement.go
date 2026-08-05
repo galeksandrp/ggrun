@@ -5491,6 +5491,45 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 		}
 		overheadByGPU[gpu.Index] = cudaOverhead
 	}
+	// Tertiary source: a whole-device reading minus what the backend says it
+	// holds. This exists because the two sources above can both be silent on a
+	// perfectly healthy launch, and then the term stays 0 forever.
+	//
+	// The breakdown table is not printed by every build -- the mainline
+	// llama-server used here emits it zero times, so that source never fires.
+	// The per-PID query answers 0 whenever the recorded PID is not the process
+	// holding the memory, which is what happens when the launch goes through the
+	// cgroup scope wrapper: the wrapper is the child ggrun waited on, the server
+	// is its child. Between them, a rig can serve for hours and still have no
+	// measurement.
+	//
+	// Measured here 2026-08-05 while the server was live: CUDA0 held 23922 MiB
+	// against 23151 MiB of reported buffers, CUDA2 11473 against 11036 --
+	// roughly 770 and 436 MiB of CUDA context that no plan reserved. The planner
+	// had packed CUDA0 to 97.4% of the card and left 642 MiB for allocations it
+	// could not see; the next context checkpoint killed it.
+	//
+	// A whole-device reading counts every process, so ggrun's own companion is
+	// subtracted (a separate, already-budgeted tenant) and the result is held to
+	// the same outlier ceiling as the other sources. Anything larger is another
+	// workload, not a CUDA context, and must not latch.
+	for _, gpu := range gpus {
+		if _, ok := overheadByGPU[gpu.Index]; ok {
+			continue // an earlier source already answered for this device
+		}
+		liveUsedMB := QueryVRAMUsed(gpu.Index)
+		if liveUsedMB <= 0 {
+			continue
+		}
+		modelBufMB, kvBufMB, computeBufMB := parseBuffersFromLog(serverLog, gpu.Index)
+		accounted := modelBufMB + kvBufMB + computeBufMB
+		if accounted <= 0 {
+			continue // the server does not use this card; skip, never guess
+		}
+		if delta, ok := wholeDeviceOverheadMB(liveUsedMB, accounted, companionVRAMByGPU[gpu.Index], gpu.VRAMTotalMB); ok {
+			overheadByGPU[gpu.Index] = delta
+		}
+	}
 	// Carry forward devices measured by earlier launches: this launch may not
 	// have occupied every card, and a device the server does not use is skipped
 	// rather than re-measured, so its prior value is the best evidence there is.
@@ -6338,4 +6377,27 @@ func cudaIndexFromLine(line string) int {
 		return -1
 	}
 	return n
+}
+
+// wholeDeviceOverheadMB derives per-device CUDA context overhead from a live
+// whole-device VRAM reading and what the backend reported it holds.
+//
+// liveUsedMB counts every process on the card, so any companion ggrun seated
+// there is subtracted: it is a separate tenant with its own budget line, and
+// charging it here is how a 12 GB card once latched a 2916 MiB "overhead" that
+// it could then never afford to contradict.
+//
+// The result is rejected unless it is positive and below the same outlier
+// ceiling the other probe sources use. A larger figure is another workload, not
+// a CUDA context, and a wrong value written here is not one bad launch -- it
+// taxes every future plan on this hardware signature.
+func wholeDeviceOverheadMB(liveUsedMB, accountedMB, companionMB, vramTotalMB int) (int, bool) {
+	if liveUsedMB <= 0 || accountedMB <= 0 || vramTotalMB <= 0 {
+		return 0, false
+	}
+	delta := liveUsedMB - accountedMB - companionMB
+	if delta <= 0 || delta >= vramTotalMB/systemProbeOutlierRatio {
+		return 0, false
+	}
+	return delta, true
 }

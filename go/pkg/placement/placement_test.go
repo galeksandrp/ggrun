@@ -3864,3 +3864,54 @@ func TestRelatedModelRuntimeGraphGrowthRejectsNonEvidence(t *testing.T) {
 		}
 	})
 }
+
+// The measurement class the planner was missing: whatever a device holds beyond
+// the buffers the backend reports. It captures CUDA context, graph capture and
+// anything else no no-alloc oracle can see, on any backend, without needing a
+// breakdown table or the right PID.
+func TestWholeDeviceOverheadMBDerivesTheUnreportedRemainder(t *testing.T) {
+	// The real 2026-08-05 reading: CUDA0 held 23922 MiB against 23151 MiB of
+	// reported model+KV+compute, on a 24564 MiB card, with no companion.
+	if got, ok := wholeDeviceOverheadMB(23922, 23151, 0, 24564); !ok || got != 771 {
+		t.Fatalf("CUDA0 overhead = %d (ok=%v), want 771", got, ok)
+	}
+	// CUDA2 the same launch.
+	if got, ok := wholeDeviceOverheadMB(11473, 11036, 0, 12282); !ok || got != 437 {
+		t.Fatalf("CUDA2 overhead = %d (ok=%v), want 437", got, ok)
+	}
+
+	// A companion on the card is a separate tenant with its own budget line.
+	// Charging it here is how a 12 GB card once latched 2916 MiB of "overhead":
+	// without the subtraction this same reading looks like 6634 MiB of context.
+	withCompanion, ok := wholeDeviceOverheadMB(12300, 5666, 6218, 12288)
+	if !ok || withCompanion != 416 {
+		t.Fatalf("overhead net of companion = %d (ok=%v), want 416", withCompanion, ok)
+	}
+	// Without the subtraction the same reading is 6634 MiB, which the outlier
+	// ceiling rejects outright -- so the device would be left unmeasured rather
+	// than latched. Both behaviours are safe; the subtraction is what turns an
+	// unusable reading into a usable one.
+	if bare, ok := wholeDeviceOverheadMB(12300, 5666, 0, 12288); ok {
+		t.Fatalf("unsubtracted companion reading was accepted as %d MiB", bare)
+	}
+}
+
+// What it refuses to record. A wrong value here is not one bad launch; it taxes
+// every future plan on this hardware signature.
+func TestWholeDeviceOverheadMBRejectsNonEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		live, accounted, companion, total int
+	}{
+		{"foreign workload above the outlier ceiling", 20000, 4000, 0, 24564},
+		{"nothing reported for this device", 12000, 0, 0, 24564},
+		{"no live reading", 0, 11036, 0, 12282},
+		{"reported exceeds live", 11036, 11473, 0, 12282},
+		{"companion accounts for all of it", 11885, 5666, 6219, 12288},
+		{"unknown card size", 23922, 23151, 0, 0},
+	} {
+		if got, ok := wholeDeviceOverheadMB(tc.live, tc.accounted, tc.companion, tc.total); ok {
+			t.Fatalf("%s recorded %d MiB", tc.name, got)
+		}
+	}
+}
