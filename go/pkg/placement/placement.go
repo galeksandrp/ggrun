@@ -3665,26 +3665,6 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 	return nil
 }
 
-// plannedHostExpertMB reports the expert bytes this plan actually parks in host
-// memory, from the plan's own CPU expert-layer count rather than from card
-// capacity. Returns 0 when the plan is not an expert offload or the profile
-// lacks the expert-size metadata to answer, so callers keep their prior estimate.
-func plannedHostExpertMB(model *ModelProfile, s *Strategy) int {
-	if model == nil || s == nil || s.NCPUMoE <= 0 || model.ExpertBytes <= 0 {
-		return 0
-	}
-	moeLayers := model.NumLayers
-	if moeLayers <= 0 {
-		return 0
-	}
-	cpuLayers := s.NCPUMoE
-	if cpuLayers > moeLayers {
-		cpuLayers = moeLayers
-	}
-	expertMB := float64(model.ExpertBytes) / (1024 * 1024)
-	return int(expertMB * float64(cpuLayers) / float64(moeLayers))
-}
-
 // computeCRAM calculates prompt cache size from remaining memory after load.
 func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, totalSizeMB, kvTotalMB int) (int, int) {
 	numGPUs := len(caps.GPUs)
@@ -3701,24 +3681,7 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 	if fitsOnGPU {
 		ramAfterLoad = caps.RAM.FreeMB
 	} else {
-		// totalSizeMB - TotalVRAM() is the floor, not the answer: it assumes every
-		// byte of every card ends up holding weights. A plan that pushes experts
-		// past that point (--n-cpu-moe) leaves much more in host RAM than the
-		// subtraction predicts, and the prompt cache is then sized against RAM
-		// that does not exist.
-		//
-		// Measured 2026-08-04: a --n-cpu-moe 42 plan put 94104 MiB of experts in
-		// host memory while this formula assumed 73128 MiB. The ~21 GiB of
-		// phantom headroom bought a full 4096 MiB prompt-cache grant, and the
-		// first 877 MiB prompt save pushed the backend past its own cgroup
-		// MemoryMax -- killed by the kernel (CONSTRAINT_MEMCG) with memory.oom.group
-		// taking the whole scope down. A prompt cache is a convenience; being
-		// OOM-killed mid-serve is not, so the estimate is taken as the larger
-		// (more pessimistic) of the two and can only ever shrink the grant.
 		ramOnCPU := totalSizeMB - caps.TotalVRAM()
-		if planned := plannedHostExpertMB(model, s); planned > ramOnCPU {
-			ramOnCPU = planned
-		}
 		if ramOnCPU < 0 {
 			ramOnCPU = 0
 		}
