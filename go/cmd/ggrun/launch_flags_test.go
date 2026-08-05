@@ -117,7 +117,12 @@ func TestResumeOverridesReachLaunchRequest(t *testing.T) {
 // come from somewhere else. One routed expert layer is the unit placement moves
 // and its size is exact; a tenth of the card is not derived from anything.
 func TestRuntimeOOMReservesOneMeasuredExpertLayer(t *testing.T) {
-	const log = `0.36.091.423 E CUDA error: out of memory
+	// The marker opens the runtime-growth window. Without it this failure is a
+	// load-time placement problem and yields no reserve at all -- which is the
+	// correct reading of a graph-capture OOM during load, but not what this case
+	// is about: here the question is what a sizeless OOM reserves once serving.
+	const log = `srv  llama_server: model loaded
+0.36.091.423 E CUDA error: out of memory
 0.36.091.432 E   current device: 0, in function ggml_cuda_graph_evaluate_and_capture at ggml-cuda.cu:104
 0.36.091.433 E   cudaGraphInstantiate(&graph->instance, graph->graph, __null, __null, 0)`
 

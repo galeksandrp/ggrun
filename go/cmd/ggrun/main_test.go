@@ -670,7 +670,10 @@ func TestRuntimeLogCUDAOOMRecognizesVMMFormat(t *testing.T) {
 }
 
 func TestRuntimeLogCUDAOOMPrefersExactAllocation(t *testing.T) {
-	log := "allocating 1679.00 MiB on device 2: cudaMalloc failed: out of memory"
+	// The marker opens the runtime-growth window; this case is about parsing the
+	// exact allocation size, not about when the failure happened.
+	log := "srv  llama_server: model loaded\n" +
+		"allocating 1679.00 MiB on device 2: cudaMalloc failed: out of memory"
 	device, reserveMB, estimated, ok := runtimeLogCUDAOOM(log, nil, nil, nil)
 	if !ok || estimated || device != 2 || reserveMB != 1679 {
 		t.Fatalf("exact OOM = device %d reserve %d estimated=%v ok=%v", device, reserveMB, estimated, ok)
@@ -2589,5 +2592,49 @@ func TestHostExpertPinningEnvDisablesPinnedIKHostBuffer(t *testing.T) {
 	}
 	if got := hostExpertPinningEnv(nil, []string{"--n-cpu-moe", "32"}); got != nil {
 		t.Fatalf("nil backend produced env %v", got)
+	}
+}
+
+// The recorder files whatever allocation size failed as runtime graph growth,
+// so the log window decides whether that number means anything. A launch that
+// dies while allocating its KV buffer must teach the planner nothing: KV is
+// budgeted separately, and recording it as growth reserves it twice. This is
+// the real 2026-08-03 poisoning — CUDA0=5504 was that plan's KV buffer.
+func TestRuntimeLogCUDAOOMIgnoresFailuresBeforeModelLoaded(t *testing.T) {
+	model := &placement.ModelProfile{NumLayers: 43, IsMoE: true}
+
+	loadTime := strings.Join([]string{
+		"llama_kv_cache:      CUDA0 KV buffer size =  5504.00 MiB",
+		"ggml-cuda.cu:104: CUDA error",
+		"CUDA error: out of memory",
+		"  current device: 0, in function alloc at ggml-cuda.cu:529",
+	}, "\n")
+	if _, reserve, _, ok := runtimeLogCUDAOOM(loadTime, nil, model, map[int]int{}); ok {
+		t.Fatalf("a load-time OOM was recorded as runtime growth (%d MiB)", reserve)
+	}
+
+	// The same failure, but after the model is serving, IS runtime growth.
+	runtime := strings.Join([]string{
+		"llama_kv_cache:      CUDA0 KV buffer size =  5504.00 MiB",
+		"srv  llama_server: model loaded",
+		"slot create_check: created context checkpoint 3 of 16",
+		"ggml-cuda.cu:104: CUDA error",
+		"CUDA error: out of memory",
+		"  current device: 0, in function alloc at ggml-cuda.cu:529",
+	}, "\n")
+	if _, _, _, ok := runtimeLogCUDAOOM(runtime, nil, model, map[int]int{}); !ok {
+		t.Fatal("a post-load OOM was not recognised as runtime growth")
+	}
+}
+
+// A log that never reached "model loaded" yields no growth at all, whatever it
+// contains. Guessing here corrupts the cache for every later launch on the key.
+func TestRuntimeGrowthWindowRequiresALoadCompleteMarker(t *testing.T) {
+	if _, ok := runtimeGrowthWindowStart([]string{"loading model", "still loading"}); ok {
+		t.Fatal("growth window opened without a load-complete marker")
+	}
+	at, ok := runtimeGrowthWindowStart([]string{"loading", "srv  llama_server: model loaded", "serving"})
+	if !ok || at != 1 {
+		t.Fatalf("growth window start = (%d, %v), want (1, true)", at, ok)
 	}
 }

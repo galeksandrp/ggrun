@@ -3511,9 +3511,52 @@ const unknownRuntimeCUDAOOMReserveMinMB = 2048
 // 10% of that device (at least 2 GiB). A repeat adds another such block. This is
 // learned only for the exact runtime probe key; normal first launches retain
 // measured, margin-free packing.
+// modelLoadedLogMarkers are how a backend announces that weights, KV and the
+// load-time compute buffers are all in place. Everything logged after one of
+// these is serving work; everything before it is still loading.
+var modelLoadedLogMarkers = []string{
+	"llama_server: model loaded",
+	"model loaded",
+	"main: model loaded",
+	// ggrun's own verdict. A passed health check is the strongest available
+	// statement that the backend is serving rather than still allocating.
+	"health check ok",
+}
+
+// runtimeGrowthWindowStart returns the line index after which an allocation
+// failure counts as runtime graph growth, and whether such a point exists.
+//
+// This gate is the difference between learning and being poisoned. The recorder
+// files whatever size failed under PROBED_RUNTIME_GRAPH_GROWTH_MB_<device>, so
+// without it a launch that dies while allocating its KV buffer teaches the
+// planner that the KV buffer is "growth" -- a budget line it already accounts
+// for, now reserved twice. Verified on this project: CUDA0 carried 5504, which
+// is exactly that plan's "CUDA0 KV buffer size = 5504.00 MiB".
+//
+// A log with no load-complete marker never yields growth. That is deliberate:
+// an OOM during load is a placement error the planner must fix by moving a
+// layer, not a runtime term to reserve, and guessing wrong here corrupts the
+// cache for every later launch on the same key.
+func runtimeGrowthWindowStart(lines []string) (int, bool) {
+	for i := len(lines) - 1; i >= 0; i-- {
+		lower := strings.ToLower(lines[i])
+		for _, marker := range modelLoadedLogMarkers {
+			if strings.Contains(lower, marker) {
+				return i, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func runtimeLogCUDAOOM(logData string, caps *detect.Capabilities, model *placement.ModelProfile, prior map[int]int) (device int, reserveMB int, estimated bool, ok bool) {
 	lines := strings.Split(logData, "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
+	loadedAt, loaded := runtimeGrowthWindowStart(lines)
+	if !loaded {
+		// Still loading when it died: a placement problem, not a runtime term.
+		return 0, 0, false, false
+	}
+	for i := len(lines) - 1; i > loadedAt; i-- {
 		if device, allocMB, ok := recovery.ParseCUDAOOM(lines[i]); ok {
 			return device, allocMB, false, true
 		}
