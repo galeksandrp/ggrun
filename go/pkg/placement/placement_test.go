@@ -4005,3 +4005,112 @@ func TestPromptCacheChargesOnlyTheAnonymousWorkingSetUnderMmap(t *testing.T) {
 		t.Errorf("a negative footprint must clamp to 0 so it reads as 'not derived', got %d", got)
 	}
 }
+
+// A growth figure written before the post-serving gate cannot be told apart
+// from a load-time allocation that was misfiled as growth. The one measured on
+// this project was 5504 MiB on CUDA0 -- exactly that plan's
+// `CUDA0 KV buffer size = 5504.00 MiB` -- and because re-probing carries growth
+// forward, it was reserved on every later plan for the signature: four expert
+// layers pushed to the CPU and decode roughly halved.
+func TestGrowthRecordedBeforeTheServingGateIsRetired(t *testing.T) {
+	dir := t.TempDir()
+	gpus := []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564}}
+	model := &ModelProfile{Path: "v4.gguf", Basename: "v4.gguf", TotalSizeMB: 122268}
+	header := "# Probe cache for v4.gguf\n# ctx=131072 ubatch=512 kv_quality=high kv_placement=gpu backend=llama@x gpu_sig=" +
+		gpuSignatureHash(gpus) + " parallel=2\n"
+
+	write := func(schema int) *probeCache {
+		body := header + fmt.Sprintf("PROBE_CACHE_SCHEMA=%d\n", schema) +
+			"PROBED_COMPUTE_BUF_MB_CUDA0=1391\n" +
+			"PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA0=5504\n"
+		path := probeCachePath(dir, model, 131072, 512, "high", "gpu", "llama@x", gpus, 2)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write probe: %v", err)
+		}
+		return loadProbeCache(dir, model, 131072, 512, "high", "gpu", "llama@x", gpus, 2)
+	}
+
+	stale := write(probeCacheSchema - 1)
+	if stale == nil {
+		t.Fatal("pre-gate probe should still load: only its growth is untrustworthy")
+	}
+	if got, ok := stale.RuntimeGraphGrowthByGPU[0]; ok {
+		t.Errorf("pre-gate growth survived as %d MiB; it must be retired", got)
+	}
+	if stale.ComputeBufByGPU[0] != 1391 {
+		t.Errorf("retiring growth must not discard the measured compute buffer, got %d", stale.ComputeBufByGPU[0])
+	}
+
+	current := write(probeCacheSchema)
+	if current == nil || current.RuntimeGraphGrowthByGPU[0] != 5504 {
+		t.Errorf("growth written through the gate must be kept, got %+v", current)
+	}
+}
+
+// The planner takes no static margins, so plannedRAMRuntimeOverheadMB returns 0
+// under RequireMeasuredBuffers. That is right about guessing and wrong about
+// measuring: ~1.9 GiB of real host overhead sat outside every plan on this rig.
+// Numbers below are from a live DeepSeek-V4 launch at --n-cpu-moe 37.
+func TestHostOverheadIsMeasuredFromWhatTheMemoryScopeHolds(t *testing.T) {
+	const (
+		anonMB, shmemMB, slabMB = 1680, 91522, 212
+		hostModelMB             = 91448 // CUDA_Host model buffer
+		hostComputeMB           = 36    // CUDA_Host compute buffer
+		hostOutputMB            = 1     // CUDA_Host output buffer
+	)
+	live := anonMB + shmemMB + slabMB
+	accounted := hostModelMB + hostComputeMB + hostOutputMB
+
+	got, ok := hostOverheadMB(live, accounted)
+	if !ok {
+		t.Fatalf("live=%d accounted=%d should yield a measurement", live, accounted)
+	}
+	if want := live - accounted; got != want {
+		t.Errorf("host overhead %d MiB, want %d", got, want)
+	}
+	// llama-server's own VmRSS that moment was 93878 MiB. The cgroup reading
+	// must agree with it closely or one of the two is measuring the wrong thing.
+	if diff := 93878 - live; diff < 0 || diff > 93878/100 {
+		t.Errorf("cgroup non-reclaimable %d MiB disagrees with VmRSS 93878 MiB by %d", live, diff)
+	}
+
+	// Page cache must never be charged: it was 15.5 GiB here and is reclaimable.
+	if inflated, _ := hostOverheadMB(live+15872, accounted); inflated > 0 && inflated < 15872 {
+		t.Errorf("including page cache changed the answer to %d MiB", inflated)
+	}
+	// Guards.
+	if _, ok := hostOverheadMB(accounted-1, accounted); ok {
+		t.Error("a reading below the declared buffers must be rejected, not negative")
+	}
+	if _, ok := hostOverheadMB(live, 0); ok {
+		t.Error("no parsed host buffers means no measurement, not a full-size overhead")
+	}
+	if _, ok := hostOverheadMB(live, live/8); ok {
+		t.Error("a delta near the whole reading means the buffers were not parsed; must be rejected")
+	}
+}
+
+// The log accumulates across launch attempts inside one ggrun run: the first
+// attempt reported an 86136 MiB host model buffer before --swa-full was
+// withdrawn, the surviving one 91448 MiB. Summing them would invent 84 GiB.
+func TestHostBufferParsingTakesMaximaNotSums(t *testing.T) {
+	log := strings.Join([]string{
+		"load_tensors:    CUDA_Host model buffer size = 86136.56 MiB",
+		"load_tensors:        CUDA0 model buffer size = 11998.86 MiB",
+		"load_tensors:    CUDA_Host model buffer size = 91448.56 MiB",
+		"llama_context:  CUDA_Host  output buffer size =     0.99 MiB",
+		"sched_reserve:  CUDA_Host compute buffer size =    36.32 MiB",
+		"sched_reserve:      CUDA0 compute buffer size =  1391.00 MiB",
+	}, "\n")
+
+	got := parseHostBuffersFromLog(log)
+	if want := 91448 + 36 + 1; got < want-2 || got > want+2 {
+		t.Errorf("host buffers %d MiB, want ~%d (max model + compute + output)", got, want)
+	}
+	if got > 100000 {
+		t.Errorf("host buffers %d MiB — the two load attempts were summed", got)
+	}
+}

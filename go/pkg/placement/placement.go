@@ -1518,7 +1518,7 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	if !cache.KVUnified && s.KVPlacement == "cpu" {
 		cpuKVMB = kvTotalMB
 	}
-	runtimeMB := plannedRAMRuntimeOverheadMB(model, cache.UBatchSize, totalSizeMB, opts)
+	runtimeMB := plannedRAMRuntimeOverheadMB(caps, model, cache.UBatchSize, totalSizeMB, opts)
 	tokenEmbdMB := bytesToMiBCeil(model.TokenEmbdBytes)
 	residentMB := cpuExpertMB + cpuKVMB + runtimeMB + tokenEmbdMB
 	residentFits := residentMB <= caps.RAM.FreeMB
@@ -1991,7 +1991,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// RAM check (checkMemoryOrDie -> ramRuntimeOverheadMB) can't disagree —
 	// a stale copy here was missing the cpuActMB term, letting this ceiling
 	// accept a CPU-layer count the real check would then reject.
-	ramOverheadPreMB := plannedRAMRuntimeOverheadMB(model, s.UBatchSize, totalSizeMB, opts)
+	ramOverheadPreMB := plannedRAMRuntimeOverheadMB(caps, model, s.UBatchSize, totalSizeMB, opts)
 	cpuBudgetStrict := caps.RAM.FreeMB - ramOverheadPreMB - cpuKVRAMMB - tokenEmbdMB
 	if cpuBudgetStrict < 0 {
 		cpuBudgetStrict = 0
@@ -2117,7 +2117,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 
 	// Non-weight RAM overhead, derived per-component (see ramRuntimeOverheadMB):
 	// CUDA host staging + graph scratch + mmap page table + CPU activation.
-	ramOverheadMB := plannedRAMRuntimeOverheadMB(model, s.UBatchSize, totalSizeMB, opts)
+	ramOverheadMB := plannedRAMRuntimeOverheadMB(caps, model, s.UBatchSize, totalSizeMB, opts)
 
 	cpuKVMB := 0
 	if kvPlacementEffective == "cpu" {
@@ -3594,8 +3594,17 @@ func ramRuntimeOverheadMB(model *ModelProfile, uBatch, totalSizeMB int) int {
 	return cudaHostMB + graphScratchMB + mmapPTMB + cpuActMB
 }
 
-func plannedRAMRuntimeOverheadMB(model *ModelProfile, uBatch, totalSizeMB int, opts Options) int {
+func plannedRAMRuntimeOverheadMB(caps *detect.Capabilities, model *ModelProfile, uBatch, totalSizeMB int, opts Options) int {
 	if opts.RequireMeasuredBuffers {
+		// A measurement satisfies the measured-buffers contract; an estimate does
+		// not. Returning 0 unconditionally is what left ~1.9 GiB of real host
+		// overhead outside every plan on this rig -- correct in refusing to guess,
+		// but wrong once the number is actually known. See hostOverheadMB.
+		if caps != nil {
+			if sp := loadSystemProbe(opts.CacheDir, caps.GPUs); sp != nil && sp.HostOverheadMB > 0 {
+				return sp.HostOverheadMB
+			}
+		}
 		return 0
 	}
 	return ramRuntimeOverheadMB(model, uBatch, totalSizeMB)
@@ -3632,7 +3641,7 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 	neededMB := modelOverheadMB + kvTotalMB
 	ramOverheadMB := 0
 	if s.Type == CPUOnly || s.Type == DenseCPUOffload {
-		ramOverheadMB = plannedRAMRuntimeOverheadMB(model, s.UBatchSize, totalSizeMB, opts)
+		ramOverheadMB = plannedRAMRuntimeOverheadMB(caps, model, s.UBatchSize, totalSizeMB, opts)
 		neededMB += ramOverheadMB
 	}
 
@@ -3979,7 +3988,7 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 		if weightsInRAM < 0 {
 			weightsInRAM = 0
 		}
-		kvBudgetMB = caps.RAM.FreeMB - weightsInRAM - plannedRAMRuntimeOverheadMB(model, 0, totalSizeMB, opts)
+		kvBudgetMB = caps.RAM.FreeMB - weightsInRAM - plannedRAMRuntimeOverheadMB(caps, model, 0, totalSizeMB, opts)
 	} else {
 		// KV lives in VRAM alongside the GPU-resident weights. Dense: the whole
 		// model. MoE: only the non-expert weights (experts offload to CPU), so the
@@ -4369,6 +4378,10 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 		case key == "SYS_PROBE_SCHEMA":
 			if v, err := strconv.Atoi(val); err == nil {
 				sysSchema = v
+			}
+		case key == "SYS_HOST_OVERHEAD_MB":
+			if v, err := strconv.Atoi(val); err == nil && v >= 0 {
+				sp.HostOverheadMB = v
 			}
 		case strings.HasPrefix(key, "SYS_CUDA_OVERHEAD_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(key, "SYS_CUDA_OVERHEAD_MB_CUDA")
@@ -4962,6 +4975,7 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 		lines := strings.Split(string(data), "\n")
 		var headerKV, sig string
 		var par int
+		fileSchema := 1
 		matched := false
 		hasEstimate := map[int]bool{}
 		growth := map[int]int{}
@@ -4969,6 +4983,11 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue
+			}
+			if strings.HasPrefix(line, "PROBE_CACHE_SCHEMA=") {
+				if v, convErr := strconv.Atoi(strings.TrimPrefix(line, "PROBE_CACHE_SCHEMA=")); convErr == nil && v > 0 {
+					fileSchema = v
+				}
 			}
 			// Model identity: the first header line is "# Probe cache for <basename>".
 			if strings.HasPrefix(line, "# Probe cache for ") {
@@ -5011,6 +5030,11 @@ func RelatedModelRuntimeGraphGrowth(cacheDir string, model *ModelProfile, gpus [
 		if !matched {
 			continue
 		}
+		// Same reasoning as loadProbeCache: an ungated growth figure carried
+		// across models is a reserve nothing can justify.
+		if growthPredatesServingGate(fileSchema) {
+			continue
+		}
 		if probeParallelKey(par) != wantParallel {
 			continue
 		}
@@ -5044,6 +5068,14 @@ func HasRuntimeGraphGrowthProbe(cacheDir string, model *ModelProfile, ctxSize, u
 		}
 	}
 	return true
+}
+
+// growthPredatesServingGate reports whether a probe file's runtime-growth
+// entries were written before the recorder learned to distinguish a failure at
+// runtime from one during load. Such entries are indistinguishable from a
+// misfiled load-time allocation and are dropped rather than reserved forever.
+func growthPredatesServingGate(schemaVersion int) bool {
+	return schemaVersion < probeCacheSchema
 }
 
 // RecordRuntimeGraphGrowth stores per-device runtime graph growth for the
@@ -5455,12 +5487,14 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 	// oracle still dies on the real load: attempt 1 of the 23:11 launch packed
 	// CUDA2 to within 97 MiB of free and needed 450.
 	existing := map[int]int{}
+	existingHostOverhead := 0
 	if sp := loadSystemProbe(cacheDir, gpus); sp != nil {
 		for idx, v := range sp.CUDAOverheadByGPU {
 			if v > 0 {
 				existing[idx] = v
 			}
 		}
+		existingHostOverhead = sp.HostOverheadMB
 	}
 	measuredEvery := len(existing) > 0
 	for _, gpu := range gpus {
@@ -5469,7 +5503,10 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 			break
 		}
 	}
-	if measuredEvery {
+	// The host term is measured on its own schedule: a rig whose cards were all
+	// measured by an earlier launch would otherwise return here and never learn
+	// its host overhead at all.
+	if measuredEvery && existingHostOverhead > 0 {
 		return
 	}
 
@@ -5591,7 +5628,19 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 			overheadByGPU[idx] = v
 		}
 	}
-	if len(overheadByGPU) == 0 {
+
+	// Host side, same shape as the whole-device source above: what the memory
+	// scope really holds, minus the host buffers the backend declared.
+	hostOverhead := existingHostOverhead
+	if live := queryHostNonReclaimableMB(serverPID); live > 0 {
+		if accounted := parseHostBuffersFromLog(serverLog); accounted > 0 {
+			if v, ok := hostOverheadMB(live, accounted); ok {
+				hostOverhead = v
+			}
+		}
+	}
+
+	if len(overheadByGPU) == 0 && hostOverhead <= 0 {
 		return
 	}
 
@@ -5621,9 +5670,103 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 	}
 	// Compatibility for older readers. This is still measured data, not a margin.
 	fmt.Fprintf(&b, "SYS_CUDA_OVERHEAD_MB=%d\n", legacyMax)
+	if hostOverhead > 0 {
+		fmt.Fprintf(&b, "SYS_HOST_OVERHEAD_MB=%d\n", hostOverhead)
+		parts = append(parts, fmt.Sprintf("host=%dMB", hostOverhead))
+	}
 	if err := atomicWriteFile(path, []byte(b.String()), 0o644); err == nil {
 		fmt.Fprintf(os.Stderr, "  System probe written: cuda_overhead %s\n", strings.Join(parts, ", "))
 	}
+}
+
+// parseHostBuffersFromLog sums the host-side buffers the backend reported:
+// CUDA_Host (pinned or plain host allocations backing CPU experts) and CPU
+// (host KV when the cache is not offloaded). Maxima, not sums, because the log
+// accumulates across launch attempts within one ggrun run -- the first attempt
+// here reported 86136 MiB before --swa-full was withdrawn and the surviving one
+// 91448 MiB, and adding them would invent 84 GiB that never existed.
+func parseHostBuffersFromLog(log string) int {
+	var maxModel, maxCompute, maxOutput, maxKV float64
+	for _, line := range strings.Split(log, "\n") {
+		if !strings.Contains(line, "CUDA_Host") && !strings.Contains(line, "CPU ") {
+			continue
+		}
+		if !strings.Contains(line, "buffer size =") {
+			continue
+		}
+		v := parseMiB(line)
+		if v <= 0 {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "KV buffer size ="):
+			if v > maxKV {
+				maxKV = v
+			}
+		case strings.Contains(line, "compute buffer size ="):
+			if v > maxCompute {
+				maxCompute = v
+			}
+		case strings.Contains(line, "output buffer size ="):
+			if v > maxOutput {
+				maxOutput = v
+			}
+		default:
+			if v > maxModel {
+				maxModel = v
+			}
+		}
+	}
+	return int(maxModel + maxCompute + maxOutput + maxKV + 0.5)
+}
+
+// queryHostNonReclaimableMB reports the non-reclaimable host memory held by the
+// cgroup the backend runs in. ggrun launches the backend inside its own memory
+// scope, so the cgroup is the exact boundary: it counts the server and nothing
+// else, and it does not care that the recorded PID is the scope wrapper rather
+// than the server itself -- the same mismatch that makes the per-PID VRAM query
+// answer 0. Returns 0 when the process is gone or the cgroup is unreadable.
+func queryHostNonReclaimableMB(pid int) int {
+	if pid <= 0 {
+		return 0
+	}
+	cgData, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return 0
+	}
+	cgPath := ""
+	for _, line := range strings.Split(string(cgData), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), ":", 3)
+		if len(parts) == 3 && parts[0] == "0" {
+			cgPath = parts[2]
+			break
+		}
+	}
+	if cgPath == "" {
+		return 0
+	}
+	statData, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", cgPath, "memory.stat"))
+	if err != nil {
+		return 0
+	}
+	// anon: the backend's own allocations. shmem: how the CUDA host buffers for
+	// CPU experts land under --no-mmap. slab: kernel structures charged to it.
+	// "file" is deliberately excluded -- that is page cache for the GGUF, which
+	// the kernel reclaims under pressure and which no plan should reserve.
+	var totalBytes int64
+	for _, line := range strings.Split(string(statData), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		switch fields[0] {
+		case "anon", "shmem", "slab":
+			if v, convErr := strconv.ParseInt(fields[1], 10, 64); convErr == nil && v > 0 {
+				totalBytes += v
+			}
+		}
+	}
+	return int(totalBytes / (1024 * 1024))
 }
 
 // QueryVRAMUsed returns current nvidia-smi memory.used for a given GPU index.
@@ -5920,6 +6063,16 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			}
 		}
 	}
+	if growthPredatesServingGate(schemaVersion) {
+		// Nothing in the file says whether a growth figure was learned after the
+		// model started serving or from an allocation that failed during load.
+		// Keeping an unverifiable one is not the safe choice it looks like: it
+		// withholds VRAM permanently and silently. Dropping a genuine one costs
+		// a single re-learn, because a real runtime OOM aborts the backend and
+		// ggrun's recovery records it again -- this time through the gate.
+		pc.RuntimeGraphGrowthByGPU = map[int]int{}
+		pc.RuntimeGraphGrowthEstimatedByGPU = map[int]bool{}
+	}
 	if schemaVersion < 2 {
 		// Before schema 2, a startup graph-reserve OOM was written once as the
 		// measured compute buffer and again as "runtime growth" from the same
@@ -6032,6 +6185,41 @@ func md5Hash12(input string) string {
 type systemProbe struct {
 	CUDAOverheadMB    int
 	CUDAOverheadByGPU map[int]int
+	// HostOverheadMB is host RAM the backend holds that is not a buffer it
+	// reported: allocator arenas, thread stacks, the CUDA host-side runtime.
+	// Zero means it was never measured.
+	HostOverheadMB int
+}
+
+// hostOverheadMB is the host analogue of wholeDeviceOverheadMB: what the
+// backend's memory scope really holds, minus the host buffers the backend
+// itself reported. plannedRAMRuntimeOverheadMB returns 0 under
+// RequireMeasuredBuffers because the project takes no static margins, so
+// without this the whole term was simply absent from every host plan.
+//
+// Measured on this host with DeepSeek-V4 serving at --n-cpu-moe 37:
+//
+//	non-reclaimable (anon 1680 + shmem 91522 + slab 212) = 93414 MiB
+//	backend-declared host buffers (91448.56 + 36.32 + 0.99) = 91486 MiB
+//	                                              overhead =  1928 MiB
+//
+// llama-server's own VmRSS was 93878 MiB, agreeing to within half a percent.
+//
+// Only non-reclaimable bytes count. Page cache for the GGUF is file-backed and
+// evictable -- it was 15.5 GiB here -- and charging the plan for it would
+// invent a shortage. The outlier ceiling is a fraction of the live reading
+// itself: real runtime overhead is a small remainder beside the weights, so
+// anything approaching the same order means the buffers were not parsed and
+// the difference is mostly model bytes, not overhead.
+func hostOverheadMB(liveNonReclaimableMB, accountedHostMB int) (int, bool) {
+	if liveNonReclaimableMB <= 0 || accountedHostMB <= 0 {
+		return 0, false
+	}
+	delta := liveNonReclaimableMB - accountedHostMB
+	if delta <= 0 || delta >= liveNonReclaimableMB/systemProbeOutlierRatio {
+		return 0, false
+	}
+	return delta, true
 }
 
 type probeCache struct {
@@ -6109,7 +6297,15 @@ type probeMeasurements struct {
 	ClearRuntimeGrowth bool
 }
 
-const probeCacheSchema = 5
+// probeCacheSchema 6 is the first version whose runtime-graph-growth entries are
+// known to have passed the post-serving window gate. Before it, the recorder
+// filed whatever cudaMalloc size had failed, so a load-time KV or compute-buffer
+// allocation became "growth" and was reserved on every later plan for that
+// signature. Measured here: 5504 MiB on CUDA0, exactly that plan's
+// `CUDA0 KV buffer size = 5504.00 MiB`, which cost four expert layers to the CPU
+// and roughly half the decode rate -- and re-probing carried it forward rather
+// than retiring it. See growthPredatesServingGate.
+const probeCacheSchema = 6
 
 // probeParallelKey preserves the legacy serial key (0) for normal --parallel 1
 // launches while isolating multi-slot graph measurements such as Claude Code's
