@@ -4154,3 +4154,40 @@ func TestHostBufferParsingTakesMaximaNotSums(t *testing.T) {
 		t.Errorf("host buffers %d MiB — the two load attempts were summed", got)
 	}
 }
+
+// The host term is measured on its own schedule, but needing it must not cause
+// the cards to be measured again. A whole-device delta charges everything it
+// cannot attribute to "CUDA overhead", and what it cannot attribute depends on
+// the launch: a single-GPU Qwen3.6-27B at -b 8192 -ub 1024 wrote CUDA0=3850 MiB
+// over a DeepSeek-V4 measurement of 1327, and applying that back to V4 cost
+// CUDA0 its only expert layer (9 GPU layers -> 8, n-cpu-moe 34 -> 35).
+func TestHostOverheadProbeDoesNotRemeasureAlreadyMeasuredCards(t *testing.T) {
+	dir := t.TempDir()
+	gpus := []detect.GPU{
+		{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564},
+		{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288},
+		{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282},
+	}
+	path := filepath.Join(dir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(gpus)))
+	good := "SYS_PROBE_SCHEMA=2\nSYS_CUDA_OVERHEAD_MB_CUDA0=1327\n" +
+		"SYS_CUDA_OVERHEAD_MB_CUDA1=301\nSYS_CUDA_OVERHEAD_MB_CUDA2=359\nSYS_CUDA_OVERHEAD_MB=1327\n"
+	if err := os.WriteFile(path, []byte(good), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A log that would make the whole-device source produce a different, larger
+	// answer for CUDA0 if it were allowed to run.
+	log := "load_tensors:        CUDA0 model buffer size = 11000.00 MiB\n" +
+		"sched_reserve:      CUDA0 compute buffer size =  1000.00 MiB\n"
+	RunPostLaunchProbe(dir, gpus, log, 0, nil)
+
+	sp := loadSystemProbe(dir, gpus)
+	if sp == nil {
+		t.Fatal("system probe disappeared")
+	}
+	for idx, want := range map[int]int{0: 1327, 1: 301, 2: 359} {
+		if got := sp.CUDAOverheadByGPU[idx]; got != want {
+			t.Errorf("CUDA%d overhead was re-measured to %d, want the existing %d", idx, got, want)
+		}
+	}
+}

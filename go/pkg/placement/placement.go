@@ -5523,6 +5523,21 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 	}
 
 	overheadByGPU := map[int]int{}
+	// When every card already has a value and only the host term is missing,
+	// take the cards as they are. Re-measuring them here would overwrite good
+	// numbers with ones taken under whatever workload happens to be running.
+	//
+	// A whole-device delta charges everything it cannot attribute to "CUDA
+	// overhead", and what it cannot attribute depends on the launch: a
+	// single-GPU Qwen3.6-27B at -b 8192 -ub 1024 produced CUDA0=3850 MiB where
+	// DeepSeek-V4 at -b 2048 -ub 512 had measured 1327, and applying that to V4
+	// cost CUDA0 its only expert layer (9 GPU layers -> 8). The device values
+	// are only replaced when a device has none.
+	if measuredEvery {
+		for idx, v := range existing {
+			overheadByGPU[idx] = v
+		}
+	}
 	// Primary source: llama.cpp's own shutdown/startup breakdown table. Its
 	// unaccounted column (total - free - self) is the allocator peak the server
 	// holds that is not model/context/compute buffers — the CUDA context overhead
@@ -5534,6 +5549,9 @@ func RunPostLaunchProbe(cacheDir string, gpus []detect.GPU, serverLog string, se
 	tableOverhead := parseMemoryBreakdownTable(serverLog)
 	if len(tableOverhead) > 0 {
 		for _, gpu := range gpus {
+			if _, done := overheadByGPU[gpu.Index]; done {
+				continue // already measured by an earlier launch; do not overwrite
+			}
 			v, ok := tableOverhead[gpu.Index]
 			if !ok || v <= 0 {
 				continue
