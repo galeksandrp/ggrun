@@ -1774,7 +1774,18 @@ func reviewedRecipeRequiredForMain(arch string, be *backendInfo) *backends.Recip
 	}
 	if be != nil && be.Path != "" {
 		supported, probed := backends.BackendSupportsArch(be.Path, arch)
-		if probed && supported && !be.IsIK {
+		// Being an ik build is not evidence of support on its own: the fork
+		// carries architectures mainline lacks and lacks some mainline has, so a
+		// reviewed recipe normally wins over it. But when ik is the family this
+		// architecture *requires*, refusing it for being ik is unsatisfiable --
+		// ggrun resolves the backend it mandated and then rejects it. A probed
+		// arch literal is the same proof there as it is for mainline.
+		//
+		// minimax-m3 hit exactly that: RequiredBackendForArch returns "ik_llama",
+		// the installed ik libllama.so carries the "minimax-m3" literal, and the
+		// launch still failed with "no proven main-model backend".
+		requiredIsIK := strings.EqualFold(backends.RequiredBackendForArch(arch), "ik_llama")
+		if probed && supported && (!be.IsIK || requiredIsIK) {
 			return nil
 		}
 		if !probed && !be.IsIK {

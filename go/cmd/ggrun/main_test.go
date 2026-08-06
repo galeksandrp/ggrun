@@ -2638,3 +2638,49 @@ func TestRuntimeGrowthWindowRequiresALoadCompleteMarker(t *testing.T) {
 		t.Fatalf("growth window start = (%d, %v), want (1, true)", at, ok)
 	}
 }
+
+// minimax-m3 could not be launched at all: RequiredBackendForArch mandates the
+// ik family, ggrun resolved an ik backend whose libllama.so carries the
+// "minimax-m3" architecture literal, and then refused it for being ik --
+// "no proven main-model backend for architecture". The guard exists so a
+// reviewed fork normally beats an ik build that merely claims an architecture,
+// but it must not reject the family the architecture itself requires.
+func TestReviewedRecipeAcceptsIKWhenTheArchRequiresIK(t *testing.T) {
+	arch := "minimax-m3"
+	if len(backends.RecipesForArch(arch)) == 0 {
+		t.Skipf("no reviewed recipe registered for %s", arch)
+	}
+	if got := backends.RequiredBackendForArch(arch); !strings.EqualFold(got, "ik_llama") {
+		t.Fatalf("fixture assumes %s requires ik_llama, got %q", arch, got)
+	}
+
+	// A binary that genuinely carries the architecture: the literal is
+	// NUL-delimited exactly as BackendSupportsArch requires.
+	dir := t.TempDir()
+	supporting := filepath.Join(dir, "llama-server")
+	body := append([]byte("\x00"+arch+"\x00"), []byte("\x00llama\x00")...)
+	if err := os.WriteFile(supporting, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if ok, probed := backends.BackendSupportsArch(supporting, arch); !ok || !probed {
+		t.Fatalf("fixture binary should probe as supporting: ok=%v probed=%v", ok, probed)
+	}
+
+	if got := reviewedRecipeRequiredForMain(arch, &backendInfo{Path: supporting, IsIK: true}); got != nil {
+		t.Errorf("ik backend carrying %s was still sent to the reviewed recipe %q", arch, got.Name)
+	}
+	// Mainline carrying it was already accepted and must stay accepted.
+	if got := reviewedRecipeRequiredForMain(arch, &backendInfo{Path: supporting, IsIK: false}); got != nil {
+		t.Errorf("mainline carrying %s was sent to the reviewed recipe %q", arch, got.Name)
+	}
+
+	// A backend that does not carry the architecture still needs the recipe,
+	// which is the case the guard exists for.
+	lacking := filepath.Join(dir, "llama-server-bare")
+	if err := os.WriteFile(lacking, []byte("\x00llama\x00qwen3moe\x00"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := reviewedRecipeRequiredForMain(arch, &backendInfo{Path: lacking, IsIK: true}); got == nil {
+		t.Error("an ik backend without the architecture must still require the reviewed recipe")
+	}
+}
