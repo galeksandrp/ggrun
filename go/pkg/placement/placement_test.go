@@ -3915,3 +3915,93 @@ func TestWholeDeviceOverheadMBRejectsNonEvidence(t *testing.T) {
 		}
 	}
 }
+
+// The prompt cache used to be sized against `totalSize - totalVRAM`, which
+// charges the model for every byte of VRAM installed instead of the bytes the
+// weights actually occupy there — VRAM also holds KV, compute buffers and CUDA
+// context. Measured on this host serving DeepSeek-V4-Flash UD-Q3_K_XL at
+// --n-cpu-moe 33, from the backend's own load_tensors report:
+//
+//	CUDA0 11998.86 + CUDA1 10734.00 + CUDA2 10736.96 = 33470 MiB of weights
+//	CUDA_Host                                        = 88793 MiB of weights
+//	total                                            = 122263 MiB
+//
+// The old subtraction called the host share 122268-49134 = 73134 MiB, understating
+// it by ~15.7 GiB, and every downstream figure — the cache budget and the hybrid
+// checkpoint headroom derived from it — was computed against RAM that was never
+// free. The backend was OOM-killed by its own memory scope while saving prompt
+// state.
+func TestPromptCacheIsSizedAgainstHostWeightsNotInstalledVRAM(t *testing.T) {
+	const (
+		freeRAMMB       = 120000
+		totalSizeMB     = 122268 // model total, all shards
+		hostWeightsMB   = 88793  // CUDA_Host model buffer, measured
+		kvTotalMB       = 6400
+		measuredEntryMB = 6656 // one saved conversation, measured
+		slots           = 4
+	)
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: freeRAMMB},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "v4.gguf", Basename: "v4.gguf",
+		SizeBytes: 128225000000, TotalSizeMB: totalSizeMB,
+		NumLayers: 44, IsMoE: true, NumExperts: 256, ExpertUsedCount: 8,
+		ModelArch: "deepseek4", ContextSize: 131072, CTXTrain: 131072,
+	}
+	newStrategy := func(footprintMB int) *Strategy {
+		return &Strategy{
+			Type: MoEOffload, Parallel: slots, HasSSM: true,
+			MeasuredPromptCacheEntryMB: measuredEntryMB,
+			PlannedHostFootprintMB:     footprintMB,
+		}
+	}
+
+	cram, _ := computeCRAM(caps, model, newStrategy(hostWeightsMB), totalSizeMB, kvTotalMB)
+	if cram < minCramMB {
+		t.Fatalf("prompt cache disabled (%d MiB) with %d MiB of host RAM left after weights",
+			cram, freeRAMMB-hostWeightsMB)
+	}
+	// The invariant the OOM-kill violated: the weights and the cache they share
+	// a memory scope with must both fit in the RAM that was free.
+	if committed := hostWeightsMB + cram; committed > freeRAMMB {
+		t.Errorf("plan commits %d MiB of host RAM (%d weights + %d cache) but only %d MiB was free",
+			committed, hostWeightsMB, cram, freeRAMMB)
+	}
+
+	// Without a plan-derived footprint the old subtraction still runs, and on
+	// these numbers it overcommits. Pin that so the fallback is never mistaken
+	// for an equivalent answer.
+	legacy, _ := computeCRAM(caps, model, newStrategy(0), totalSizeMB, kvTotalMB)
+	if legacy <= cram {
+		t.Fatalf("expected the VRAM-install subtraction to grant more than the measured footprint does, got legacy=%d measured=%d", legacy, cram)
+	}
+	if hostWeightsMB+legacy <= freeRAMMB {
+		t.Fatalf("fixture no longer reproduces the overcommit: legacy cram %d + %d weights fits in %d MiB",
+			legacy, hostWeightsMB, freeRAMMB)
+	}
+}
+
+// Charging the cache for mmap-backed expert pages would disable it on exactly
+// the hosts that page happily today: those bytes are clean and file-backed, so
+// the kernel reclaims them under pressure. Only the anonymous working set is
+// genuinely spoken for.
+func TestPromptCacheChargesOnlyTheAnonymousWorkingSetUnderMmap(t *testing.T) {
+	const residentMB, workingSetMB = 88793, 4200
+
+	if got := hostFootprintForCache(residentMB, workingSetMB, false); got != residentMB {
+		t.Errorf("resident plan should charge the whole footprint, got %d want %d", got, residentMB)
+	}
+	if got := hostFootprintForCache(residentMB, workingSetMB, true); got != workingSetMB {
+		t.Errorf("mmap plan should charge only the working set, got %d want %d", got, workingSetMB)
+	}
+	if got := hostFootprintForCache(-1, -1, false); got != 0 {
+		t.Errorf("a negative footprint must clamp to 0 so it reads as 'not derived', got %d", got)
+	}
+}

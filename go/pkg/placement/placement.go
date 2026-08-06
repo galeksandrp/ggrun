@@ -143,6 +143,19 @@ type Strategy struct {
 	// cost because it needs no assumption about how long a typical turn is.
 	MeasuredPromptCacheEntryMB float64 `json:"measured_prompt_cache_entry_mb,omitempty"`
 	MaxCheckpoints             int     `json:"max_checkpoints,omitempty"`
+	// PlannedHostFootprintMB is the host RAM this plan has already spoken for:
+	// CPU-resident expert weights, token embeddings, any CPU-side KV, and the
+	// runtime overhead — the same quantity the mmap decision is made against.
+	// The prompt cache must be sized against what is left after it, not against
+	// free RAM, and not against `totalSize - totalVRAM`: that older subtraction
+	// charged the model for every byte of VRAM installed rather than the bytes
+	// the weights actually occupy there, and VRAM also carries KV, compute
+	// buffers and CUDA overhead. On this 3-GPU host serving DeepSeek-V4 it put
+	// 88793 MiB of host weights at 73128 MiB, so the cache was handed ~15 GiB of
+	// RAM that was never free and the backend was OOM-killed by its own memory
+	// scope while saving prompt state. Zero means the plan did not derive one and
+	// the fallback stands.
+	PlannedHostFootprintMB int `json:"-"`
 	// CheckpointMinStep is the token spacing between context checkpoints. It
 	// decides whether one can sit at the point a later turn resumes from.
 	CheckpointMinStep int          `json:"checkpoint_min_step,omitempty"`
@@ -881,9 +894,12 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		cacheMMap, cacheMMapRequired := false, false
 		if err == nil && cache != nil {
 			var fits bool
-			fits, cacheMMap, cacheMMapRequired = cachedMoEHostMemoryFits(caps, model, s, cache, totalSizeMB, kvTotalMB, opts)
+			var cacheHostFootprintMB int
+			fits, cacheMMap, cacheMMapRequired, cacheHostFootprintMB = cachedMoEHostMemoryFits(caps, model, s, cache, totalSizeMB, kvTotalMB, opts)
 			if !fits {
 				cache = nil
+			} else {
+				s.PlannedHostFootprintMB = cacheHostFootprintMB
 			}
 		}
 		if err == nil && cache != nil {
@@ -1469,9 +1485,26 @@ func sumRoutedLayerMB(costs []moeLayerMemoryMB, start int) int {
 	return total
 }
 
-func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *Strategy, cache *CacheEntry, totalSizeMB, kvTotalMB int, opts Options) (fits, mmap, mmapRequired bool) {
+// hostFootprintForCache reports how much host RAM a plan denies the prompt
+// cache. With the weights resident that is the whole footprint. Under mmap the
+// expert bytes are clean, file-backed pages the kernel evicts under pressure,
+// so only the anonymous working set — runtime overhead plus any CPU-side KV —
+// is genuinely unavailable; charging the cache for reclaimable pages there
+// would disable it on exactly the hosts that page happily today.
+func hostFootprintForCache(residentMB, workingSetMB int, mmap bool) int {
+	footprint := residentMB
+	if mmap {
+		footprint = workingSetMB
+	}
+	if footprint < 0 {
+		return 0
+	}
+	return footprint
+}
+
+func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *Strategy, cache *CacheEntry, totalSizeMB, kvTotalMB int, opts Options) (fits, mmap, mmapRequired bool, hostFootprintMB int) {
 	if caps == nil || model == nil || s == nil || cache == nil {
-		return false, false, false
+		return false, false, false, 0
 	}
 	moeLayers := model.NumLayers - model.LeadingDense
 	if moeLayers <= 0 {
@@ -1496,17 +1529,17 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	} else if opts.ForceMMap {
 		mmap = true
 	}
+	workingSetFloor := runtimeMB + cpuKVMB
 	if residentFits {
-		return true, mmap, false
+		return true, mmap, false, hostFootprintForCache(residentMB, workingSetFloor, mmap)
 	}
 	if !mmap || !mmapCanPageCPUExperts(opts) {
-		return false, mmap, false
+		return false, mmap, false, 0
 	}
-	workingSetFloor := runtimeMB + cpuKVMB
 	if workingSetFloor > caps.RAM.FreeMB {
-		return false, mmap, false
+		return false, mmap, false, 0
 	}
-	return true, true, true
+	return true, true, true, hostFootprintForCache(residentMB, workingSetFloor, true)
 }
 
 func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, error) {
@@ -2128,6 +2161,15 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		s.MMap = true
 	} else {
 		s.MMap = false
+	}
+
+	// Hand the same footprint to the prompt cache that the mmap decision was
+	// just made against, so the cache is sized against RAM that will really be
+	// free rather than against RAM the weights are about to take.
+	s.PlannedHostFootprintMB = hostFootprintForCache(ramNeeded, ramOverheadMB+cpuKVMB, s.MMap)
+	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
+		fmt.Fprintf(os.Stderr, "[trace] host footprint=%d (cpuExperts=%d tokenEmbd=%d cpuKV=%d overhead=%d mmap=%v) freeRAM=%d\n",
+			s.PlannedHostFootprintMB, cpuExpertMB, tokenEmbdMB, cpuKVMB, ramOverheadMB, s.MMap, ramAvailMB)
 	}
 
 	// Build -ot string. Always include the exps=CPU catch-all so expert
@@ -3678,17 +3720,28 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 
 	// RAM remaining after weights load
 	var ramAfterLoad int
-	if fitsOnGPU {
+	switch {
+	case fitsOnGPU:
 		ramAfterLoad = caps.RAM.FreeMB
-	} else {
+	case s.PlannedHostFootprintMB > 0:
+		// What this plan actually puts in host RAM, taken from the plan rather
+		// than re-derived here. See Strategy.PlannedHostFootprintMB.
+		ramAfterLoad = caps.RAM.FreeMB - s.PlannedHostFootprintMB
+	default:
+		// No plan-derived figure (CPU-only, dense CPU offload, or a strategy
+		// built by a path that does not compute one). Charging the model for
+		// the whole VRAM install is wrong whenever VRAM holds anything besides
+		// weights, but it is the only estimate available here and it errs
+		// toward a larger cache, so keep it bounded by the two-thirds rule
+		// below rather than trusted on its own.
 		ramOnCPU := totalSizeMB - caps.TotalVRAM()
 		if ramOnCPU < 0 {
 			ramOnCPU = 0
 		}
 		ramAfterLoad = caps.RAM.FreeMB - ramOnCPU
-		if ramAfterLoad < 0 {
-			ramAfterLoad = 0
-		}
+	}
+	if ramAfterLoad < 0 {
+		ramAfterLoad = 0
 	}
 
 	// Size the cache to what an entry actually costs, not to an arbitrary
