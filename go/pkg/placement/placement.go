@@ -5075,8 +5075,15 @@ func HasRuntimeGraphGrowthProbe(cacheDir string, model *ModelProfile, ctxSize, u
 // runtime from one during load. Such entries are indistinguishable from a
 // misfiled load-time allocation and are dropped rather than reserved forever.
 func growthPredatesServingGate(schemaVersion int) bool {
-	return schemaVersion < probeCacheSchema
+	// Pinned to the version that introduced the gate, not to the current schema:
+	// a later bump for an unrelated reason must not start discarding growth that
+	// was gated correctly.
+	return schemaVersion < probeGrowthGateSchema
 }
+
+// probeGrowthGateSchema is the schema at which runtime-graph-growth entries
+// began passing the post-serving window gate.
+const probeGrowthGateSchema = 6
 
 // RecordRuntimeGraphGrowth stores per-device runtime graph growth for the
 // current runtime signature.
@@ -6061,7 +6068,25 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			if v, err := strconv.Atoi(val); err == nil && v >= 0 {
 				pc.KVPerLayerMB = v
 			}
+		case k == "PROBED_FREE_VRAM":
+			pc.FreeVRAMAtProbe = parsePlanFreeVRAM(val)
 		}
+	}
+	// Reject the whole file, not just one field: a backend boxed into a
+	// degenerate placement reserves a different graph, sizes a different
+	// context, and reports different buffers. Every number in it is
+	// conditional on how busy the machine was.
+	//
+	// Below schema 7 nothing recorded those conditions, so no such file can be
+	// judged and all of them are discarded. From schema 7 on, the writer always
+	// tries: an absent field then means the free-VRAM reading itself was
+	// unavailable, which is a different thing from a busy machine and must not
+	// cost the cache.
+	if schemaVersion < probeCacheSchema {
+		return nil
+	}
+	if len(pc.FreeVRAMAtProbe) > 0 && probeMeasuredUnderDuress(pc.FreeVRAMAtProbe, gpus) {
+		return nil
 	}
 	if growthPredatesServingGate(schemaVersion) {
 		// Nothing in the file says whether a growth figure was learned after the
@@ -6073,19 +6098,12 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 		pc.RuntimeGraphGrowthByGPU = map[int]int{}
 		pc.RuntimeGraphGrowthEstimatedByGPU = map[int]bool{}
 	}
-	if schemaVersion < 2 {
-		// Before schema 2, a startup graph-reserve OOM was written once as the
-		// measured compute buffer and again as "runtime growth" from the same
-		// cudaMalloc line (rounding made the second value exactly compute or
-		// compute+1 MiB). Summing both excluded otherwise viable GPUs. Drop only
-		// that unambiguous legacy duplicate; genuine post-health growth is kept.
-		for idx, growth := range pc.RuntimeGraphGrowthByGPU {
-			compute := pc.ComputeBufByGPU[idx]
-			if compute > 0 && growth >= compute && growth <= compute+1 {
-				delete(pc.RuntimeGraphGrowthByGPU, idx)
-			}
-		}
-	}
+	// A schema-1 repair used to live here: before schema 2 a startup
+	// graph-reserve OOM was written once as the compute buffer and again as
+	// "runtime growth" from the same cudaMalloc line, and summing both excluded
+	// otherwise viable GPUs. The conditions gate above now discards every
+	// pre-schema-7 file outright, so that repair became unreachable and was
+	// removed rather than left to imply a guarantee it no longer provides.
 	if pc.ComputeBufMB > 0 || len(pc.ComputeBufByGPU) > 0 || len(pc.RuntimeGraphGrowthByGPU) > 0 ||
 		pc.KVPerLayerMB > 0 || pc.ContextTotalMB > 0 || pc.PromptCacheBytesPerToken > 0 || pc.PromptCacheEntryMB > 0 {
 		return pc
@@ -6277,6 +6295,71 @@ type probeCache struct {
 	// arrives without raising verbosity. It only appears once the cache is
 	// already under pressure, which is exactly when the budget is wrong.
 	PromptCacheEntryMB float64
+	// FreeVRAMAtProbe is the free VRAM each GPU showed when these numbers were
+	// measured. Every value above is conditional on it: a backend boxed into a
+	// degenerate placement by a busy card reserves a completely different graph
+	// than the same backend on an idle one. See probeMeasuredUnderDuress.
+	FreeVRAMAtProbe map[int]int
+}
+
+// probeMeasuredUnderDuress reports whether a probe's numbers were measured on a
+// machine materially busier than it is now, which makes them stale-pessimistic
+// rather than wrong-at-the-time.
+//
+// ggrun learns from every launch but had no notion of whether a launch was
+// healthy, so a probe taken while the previous server was still releasing VRAM
+// was cached and then believed. Measured here: launching before teardown
+// finished recorded a CUDA2 compute buffer of 8641 MiB against a healthy
+// 149 MiB. The next launch read that as fact --
+//
+//	12282 total - 8641 compute - 359 overhead = 3282 MiB room
+//	one expert layer                          = 3292 MiB
+//
+// -- and gave the card zero expert layers, missing by 10 MiB. Three of 43
+// layers landed on GPU, 107 GB of weights went to host RAM, and that plan was
+// cached in turn. Each degraded launch taught the next one to be worse.
+//
+// A probe with no recorded conditions cannot be judged and is treated as
+// suspect: the unjudgeable ones are exactly the population this exists to
+// contain. The re-probe that follows costs one preflight.
+// formatProbeFreeVRAM renders the current per-GPU free VRAM for the probe
+// header, in the same "idx:MB" shape the placement cache uses.
+func formatProbeFreeVRAM(gpus []detect.GPU) string {
+	idxs := make([]int, 0, len(gpus))
+	free := make(map[int]int, len(gpus))
+	for _, g := range gpus {
+		v := g.VRAMFreeMB()
+		if v <= 0 {
+			continue
+		}
+		idxs = append(idxs, g.Index)
+		free[g.Index] = v
+	}
+	if len(idxs) == 0 {
+		return ""
+	}
+	sort.Ints(idxs)
+	tokens := make([]string, 0, len(idxs))
+	for _, idx := range idxs {
+		tokens = append(tokens, fmt.Sprintf("%d:%d", idx, free[idx]))
+	}
+	return strings.Join(tokens, " ")
+}
+
+func probeMeasuredUnderDuress(freeAtProbe map[int]int, gpus []detect.GPU) bool {
+	if len(freeAtProbe) == 0 {
+		return true
+	}
+	for _, g := range gpus {
+		recorded, ok := freeAtProbe[g.Index]
+		if !ok {
+			return true
+		}
+		if g.VRAMFreeMB() > recorded+planFreeVRAMSlackMB {
+			return true
+		}
+	}
+	return false
 }
 
 // probeMeasurements carries optional measurements into the shared probe
@@ -6297,7 +6380,12 @@ type probeMeasurements struct {
 	ClearRuntimeGrowth bool
 }
 
-// probeCacheSchema 6 is the first version whose runtime-graph-growth entries are
+// probeCacheSchema 7 is the first version that records the conditions its
+// numbers were measured under (PROBED_FREE_VRAM), so a reader can tell a
+// healthy measurement from one taken while the machine was still busy. Files
+// below it are discarded outright: see probeMeasuredUnderDuress.
+//
+// Schema 6 was the first whose runtime-graph-growth entries are
 // known to have passed the post-serving window gate. Before it, the recorder
 // filed whatever cudaMalloc size had failed, so a load-time KV or compute-buffer
 // allocation became "growth" and was reserved on every later plan for that
@@ -6305,7 +6393,7 @@ type probeMeasurements struct {
 // `CUDA0 KV buffer size = 5504.00 MiB`, which cost four expert layers to the CPU
 // and roughly half the decode rate -- and re-probing carried it forward rather
 // than retiring it. See growthPredatesServingGate.
-const probeCacheSchema = 6
+const probeCacheSchema = 7
 
 // probeParallelKey preserves the legacy serial key (0) for normal --parallel 1
 // launches while isolating multi-slot graph measurements such as Claude Code's
@@ -6461,6 +6549,12 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	fmt.Fprintf(&b, "# Generated: %s\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(&b, "# ctx=%d ubatch=%d kv_quality=%s kv_placement=%s backend=%s gpu_sig=%s parallel=%d\n", ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpuSignatureHash(gpus), parallelKey)
 	fmt.Fprintf(&b, "PROBE_CACHE_SCHEMA=%d\n", probeCacheSchema)
+	// The conditions every number below was measured under. Without them a
+	// reader cannot tell a healthy measurement from one taken while the previous
+	// server was still releasing the cards.
+	if freeParts := formatProbeFreeVRAM(gpus); freeParts != "" {
+		fmt.Fprintf(&b, "PROBED_FREE_VRAM=\"%s\"\n", freeParts)
+	}
 	if maxCompute > 0 {
 		fmt.Fprintf(&b, "PROBED_COMPUTE_BUF_MB=%d\n", maxCompute)
 	}

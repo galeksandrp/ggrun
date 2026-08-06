@@ -4019,8 +4019,8 @@ func TestGrowthRecordedBeforeTheServingGateIsRetired(t *testing.T) {
 	header := "# Probe cache for v4.gguf\n# ctx=131072 ubatch=512 kv_quality=high kv_placement=gpu backend=llama@x gpu_sig=" +
 		gpuSignatureHash(gpus) + " parallel=2\n"
 
-	write := func(schema int) *probeCache {
-		body := header + fmt.Sprintf("PROBE_CACHE_SCHEMA=%d\n", schema) +
+	write := func(schema int, extra string) *probeCache {
+		body := header + fmt.Sprintf("PROBE_CACHE_SCHEMA=%d\n", schema) + extra +
 			"PROBED_COMPUTE_BUF_MB_CUDA0=1391\n" +
 			"PROBED_RUNTIME_GRAPH_GROWTH_MB_CUDA0=5504\n"
 		path := probeCachePath(dir, model, 131072, 512, "high", "gpu", "llama@x", gpus, 2)
@@ -4033,20 +4033,60 @@ func TestGrowthRecordedBeforeTheServingGateIsRetired(t *testing.T) {
 		return loadProbeCache(dir, model, 131072, 512, "high", "gpu", "llama@x", gpus, 2)
 	}
 
-	stale := write(probeCacheSchema - 1)
-	if stale == nil {
-		t.Fatal("pre-gate probe should still load: only its growth is untrustworthy")
-	}
-	if got, ok := stale.RuntimeGraphGrowthByGPU[0]; ok {
-		t.Errorf("pre-gate growth survived as %d MiB; it must be retired", got)
-	}
-	if stale.ComputeBufByGPU[0] != 1391 {
-		t.Errorf("retiring growth must not discard the measured compute buffer, got %d", stale.ComputeBufByGPU[0])
+	// A file from before the conditions were recorded is discarded whole, which
+	// takes the ungated growth with it.
+	if stale := write(probeGrowthGateSchema-1, ""); stale != nil {
+		t.Errorf("probe with no recorded measurement conditions was used: %+v", stale)
 	}
 
-	current := write(probeCacheSchema)
-	if current == nil || current.RuntimeGraphGrowthByGPU[0] != 5504 {
-		t.Errorf("growth written through the gate must be kept, got %+v", current)
+	// With conditions recorded and unchanged, the file is usable and gated growth
+	// survives. gpus carry no free-VRAM reading here, so nothing looks busier.
+	current := write(probeCacheSchema, "PROBED_FREE_VRAM=\"0:24111\"\n")
+	if current == nil {
+		t.Fatal("current-schema probe measured on an idle machine must load")
+	}
+	if current.RuntimeGraphGrowthByGPU[0] != 5504 {
+		t.Errorf("growth written through the gate must be kept, got %+v", current.RuntimeGraphGrowthByGPU)
+	}
+	if current.ComputeBufByGPU[0] != 1391 {
+		t.Errorf("measured compute buffer lost, got %d", current.ComputeBufByGPU[0])
+	}
+}
+
+// The mechanism behind the run that put 3 of 43 expert layers on GPU: a probe
+// taken while the previous server was still releasing the cards recorded a
+// CUDA2 compute buffer of 8641 MiB against a healthy 149 MiB, and the next
+// launch believed it. 12282 total - 8641 compute - 359 overhead = 3282 MiB of
+// room against a 3292 MiB expert layer, so the card got nothing -- short by
+// 10 MiB. That plan was then cached in turn.
+func TestProbeMeasuredWhileTheMachineWasBusyIsNotReused(t *testing.T) {
+	gpus := func(free int) []detect.GPU {
+		return []detect.GPU{{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, VRAMUsedMB: 12282 - free}}
+	}
+	const busyFree, idleFree = 2000, 11873
+
+	if !probeMeasuredUnderDuress(map[int]int{2: busyFree}, gpus(idleFree)) {
+		t.Error("a probe measured with 2000 MiB free must not be reused now that 11873 MiB is free")
+	}
+	if probeMeasuredUnderDuress(map[int]int{2: idleFree}, gpus(idleFree)) {
+		t.Error("a probe measured under today's conditions must stay usable")
+	}
+	// Ordinary allocator jitter must not invalidate a good probe.
+	if probeMeasuredUnderDuress(map[int]int{2: idleFree}, gpus(idleFree+planFreeVRAMSlackMB-1)) {
+		t.Error("sub-slack drift invalidated a probe")
+	}
+	// The machine being busier now than at probe time is not duress: the probe
+	// saw more headroom than exists today, and the launch preflight handles a
+	// plan that asks for too much.
+	if probeMeasuredUnderDuress(map[int]int{2: idleFree}, gpus(busyFree)) {
+		t.Error("a probe from an idle machine was rejected merely because the machine is busy now")
+	}
+	// No recorded conditions, and a device with no entry, are both unjudgeable.
+	if !probeMeasuredUnderDuress(nil, gpus(idleFree)) {
+		t.Error("a probe with no recorded conditions must not be trusted")
+	}
+	if !probeMeasuredUnderDuress(map[int]int{0: idleFree}, gpus(idleFree)) {
+		t.Error("a probe missing this device's conditions must not be trusted")
 	}
 }
 

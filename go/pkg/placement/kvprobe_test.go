@@ -176,23 +176,24 @@ func TestLoadProbeCacheDropsLegacyStartupOOMDoubleCount(t *testing.T) {
 	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
 		t.Fatal(err)
 	}
-	got := loadProbeCache(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1)
-	if got == nil || got.ComputeBufByGPU[2] != 8616 {
-		t.Fatalf("legacy compute measurement lost: %#v", got)
-	}
-	if _, poisoned := got.RuntimeGraphGrowthByGPU[2]; poisoned {
-		t.Fatalf("startup compute OOM was still double-counted as runtime growth: %#v", got)
+	// This file records nothing about how busy the machine was when its numbers
+	// were taken, so none of them can be trusted -- not just the growth entry
+	// that duplicated the compute buffer. Discarding it subsumes the older
+	// double-count repair, which is why that repair no longer exists.
+	if got := loadProbeCache(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1); got != nil {
+		t.Fatalf("probe with no recorded measurement conditions was used: %#v", got)
 	}
 
-	// Schema-2 growth is known to come from a post-health crash and must remain,
-	// even in the unlikely event its measured size equals the compute buffer.
+	// Written through the current writer, so the conditions are recorded and the
+	// growth entry passed the post-serving gate: it must survive, even in the
+	// unlikely event its measured size equals the compute buffer.
 	if err := writeProbeCacheForModel(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1,
 		map[int]int{2: 8616}, map[int]int{2: 8616}, nil, 0); err != nil {
 		t.Fatal(err)
 	}
-	got = loadProbeCache(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1)
+	got := loadProbeCache(dir, model, 1048576, 64, "high", "gpu", "llama", gpus, 1)
 	if got == nil || got.RuntimeGraphGrowthByGPU[2] != 8616 {
-		t.Fatalf("schema-2 runtime growth was not preserved: %#v", got)
+		t.Fatalf("gated runtime growth was not preserved: %#v", got)
 	}
 }
 
