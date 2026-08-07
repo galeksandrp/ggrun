@@ -1329,3 +1329,89 @@ func TestShortSessionIDKeepsPrelaunchReadable(t *testing.T) {
 		t.Errorf("short id was truncated: %q", got)
 	}
 }
+
+// A download must be able to land on a different disk than the configured model
+// directory without the user having to repoint ModelDir and put it back. The
+// repo prompt therefore hands off to a destination prompt rather than quitting,
+// and only emits the request once both halves are known.
+func TestDownloadPromptsForDestination(t *testing.T) {
+	m := Model{screen: ScreenFirstRun, modelDir: "/home/u/models"}
+	m.input = textinput.New()
+
+	nm, _ := m.doFirstRunAction("download")
+	m = nm.(Model)
+	m.input.SetValue("unsloth/Inkling-Small-GGUF")
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+
+	if m.launchRequest != nil {
+		t.Fatal("entering the repo must not emit the download yet")
+	}
+	if m.inputMode != "downloaddir" {
+		t.Fatalf("expected the destination prompt, got inputMode=%q", m.inputMode)
+	}
+	if got := m.input.Value(); got != "/home/u/models" {
+		t.Fatalf("destination should be pre-filled with the model dir, got %q", got)
+	}
+
+	m.input.SetValue("/mnt/2tb/AI_Models")
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if m.launchRequest == nil {
+		t.Fatal("confirming the destination must emit the download")
+	}
+	if m.launchRequest.DownloadRepo != "unsloth/Inkling-Small-GGUF" {
+		t.Fatalf("repo lost across the destination prompt: %q", m.launchRequest.DownloadRepo)
+	}
+	if m.launchRequest.DownloadDir != "/mnt/2tb/AI_Models" {
+		t.Fatalf("destination not carried, got %q", m.launchRequest.DownloadDir)
+	}
+}
+
+// Pressing Enter on the pre-filled default must behave exactly as before this
+// prompt existed: download into the configured model directory, with no
+// per-download override recorded.
+func TestDownloadDestinationDefaultsToModelDir(t *testing.T) {
+	m := Model{screen: ScreenFirstRun, modelDir: "/home/u/models"}
+	m.input = textinput.New()
+	nm, _ := m.promptDownloadDir(&LaunchRequest{DownloadRepo: "org/repo", DownloadQuant: "Q3_K_XL"})
+	m = nm.(Model)
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+
+	if m.launchRequest == nil {
+		t.Fatal("expected the download to be emitted")
+	}
+	if m.launchRequest.DownloadDir != "" {
+		t.Fatalf("accepting the default must not record an override, got %q", m.launchRequest.DownloadDir)
+	}
+	if m.launchRequest.DownloadQuant != "Q3_K_XL" {
+		t.Fatalf("quant lost across the destination prompt: %q", m.launchRequest.DownloadQuant)
+	}
+}
+
+// The quant picker reached from the recommendation screen is the other way into
+// a download, and needs the same destination step.
+func TestRecommendedDownloadPromptsForDestination(t *testing.T) {
+	m := Model{
+		screen:   ScreenRecommended,
+		modelDir: "/home/u/models",
+		recommendations: []recommend.Recommendation{{
+			Candidate: recommend.Candidate{Repo: "unsloth/Inkling-Small-GGUF"},
+			QuantName: "UD-Q3_K_XL",
+		}},
+		selectedRecommendation: 0,
+	}
+	m.input = textinput.New()
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if m.launchRequest != nil {
+		t.Fatal("the quant picker must ask for a destination before downloading")
+	}
+	if m.inputMode != "downloaddir" || m.pendingDownload == nil {
+		t.Fatalf("expected the destination prompt, got inputMode=%q", m.inputMode)
+	}
+	if m.pendingDownload.DownloadQuant != "UD-Q3_K_XL" {
+		t.Fatalf("selected quant not carried, got %q", m.pendingDownload.DownloadQuant)
+	}
+}

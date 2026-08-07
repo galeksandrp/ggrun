@@ -216,8 +216,8 @@ func TestBackendStartOptionsArePlacementStrategyIndependent(t *testing.T) {
 	single := &placement.Strategy{Type: placement.SingleGPU}
 	multi := &placement.Strategy{Type: placement.MultiGPUDense}
 
-	singleOpts := backendStartOptions(req, caps, nil)
-	multiOpts := backendStartOptions(req, caps, nil)
+	singleOpts := backendStartOptions(req, caps, nil, nil)
+	multiOpts := backendStartOptions(req, caps, nil, nil)
 
 	if single.Type != placement.SingleGPU || multi.Type != placement.MultiGPUDense {
 		t.Fatalf("test setup broken: single=%s multi=%s", single.Type, multi.Type)
@@ -2682,5 +2682,148 @@ func TestReviewedRecipeAcceptsIKWhenTheArchRequiresIK(t *testing.T) {
 	}
 	if got := reviewedRecipeRequiredForMain(arch, &backendInfo{Path: lacking, IsIK: true}); got == nil {
 		t.Error("an ik backend without the architecture must still require the reviewed recipe")
+	}
+}
+
+// MiniMax-M3 could not run in any mode. Under mmap its CPU-side experts are
+// file-backed, so the plan correctly reports a tiny host footprint -- but page
+// cache is still charged to the cgroup, and with MemoryHigh == MemoryMax the
+// reclaim threshold and the kill threshold arrive together. ~107 GiB of
+// reclaimable experts under a 114 GiB cap walked straight into the OOM killer
+// (measured: cgroup peak 114558 MiB, oom_kill=1) when the kernel could have
+// dropped clean pages instead.
+func TestMMapBackedPlanGetsAReclaimBandBeforeTheKillThreshold(t *testing.T) {
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	req := &launchRequest{RAMLimitPercent: 95}
+
+	mmapArgs := []string{"-m", "m3.gguf", "--n-cpu-moe", "44", "-ot", "exps=CPU"}
+	residentArgs := append(append([]string{}, mmapArgs...), "--no-mmap")
+
+	if !argsMMapBackedExperts(mmapArgs) {
+		t.Fatal("CPU experts with no --no-mmap must count as mmap-backed")
+	}
+	if argsMMapBackedExperts(residentArgs) {
+		t.Fatal("--no-mmap means the experts are resident, not file-backed")
+	}
+	if argsMMapBackedExperts([]string{"-m", "dense.gguf"}) {
+		t.Fatal("a plan with no CPU experts has no file-backed expert bytes")
+	}
+
+	// Resident: the bytes are anonymous and cannot be reclaimed, so a hard cap
+	// at the plan's budget is exactly right and must not be loosened.
+	res := backendStartOptions(req, caps, nil, residentArgs)
+	if res.MemoryHighMB != res.MemoryMaxMB {
+		t.Errorf("resident plan should keep a hard cap, got high=%d max=%d", res.MemoryHighMB, res.MemoryMaxMB)
+	}
+	if res.MemoryMaxMB != backendMemoryMaxMB(req, caps) {
+		t.Errorf("resident ceiling moved off the plan budget: %d", res.MemoryMaxMB)
+	}
+
+	// mmap: reclaim at the budget, kill only at the whole-host limit.
+	mm := backendStartOptions(req, caps, nil, mmapArgs)
+	if mm.MemoryHighMB != backendMemoryMaxMB(req, caps) {
+		t.Errorf("reclaim threshold should stay at the plan budget, got %d", mm.MemoryHighMB)
+	}
+	if mm.MemoryMaxMB <= mm.MemoryHighMB {
+		t.Errorf("mmap plan has no reclaim band: high=%d max=%d", mm.MemoryHighMB, mm.MemoryMaxMB)
+	}
+	// The percent target becomes reclaim pressure, so the hard ceiling is the RAM
+	// that was actually free -- the physical bound the plan could reach in any
+	// case. It must never exceed that, and must leave a real band below it.
+	if mm.MemoryMaxMB > caps.RAM.FreeMB {
+		t.Errorf("hard ceiling %d exceeds free RAM %d", mm.MemoryMaxMB, caps.RAM.FreeMB)
+	}
+	if mm.MemoryHighMB >= mm.MemoryMaxMB {
+		t.Errorf("no reclaim band: high=%d max=%d", mm.MemoryHighMB, mm.MemoryMaxMB)
+	}
+
+	// An explicitly named --ram-budget is a ceiling the user asked for by name
+	// and must stay hard, even under mmap.
+	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000, RAMLimitPercent: 95}, caps, nil, mmapArgs)
+	if named.MemoryHighMB != named.MemoryMaxMB {
+		t.Errorf("an explicit --ram-budget must stay a hard cap, got high=%d max=%d", named.MemoryHighMB, named.MemoryMaxMB)
+	}
+
+	// With no percent target there is nothing to reinterpret as pressure, so
+	// containment must be exactly as it was.
+	bare := backendStartOptions(&launchRequest{RamBudgetMB: 100000}, caps, nil, mmapArgs)
+	if bare.MemoryHighMB != bare.MemoryMaxMB {
+		t.Errorf("no ram-limit-percent must leave the cap unchanged, got high=%d max=%d", bare.MemoryHighMB, bare.MemoryMaxMB)
+	}
+}
+
+// MODEL_DIR is a single path, so every download landed on whichever filesystem
+// it sits on -- here the 456 GB root volume with 67 GB free, while the 1.9 TB
+// volume holding the large quants had 935 GB. The only way to put a model there
+// was to download it elsewhere and symlink it in by hand.
+func TestDownloadAcceptsAnExplicitDestination(t *testing.T) {
+	const fallback = "/home/mik/ggrun-project/ggrun/models"
+	alt := "/home/mik/2tb-disk/AI_Models"
+
+	for _, form := range [][]string{
+		{"unsloth/Inkling-Small-GGUF", "--dir", alt},
+		{"unsloth/Inkling-Small-GGUF", "--dir=" + alt},
+		{"--dir", alt, "unsloth/Inkling-Small-GGUF"},
+		{"unsloth/Inkling-Small-GGUF", "-dir", alt},
+		{"unsloth/Inkling-Small-GGUF", "--model-dir", alt},
+	} {
+		repo, dir, err := downloadDirFromArgs(form, fallback)
+		if err != nil {
+			t.Fatalf("%v: %v", form, err)
+		}
+		if repo != "unsloth/Inkling-Small-GGUF" {
+			t.Errorf("%v: repo = %q", form, repo)
+		}
+		if dir != alt {
+			t.Errorf("%v: dir = %q, want %q", form, dir, alt)
+		}
+	}
+
+	// No flag means the configured MODEL_DIR, unchanged.
+	repo, dir, err := downloadDirFromArgs([]string{"unsloth/Inkling-Small-GGUF"}, fallback)
+	if err != nil || repo != "unsloth/Inkling-Small-GGUF" || dir != fallback {
+		t.Errorf("bare download changed behaviour: repo=%q dir=%q err=%v", repo, dir, err)
+	}
+
+	if _, _, err := downloadDirFromArgs([]string{"--dir"}, fallback); err == nil {
+		t.Error("a --dir with no value must be rejected, not silently ignored")
+	}
+	if _, _, err := downloadDirFromArgs([]string{"--dir", alt}, fallback); err == nil {
+		t.Error("a destination with no repository must be rejected")
+	}
+	if _, _, err := downloadDirFromArgs(nil, fallback); err == nil {
+		t.Error("no arguments must be rejected")
+	}
+}
+
+// A destination typed by hand -- which is how the TUI collects it -- routinely
+// starts with ~. Without expansion that creates a directory literally named "~"
+// in the working directory and the model lands on the wrong disk, which is the
+// exact failure this flag exists to avoid.
+func TestExpandPathResolvesTildeAndEnv(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	if got := expandPath("~/2tb-disk/AI_Models"); got != filepath.Join(home, "2tb-disk/AI_Models") {
+		t.Fatalf("tilde not expanded: %q", got)
+	}
+	if got := expandPath("~"); got != home {
+		t.Fatalf("bare tilde not expanded: %q", got)
+	}
+	t.Setenv("GGRUN_TEST_DEST", "/mnt/2tb")
+	if got := expandPath("$GGRUN_TEST_DEST/models"); got != "/mnt/2tb/models" {
+		t.Fatalf("env not expanded: %q", got)
+	}
+	if got := expandPath("  /mnt/2tb/models  "); got != "/mnt/2tb/models" {
+		t.Fatalf("surrounding space not trimmed: %q", got)
+	}
+	// A path that is neither ~ nor env-bearing must survive untouched apart from
+	// being made absolute.
+	if got := expandPath("/mnt/2tb/AI_Models"); got != "/mnt/2tb/AI_Models" {
+		t.Fatalf("absolute path altered: %q", got)
 	}
 }

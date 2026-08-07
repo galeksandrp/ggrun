@@ -2792,13 +2792,86 @@ func argsOffloadExpertsToCPU(serverArgs []string) bool {
 	return false
 }
 
-func backendStartOptions(req *launchRequest, caps *detect.Capabilities, envOverrides []string) server.StartOptions {
-	memoryMaxMB := backendMemoryMaxMB(req, caps)
-	return server.StartOptions{EnvOverrides: envOverrides, MemoryHighMB: memoryMaxMB, MemoryMaxMB: memoryMaxMB}
+// argsMMapBackedExperts reports whether the emitted command leaves CPU-side
+// expert tensors file-backed rather than copied into host buffers. Keyed off
+// argv for the same reason as argsOffloadExpertsToCPU: it cannot drift from
+// what the backend is actually told.
+func argsMMapBackedExperts(serverArgs []string) bool {
+	if !argsOffloadExpertsToCPU(serverArgs) {
+		return false
+	}
+	for _, a := range serverArgs {
+		if a == "--no-mmap" {
+			return false
+		}
+	}
+	return true
+}
+
+// backendStartOptions builds the memory scope for the backend.
+//
+// MemoryHigh and MemoryMax were the same number, which leaves the kernel no
+// band to work in: the reclaim threshold and the kill threshold arrive
+// together. That is correct for resident weights, where the bytes are anonymous
+// and reclaiming is not an option -- a hard cap is the whole point.
+//
+// Under mmap it is wrong, and it is what stops MiniMax-M3 from running here.
+// Its CPU-side experts are file-backed, so the plan correctly reports only a
+// 458 MiB host footprint -- those pages are reclaimable. But page cache is
+// still *charged* to the cgroup, so ~107 GiB of experts under a 114 GiB cap
+// walked memory.current straight into memory.max and the OOM killer fired
+// (measured: cgroup peak 114558 MiB, oom_kill=1) when the kernel could simply
+// have dropped clean pages. DeepSeek-V4 survives the same path only because its
+// ~80 GiB of experts happen to leave headroom.
+//
+// So for an mmap-backed plan the plan's own budget becomes the reclaim
+// threshold and the hard ceiling moves up to the whole-host utilisation limit
+// the user already configures with --ram-limit-percent. Containment is kept --
+// there is still a hard ceiling, and MemorySwapMax=0 still holds -- but the
+// kernel is allowed to evict page cache before it kills the process.
+func backendStartOptions(req *launchRequest, caps *detect.Capabilities, envOverrides []string, serverArgs []string) server.StartOptions {
+	budgetMB := backendMemoryMaxMB(req, caps)
+	highMB, maxMB := budgetMB, budgetMB
+	if budgetMB > 0 && argsMMapBackedExperts(serverArgs) {
+		if hostCeiling := hostReclaimCeilingMB(req, caps); hostCeiling > budgetMB {
+			maxMB = hostCeiling
+		}
+	}
+	return server.StartOptions{EnvOverrides: envOverrides, MemoryHighMB: highMB, MemoryMaxMB: maxMB}
+}
+
+// hostReclaimCeilingMB is the hard ceiling an mmap-backed plan may reach before
+// the OOM killer is the right answer.
+//
+// --ram-limit-percent expresses a whole-host *utilisation* target. For
+// reclaimable page cache that is a pressure threshold, not a death sentence: it
+// belongs on MemoryHigh, where it makes the kernel drop clean pages. The hard
+// ceiling is then the RAM that was actually free, which is the physical bound
+// the plan could reach in any case. Containment is preserved -- a runaway
+// anonymous allocation still meets a real limit, and MemorySwapMax=0 still
+// holds, so nothing spills to disk.
+//
+// An explicit --ram-budget is a ceiling the user named, so it is left alone;
+// only the derived percent target is reinterpreted as reclaim pressure.
+func hostReclaimCeilingMB(req *launchRequest, caps *detect.Capabilities) int {
+	if req == nil || caps == nil || runtime.GOOS != "linux" {
+		return 0
+	}
+	if req.RamBudgetMB > 0 || req.RAMLimitPercent <= 0 {
+		return 0
+	}
+	ceiling := caps.RAM.FreeMB
+	if req.RAMHeadroomMB > 0 {
+		ceiling -= req.RAMHeadroomMB
+	}
+	if ceiling <= 0 {
+		return 0
+	}
+	return ceiling
 }
 
 func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration) (*server.Process, error) {
-	startOpts := backendStartOptions(req, caps, hostExpertPinningEnv(be, serverArgs))
+	startOpts := backendStartOptions(req, caps, hostExpertPinningEnv(be, serverArgs), serverArgs)
 	if req.ClaudeCode {
 		// In Claude Code mode ggrun hands the terminal to the `claude` client, so
 		// the backend's ongoing per-request logs must go to a file instead of
@@ -5203,7 +5276,18 @@ func cmdGUI() {
 				fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
 				os.Exit(1)
 			}
-			d := download.New(cfg.ModelDir, cfg.CacheDir, cfg.AppHome)
+			modelDir := cfg.ModelDir
+			if req.DownloadDir != "" {
+				modelDir = expandPath(req.DownloadDir)
+			}
+			if err := os.MkdirAll(modelDir, 0o755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: cannot use %s: %v\n", modelDir, err)
+				os.Exit(1)
+			}
+			if modelDir != cfg.ModelDir {
+				fmt.Fprintf(os.Stderr, "[download] destination: %s\n", modelDir)
+			}
+			d := download.New(modelDir, cfg.CacheDir, cfg.AppHome)
 			if err := d.RunQuant(req.DownloadRepo, req.DownloadQuant, caps); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
@@ -5889,22 +5973,81 @@ func cmdProbe() {
 	fmt.Println(mem.String())
 }
 
+// downloadDirFromArgs pulls an explicit destination out of the download argv.
+//
+// MODEL_DIR is a single path, so every download landed on whichever filesystem
+// it happens to sit on. On this machine that is the 456 GB root volume with
+// 67 GB free, while the 1.9 TB volume holding the large quants has 935 GB --
+// and the only way to put a model there was to download it elsewhere and
+// symlink it in by hand. A destination belongs to one download, not to the
+// whole configuration, so it is a flag rather than a config change.
+// expandPath resolves a user-supplied directory to an absolute path, expanding
+// environment variables and a leading ~. The tilde matters most for the TUI,
+// where a destination is typed by hand and "~/2tb-disk/models" would otherwise
+// create a directory literally named "~".
+func expandPath(dir string) string {
+	dir = os.ExpandEnv(strings.TrimSpace(dir))
+	if dir == "~" || strings.HasPrefix(dir, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dir = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(dir, "~"), "/"))
+		}
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+func downloadDirFromArgs(args []string, fallback string) (repo, dir string, err error) {
+	dir = fallback
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		key, val, hasVal := strings.Cut(args[i], "=")
+		if key != "--dir" && key != "-dir" && key != "--model-dir" {
+			rest = append(rest, args[i])
+			continue
+		}
+		if !hasVal {
+			if i+1 >= len(args) {
+				return "", "", fmt.Errorf("%s needs a directory", key)
+			}
+			i++
+			val = args[i]
+		}
+		if strings.TrimSpace(val) == "" {
+			return "", "", fmt.Errorf("%s needs a directory", key)
+		}
+		dir = val
+	}
+	if len(rest) < 1 {
+		return "", "", fmt.Errorf("no repository given")
+	}
+	return rest[0], expandPath(dir), nil
+}
+
 func cmdDownload(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "Usage: ggrun download <repo/name>")
+	cfg := loadConfigOrExit()
+	repo, modelDir, err := downloadDirFromArgs(args, cfg.ModelDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Usage: ggrun download <repo/name> [--dir <path>]\n  %v\n", err)
 		os.Exit(2)
 	}
-	repo := args[0]
 
-	caps, err := detect.Detect()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
+	caps, derr := detect.Detect()
+	if derr != nil {
+		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", derr)
 		os.Exit(1)
 	}
 
-	cfg := loadConfigOrExit()
+	if err := os.MkdirAll(modelDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot use %s: %v\n", modelDir, err)
+		os.Exit(1)
+	}
+	if modelDir != cfg.ModelDir {
+		fmt.Fprintf(os.Stderr, "[download] destination: %s\n", modelDir)
+	}
 
-	d := download.New(cfg.ModelDir, cfg.CacheDir, cfg.AppHome)
+	d := download.New(modelDir, cfg.CacheDir, cfg.AppHome)
 	if err := d.Run(repo, caps); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -6128,7 +6271,7 @@ func cmdTune(args []string) {
 			fmt.Println("[tune]", msg)
 		},
 		StartServer: func(flags []string) (func(), error) {
-			p, err := server.StartWithTimeoutToOptions(flags, req.Port, timeout, os.Stdout, os.Stderr, backendStartOptions(req, caps, nil))
+			p, err := server.StartWithTimeoutToOptions(flags, req.Port, timeout, os.Stdout, os.Stderr, backendStartOptions(req, caps, nil, flags))
 			if err != nil {
 				return nil, err
 			}

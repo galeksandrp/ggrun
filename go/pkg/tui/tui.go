@@ -73,6 +73,10 @@ type Model struct {
 	recommendationGroups   recommend.Categories
 	recommendations        []recommend.Recommendation
 	selectedRecommendation int
+	// pendingDownload holds the repo/quant already chosen while the destination
+	// directory is being asked for, so a download is only emitted once both
+	// halves are known.
+	pendingDownload *LaunchRequest
 
 	// Main menu list
 	mainList list.Model
@@ -1124,6 +1128,20 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// promptDownloadDir asks where a chosen download should land, pre-filled with
+// the configured model directory so Enter keeps the existing behaviour.
+func (m Model) promptDownloadDir(req *LaunchRequest) (tea.Model, tea.Cmd) {
+	m.pendingDownload = req
+	m.screen = ScreenDownload
+	m.inputMode = "downloaddir"
+	m.input.SetValue(m.modelDir)
+	m.input.Placeholder = "Destination directory"
+	m.input.Focus()
+	m.message = fmt.Sprintf("Destination for %s (Enter keeps %s)", req.DownloadRepo, m.modelDir)
+	m.messageType = "info"
+	return m, nil
+}
+
 func firstRunActions() []string {
 	return []string{"recommend", "latest", "scan", "download", "modeldir", "backends", "update", "quit"}
 }
@@ -1209,11 +1227,22 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "download":
 			val = strings.TrimSpace(val)
 			if val != "" {
-				m.launchRequest = &LaunchRequest{DownloadRepo: val}
-				return m, tea.Quit
+				return m.promptDownloadDir(&LaunchRequest{DownloadRepo: val})
 			}
 			m.message = "Warning: Enter a Hugging Face GGUF repository"
 			m.messageType = "warning"
+		case "downloaddir":
+			req := m.pendingDownload
+			if req == nil {
+				m.inputMode = ""
+				m.screen = ScreenFirstRun
+				return m, nil
+			}
+			if dir := strings.TrimSpace(val); dir != "" && dir != m.modelDir {
+				req.DownloadDir = dir
+			}
+			m.launchRequest = req
+			return m, tea.Quit
 		case "modeldir":
 			val = strings.TrimSpace(val)
 			if val != "" {
@@ -1773,8 +1802,7 @@ func (m Model) updateRecommended(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if len(m.recommendations) > 0 && m.selectedRecommendation >= 0 && m.selectedRecommendation < len(m.recommendations) {
 				rec := m.recommendations[m.selectedRecommendation]
-				m.launchRequest = &LaunchRequest{DownloadRepo: rec.Repo, DownloadQuant: rec.QuantName}
-				return m, tea.Quit
+				return m.promptDownloadDir(&LaunchRequest{DownloadRepo: rec.Repo, DownloadQuant: rec.QuantName})
 			}
 		case "d", "D":
 			m.screen = ScreenDownload
@@ -2066,6 +2094,8 @@ func (m Model) viewInputScreen() string {
 	switch m.inputMode {
 	case "download":
 		title = "Download Model"
+	case "downloaddir":
+		title = "Download Destination"
 	case "modeldir":
 		title = "Model Directory"
 	case "backend-add":
@@ -3043,7 +3073,13 @@ type LaunchRequest struct {
 	BackendArgs   []string
 	DownloadRepo  string
 	DownloadQuant string
-	ModelPath     string
+	// DownloadDir sends this one download somewhere other than the configured
+	// model directory, without changing that setting. Large quants routinely
+	// have to land on a different disk than the default one, and making the
+	// user repoint ModelDir and then remember to put it back is both tedious
+	// and easy to get wrong.
+	DownloadDir string
+	ModelPath   string
 	Port          int
 	CtxSize       int
 	CtxFlag       string
