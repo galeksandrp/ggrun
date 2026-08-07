@@ -1485,15 +1485,37 @@ func sumRoutedLayerMB(costs []moeLayerMemoryMB, start int) int {
 	return total
 }
 
+// mmapFreesCPUExperts reports whether leaving CPU-side expert tensors
+// file-backed actually makes them reclaimable. This is not a property of the
+// flag; it is a property of the loader.
+//
+// Measured 2026-08-07 on this machine. Under ik_llama, MiniMax-M3's CPU experts
+// land in anonymous memory whether or not --mmap is passed — the mmap and
+// resident rows' cgroups matched to the byte (anon 113363 MB, file 449 MB), so
+// the flag changed nothing at all. ik_llama's mmap fast path
+// (src/llama.cpp:4457) is taken only when the buffer type is the default-CPU or
+// plain-CPU buffer type; with "-ot ...exps=CPU" the expert tensors match neither
+// and fall through to an ordinary allocation. Mainline llama.cpp maps them and
+// reports CPU_Mapped buffers instead, which is why DeepSeek-V4 under the same
+// flags shows anon 1.9 GB against file 113 GB.
+func mmapFreesCPUExperts(backendTag string) bool {
+	return !strings.EqualFold(strings.TrimSpace(backendTag), "ik_llama")
+}
+
 // hostFootprintForCache reports how much host RAM a plan denies the prompt
 // cache. With the weights resident that is the whole footprint. Under mmap the
 // expert bytes are clean, file-backed pages the kernel evicts under pressure,
 // so only the anonymous working set — runtime overhead plus any CPU-side KV —
 // is genuinely unavailable; charging the cache for reclaimable pages there
 // would disable it on exactly the hosts that page happily today.
-func hostFootprintForCache(residentMB, workingSetMB int, mmap bool) int {
+//
+// That reclaimability is conditional on the backend actually mapping those
+// bytes. Where it does not, charging only the working set understates the plan
+// by the entire expert set: for MiniMax-M3 it predicted 458 MB against a real
+// 113 GB, a 250x error that the memory preflight then had to catch at launch.
+func hostFootprintForCache(residentMB, workingSetMB int, mmap bool, backendTag string) int {
 	footprint := residentMB
-	if mmap {
+	if mmap && mmapFreesCPUExperts(backendTag) {
 		footprint = workingSetMB
 	}
 	if footprint < 0 {
@@ -1531,7 +1553,7 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	}
 	workingSetFloor := runtimeMB + cpuKVMB
 	if residentFits {
-		return true, mmap, false, hostFootprintForCache(residentMB, workingSetFloor, mmap)
+		return true, mmap, false, hostFootprintForCache(residentMB, workingSetFloor, mmap, opts.BackendTag)
 	}
 	if !mmap || !mmapCanPageCPUExperts(opts) {
 		return false, mmap, false, 0
@@ -1539,7 +1561,7 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	if workingSetFloor > caps.RAM.FreeMB {
 		return false, mmap, false, 0
 	}
-	return true, true, true, hostFootprintForCache(residentMB, workingSetFloor, true)
+	return true, true, true, hostFootprintForCache(residentMB, workingSetFloor, true, opts.BackendTag)
 }
 
 func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, error) {
@@ -2166,7 +2188,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// Hand the same footprint to the prompt cache that the mmap decision was
 	// just made against, so the cache is sized against RAM that will really be
 	// free rather than against RAM the weights are about to take.
-	s.PlannedHostFootprintMB = hostFootprintForCache(ramNeeded, ramOverheadMB+cpuKVMB, s.MMap)
+	s.PlannedHostFootprintMB = hostFootprintForCache(ramNeeded, ramOverheadMB+cpuKVMB, s.MMap, opts.BackendTag)
 	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
 		fmt.Fprintf(os.Stderr, "[trace] host footprint=%d (cpuExperts=%d tokenEmbd=%d cpuKV=%d overhead=%d mmap=%v) freeRAM=%d\n",
 			s.PlannedHostFootprintMB, cpuExpertMB, tokenEmbdMB, cpuKVMB, ramOverheadMB, s.MMap, ramAvailMB)

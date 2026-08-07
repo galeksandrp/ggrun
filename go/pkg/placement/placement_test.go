@@ -3995,13 +3995,13 @@ func TestPromptCacheIsSizedAgainstHostWeightsNotInstalledVRAM(t *testing.T) {
 func TestPromptCacheChargesOnlyTheAnonymousWorkingSetUnderMmap(t *testing.T) {
 	const residentMB, workingSetMB = 88793, 4200
 
-	if got := hostFootprintForCache(residentMB, workingSetMB, false); got != residentMB {
+	if got := hostFootprintForCache(residentMB, workingSetMB, false, "llama"); got != residentMB {
 		t.Errorf("resident plan should charge the whole footprint, got %d want %d", got, residentMB)
 	}
-	if got := hostFootprintForCache(residentMB, workingSetMB, true); got != workingSetMB {
+	if got := hostFootprintForCache(residentMB, workingSetMB, true, "llama"); got != workingSetMB {
 		t.Errorf("mmap plan should charge only the working set, got %d want %d", got, workingSetMB)
 	}
-	if got := hostFootprintForCache(-1, -1, false); got != 0 {
+	if got := hostFootprintForCache(-1, -1, false, "llama"); got != 0 {
 		t.Errorf("a negative footprint must clamp to 0 so it reads as 'not derived', got %d", got)
 	}
 }
@@ -4188,6 +4188,43 @@ func TestHostOverheadProbeDoesNotRemeasureAlreadyMeasuredCards(t *testing.T) {
 	for idx, want := range map[int]int{0: 1327, 1: 301, 2: 359} {
 		if got := sp.CUDAOverheadByGPU[idx]; got != want {
 			t.Errorf("CUDA%d overhead was re-measured to %d, want the existing %d", idx, got, want)
+		}
+	}
+}
+
+// mmap makes CPU-side experts reclaimable only where the loader actually maps
+// them. Under ik_llama they land in anonymous memory regardless of the flag:
+// MiniMax-M3's mmap and resident rows had identical cgroups (anon 113363 MB,
+// file 449 MB) on 2026-08-07. Charging only the anonymous working set there
+// predicted a 458 MB host footprint against a real 113 GB.
+func TestHostFootprintChargesFullResidentWhenBackendDoesNotMap(t *testing.T) {
+	const resident = 111130 // MiniMax-M3's CPU experts plus overhead
+	const workingSet = 458  // what mmap would appear to cost
+
+	if got := hostFootprintForCache(resident, workingSet, true, "ik_llama"); got != resident {
+		t.Fatalf("ik_llama does not map CPU experts, so the plan must charge the full %d MB, got %d", resident, got)
+	}
+	// Case is not meaningful for a backend tag.
+	if got := hostFootprintForCache(resident, workingSet, true, "IK_Llama"); got != resident {
+		t.Fatalf("backend tag must match case-insensitively, got %d", got)
+	}
+
+	// Mainline does map them (DeepSeek-V4: anon 1.9 GB, file 113 GB), so the
+	// reclaimable bytes must not be charged or the prompt cache is disabled on
+	// exactly the hosts that page happily.
+	if got := hostFootprintForCache(resident, workingSet, true, "llama"); got != workingSet {
+		t.Fatalf("mainline maps CPU experts, so only the working set is charged: want %d, got %d", workingSet, got)
+	}
+	// An unknown or empty tag must not silently become the conservative case
+	// either -- mainline is the default backend.
+	if got := hostFootprintForCache(resident, workingSet, true, ""); got != workingSet {
+		t.Fatalf("default backend must keep mmap accounting, got %d", got)
+	}
+
+	// Without mmap the backend is irrelevant: the bytes are resident either way.
+	for _, tag := range []string{"llama", "ik_llama", ""} {
+		if got := hostFootprintForCache(resident, workingSet, false, tag); got != resident {
+			t.Fatalf("resident plan on %q must charge %d, got %d", tag, resident, got)
 		}
 	}
 }
