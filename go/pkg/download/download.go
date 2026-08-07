@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
 )
@@ -106,6 +107,15 @@ func (d *Downloader) RunQuant(repo string, quant string, caps *detect.Capabiliti
 	if quant != "" && quant != "auto" && quant != "catalog" {
 		args = append(args, "--quant", quant)
 	}
+	// The downloader ends with a "Start download? (y/n)" prompt. With no terminal
+	// attached that raises EOFError and kills the run after the repo and file
+	// list have already been resolved -- which is exactly what happens to a
+	// scripted or queued download. Confirming is only meaningful when there is
+	// someone there to confirm, so skip it precisely when stdin is not a TTY and
+	// leave interactive behaviour untouched.
+	if !stdinIsTerminal() {
+		args = append(args, "--yes")
+	}
 	py, ok := pythonCommand()
 	if !ok {
 		return fmt.Errorf("Python 3 is required to download models, but no python interpreter was found on PATH.\n%s", pythonInstallHint())
@@ -148,4 +158,29 @@ func pythonInstallHint() string {
 	default:
 		return "Install it with your package manager, e.g.:  sudo apt install python3 python3-pip"
 	}
+}
+
+// stdinIsTerminal reports whether standard input is an interactive terminal,
+// i.e. whether a confirmation prompt could actually be answered.
+//
+// The obvious ModeCharDevice test is not enough: /dev/null is a character
+// device too, and redirecting from /dev/null is precisely what a scripted run
+// does. Treating that as a terminal is what let the Inkling download die on
+// EOFError after it had already resolved the repo and file list. On Linux the
+// fd's target names the device, which separates a real tty from /dev/null;
+// elsewhere fall back to the mode test.
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return false // pipe or regular file: certainly not interactive
+	}
+	if target, err := os.Readlink("/proc/self/fd/0"); err == nil {
+		return strings.HasPrefix(target, "/dev/pts/") ||
+			strings.HasPrefix(target, "/dev/tty") ||
+			strings.HasPrefix(target, "/dev/console")
+	}
+	return true
 }
