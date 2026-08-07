@@ -147,6 +147,8 @@ Commands:
   dry-run <model.gguf> Print computed flags without launching
                        (--emit-server-argv-json supported)
   download <repo/name> Download from HuggingFace
+                       (--dir <path> to use another disk, --quant <name> to
+                       preselect instead of the interactive picker)
   tune <model.gguf>    AI-tune model for best performance
   recommend [-n N]     Rank models that fit this machine (intelligence x speed)
   support              Native optional support expert / optimizer (status, install, doctor)
@@ -5998,38 +6000,50 @@ func expandPath(dir string) string {
 	return dir
 }
 
-func downloadDirFromArgs(args []string, fallback string) (repo, dir string, err error) {
-	dir = fallback
+// downloadOptionsFromArgs pulls an explicit destination and quant out of the
+// download argv. Both accept "--flag value" and "--flag=value".
+//
+// --quant matters for scripted and unattended use: without it the downloader
+// drops into its interactive numbered picker, so a download cannot be started
+// from anything that has no terminal attached.
+func downloadOptionsFromArgs(args []string, fallbackDir string) (repo, dir, quant string, err error) {
+	dir = fallbackDir
 	rest := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
 		key, val, hasVal := strings.Cut(args[i], "=")
-		if key != "--dir" && key != "-dir" && key != "--model-dir" {
+		var target *string
+		switch key {
+		case "--dir", "-dir", "--model-dir":
+			target = &dir
+		case "--quant", "-quant":
+			target = &quant
+		default:
 			rest = append(rest, args[i])
 			continue
 		}
 		if !hasVal {
 			if i+1 >= len(args) {
-				return "", "", fmt.Errorf("%s needs a directory", key)
+				return "", "", "", fmt.Errorf("%s needs a value", key)
 			}
 			i++
 			val = args[i]
 		}
 		if strings.TrimSpace(val) == "" {
-			return "", "", fmt.Errorf("%s needs a directory", key)
+			return "", "", "", fmt.Errorf("%s needs a value", key)
 		}
-		dir = val
+		*target = strings.TrimSpace(val)
 	}
 	if len(rest) < 1 {
-		return "", "", fmt.Errorf("no repository given")
+		return "", "", "", fmt.Errorf("no repository given")
 	}
-	return rest[0], expandPath(dir), nil
+	return rest[0], expandPath(dir), quant, nil
 }
 
 func cmdDownload(args []string) {
 	cfg := loadConfigOrExit()
-	repo, modelDir, err := downloadDirFromArgs(args, cfg.ModelDir)
+	repo, modelDir, quant, err := downloadOptionsFromArgs(args, cfg.ModelDir)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Usage: ggrun download <repo/name> [--dir <path>]\n  %v\n", err)
+		fmt.Fprintf(os.Stderr, "Usage: ggrun download <repo/name> [--dir <path>] [--quant <name>]\n  %v\n", err)
 		os.Exit(2)
 	}
 
@@ -6048,7 +6062,7 @@ func cmdDownload(args []string) {
 	}
 
 	d := download.New(modelDir, cfg.CacheDir, cfg.AppHome)
-	if err := d.Run(repo, caps); err != nil {
+	if err := d.RunQuant(repo, quant, caps); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

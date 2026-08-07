@@ -2770,7 +2770,7 @@ func TestDownloadAcceptsAnExplicitDestination(t *testing.T) {
 		{"unsloth/Inkling-Small-GGUF", "-dir", alt},
 		{"unsloth/Inkling-Small-GGUF", "--model-dir", alt},
 	} {
-		repo, dir, err := downloadDirFromArgs(form, fallback)
+		repo, dir, _, err := downloadOptionsFromArgs(form, fallback)
 		if err != nil {
 			t.Fatalf("%v: %v", form, err)
 		}
@@ -2783,18 +2783,18 @@ func TestDownloadAcceptsAnExplicitDestination(t *testing.T) {
 	}
 
 	// No flag means the configured MODEL_DIR, unchanged.
-	repo, dir, err := downloadDirFromArgs([]string{"unsloth/Inkling-Small-GGUF"}, fallback)
+	repo, dir, _, err := downloadOptionsFromArgs([]string{"unsloth/Inkling-Small-GGUF"}, fallback)
 	if err != nil || repo != "unsloth/Inkling-Small-GGUF" || dir != fallback {
 		t.Errorf("bare download changed behaviour: repo=%q dir=%q err=%v", repo, dir, err)
 	}
 
-	if _, _, err := downloadDirFromArgs([]string{"--dir"}, fallback); err == nil {
+	if _, _, _, err := downloadOptionsFromArgs([]string{"--dir"}, fallback); err == nil {
 		t.Error("a --dir with no value must be rejected, not silently ignored")
 	}
-	if _, _, err := downloadDirFromArgs([]string{"--dir", alt}, fallback); err == nil {
+	if _, _, _, err := downloadOptionsFromArgs([]string{"--dir", alt}, fallback); err == nil {
 		t.Error("a destination with no repository must be rejected")
 	}
-	if _, _, err := downloadDirFromArgs(nil, fallback); err == nil {
+	if _, _, _, err := downloadOptionsFromArgs(nil, fallback); err == nil {
 		t.Error("no arguments must be rejected")
 	}
 }
@@ -2825,5 +2825,46 @@ func TestExpandPathResolvesTildeAndEnv(t *testing.T) {
 	// being made absolute.
 	if got := expandPath("/mnt/2tb/AI_Models"); got != "/mnt/2tb/AI_Models" {
 		t.Fatalf("absolute path altered: %q", got)
+	}
+}
+
+// Without an explicit quant the downloader drops into its interactive numbered
+// picker, so a download cannot be started from anything without a terminal --
+// which rules out scripted and unattended use entirely.
+func TestDownloadAcceptsAnExplicitQuant(t *testing.T) {
+	const fallback = "/models"
+	for _, form := range [][]string{
+		{"unsloth/Inkling-Small-GGUF", "--quant", "UD-Q3_K_XL"},
+		{"unsloth/Inkling-Small-GGUF", "--quant=UD-Q3_K_XL"},
+		{"--quant", "UD-Q3_K_XL", "unsloth/Inkling-Small-GGUF"},
+		{"unsloth/Inkling-Small-GGUF", "-quant", "UD-Q3_K_XL"},
+	} {
+		repo, _, quant, err := downloadOptionsFromArgs(form, fallback)
+		if err != nil {
+			t.Fatalf("%v: %v", form, err)
+		}
+		if repo != "unsloth/Inkling-Small-GGUF" || quant != "UD-Q3_K_XL" {
+			t.Errorf("%v: repo=%q quant=%q", form, repo, quant)
+		}
+	}
+
+	// Both flags together is the case that actually motivated this: a 111 GiB
+	// quant that has to land on the other disk, started without a terminal.
+	repo, dir, quant, err := downloadOptionsFromArgs(
+		[]string{"unsloth/Inkling-Small-GGUF", "--dir", "/home/mik/2tb-disk/AI_Models", "--quant", "UD-Q3_K_XL"},
+		fallback)
+	if err != nil {
+		t.Fatalf("combined flags: %v", err)
+	}
+	if repo != "unsloth/Inkling-Small-GGUF" || dir != "/home/mik/2tb-disk/AI_Models" || quant != "UD-Q3_K_XL" {
+		t.Errorf("combined flags: repo=%q dir=%q quant=%q", repo, dir, quant)
+	}
+
+	// Omitting it must keep the previous behaviour: empty means "ask".
+	if _, _, quant, err := downloadOptionsFromArgs([]string{"org/repo"}, fallback); err != nil || quant != "" {
+		t.Errorf("bare download must not preselect a quant: quant=%q err=%v", quant, err)
+	}
+	if _, _, _, err := downloadOptionsFromArgs([]string{"org/repo", "--quant"}, fallback); err == nil {
+		t.Error("a --quant with no value must be rejected, not silently ignored")
 	}
 }
