@@ -445,9 +445,20 @@ func buildLlamaFork(srcDir, accel, cudaArch string) (string, error) {
 	return buildLlamaForkAt(srcDir, buildDir, accel, cudaArch)
 }
 
-// buildLlamaForkAt allows updates to compile beside the active build. Callers
-// must run validateBackendCandidate before atomically promoting that directory.
-func buildLlamaForkAt(srcDir, buildDir, accel, cudaArch string) (string, error) {
+// forkCMakeConfigureArgs builds the cmake configure line for a registered fork.
+//
+// GGML_CUDA_FA_ALL_QUANTS compiles the flash-attention kernels for every
+// quantized KV type. Without it only a subset is built, so a plan that selects a
+// quantized K/V the binary has no kernel for loads its weights successfully and
+// then dies at context creation. That is exactly how the Inkling fork behaved on
+// first registration: tensors placed across all three GPUs, then
+// "failed to create_context" with -ctk q4_0 -ctv q4_0 --flash-attn on.
+//
+// collectCMakeFlags already preserves this flag when updating a backend, so
+// omitting it here made a freshly registered fork strictly worse than the same
+// source rebuilt by `ggrun backend update`. It costs build time and buys the
+// guarantee that every KV quality the planner may choose exists in the binary.
+func forkCMakeConfigureArgs(buildDir, accel, cudaArch string) ([]string, error) {
 	cfg := []string{
 		"-B", buildDir,
 		"-DCMAKE_BUILD_TYPE=Release",
@@ -459,13 +470,24 @@ func buildLlamaForkAt(srcDir, buildDir, accel, cudaArch string) (string, error) 
 		if cudaArch == "" {
 			cudaArch = "native"
 		}
-		cfg = append(cfg, "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES="+cudaArch)
+		cfg = append(cfg, "-DGGML_CUDA=ON", "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+			"-DCMAKE_CUDA_ARCHITECTURES="+cudaArch)
 	case "vulkan":
 		cfg = append(cfg, "-DGGML_VULKAN=ON")
 	case "cpu":
 		// default CPU build
 	default:
-		return "", fmt.Errorf("unknown --accel %q (use cuda|vulkan|cpu)", accel)
+		return nil, fmt.Errorf("unknown --accel %q (use cuda|vulkan|cpu)", accel)
+	}
+	return cfg, nil
+}
+
+// buildLlamaForkAt allows updates to compile beside the active build. Callers
+// must run validateBackendCandidate before atomically promoting that directory.
+func buildLlamaForkAt(srcDir, buildDir, accel, cudaArch string) (string, error) {
+	cfg, err := forkCMakeConfigureArgs(buildDir, accel, cudaArch)
+	if err != nil {
+		return "", err
 	}
 	if err := runStreamed(srcDir, "cmake", cfg...); err != nil {
 		return "", fmt.Errorf("cmake configure: %w", err)
