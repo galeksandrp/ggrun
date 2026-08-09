@@ -553,11 +553,13 @@ func runGuardedAllocationPreflight(req *launchRequest, be *backendInfo, cfg *con
 	if !dryRun {
 		timeout = autoStartupTimeout(model)
 	}
-	p, startErr := server.StartWithTimeoutToOptions(args, port, timeout, io.Discard, io.Discard, server.StartOptions{
-		EnvOverrides: envOverrides,
-		MemoryHighMB: memoryMaxMB,
-		MemoryMaxMB:  memoryMaxMB,
-	})
+	// Same scope regime as the production launch (backendStartOptions): under
+	// mmap the plan's full file-backed footprint is charged to the cgroup as
+	// reclaimable page cache, so a hard cap at the resident budget OOM-kills a
+	// probe the launch would survive. Routing through the shared builder keeps
+	// probe and launch from ever diverging.
+	probeOpts := backendStartOptions(req, caps, envOverrides, args)
+	p, startErr := server.StartWithTimeoutToOptions(args, port, timeout, io.Discard, io.Discard, probeOpts)
 	logData := ""
 	var cgroupPeakBytes uint64
 	var cgroupOOMKills uint64

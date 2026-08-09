@@ -2940,3 +2940,31 @@ func TestRuntimeOOMReplanRefusesIdenticalFailedArgv(t *testing.T) {
 		t.Fatalf("re-plan after the crashed argv should refuse an identical relaunch, got %v", err)
 	}
 }
+
+func TestComputeServerArgsAppliesCachedCalibrationWinner(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	// Compute the base estimate first, then seed a kv-alternate decision under
+	// the exact scope that strategy produces — so a fresh recompute of the same
+	// shape must consume the winner rather than the raw estimate.
+	base, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	if err != nil || base == nil {
+		t.Fatalf("base compute: %v", err)
+	}
+	scopeKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: scopeKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	// Recompute the same shape (as the daemon's computeServerArgs would) and
+	// confirm the cached winner is consumed, not the raw estimate.
+	recomputed, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	if err != nil {
+		t.Fatalf("recompute: %v", err)
+	}
+	applied := applyCalibrationDecision(req, cfg, model, be, caps, recomputed)
+	if applied == recomputed {
+		t.Fatal("daemon compute path did not consume the cached calibration winner")
+	}
+}

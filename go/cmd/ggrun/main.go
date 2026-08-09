@@ -6513,6 +6513,12 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compute placement: %w", err)
 	}
+	// Consume a cached calibration winner just like the interactive launch path,
+	// so a daemon/serve model load applies the measured fastest placement instead
+	// of the raw estimate. (The daemon is deliberately not given the full
+	// OOM-recovery/relaunch lifecycle; this closes the calibration gap without
+	// changing the daemon's process model.)
+	strategy = applyCalibrationDecision(backendReq, cfg, model, be, caps, strategy)
 	strategy.BackendTag = backendDialect(be)
 	serverArgs := append([]string{be.Path}, strategy.Args(modelPath, port)...)
 	if hasArg(backendReq.ExtraArgs, "--swa-full") {
@@ -6557,13 +6563,13 @@ func cmdDaemon(args []string) {
 		fmt.Fprintln(os.Stderr, "Usage: ggrun daemon --model <model.gguf>")
 		os.Exit(2)
 	}
+	caps, err := detect.Detect()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
+		os.Exit(1)
+	}
 	if *memoryMaxMB == 0 {
 		cfg := loadConfigOrExit()
-		caps, err := detect.Detect()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
-			os.Exit(1)
-		}
 		percent := cfg.RAMLimitPercent
 		if *ramLimitPercent != 0 {
 			percent = *ramLimitPercent
@@ -6585,12 +6591,39 @@ func cmdDaemon(args []string) {
 		os.Exit(1)
 	}
 
+	// For an mmap-backed plan the daemon gets the same reclaim band the
+	// interactive launcher grants: the plan budget stays on the soft
+	// (reclaim) boundary and the hard ceiling is the configured max. Mirror
+	// backendStartOptions' argv-derived decision so the managed backend can
+	// evict clean page cache before the OOM killer. When --no-mmap is present
+	// the single hard cap is correct and high stays at the max (the daemon's
+	// memoryHighMaxMB preserves that as the default).
+	highMB := 0
+	if argsMMapBackedExperts(serverArgs) {
+		// Recompute the plan's budget the same way backendStartOptions does:
+		// the soft threshold is the derived budget; the hard ceiling remains
+		// the configured max. If no caps are reachable, fall back to the max
+		// so containment is never loosened.
+		highMB = *memoryMaxMB
+		if caps != nil {
+			cfgDaemon := loadConfigOrExit()
+			budget := backendMemoryMaxMB(&launchRequest{
+				RamBudgetMB:     parseBudgetMB(cfgDaemon.RamBudget),
+				RAMLimitPercent: *ramLimitPercent,
+				RAMHeadroomMB:   parseBudgetMB(cfgDaemon.RAMHeadroom),
+			}, caps)
+			if budget > 0 && budget < *memoryMaxMB {
+				highMB = budget
+			}
+		}
+	}
 	d := daemon.New(daemon.Config{
 		ModelPath:          *modelPath,
 		ServerArgs:         serverArgs,
 		Port:               *port,
 		ControlPort:        *controlPort,
 		MemoryMaxMB:        *memoryMaxMB,
+		MemoryHighMB:       highMB,
 		StartupTimeoutSecs: *startupTimeoutSecs,
 		// Let /reload recompute placement when handed a bare model path,
 		// so model swaps get the same auto-placement as the initial launch.

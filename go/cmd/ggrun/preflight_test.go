@@ -449,3 +449,45 @@ func TestWaitForPredecessorPort(t *testing.T) {
 		t.Fatal("an unknown port must not block the launch")
 	}
 }
+
+func TestAllocationProbeScopeSharesProductionReclaimBand(t *testing.T) {
+	caps := &detect.Capabilities{RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844}, CPU: detect.CPUInfo{Cores: 8}}
+	req := &launchRequest{RAMLimitPercent: 95}
+	mmapArgs := []string{"-m", "m3.gguf", "--n-cpu-moe", "44", "-ot", "exps=CPU"}
+	probeArgs := append(append([]string{}, mmapArgs...), "--port", "8080", "--host", "127.0.0.1", "--dry-run")
+	budget := backendMemoryMaxMB(req, caps)
+
+	probeScope := backendStartOptions(req, caps, []string{"GGML_CUDA_NO_PINNED=1"}, probeArgs)
+
+	// Regression assertion (this is what the old probe violated): the probe must
+	// carry a reclaim band, not a hard cap at the budget.
+	if probeScope.MemoryHighMB != budget {
+		t.Errorf("probe reclaim threshold must be the plan budget, got high=%d budget=%d", probeScope.MemoryHighMB, budget)
+	}
+	if probeScope.MemoryMaxMB <= probeScope.MemoryHighMB {
+		t.Errorf("mmap-backed probe has no reclaim band: high=%d max=%d (would OOM-kill on page cache prod survives)", probeScope.MemoryHighMB, probeScope.MemoryMaxMB)
+	}
+	if probeScope.MemoryMaxMB > caps.RAM.FreeMB {
+		t.Errorf("probe hard ceiling %d exceeds free RAM %d", probeScope.MemoryMaxMB, caps.RAM.FreeMB)
+	}
+
+	// Probe must run under exactly the regime the launch will run in.
+	prodScope := backendStartOptions(req, caps, nil, mmapArgs)
+	if probeScope.MemoryHighMB != prodScope.MemoryHighMB || probeScope.MemoryMaxMB != prodScope.MemoryMaxMB {
+		t.Errorf("probe scope (%d/%d) must match production scope (%d/%d)",
+			probeScope.MemoryHighMB, probeScope.MemoryMaxMB, prodScope.MemoryHighMB, prodScope.MemoryMaxMB)
+	}
+
+	// A named --ram-budget stays a hard cap in the probe too (policy preserved).
+	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000}, caps, nil, probeArgs)
+	if named.MemoryHighMB != named.MemoryMaxMB {
+		t.Errorf("a named --ram-budget must stay a hard cap in the probe, got high=%d max=%d", named.MemoryHighMB, named.MemoryMaxMB)
+	}
+
+	// Resident plans still get a hard cap at the budget (nothing to reclaim).
+	residentArgs := append(append([]string{}, mmapArgs...), "--no-mmap")
+	resident := backendStartOptions(req, caps, nil, residentArgs)
+	if resident.MemoryHighMB != resident.MemoryMaxMB || resident.MemoryMaxMB != budget {
+		t.Errorf("resident probe must keep a hard cap at the budget, got high=%d max=%d budget=%d", resident.MemoryHighMB, resident.MemoryMaxMB, budget)
+	}
+}

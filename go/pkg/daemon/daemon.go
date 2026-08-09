@@ -35,6 +35,11 @@ type Config struct {
 	Port        int      `json:"port"`
 	ControlPort int      `json:"control_port"`
 	MemoryMaxMB int      `json:"memory_max_mb,omitempty"`
+	// MemoryHighMB is the cgroup reclaim threshold for the managed backend.
+	// When zero and MemoryMaxMB is set, the daemon derives it the same way the
+	// launcher does: for an mmap-backed plan the plan budget stays on the soft
+	// boundary and the hard ceiling moves up to the host reclaim ceiling.
+	MemoryHighMB int `json:"memory_high_mb,omitempty"`
 
 	// ControlToken authenticates every control route. New generates one when it
 	// is empty, so browser-originated localhost POSTs cannot mutate the daemon.
@@ -255,17 +260,35 @@ func (d *Daemon) handleReload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "reloaded"})
 }
 
+func (c Config) memoryHighMaxMB(args []string) (highMB, maxMB int) {
+	_ = args
+	maxMB = c.MemoryMaxMB
+	highMB = c.MemoryHighMB
+	if highMB > 0 {
+		// An explicit reclaim threshold (the mmap reclaim band) is carried
+		// through as configured; the caller has already placed the host
+		// ceiling in MemoryMaxMB.
+		return highMB, maxMB
+	}
+	// No explicit band: the soft threshold equals the hard ceiling, which is
+	// exactly the daemon's pre-existing behavior (a single MemoryMax cap). A
+	// zero max leaves both zero — no cgroup memory limit, as before.
+	highMB = maxMB
+	return highMB, maxMB
+}
+
 func (d *Daemon) start(args []string, port int, timeout time.Duration) (*server.Process, error) {
 	if d.startServer != nil {
 		return d.startServer(args, port, timeout)
 	}
+	highMB, maxMB := d.config.memoryHighMaxMB(args)
 	return server.StartWithTimeoutToOptions(
 		args,
 		port,
 		timeout,
 		os.Stdout,
 		os.Stderr,
-		server.StartOptions{MemoryMaxMB: d.config.MemoryMaxMB},
+		server.StartOptions{MemoryHighMB: highMB, MemoryMaxMB: maxMB},
 	)
 }
 

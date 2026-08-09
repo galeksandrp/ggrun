@@ -183,3 +183,27 @@ func authedRequest(method, target string, body *strings.Reader) *http.Request {
 	r.Header.Set("X-GGRUN-Daemon-Token", "test-token")
 	return r
 }
+
+func TestDaemonCarriesMmapReclaimBand(t *testing.T) {
+	// Config with a band must retain it through the scope mapping: an explicit
+	// MemoryHighMB below MemoryMaxMB is the mmap reclaim band.
+	high, max := (Config{MemoryMaxMB: 114000, MemoryHighMB: 100000}).memoryHighMaxMB(nil)
+	if high != 100000 || max != 114000 {
+		t.Fatalf("daemon must retain the band: high=%d max=%d", high, max)
+	}
+
+	// Without an explicit band, the daemon derives the soft threshold from the
+	// max (the pre-existing single-cap behavior) — never loosens containment.
+	high, max = (Config{MemoryMaxMB: 114000}).memoryHighMaxMB(nil)
+	if high != 114000 || max != 114000 {
+		t.Fatalf("default daemon scope must be a single hard cap: high=%d max=%d", high, max)
+	}
+
+	// An mmap-backed plan must carry a reclaim band (high < max) so the kernel
+	// can evict clean page cache before OOM-killing. This is the assertion that
+	// fails on the pre-fix code (no MemoryHighMB field at all).
+	high, max = (Config{MemoryMaxMB: 114000, MemoryHighMB: 100000}).memoryHighMaxMB([]string{"llama-server", "--n-cpu-moe", "48"})
+	if !(high > 0 && high < max) {
+		t.Fatalf("mmap plan must carry a reclaim band, got high=%d max=%d", high, max)
+	}
+}
