@@ -74,7 +74,7 @@ func TestKVGeometryHandlesNonSWAModels(t *testing.T) {
 func TestKVGeometryRoundTripsThroughTheCacheFile(t *testing.T) {
 	dir := t.TempDir()
 	model := &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242}
-	RunPostLaunchKVProbe(dir, model, 1048576, "q4_0", lagunaKVLog)
+	RunPostLaunchKVProbe(dir, model, 1048576, "q4_0", lagunaKVLog, 1)
 
 	if got := model.MeasuredKVGeometry["q4_0"]; got.FullLayers != 12 || got.SWALayers != 36 {
 		t.Fatalf("probe did not record the geometry: %+v", got)
@@ -361,7 +361,7 @@ func TestPostLaunchKVProbeIgnoresSWAFullLaunches(t *testing.T) {
 	model := &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242}
 
 	// A good, non-flattened launch establishes the truth.
-	RunPostLaunchKVProbe(dir, model, 1048576, "q4_0", lagunaKVLog)
+	RunPostLaunchKVProbe(dir, model, 1048576, "q4_0", lagunaKVLog, 1)
 	good := model.MeasuredKVGeometry["q4_0"]
 	if good.FullLayers != 12 || good.SWALayers != 36 {
 		t.Fatalf("baseline geometry not recorded: %+v", good)
@@ -372,7 +372,7 @@ func TestPostLaunchKVProbeIgnoresSWAFullLaunches(t *testing.T) {
 llama_kv_cache: size = 13824.00 MiB (524288 cells,  12 layers,  1/1 seqs), K (q4_0): ...
 llama_kv_cache: size = 41472.00 MiB (524288 cells,  36 layers,  1/1 seqs), K (q4_0): ...
 `
-	RunPostLaunchKVProbe(dir, model, 524288, "q4_0", swaFullLog)
+	RunPostLaunchKVProbe(dir, model, 524288, "q4_0", swaFullLog, 1)
 
 	if got := model.MeasuredKVGeometry["q4_0"]; got != good {
 		t.Errorf("a --swa-full launch overwrote the geometry: %+v, want %+v", got, good)

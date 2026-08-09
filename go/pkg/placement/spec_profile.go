@@ -31,6 +31,10 @@ type SpecProfileScope struct {
 	Parallel          int    `json:"parallel"`
 	SamplingProfile   string `json:"sampling_profile"`
 	ReasoningOff      bool   `json:"reasoning_off"`
+	SpecMode          string `json:"spec_mode"`      // NEW
+	ForceSpecMoE      bool   `json:"force_spec_moe"` // NEW
+	Threads           int    `json:"threads"`        // NEW
+	CacheRAMMB        int    `json:"cache_ram_mb"`   // NEW
 }
 
 type SpecPerformanceProfile struct {
@@ -164,6 +168,13 @@ func NewSpecProfileScope(target *ModelProfile, caps *detect.Capabilities, opts O
 		TargetIdentity: SpecTargetIdentity(target), CompanionIdentity: SpecCompanionIdentity(companionPath),
 		BackendIdentity: backend, HardwareIdentity: SpecHardwareIdentity(caps), GPUSet: specGPUSet(opts.GPUs), Kind: kind,
 		ContextSize: ctx, Parallel: parallel, SamplingProfile: sampling, ReasoningOff: opts.ReasoningOff,
+		// SpecMode is the mode this profile is proof for: on the spec-test save
+		// path kind is the tested --spec flag, and in Auto kind is the candidate
+		// path being validated, so both describe the same launch. The literal
+		// knob ("auto" vs "mtp") must NOT enter the key or Auto could never
+		// consume a profile saved by spec-test.
+		SpecMode: normalizeSpecMode(kind), ForceSpecMoE: opts.ForceSpecMoE,
+		Threads: opts.Threads, CacheRAMMB: opts.CacheRAMMB,
 	}
 }
 

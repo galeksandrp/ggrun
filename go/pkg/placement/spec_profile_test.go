@@ -118,3 +118,43 @@ func TestSpecProfileScopeTracksGPUSetAndEveryShard(t *testing.T) {
 		t.Fatal("changing a non-primary shard did not invalidate the profile")
 	}
 }
+
+func TestSpecProfileScopeTracksThreadsCacheRAMAndSpecKnobs(t *testing.T) {
+	target := &ModelProfile{
+		Path: "model.gguf", SizeBytes: 1234, TotalSizeMB: 1, ModelArch: "qwen35",
+		NumLayers: 33, EmbeddingLength: 2560, VocabSize: 248320,
+		TokenizerHash: "abc", NextNPredictLayers: 1, ContextSize: 262144,
+	}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "RTX", VRAMTotalMB: 24576}}}
+	base := NewSpecProfileScope(target, caps, Options{SpecMode: "auto", ContextSize: 262144}, "mtp", "")
+	flip := func(mut func(*Options)) SpecProfileScope {
+		opts := Options{SpecMode: "auto", ContextSize: 262144}
+		mut(&opts)
+		return NewSpecProfileScope(target, caps, opts, "mtp", "")
+	}
+	if got := flip(func(o *Options) { o.Threads = 8 }); got.Key() == base.Key() {
+		t.Fatal("changing --threads did not invalidate the spec profile scope")
+	}
+	if got := flip(func(o *Options) { o.CacheRAMMB = 16384 }); got.Key() == base.Key() {
+		t.Fatal("changing --cache-ram did not invalidate the spec profile scope")
+	}
+	if got := flip(func(o *Options) { o.ForceSpecMoE = true }); got.Key() == base.Key() {
+		t.Fatal("changing --force-spec-moe did not invalidate the spec profile scope")
+	}
+	if got := NewSpecProfileScope(target, caps, Options{SpecMode: "auto", ContextSize: 262144}, "dflash", ""); got.Key() == base.Key() {
+		t.Fatal("changing the tested kind did not invalidate the scope")
+	}
+
+	// The reconciliation property: a profile saved by spec-test (kind "mtp",
+	// SpecMode normalized from kind) and one validated by Auto (opts.SpecMode
+	// "auto", kind "mtp") must share a key, or Auto could never consume a
+	// profile saved by spec-test.
+	a := NewSpecProfileScope(target, caps, Options{SpecMode: "auto", ContextSize: 262144, Threads: 8}, "mtp", "")
+	b := NewSpecProfileScope(target, caps, Options{SpecMode: "mtp", ContextSize: 262144, Threads: 8}, "mtp", "")
+	if a.Key() != b.Key() {
+		t.Fatal("spec-test-saved and Auto-validated scopes for the same launch differ")
+	}
+	if a.SpecMode != b.SpecMode {
+		t.Fatalf("SpecMode normalized inconsistently: %q vs %q", a.SpecMode, b.SpecMode)
+	}
+}

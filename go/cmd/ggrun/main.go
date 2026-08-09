@@ -3111,7 +3111,7 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 	computeByGPU := placement.ParseComputeBuffersByGPU(serverLog)
 	probeWritten := placement.RunPostLaunchModelProbe(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, gpus, strategy.Parallel, serverLog)
 	placement.RecordPostLaunchContextAllocation(cfg.CacheDir, model, strategy, cacheBackendTag, gpus, serverLog)
-	placement.RunPostLaunchKVProbe(cfg.CacheDir, model, strategy.ContextSize, strategy.KVType, serverLog)
+	placement.RunPostLaunchKVProbe(cfg.CacheDir, model, strategy.ContextSize, strategy.KVType, serverLog, strategy.Parallel)
 	if !probeWritten {
 		return nil
 	}

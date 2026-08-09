@@ -83,7 +83,7 @@ func TestKVProbeRoundTrip(t *testing.T) {
 	model := &ModelProfile{Basename: "TestModel", SizeBytes: 12345, Path: "/x/TestModel.gguf"}
 	log := "llama: CUDA0 KV buffer size = 4096.00 MiB\nllama: CUDA1 KV buffer size = 4096.00 MiB\n"
 	// ctx 262144, total KV 8192 MiB → 8192*1MiB/262144 = 32768 bytes/token
-	RunPostLaunchKVProbe(dir, model, 262144, "q8_0", log)
+	RunPostLaunchKVProbe(dir, model, 262144, "q8_0", log, 1)
 	rates := loadMeasuredKVRates(dir, model)
 	if rates == nil || rates["q8_0"] < 32700 || rates["q8_0"] > 32800 {
 		t.Fatalf("round-trip rate = %v, want ~32768", rates)
@@ -114,7 +114,7 @@ func TestRecordMeasuredContextMBUpdatesImmediatePlacementState(t *testing.T) {
 	}
 	// The final successful-launch log is still the most precise measurement and
 	// refines the no-allocation preflight value.
-	RunPostLaunchKVProbe(dir, model, 524288, "f16", "llama: CUDA0 KV buffer size = 3450.00 MiB")
+	RunPostLaunchKVProbe(dir, model, 524288, "f16", "llama: CUDA0 KV buffer size = 3450.00 MiB", 1)
 	if got := model.MeasuredKVBytesPerTok["f16"]; got != 6900 {
 		t.Fatalf("successful launch did not refine rate: %.2f", got)
 	}
@@ -515,5 +515,36 @@ func TestRecordMeasuredContextMBRefusesSWAFullTotals(t *testing.T) {
 	RecordMeasuredContextMB(dir, dense, 131072, "q4_0", 6912, true)
 	if got := dense.MeasuredKVBytesPerTok["q4_0"]; got != 55296 {
 		t.Fatalf("dense model rate = %.2f, want 55296 recorded normally", got)
+	}
+}
+
+func TestPostLaunchKVProbeRefusesParallelTotals(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "m.gguf", Basename: "m.gguf", SizeBytes: 4242}
+
+	// A plain single-slot launch establishes the truth first.
+	serialLog := "llama: CUDA0 KV buffer size = 1000.00 MiB\nllama: CUDA1 KV buffer size = 1000.00 MiB\n"
+	RunPostLaunchKVProbe(dir, model, 262144, "q8_0", serialLog, 1)
+	rates := loadMeasuredKVRates(dir, model)
+	if rates == nil || rates["q8_0"] < 7900 || rates["q8_0"] > 8100 {
+		t.Fatalf("serial rate = %v, want ~8000 bytes/token (2 MiB/KV per ctx token)", rates)
+	}
+
+	// Then a --parallel 4 launch prints 4x the KV total (4 sequences).
+	parallelLog := "llama: CUDA0 KV buffer size = 4000.00 MiB\nllama: CUDA1 KV buffer size = 4000.00 MiB\n"
+	RunPostLaunchKVProbe(dir, model, 262144, "q8_0", parallelLog, 4)
+
+	// The parallel launch must NOT overwrite the model-wide rate.
+	rates = loadMeasuredKVRates(dir, model)
+	if rates == nil || rates["q8_0"] < 7900 || rates["q8_0"] > 8100 {
+		t.Fatalf("parallel=4 launch poisoned the rate: %v, want the serial ~8000 preserved", rates)
+	}
+}
+
+func TestParseKVBufferMultipleAggregateLines(t *testing.T) {
+	log := "llama_init_from_model: KV self size  = 13824.00 MiB, K (q4_0): 6912.00 MiB, V (q4_0): 6912.00 MiB\n" +
+		"llama_init_from_model: KV cache size =  3000.00 MiB\n"
+	if got := parseKVBufferTotalMB(log); got != 16824 {
+		t.Fatalf("multi-region aggregate: got %.0f, want 16824 (13824+3000)", got)
 	}
 }

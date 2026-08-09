@@ -1413,8 +1413,23 @@ func buildDenseCPUOffload(s *Strategy, caps *detect.Capabilities, model *ModelPr
 // expert tensors file-backed. ik_llama's CUDA path converts exps=CPU into one
 // anonymous CUDA_Host buffer; --mmap, GGML_CUDA_NO_PINNED, and --defer-experts
 // do not make that allocation reclaimable.
+// backendUsesAnonymousCPUExperts reports whether the selected loader family
+// allocates CPU-offloaded expert tensors in anonymous CUDA-host memory where
+// --mmap cannot make them file-backed. This is a property of the loader, not
+// the flag: ik_llama and its forks (e.g. the hy3 recipe, noonr48/ik_llama-hy3)
+// convert exps=CPU into one anonymous CUDA_Host buffer regardless of --mmap,
+// so leaving them file-backed is not reclaimable there. Recipe tags reach
+// placement as the registered tag (see detectRegisteredBackend), so match the
+// whole family like backendSupportsMTP does, not one canonical spelling.
+func backendUsesAnonymousCPUExperts(backendTag string) bool {
+	t := strings.ToLower(strings.TrimSpace(backendTag))
+	return t == "ik" || t == "ik_llama" ||
+		strings.Contains(t, "ik_llama") ||
+		t == "hy3" // noonr48/ik_llama-hy3 recipe (reviewed built-in)
+}
+
 func mmapCanPageCPUExperts(opts Options) bool {
-	return !strings.EqualFold(strings.TrimSpace(opts.BackendTag), "ik_llama")
+	return !backendUsesAnonymousCPUExperts(opts.BackendTag)
 }
 
 type moeLayerMemoryMB struct {
@@ -1499,7 +1514,7 @@ func sumRoutedLayerMB(costs []moeLayerMemoryMB, start int) int {
 // reports CPU_Mapped buffers instead, which is why DeepSeek-V4 under the same
 // flags shows anon 1.9 GB against file 113 GB.
 func mmapFreesCPUExperts(backendTag string) bool {
-	return !strings.EqualFold(strings.TrimSpace(backendTag), "ik_llama")
+	return !backendUsesAnonymousCPUExperts(backendTag)
 }
 
 // hostFootprintForCache reports how much host RAM a plan denies the prompt
@@ -4575,9 +4590,10 @@ func loadMeasuredKVGeometry(cacheDir string, model *ModelProfile) map[string]KVG
 
 // parseKVBufferTotalMB extracts the model's TOTAL KV cache allocation (MiB) at the
 // launched context from a backend log. llama.cpp's wording varies across versions
-// and backends, so match all known forms: an aggregate "KV self size = X MiB" /
-// "KV cache size = X MiB" line (already the total — take it directly), otherwise
-// SUM the per-device "... KV buffer size = X MiB" lines across CUDA devices + CPU.
+// and backends, so match all known forms: aggregate "KV self size = X MiB" /
+// "KV cache size = X MiB" lines (each one region's total — SUM them, since a
+// multi-region SWA/recurrent model prints one per region), otherwise SUM the
+// per-device "... KV buffer size = X MiB" lines across CUDA devices + CPU.
 // Returns 0 when the log carries no KV line (caller falls back to the formula or
 // the VRAM-delta probe).
 func parseKVBufferTotalMB(log string) float64 {
@@ -4589,9 +4605,9 @@ func parseKVBufferTotalMB(log string) float64 {
 		}
 		switch {
 		case strings.Contains(low, "kv self size"), strings.Contains(low, "kv cache size"):
-			if v := parseMiB(line); v > aggregate {
-				aggregate = v // aggregate line: the total, printed once
-			}
+			// Each aggregate line is one KV region's total; a multi-region model
+			// (SWA/recurrent, e.g. DeepSeek-V4) prints one per region, so SUM them.
+			aggregate += parseMiB(line)
 		case strings.Contains(low, "kv buffer size"):
 			bufSum += parseMiB(line) // per-device: sum across GPUs + CPU
 		}
@@ -4723,7 +4739,7 @@ func ProbeKVViaVRAMDelta(backendPath string, baseArgs []string, gpus []detect.GP
 // kvType, so future launches size the context from measured truth instead of the
 // per-arch GGUF formula. A successful launch deliberately refreshes a preflight
 // estimate because the final buffer log is the most precise measurement.
-func RunPostLaunchKVProbe(cacheDir string, model *ModelProfile, ctxSize int, kvType, serverLog string) {
+func RunPostLaunchKVProbe(cacheDir string, model *ModelProfile, ctxSize int, kvType, serverLog string, parallel int) {
 	if model == nil || ctxSize <= 0 || serverLog == "" {
 		return
 	}
@@ -4737,6 +4753,16 @@ func RunPostLaunchKVProbe(cacheDir string, model *ModelProfile, ctxSize int, kvT
 		kvType = "q8_0"
 	}
 	kvType = strings.ToLower(kvType)
+	// A --parallel N launch allocates the KV cache N times (one sequence per
+	// slot), so totalKVMB/ctxSize is Nx too large to describe this model at
+	// any other slot count. The geometry already refuses multi-seq evidence;
+	// the model-wide rate must too, or one Claude-mode --parallel 4 launch
+	// over-reserves KV for every later plain launch (same hazard as the
+	// swa-full total below). The exact multi-seq allocation is still kept by
+	// RecordPostLaunchContextAllocation under the parallel-keyed probe cache.
+	if parallel > 1 {
+		return
+	}
 	totalKVMB := parseKVBufferTotalMB(serverLog)
 	if totalKVMB <= 0 {
 		return

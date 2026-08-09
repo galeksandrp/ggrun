@@ -4228,3 +4228,32 @@ func TestHostFootprintChargesFullResidentWhenBackendDoesNotMap(t *testing.T) {
 		}
 	}
 }
+
+// An ik_llama-derived fork routes to placement under its recipe tag (hy3),
+// not "ik_llama" (detectRegisteredBackend sets info.Tag = cb.Tag). The mmap
+// band and the working-set-only cache charge must not be granted to a loader
+// that still allocates CPU experts in anonymous CUDA-host memory.
+func TestHostFootprintChargesFullResidentForIKDerivedForkTags(t *testing.T) {
+	const resident = 111130 // MiniMax-M3 CPU experts plus overhead
+	const workingSet = 458  // what mmap would appear to cost
+	for _, tag := range []string{"hy3", "ik", "ik_llama-fork"} {
+		if got := hostFootprintForCache(resident, workingSet, true, tag); got != resident {
+			t.Errorf("%q is an ik-derived loader: mmap must charge the full %d MB, got %d", tag, resident, got)
+		}
+	}
+	// Mainline still maps (DeepSeek-V4 measured anon 1.9GB / file 113GB): the
+	// reclaimable bytes must not be charged or the cache is disabled there.
+	if got := hostFootprintForCache(resident, workingSet, true, "llama"); got != workingSet {
+		t.Errorf("mainline maps CPU experts: want working set %d, got %d", workingSet, got)
+	}
+}
+
+// And an Options-level assertion that the band predicate agrees.
+func TestMMapBandDeniedForIKDerivedFork(t *testing.T) {
+	if mmapCanPageCPUExperts(Options{BackendTag: "hy3"}) {
+		t.Error("hy3 uses the anonymous CUDA-host loader: mmap must not be considered reclaimable")
+	}
+	if !mmapCanPageCPUExperts(Options{BackendTag: "llama"}) {
+		t.Error("mainline maps CPU experts: mmap reclaimability must be kept")
+	}
+}
