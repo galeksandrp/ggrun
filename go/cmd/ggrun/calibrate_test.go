@@ -199,6 +199,42 @@ func TestRuntimeOOMInvalidatesCalibrationDecision(t *testing.T) {
 	}
 }
 
+// The runtime OOM invalidation must delete the decision even when the serving
+// strategy is the calibration winner (kv-alternate), whose scope key differs
+// from the default strategy the decision was saved under. This is the real
+// flow: runCalibration saves under the default key, the winner serves, then a
+// runtime OOM invalidates with the winner strategy in hand.
+func TestRuntimeOOMInvalidatesWinnerStrategyCalibrationDecision(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	// Compute the default strategy and seed a decision under its scope key —
+	// exactly how runCalibration saves.
+	base, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	if err != nil || base == nil {
+		t.Fatalf("base compute: %v", err)
+	}
+	defaultKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: defaultKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	// A calibration candidate (kv-alternate) with a different scope key serves.
+	winner := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "gpu", NCPUMoE: 40}
+	winnerKey := calibrationScopeKey(req, model, be, caps, winner)
+	if winnerKey == defaultKey {
+		t.Fatal("test setup: winner and default keys must differ for this scenario")
+	}
+	// A runtime OOM on the winner must delete the decision saved under the
+	// default key.
+	if err := invalidateRuntimeOOMLaunch(req, cfg, model, be, caps, winner, nil, "runtime oom"); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, defaultKey); err == nil {
+		t.Fatal("calibration decision saved under the default key survived an OOM on the winner")
+	}
+}
+
 func TestMeasuredRecomputeReappliesCachedCalibrationWinner(t *testing.T) {
 	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
 	cfg.CacheDir = t.TempDir()

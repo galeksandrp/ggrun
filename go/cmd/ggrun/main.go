@@ -4830,8 +4830,24 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 			return fmt.Errorf("remove stale placement cache: %w", err)
 		}
 	}
-	if err := placement.DeleteCalibrationDecision(cfg.CacheDir, calibrationScopeKey(req, model, be, caps, strategy)); err != nil {
-		return fmt.Errorf("remove stale calibration decision: %w", err)
+	// A runtime OOM is evidence the declared winner is unsafe at runtime. The
+	// decision may have been saved under the default strategy's scope key
+	// (runCalibration hashes the pre-calibration strategy) while the serving
+	// strategy is the winner (kv-alternate/split-inverted), whose scope key
+	// differs. Sweep the default plus every calibration candidate so whichever
+	// key the decision was saved under is removed — otherwise the OOM'd
+	// placement is re-declared the winner on the next launch.
+	keys := []string{calibrationScopeKey(req, model, be, caps, strategy)}
+	for _, cand := range calibrationCandidates(req, cfg, model, be, caps, strategy) {
+		if cand.Strategy == nil || cand.Strategy == strategy {
+			continue
+		}
+		keys = append(keys, calibrationScopeKey(req, model, be, caps, cand.Strategy))
+	}
+	for _, key := range keys {
+		if err := placement.DeleteCalibrationDecision(cfg.CacheDir, key); err != nil {
+			return fmt.Errorf("remove stale calibration decision: %w", err)
+		}
 	}
 	return nil
 }
@@ -6481,6 +6497,18 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 		AppHome:         cfg.AppHome,
 		Backend:         cfg.Backend,
 		BackendExplicit: configuredBackendExplicit(cfg.Backend),
+		// Populate the runtime knobs that enter the calibration scope key the
+		// same way the interactive launch request does, so a decision cached by
+		// an interactive launch is found by the daemon (and vice versa). Leaving
+		// them zero produced a scope key that could never match the interactive
+		// save, making the daemon's calibration consume a silent no-op.
+		RAMLimitPercent: cfg.RAMLimitPercent,
+		RamBudgetMB:     parseBudgetMB(cfg.RamBudget),
+		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
+		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
+		KVPlacement:     cfg.KVPlacement,
+		KVQuality:       cfg.KVQuality,
+		Host:            cfg.Host,
 	}
 	if cfg.SWAFull {
 		backendReq.ExtraArgs = append(backendReq.ExtraArgs, "--swa-full")
@@ -6607,9 +6635,19 @@ func cmdDaemon(args []string) {
 		highMB = *memoryMaxMB
 		if caps != nil {
 			cfgDaemon := loadConfigOrExit()
+			// The effective RAM limit is the configured percent with the
+			// --ram-limit-percent flag as an override — NOT the raw flag, which
+			// is 0 unless the operator passed it. Using the raw flag produced
+			// high==max (no band) for the documented --memory-max-mb-only
+			// invocation, re-creating the MiniMax-M3 OOM-kill the band exists
+			// to prevent.
+			percent := cfgDaemon.RAMLimitPercent
+			if *ramLimitPercent != 0 {
+				percent = *ramLimitPercent
+			}
 			budget := backendMemoryMaxMB(&launchRequest{
 				RamBudgetMB:     parseBudgetMB(cfgDaemon.RamBudget),
-				RAMLimitPercent: *ramLimitPercent,
+				RAMLimitPercent: percent,
 				RAMHeadroomMB:   parseBudgetMB(cfgDaemon.RAMHeadroom),
 			}, caps)
 			if budget > 0 && budget < *memoryMaxMB {
