@@ -88,6 +88,17 @@ func LoadCalibrationDecision(cacheDir, scopeKey string) (*CalibrationDecision, e
 	return &d, nil
 }
 
+// DeleteCalibrationDecision removes a cached calibration result for one scope.
+// A runtime OOM is evidence the declared winner is unsafe at runtime, so the
+// decision must not re-declare it the winner on the next launch.
+func DeleteCalibrationDecision(cacheDir, scopeKey string) error {
+	path := CalibrationPath(cacheDir, scopeKey)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // CalibrationCandidate is one alternative placement to measure at first launch.
 // The base strategy (index 0 in the slice returned by CalibrationCandidates) is
 // the estimated default; the rest are deliberate variations the planner believes

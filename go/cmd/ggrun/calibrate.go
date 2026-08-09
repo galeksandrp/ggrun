@@ -114,6 +114,15 @@ func applyCalibrationDecision(req *launchRequest, cfg *config.Config, model *pla
 	return strategy
 }
 
+// recomputeAndApplyCalibration re-derives placement from current evidence and
+// re-applies the cached calibration winner on top, so a corrective recompute
+// never replaces the applied winner with an unbenchmarked estimate. Mirror of
+// the computeStrategy path in main(); SkipPlacementCache and CacheFile are
+// caller-managed because a mid-retry placement is never persisted.
+func recomputeAndApplyCalibration(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, s *placement.Strategy) *placement.Strategy {
+	return applyCalibrationDecision(req, cfg, model, be, caps, s)
+}
+
 // calibrationScopeKey builds the opaque cache key for this launch shape. It
 // mirrors placement.NewCalibrationScopeKey on the request's resolved options so
 // a decision is valid only for the exact model + backend + hardware + workload

@@ -175,3 +175,56 @@ func TestParseCalibrateMode(t *testing.T) {
 		t.Fatal("parseCalibrateMode must reject unknown modes")
 	}
 }
+
+func TestRuntimeOOMInvalidatesCalibrationDecision(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	base := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu", NCPUMoE: 40}
+	scopeKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: scopeKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey); err != nil {
+		t.Fatalf("decision not present before invalidation: %v", err)
+	}
+	// A runtime OOM must invalidate the calibration decision for the same scope,
+	// so the OOM'd placement is never re-declared the winner.
+	if err := invalidateRuntimeOOMLaunch(req, cfg, model, be, caps, base, nil, "runtime oom"); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey); err == nil {
+		t.Fatal("calibration decision survived a runtime OOM; stale winner would be re-applied")
+	}
+}
+
+func TestMeasuredRecomputeReappliesCachedCalibrationWinner(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	base, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	if err != nil || base == nil {
+		t.Fatalf("base compute: %v", err)
+	}
+	scopeKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: scopeKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	// A corrective recompute (cache bypassed) must re-apply the cached winner,
+	// not replace it with an unbenchmarked estimate.
+	recomputed, err := placement.Compute(caps, model, func() placement.Options {
+		o := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+		o.SkipPlacementCache = true
+		o.CacheFile = ""
+		return o
+	}())
+	if err != nil {
+		t.Fatalf("recompute: %v", err)
+	}
+	applied := recomputeAndApplyCalibration(req, cfg, model, be, caps, recomputed)
+	if applied == recomputed {
+		t.Fatal("cached calibration winner was not re-applied to the corrected recompute")
+	}
+}

@@ -3403,6 +3403,7 @@ func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config,
 					}
 					return nil, strategy, serverArgs, fmt.Errorf("backend-measured placement recompute returned no strategy")
 				}
+				next = recomputeAndApplyCalibration(req, cfg, model, be, caps, next)
 				claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 				nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 				if changed, rejected := memoryRecovery.recomputeDecision(serverArgs, nextArgs); changed {
@@ -3499,6 +3500,9 @@ func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config,
 			opts.SkipPlacementCache = true
 			opts.CacheFile = ""
 			s, rerr = placement.Compute(caps, model, opts)
+			if rerr == nil && s != nil {
+				s = recomputeAndApplyCalibration(req, cfg, model, be, caps, s)
+			}
 		} else {
 			oomPenalty[physicalDevice] += oomOvershoot(caps, physicalDevice, allocMB)
 			s, rerr = placement.ReplanAfterOOM(caps, model, placementOpts(), oomPenalty)
@@ -3822,6 +3826,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 		if err != nil {
 			return nil, err
 		}
+		next = applyCalibrationDecision(req, cfg, model, be, caps, next)
 		claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 		fmt.Printf("[launch] prompt cache: re-planned -cram %d -> %d MiB from the measured entry size\n", strategy.CRAM, next.CRAM)
 		return next, nil
@@ -3837,6 +3842,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 	if err != nil {
 		return nil, err
 	}
+	next = applyCalibrationDecision(req, cfg, model, be, caps, next)
 	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
 	return next, nil
 }
@@ -4794,6 +4800,9 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove stale placement cache: %w", err)
 		}
+	}
+	if err := placement.DeleteCalibrationDecision(cfg.CacheDir, calibrationScopeKey(req, model, be, caps, strategy)); err != nil {
+		return fmt.Errorf("remove stale calibration decision: %w", err)
 	}
 	return nil
 }
