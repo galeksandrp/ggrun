@@ -3188,6 +3188,23 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 // load, measured promotion, calibration, restoration, and runtime recovery can
 // never forget an argv that an earlier phase disproved.
 func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
+	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, false)
+}
+
+// restoreLaunchWithCUDAOOMRecoveryState re-enters the start boundary to bring
+// back a placement the OUTER launcher has unconditionally committed to (the
+// failed-promotion fallback in cmdLaunch and the calibration default/winner
+// restarts). The isRejected gate exists to keep the memory-recovery loop from
+// resurrecting an argv it disproved; a deliberate restore carries an explicit
+// Strategy argument whose loading the caller falls back to no matter what, so
+// re-gating it would only convert a working fallback into "die with no server".
+// Recovery rejections remain recorded and enforced everywhere the argv is chosen
+// by recovery/recompute.
+func restoreLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
+	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, true)
+}
+
+func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool) (*server.Process, *placement.Strategy, []string, error) {
 	const maxRetries = 2
 	const maxPreflightReplans = 5
 	retries := 0
@@ -3207,7 +3224,7 @@ func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config,
 		return opts
 	}
 	for {
-		if memoryRecovery.isRejected(serverArgs) {
+		if !restoreExempt && memoryRecovery.isRejected(serverArgs) {
 			return nil, strategy, serverArgs, fmt.Errorf("refusing to retry a memory configuration rejected earlier in this launch lifecycle")
 		}
 		if !specDisabled && strings.EqualFold(strings.TrimSpace(req.SpecMode), "auto") && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
@@ -4466,28 +4483,41 @@ func cmdLaunch(args []string) {
 		} else if nextStrategy, nextArgs, ok := maybePromoteMeasuredPlacement(req, cfg, be, caps, model, strategy, serverArgs, launchRecovery); ok {
 			fmt.Printf("[launch] allocation measurement fits more GPU experts (%d CPU MoE -> %d); establishing the calibrated baseline\n", strategy.NCPUMoE, nextStrategy.NCPUMoE)
 			oldStrategy, oldArgs := strategy, append([]string(nil), serverArgs...)
-			if !stopCalibrationProcessAndWait(p, "measured baseline promotion", resourceBaseline, 30*time.Second) {
-				claudeAuto.stop()
-				fmt.Fprintln(os.Stderr, "Error: current server/resources did not release before measured baseline promotion")
-				os.Exit(1)
-			}
-			fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
-			promotedP, promotedStrategy, promotedArgs, promoteErr := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout, launchRecovery)
-			if promoteErr != nil {
-				if !stopCalibrationProcessAndWait(promotedP, "failed measured baseline", resourceBaseline, 30*time.Second) {
-					claudeAuto.stop()
-					fmt.Fprintln(os.Stderr, "Error: failed measured baseline did not release resources; refusing an overlapping restore")
-					os.Exit(1)
-				}
-				fmt.Fprintf(os.Stderr, "[launch] measured baseline failed (%v); restoring the previously loaded placement\n", promoteErr)
-				p, strategy, serverArgs, err = startLaunchWithCUDAOOMRecoveryState(req, cfg, model, oldStrategy, be, caps, oldArgs, timeout, launchRecovery)
+			// restorePrevious brings back the pre-promotion placement after a
+			// failed promotion or resource-release failure. The old args are the
+			// currently-serving, health-verified argv — never in the rejected set —
+			// so the restore-exempt start boundary is used (a deliberate fallback
+			// must not be re-gated into a dead box).
+			restorePrevious := func() bool {
+				p, strategy, serverArgs, err = restoreLaunchWithCUDAOOMRecoveryState(req, cfg, model, oldStrategy, be, caps, oldArgs, timeout, launchRecovery)
 				if err != nil {
 					claudeAuto.stop()
 					fmt.Fprintf(os.Stderr, "Error restoring previous loaded placement: %v\n", err)
+					fmt.Fprintln(os.Stderr, "Error: no server is running after failed measured baseline promotion")
 					os.Exit(1)
 				}
+				return true
+			}
+			if !stopCalibrationProcessAndWait(p, "measured baseline promotion", resourceBaseline, 30*time.Second) {
+				// The old process was force-stopped by Stop(); degrade to restoring
+				// it rather than exiting with no server. Mirrors the calibration
+				// winner-restore path.
+				fmt.Fprintln(os.Stderr, "Error: current server/resources did not release before measured baseline promotion; attempting restore of the previous placement")
+				restorePrevious()
 			} else {
-				p, strategy, serverArgs = promotedP, promotedStrategy, promotedArgs
+				fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
+				promotedP, promotedStrategy, promotedArgs, promoteErr := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout, launchRecovery)
+				if promoteErr != nil {
+					if !stopCalibrationProcessAndWait(promotedP, "failed measured baseline", resourceBaseline, 30*time.Second) {
+						fmt.Fprintln(os.Stderr, "Error: failed measured baseline did not release resources; refusing an overlapping restore — attempting restore of the previous placement")
+						// promotedP was force-killed; the old placement's resources
+						// are the pre-promotion baseline, so restoring it is safe.
+					}
+					fmt.Fprintf(os.Stderr, "[launch] measured baseline failed (%v); restoring the previously loaded placement\n", promoteErr)
+					restorePrevious()
+				} else {
+					p, strategy, serverArgs = promotedP, promotedStrategy, promotedArgs
+				}
 			}
 			fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 			if p.LogBuf != nil {

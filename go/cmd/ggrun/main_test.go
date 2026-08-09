@@ -1942,6 +1942,25 @@ func TestSharedLaunchRecoveryRefusesRejectedEntryArgv(t *testing.T) {
 	}
 }
 
+func TestRestoreBypassesRejectedMemoryArgv(t *testing.T) {
+	args := []string{"llama-server", "--n-cpu-moe", "35", "--swa-full"}
+	recovery := newLaunchMemoryRecovery()
+	recovery.reject(args)
+	// The restore boundary is exempt from the isRejected gate: it is the outer
+	// launcher's unconditional fallback (failed-promotion restore, calibration
+	// winner restart). Re-gating it would convert a working fallback into a
+	// dead box. SpecMode "off" skips the speculation block and a nil strategy
+	// skips the preflight, so the body proceeds to the real start and fails on
+	// nil be/caps with a non-gate error — proving the gate was bypassed.
+	req := &launchRequest{SpecMode: "off"}
+	_, _, _, err := restoreLaunchWithCUDAOOMRecoveryState(
+		req, nil, nil, nil, nil, nil, args, time.Second, recovery,
+	)
+	if err == nil || strings.Contains(err.Error(), "rejected earlier in this launch lifecycle") {
+		t.Fatalf("restore boundary re-gated a rejected argv: %v", err)
+	}
+}
+
 func TestOOMOvershootEnforcesDocumentedFloor(t *testing.T) {
 	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 2, VRAMTotalMB: 12288}}}
 	if got := oomOvershoot(caps, 2, 75); got != 512 {

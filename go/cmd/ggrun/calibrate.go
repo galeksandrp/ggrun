@@ -530,7 +530,7 @@ func calibrationAdvisorIncident(req *launchRequest, model *placement.ModelProfil
 // leaving the user with no server after a calibration that already measured a
 // working default is worse than failing loudly.
 func restartPlacement(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) *server.Process {
-	p, _, _, err := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery)
+	p, _, _, err := restoreLaunchWithCUDAOOMRecoveryState(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[calibrate] restart of best placement failed: %v\n", err)
 		return nil
