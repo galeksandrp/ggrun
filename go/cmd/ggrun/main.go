@@ -3101,7 +3101,15 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 			if cp.GPU < 0 {
 				continue
 			}
-			if mb := placement.MeasuredCompanionVRAMMB(cfg.CacheDir, cp.Name); mb > 0 {
+			// The NanoBeige worker stores its measured VRAM under its KV-qualified
+			// MeasurementKey (claude_auto.go companionMeasurementKey/recordReviewerVRAM),
+			// not its public Name; the strategy only carries Name. Resolve the key via
+			// the frozen profile so the netting lookup finds the file the writer wrote.
+			key := cp.Name
+			if req != nil && req.ReviewerProfile != nil && cp.Name == req.ReviewerProfile.Name {
+				key = req.ReviewerProfile.companionMeasurementKey()
+			}
+			if mb := placement.MeasuredCompanionVRAMMB(cfg.CacheDir, key); mb > 0 {
 				companionVRAMByGPU[cp.GPU] += mb
 			}
 		}
@@ -4762,21 +4770,12 @@ func cmdLaunch(args []string) {
 				device, allocMB, runtimeOOMRetries, maxRuntimeOOMRetries)
 		}
 
-		replanOpts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
-		// Without this, Compute() prefers the .place cache written when the
-		// prior instance loaded cleanly and passed health — which is exactly
-		// the placement that just OOM'd mid-request. Skipping it forces a
-		// fresh derivation that actually consults the growth deficit just
-		// recorded above via RecordRuntimeGraphGrowthFromOOM.
-		replanOpts.SkipPlacementCache = true
-		nextStrategy, err := placement.Compute(caps, model, replanOpts)
+		nextStrategy, nextArgs, err := replanAfterRuntimeOOM(req, cfg, model, be, caps, serverArgs, launchRecovery)
 		if err != nil {
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "[launch] re-plan after runtime OOM failed: %v\n", err)
 			os.Exit(1)
 		}
-		claudeCodeSlotAdjust(nextStrategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
-		nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, nextStrategy)
 		fmt.Printf("[launch] %s\n", formatCommand(nextArgs))
 		newP, newStrategy, newArgs, err := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, nextStrategy, be, caps, nextArgs, timeout, launchRecovery)
 		if err != nil {
@@ -4835,6 +4834,38 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 		return fmt.Errorf("remove stale calibration decision: %w", err)
 	}
 	return nil
+}
+
+// replanAfterRuntimeOOM derives a fresh placement after a post-health CUDA
+// OOM, honoring the growth deficit the caller just recorded. It rejects the
+// argv that just crashed on the shared lifecycle recovery state, then refuses
+// to hand back an argv identical to it: a fresh derivation can legitimately
+// reproduce the same placement when the recorded deficit fits inside the
+// plan's slack, and re-running it would just re-crash identically. Every
+// other recovery path (preflight, startup OOM, measured promotion,
+// calibration candidates) already refuses a rejected argv; this is the one
+// path that previously relied on the retry counter alone.
+func replanAfterRuntimeOOM(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, serverArgs []string, launchRecovery *launchMemoryRecovery) (*placement.Strategy, []string, error) {
+	if launchRecovery != nil {
+		launchRecovery.reject(serverArgs)
+	}
+	replanOpts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+	// Without this, Compute() prefers the .place cache written when the
+	// prior instance loaded cleanly and passed health — which is exactly
+	// the placement that just OOM'd mid-request. Skipping it forces a
+	// fresh derivation that actually consults the growth deficit the
+	// caller just recorded via RecordRuntimeGraphGrowthFromOOM.
+	replanOpts.SkipPlacementCache = true
+	nextStrategy, err := placement.Compute(caps, model, replanOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+	claudeCodeSlotAdjust(nextStrategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, nextStrategy)
+	if formatCommand(nextArgs) == formatCommand(serverArgs) {
+		return nil, nil, fmt.Errorf("runtime OOM re-plan reproduced the exact failed argv; refusing an identical relaunch")
+	}
+	return nextStrategy, nextArgs, nil
 }
 
 // waitForShutdownOrCrash blocks until either a shutdown signal arrives

@@ -2887,3 +2887,56 @@ func TestDownloadAcceptsAnExplicitQuant(t *testing.T) {
 		t.Error("a --quant with no value must be rejected, not silently ignored")
 	}
 }
+
+func TestMeasuredLaunchProbesNetsNanoBeigeUnderMeasurementKey(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.CacheDir = t.TempDir()
+	profile := &claudeCompanionProfile{
+		Name: claudeNanoCompanionName, MeasurementKey: claudeNanoCompanionName + "-ctx65536-kv-q4_0",
+	}
+	// Write the measured VRAM exactly as recordReviewerVRAM does, under the
+	// KV-qualified MeasurementKey — the real storage location.
+	if err := placement.RecordCompanionVRAM(cfg.CacheDir, profile.companionMeasurementKey(), 2916); err != nil {
+		t.Fatalf("seed companion VRAM: %v", err)
+	}
+	req := &launchRequest{ReviewerProfile: profile}
+	model := &placement.ModelProfile{IsMoE: true}
+	strategy := &placement.Strategy{CompanionPlacements: []placement.CompanionPlacement{{Name: claudeNanoCompanionName, GPU: 1}}}
+	be := &backendInfo{Tag: "llama"}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 1, VRAMTotalMB: 12288}}}
+	// recordMeasuredLaunchProbes requires a non-empty server log and is MoE-gated.
+	recordMeasuredLaunchProbes(req, cfg, model, strategy, be, caps, "fake-server-log\n", nil, 0)
+	// The NanoBeige worker's VRAM must now be nettable under its MeasurementKey
+	// (the fix resolves the key via the frozen profile). Without the fix the
+	// lookup under cp.Name misses and the worker stays booked as CUDA overhead.
+	if got := placement.MeasuredCompanionVRAMMB(cfg.CacheDir, profile.companionMeasurementKey()); got != 2916 {
+		t.Fatalf("companion measurement not found under MeasurementKey: got %d", got)
+	}
+}
+
+func TestRuntimeOOMReplanRefusesIdenticalFailedArgv(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.CacheDir = t.TempDir()
+	req := &launchRequest{CtxFlag: "32768", Parallel: 1}
+	model := &placement.ModelProfile{SizeBytes: 1, NumLayers: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128}
+	be := &backendInfo{Tag: "llama", Identity: "build"}
+	caps := &detect.Capabilities{CPU: detect.CPUInfo{Cores: 4}, RAM: detect.RAMInfo{TotalMB: 16384, FreeMB: 16384}}
+
+	// Derive a first argv, then ask for a re-plan after a runtime OOM of that
+	// same argv. The crashed argv is rejected on the shared lifecycle recovery,
+	// and an identical re-plan is refused outright.
+	firstStrategy, firstArgs, err := replanAfterRuntimeOOM(req, cfg, model, be, caps, nil, newLaunchMemoryRecovery())
+	if err != nil {
+		t.Fatalf("first runtime OOM replan failed: %v", err)
+	}
+	if firstStrategy == nil {
+		t.Fatal("first replan returned no strategy")
+	}
+	// Re-planning after the exact argv that just crashed must reject that argv
+	// and refuse an identical relaunch: a fresh derivation that reproduces the
+	// failed placement must not be handed back to be re-run identically.
+	_, _, err = replanAfterRuntimeOOM(req, cfg, model, be, caps, firstArgs, newLaunchMemoryRecovery())
+	if err == nil || !strings.Contains(err.Error(), "refusing an identical relaunch") {
+		t.Fatalf("re-plan after the crashed argv should refuse an identical relaunch, got %v", err)
+	}
+}
