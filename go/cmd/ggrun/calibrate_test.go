@@ -264,3 +264,26 @@ func TestMeasuredRecomputeReappliesCachedCalibrationWinner(t *testing.T) {
 		t.Fatal("cached calibration winner was not re-applied to the corrected recompute")
 	}
 }
+
+// --no-cached-config must bypass a cached calibration winner: the launch is the
+// user's escape hatch from a stale measured decision, so it re-derives from the
+// fresh estimate instead of re-applying the last winner.
+func TestApplyCalibrationDecisionSkipsWithNoCachedConfig(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	base := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu", NCPUMoE: 40}
+	scopeKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: scopeKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24.5,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	req.NoCachedConfig = true
+	got := applyCalibrationDecision(req, cfg, model, be, caps, base)
+	if got != base {
+		t.Fatal("--no-cached-config must not re-apply a cached calibration winner")
+	}
+	if base.KVPlacement != "cpu" {
+		t.Fatalf("base strategy mutated to %q", base.KVPlacement)
+	}
+}

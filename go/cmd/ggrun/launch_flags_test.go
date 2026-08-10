@@ -321,3 +321,28 @@ func TestClaudeClientEnvDisablesAttributionHeader(t *testing.T) {
 		t.Errorf("CLAUDE_CODE_ATTRIBUTION_HEADER=%q, want 0", got)
 	}
 }
+
+// --no-cached-config must parse as an explicit one-shot escape hatch and must
+// reach placement options as SkipCachedConfig (which implies the placement
+// cache skip inside Compute).
+func TestNoCachedConfigFlagParsesAndReachesPlacementOptions(t *testing.T) {
+	req, err := parseLaunchArgs([]string{"m.gguf", "--no-cached-config"})
+	if err != nil {
+		t.Fatalf("parseLaunchArgs: %v", err)
+	}
+	if !req.NoCachedConfig {
+		t.Fatal("--no-cached-config must set NoCachedConfig")
+	}
+	// Without the flag the field stays false.
+	plain, err := parseLaunchArgs([]string{"m.gguf"})
+	if err != nil {
+		t.Fatalf("parseLaunchArgs: %v", err)
+	}
+	if plain.NoCachedConfig {
+		t.Fatal("default launch must not set NoCachedConfig")
+	}
+	// And it must not leak into server argv (it is a placement-scope switch).
+	if strings.Contains(strings.Join(req.ExtraArgs, " "), "--no-cached-config") {
+		t.Errorf("--no-cached-config must not pass through to the backend argv")
+	}
+}

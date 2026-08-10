@@ -285,3 +285,69 @@ func TestPlacementCacheKeySeparatesSWAFull(t *testing.T) {
 		t.Errorf("key is not stable for the same inputs: %s vs %s", again, full)
 	}
 }
+
+// A "launch without cached config" must derive fresh: Compute with
+// SkipCachedConfig ignores an existing placement cache, probe cache, and
+// measured KV rate that a normal Compute would reuse, without deleting the
+// files (they stay on disk for later launches).
+func TestSkipCachedConfigIgnoresExistingCaches(t *testing.T) {
+	dir := t.TempDir()
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "3090 Ti", VRAMTotalMB: 24576, VRAMUsedMB: 800, BandwidthMBps: 31504},
+			{Index: 1, Name: "3060", VRAMTotalMB: 12288, VRAMUsedMB: 600, BandwidthMBps: 12000},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 120000},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "V4.gguf", TotalSizeMB: 80 * 1024, SizeBytes: 80 * 1024 * 1024 * 1024,
+		NumLayers: 43, IsMoE: true, NumExperts: 256,
+		ExpertBytes: int64(43 * 1800 * 1024 * 1024), NonExpertBytes: int64(7680 * 1024 * 1024),
+		ContextSize: 32768, EmbeddingLength: 4096, HeadCountKV: 1, KeyLength: 512, ValueLength: 512,
+		ExpertUsedCount: 6, ExpertFF: 2048,
+	}
+	opts := Options{ContextSize: 32768, KVQuality: "low", KVPlacement: "cpu", CacheDir: dir}
+
+	// Establish the cached evidence a normal launch would reuse: a measured KV
+	// rate and a placement cache at the exact path Compute derives.
+	// writeMeasuredKVRate would also set the in-memory model field, so write the
+	// cache file directly to keep the model clean for the skip-cached check.
+	kvPath := kvCachePath(dir, model)
+	if err := os.MkdirAll(filepath.Dir(kvPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kvPath, []byte("KV_BYTES_PER_TOK_q8_0=2048.0000\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Compute the placement path (derives the key) then write a tagged cache.
+	place := PlacementCachePathFor(dir, model, 32768, opts.UBatchSize, "low", "cpu", "llama", caps.GPUs, 1, "", false)
+	if err := SavePlacementCache(place, &CacheEntry{
+		OTString: "exps=CPU", TensorSplit: []float64{1}, SplitMode: "layer",
+		NCPUMoE: 30, BatchSize: 2048, UBatchSize: 512, Parallel: 1, MMap: true, ModelBasename: "V4.gguf",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(place); err != nil {
+		t.Fatalf("expected placement cache file: %v", err)
+	}
+
+	// A Compute with SkipCachedConfig must not load the measured KV rate.
+	freshModel := *model
+	skipOpts := opts
+	skipOpts.SkipCachedConfig = true
+	if _, err := Compute(caps, &freshModel, skipOpts); err != nil {
+		t.Fatalf("skip-cached compute: %v", err)
+	}
+	if freshModel.MeasuredKVBytesPerTok != nil {
+		t.Errorf("SkipCachedConfig must not load measured KV rates, got %v", freshModel.MeasuredKVBytesPerTok)
+	}
+
+	// The cache files themselves must still be on disk (non-destructive).
+	if _, err := os.Stat(kvPath); err != nil {
+		t.Errorf("SkipCachedConfig must leave the KV cache on disk, stat err=%v", err)
+	}
+	if _, err := os.Stat(place); err != nil {
+		t.Errorf("SkipCachedConfig must leave the placement cache on disk, stat err=%v", err)
+	}
+}

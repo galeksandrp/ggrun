@@ -866,6 +866,124 @@ func statusArtifactReady(cfg *config.Config) bool {
 	return advisor.VerifyArtifact(advisorModelPath(cfg), advisor.DefaultArtifact) == nil
 }
 
+// adviseUnclassifiedLaunchFailure is the crash-diagnosis hook. It consults the
+// local assistant model (the advisor) about a launch failure that no ggrun rule
+// classified — no memory OOM, no backendAdjustmentFromLog match, no known flag —
+// and surfaces the diagnosis on stderr. This is the user's ask: "integrate the
+// local assistant model for things like that when models crash and ggrun does
+// not know why".
+//
+// It is STRICTLY advisory: the incident's AllowedActions is only no_action, so
+// ValidateDecision rejects any recommendation the model makes and nothing it
+// says can reach argv or placement. The launch still fails closed exactly as it
+// would have without the consultation; the only observable effect is the printed
+// rationale and a persisted analysis record. Mode is governed by the same
+// support_expert / --support-expert policy as the optimizer: off never consults,
+// auto consults only when an already-verified artifact is installed, on consults
+// and reports a missing artifact as a diagnostic. A helper-process or research
+// failure is non-fatal and logged, never escalated.
+func adviseUnclassifiedLaunchFailure(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, logExcerpt string) {
+	mode := "auto"
+	online := false
+	if cfg != nil {
+		mode, online = cfg.SupportExpert, cfg.SupportOnline
+	}
+	if req != nil {
+		if req.SupportExpert != "" {
+			mode = req.SupportExpert
+		}
+		online = req.SupportOnline
+	}
+	if mode == "off" {
+		return
+	}
+	if mode == "auto" && !statusArtifactReady(cfg) {
+		return
+	}
+	incident := unclassifiedFailureIncident(req, model, be, caps, logExcerpt)
+	preferred := ""
+	if be != nil {
+		preferred = be.Path
+	}
+	decision, report, runErr := runSupportIncidentFn(context.Background(), cfg, caps, preferred, incident, online)
+	var decisionPtr *advisor.Decision
+	if runErr == nil {
+		decisionPtr = &decision
+	}
+	history, historyErr := advisor.SaveAnalysis(cfg.CacheDir, incident, decisionPtr, report, runErr)
+	if historyErr != nil {
+		fmt.Fprintf(os.Stderr, "[support] could not persist crash diagnosis: %v\n", historyErr)
+	}
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "[support] crash diagnosis unavailable; the launch error above is authoritative: %v\n", runErr)
+		if mode == "auto" && !statusArtifactReady(cfg) {
+			fmt.Fprintln(os.Stderr, "[support] install the optional native expert/optimizer with: ggrun support install")
+		}
+		return
+	}
+	// Only a rationale is surfaced. The advisor was offered exactly one allowed
+	// action (no_action), so even if the model emitted a recommendation it was
+	// rejected by ValidateDecision and could not reach a launch.
+	fmt.Fprintf(os.Stderr, "[support] diagnosis (advisory, no launch action taken): %s\n", decision.Rationale)
+	if history != "" {
+		fmt.Fprintf(os.Stderr, "[support] diagnosis record=%s\n", history)
+	}
+}
+
+// unclassifiedFailureIncident builds the advisory-only advisor incident for a
+// launch failure that no ggrun rule classified. The backend's own log excerpt is
+// the primary evidence; model/backend metadata gives the advisor the shape of the
+// failed launch. AllowedActions is exactly no_action, making the consultation
+// diagnostic by construction: the model may explain what it sees, never change
+// what ggrun does.
+func unclassifiedFailureIncident(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, logExcerpt string) advisor.Incident {
+	arch := ""
+	if model != nil {
+		arch = model.ModelArch
+	}
+	backendFamily, backendIdentity := "", ""
+	if be != nil {
+		backendFamily, backendIdentity = backendDialect(be), evidenceBackendCacheTag(be)
+	}
+	settings := map[string]string{"stage": "backend_start", "role": "crash_diagnosis_advisory"}
+	if req != nil {
+		settings["context"] = req.CtxFlag
+		settings["kv_placement"] = req.KVPlacement
+		settings["kv_quality"] = req.KVQuality
+		settings["parallel"] = strconv.Itoa(req.Parallel)
+	}
+	hardware := map[string]string{}
+	if caps != nil {
+		hardware["ram_total_mb"] = strconv.Itoa(caps.RAM.TotalMB)
+		hardware["ram_free_mb"] = strconv.Itoa(caps.RAM.FreeMB)
+		for _, gpu := range caps.GPUs {
+			prefix := fmt.Sprintf("gpu%d_", gpu.Index)
+			hardware[prefix+"name"] = gpu.Name
+			hardware[prefix+"total_mb"] = strconv.Itoa(gpu.VRAMTotalMB)
+			hardware[prefix+"free_mb"] = strconv.Itoa(gpu.VRAMFreeMB())
+		}
+	}
+	// The hook fires precisely because no ggrun rule classified the failure, so
+	// the observation code is the unclassified class by construction. The
+	// advisor's evidence is the backend log excerpt, not a re-derived taxonomy.
+	code := "unclassified_launch_failure"
+	observation := advisor.Observation{
+		Code: code, Component: "backend_start", Source: "ggrun_controller",
+		Confidence: "measured", Attributes: map[string]string{"backend_log_excerpt": logExcerpt},
+	}
+	scope := strings.Join([]string{arch, backendIdentity, code, settings["context"]}, "|")
+	sum := sha256.Sum256([]byte(scope))
+	incident := advisor.Incident{
+		ID: "diag-" + hex.EncodeToString(sum[:8]), Mode: advisor.ModeSupport,
+		Architecture: arch, BackendFamily: backendFamily, BackendIdentity: backendIdentity,
+		Workload: requestWorkloadProfile(req, model), ProfileState: "crash_diagnosis_advisory",
+		Hardware: hardware, Settings: settings, Observations: []advisor.Observation{observation},
+		AllowedActions: []advisor.ActionID{advisor.ActionNoAction},
+	}
+	_ = incident.Normalize()
+	return incident
+}
+
 func applyAdvisorDecision(req *launchRequest, model *placement.ModelProfile, strategy *placement.Strategy, decision advisor.Decision) bool {
 	if req == nil {
 		return false

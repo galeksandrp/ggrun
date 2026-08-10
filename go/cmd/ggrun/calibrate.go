@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -98,6 +99,11 @@ func applyCalibrationDecision(req *launchRequest, cfg *config.Config, model *pla
 		return strategy
 	}
 	if req.Calibrate == calibrateOff {
+		return strategy
+	}
+	// --no-cached-config is the escape hatch for a stale cached decision: do not
+	// re-apply a measured calibration winner to this launch either.
+	if req.NoCachedConfig {
 		return strategy
 	}
 	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
@@ -358,7 +364,8 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	}
 
 	pending := &placement.CalibrationDecision{
-		ScopeKey: scopeKey, Winner: best.Name,
+		ScopeKey:      scopeKey, Winner: best.Name,
+		ModelBasename: filepath.Base(model.Path),
 		DefaultTPS:       defaultResult.GenTPS,
 		DefaultPromptTPS: defaultResult.PromptTPS,
 		DefaultScore:     1,

@@ -609,6 +609,118 @@ func TestArgs(t *testing.T) {
 	}
 }
 
+// TestArgsMixedKVTypeVEmitsDistinctVCache verifies the V-leg override: a
+// strategy that forced V to f16 (Inkling) still compresses K but must not emit
+// a compressed --cache-type-v, because the backend rejects it outright.
+func TestArgsMixedKVTypeVEmitsDistinctVCache(t *testing.T) {
+	s := &Strategy{
+		ContextSize:    4096,
+		GPULayers:      32,
+		KVQuality:      "mid",
+		KVType:         "q8_0",
+		KVTypeV:        "f16",
+		FlashAttention: true,
+		Threads:        16,
+		BatchSize:      2048,
+		UBatchSize:     512,
+	}
+	args := s.Args("/models/inkling.gguf", 8081)
+	argV := ""
+	for i, a := range args {
+		if a == "--cache-type-v" && i+1 < len(args) {
+			argV = args[i+1]
+		}
+		if a == "--cache-type-k" && i+1 < len(args) {
+			if args[i+1] != "q8_0" {
+				t.Fatalf("K cache must stay compressed q8_0, got %q in %v", args[i+1], args)
+			}
+		}
+	}
+	if argV != "f16" {
+		t.Fatalf("V cache must be promoted to f16 while K is compressed, got %q in %v", argV, args)
+	}
+	// A strategy without the override keeps the unified pair.
+	plain := (&Strategy{ContextSize: 4096, KVType: "q4_0", FlashAttention: true, Threads: 8, BatchSize: 1024, UBatchSize: 512}).Args("/models/x.gguf", 8081)
+	for i, a := range plain {
+		if a == "--cache-type-v" && i+1 < len(plain) && plain[i+1] != "q4_0" {
+			t.Fatalf("unified strategy must emit V == K, got V %q in %v", plain[i+1], plain)
+		}
+	}
+}
+
+// TestResolveKVQualityInklingKeepsCompressedKWithFV pins the Inkling rule: a
+// compressed K request is legal (that is where the memory savings are), and the
+// unified quality still resolves to a compressed K type. The V-leg f16 pinning
+// happens in Compute, not here.
+func TestResolveKVQualityInklingKeepsCompressedKWithFV(t *testing.T) {
+	model := &ModelProfile{ModelArch: "inkling"}
+	for _, quality := range []string{"auto", "mid", "low", "q8_0", "q4_0"} {
+		got, err := resolveKVQuality(model, quality, "llama")
+		if err != nil {
+			t.Errorf("Inkling compressed K quality %q must not be rejected (K may compress): %v", quality, err)
+			continue
+		}
+		if got == "" {
+			t.Errorf("Inkling quality %q resolved to empty", quality)
+		}
+	}
+	// Explicit invalid type still fails with the normal validation error.
+	if _, err := resolveKVQuality(model, "nonsense", "llama"); err == nil {
+		t.Error("invalid KV type accepted for Inkling")
+	}
+}
+
+// TestComputeInklingPinsVCacheToF16 verifies Compute emits a f16 V override for
+// the inkling architecture regardless of the requested K quality, so the launch
+// never sends a compressed --cache-type-v to the rejecting backend.
+func TestComputeInklingPinsVCacheToF16(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, VRAMUsedMB: 0, BandwidthMBps: 15754}},
+		RAM:  detect.RAMInfo{TotalMB: 128512, FreeMB: 120000},
+		CPU:  detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "inkling-small.gguf", Basename: "inkling-small.gguf",
+		ModelArch: "inkling", SizeBytes: 8 * 1024 * 1024 * 1024, TotalSizeMB: 8192,
+		NumLayers: 32, IsMoE: false, ContextSize: 32768,
+		EmbeddingLength: 4096, HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
+	}
+	for _, quality := range []string{"auto", "low", "q4_0", "q8_0"} {
+		opts := Options{ContextSize: 32768, KVQuality: quality, KVPlacement: "gpu", CacheDir: t.TempDir()}
+		strategy, err := Compute(caps, model, opts)
+		if err != nil {
+			t.Fatalf("Compute inkling quality %q: %v", quality, err)
+		}
+		if strategy.KVTypeV != "f16" {
+			t.Errorf("Inkling quality %q must pin V cache to f16, got KVTypeV=%q KVType=%q", quality, strategy.KVTypeV, strategy.KVType)
+		}
+		args := strategy.Args(model.Path, 8081)
+		argV := ""
+		for i, a := range args {
+			if a == "--cache-type-v" && i+1 < len(args) {
+				argV = args[i+1]
+			}
+		}
+		if argV != "f16" {
+			t.Errorf("Inkling quality %q emitted --cache-type-v %q, want f16 (args %v)", quality, argV, args)
+		}
+	}
+	// A non-inkling model is unaffected.
+	other := &ModelProfile{
+		Path: "qwen.gguf", Basename: "qwen.gguf",
+		ModelArch: "qwen3", SizeBytes: 8 * 1024 * 1024 * 1024, TotalSizeMB: 8192,
+		NumLayers: 32, IsMoE: false, ContextSize: 32768,
+		EmbeddingLength: 4096, HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
+	}
+	otherStrategy, err := Compute(caps, other, Options{ContextSize: 32768, KVQuality: "low", KVPlacement: "gpu", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Compute qwen3: %v", err)
+	}
+	if otherStrategy.KVTypeV != "" {
+		t.Errorf("non-Inkling model must not set KVTypeV, got %q", otherStrategy.KVTypeV)
+	}
+}
+
 // Regression: DeepSeek-V4-Flash MXFP4 on the real 3090Ti+3060+4070 box. The
 // parser once under-sized MXFP4 tensors (unknown ggml type 39 → 0.5 B/elem
 // guess instead of 17 B / 32 elems), so expertPerLayerMB came out 3098 instead

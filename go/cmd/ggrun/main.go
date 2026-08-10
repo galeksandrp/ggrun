@@ -531,6 +531,12 @@ type launchRequest struct {
 	CtxFlag              string
 	KVPlacement          string
 	KVQuality            string
+	// KVQualityV forces the V-cache leg (--cache-type-v) to a fixed type while
+	// KVQuality still sizes the unified plan. Set by the backend-compatibility
+	// retry when a backend rejects a quantized V cache for a model whose K leg
+	// may stay compressed; persisted on the request so every later re-plan
+	// (OOM recovery, measured-evidence recompute) keeps the override.
+	KVQualityV           string
 	KVTypeK              string // explicit llama.cpp --cache-type-k override
 	KVTypeV              string // explicit llama.cpp --cache-type-v override
 	CPUMode              bool
@@ -575,6 +581,7 @@ type launchRequest struct {
 	ClaudeResumeForce      bool     // accept a resume whose backend shape no longer matches
 	OriginalArgs           []string // launch argv as given, so a resume can reproduce it exactly
 	Calibrate              string   // "auto" (default: calibrate unproven small models), "on" (force), "off"
+	NoCachedConfig         bool     // --no-cached-config: derive placement fresh, ignoring cached measurements
 	SupportExpert          string   // off, auto (installed-only), on
 	SupportOnline          bool     // typed official llama.cpp research only
 	// SupportOnlineSet is true when the user named --support-online or
@@ -972,6 +979,8 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			req.ClaudeResume, req.ClaudeCode = v, true
 		case "--claude-resume-force":
 			req.ClaudeResumeForce = true
+		case "--no-cached-config":
+			req.NoCachedConfig = true
 		case "--claude-profile":
 			v, err := next()
 			if err != nil {
@@ -1992,6 +2001,7 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		ContextSize:            ctxSize,
 		KVPlacement:            req.KVPlacement,
 		KVQuality:              req.KVQuality,
+		KVQualityV:             req.KVQualityV,
 		CPUMode:                req.CPUMode,
 		RamBudgetMB:            req.RamBudgetMB,
 		RAMLimitPercent:        req.RAMLimitPercent,
@@ -2027,6 +2037,10 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		// Disable the model's thinking only when measuring (`--benchmark`); a
 		// normal launch keeps reasoning on so tools like Claude Code can think.
 		ReasoningOff: req.Benchmark || req.WorkerBenchmark,
+		// --no-cached-config derives placement fresh: skip the keyed .place cache
+		// and every probe/KV/prompt measurement (SkipCachedConfig implies
+		// SkipPlacementCache inside Compute).
+		SkipCachedConfig: req.NoCachedConfig,
 	}
 	if req.GPUsFlag != "" {
 		if indices, err := parseGPUIndices(req.GPUsFlag); err == nil {
@@ -3333,6 +3347,53 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 					)
 					continue
 
+				case adjustment.KVQualityV != "":
+					targetV, vErr := placement.NormalizeKVType(adjustment.KVQualityV)
+					if vErr != nil {
+						return nil, strategy, serverArgs, fmt.Errorf("backend requested invalid KV V-cache compatibility type %q: %w", adjustment.KVQualityV, vErr)
+					}
+					// An explicit user-supplied --cache-type-v is not ggrun's to
+					// override: the backend rejected it, so fail closed rather than
+					// silently rewrite an explicit user flag (same policy as the
+					// RemoveFlag case above).
+					if req.KVTypeV != "" {
+						return nil, strategy, serverArgs, fmt.Errorf(
+							"backend rejected explicitly supplied --cache-type-v %s: %s; refusing to change a user-supplied backend flag",
+							req.KVTypeV, adjustment.Reason,
+						)
+					}
+					previousV := "auto"
+					if strategy != nil && strategy.KVTypeV != "" {
+						previousV = strategy.KVTypeV
+					} else if strategy != nil {
+						previousV = strategy.KVType
+					}
+					if currentV, _ := placement.NormalizeKVType(req.KVQualityV); currentV == targetV {
+						return nil, strategy, serverArgs, fmt.Errorf("backend compatibility adjustment repeated for V cache type %s without changing the launch", targetV)
+					}
+					req.KVQualityV = targetV
+					next, replanErr := placement.Compute(caps, model, placementOpts())
+					if replanErr != nil || next == nil {
+						if replanErr != nil {
+							return nil, strategy, serverArgs, fmt.Errorf("backend-compatible V-cache re-plan failed: %w", replanErr)
+						}
+						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible V-cache re-plan returned no strategy")
+					}
+					claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+					nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
+					if formatCommand(nextArgs) == formatCommand(serverArgs) {
+						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible V-cache re-plan produced no argument change")
+					}
+					if validateErr := validateBackendLaunchArgs(be, nextArgs); validateErr != nil {
+						return nil, strategy, serverArgs, validateErr
+					}
+					preflightReplans++
+					strategy, serverArgs = next, nextArgs
+					fmt.Fprintf(os.Stderr,
+						"[launch] backend/model compatibility: %s; promoting V cache %s -> %s, recomputing placement, and retrying\n",
+						adjustment.Reason, previousV, targetV,
+					)
+					continue
 				case adjustment.KVQuality != "":
 					targetKV, kvErr := placement.NormalizeKVType(adjustment.KVQuality)
 					if kvErr != nil {
@@ -3376,6 +3437,15 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 						return nil, strategy, serverArgs, err
 					}
 					continue
+				}
+				// A backend/model error that no ggrun rule classified (no OOM, no
+				// backendAdjustmentFromLog match, no known flag) is the launch-failure
+				// case the advisor exists for. Consult it for a DIAGNOSIS ONLY: the
+				// consultation never mutates the request or argv, and the launch still
+				// fails closed exactly as it would have without the advisor.
+				var unclassified *backendUnclassifiedProbeError
+				if errors.As(preflight.Err, &unclassified) {
+					adviseUnclassifiedLaunchFailure(req, cfg, model, be, caps, unclassified.LogExcerpt)
 				}
 				return nil, strategy, serverArgs, fmt.Errorf("memory preflight failed closed: %w", preflight.Err)
 			}

@@ -1,18 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"bytes"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/memprobe"
 	"github.com/raketenkater/ggrun/pkg/placement"
-	"net"
-	"time"
 )
 
 func TestFindFitParamsDoesNotCrossCustomForksViaPATH(t *testing.T) {
@@ -319,6 +320,65 @@ func TestBackendLoadFailureDiagnosticSkipsGenericTail(t *testing.T) {
 	}
 }
 
+// TestBackendUnclassifiedLogExcerptWindowsErrorLine checks that the excerpt
+// helper keeps the actionable error line and some surrounding context instead of
+// returning only the generic "unable to load model" tail, which is what the
+// crash-diagnosis hook feeds the advisor. The error line can be hundreds of
+// lines above the tail (the same point persistFailedAllocationProbe makes).
+func TestBackendUnclassifiedLogExcerptWindowsErrorLine(t *testing.T) {
+	var log strings.Builder
+	log.WriteString(strings.Repeat("load progress tensor blk.X\n", 200))
+	log.WriteString("GGML_ASSERT: quantized V cache not supported by this model\n")
+	log.WriteString(strings.Repeat("unable to load model\n", 3))
+	excerpt := backendUnclassifiedLogExcerpt(log.String())
+	if excerpt == "" {
+		t.Fatal("excerpt is empty")
+	}
+	if !strings.Contains(excerpt, "quantized V cache not supported") {
+		t.Fatalf("excerpt lost the actionable error line: %q", excerpt)
+	}
+	if len(excerpt) > len(log.String()) {
+		t.Fatalf("excerpt larger than source log")
+	}
+}
+
+// TestBackendUnclassifiedLogExcerptFallsBackToTail covers a log with no
+// classifyable error line: the excerpt must still be non-empty (the tail) rather
+// than empty, so the advisor gets something to read.
+func TestBackendUnclassifiedLogExcerptFallsBackToTail(t *testing.T) {
+	var log strings.Builder
+	log.WriteString(strings.Repeat("loading...\n", 600))
+	excerpt := backendUnclassifiedLogExcerpt(log.String())
+	if excerpt == "" {
+		t.Fatal("excerpt is empty for an error-less log")
+	}
+	if len(excerpt) > 2048 {
+		t.Fatalf("excerpt exceeds tail bound: %d bytes", len(excerpt))
+	}
+}
+
+// TestBackendUnclassifiedProbeErrorWrapsCause verifies the typed error that
+// marks the unclassified preflight path: it is advisory-only (wraps the real
+// cause) and detectable via errors.As, so the launch handler can consult the
+// advisor without changing launch behavior.
+func TestBackendUnclassifiedProbeErrorWrapsCause(t *testing.T) {
+	cause := errors.New("contained backend memory probe did not complete: GGML_ASSERT failed")
+	unclassified := &backendUnclassifiedProbeError{LogExcerpt: "GGML_ASSERT: quantized V cache not supported", Cause: cause}
+	if unclassified.Error() != cause.Error() {
+		t.Fatalf("wrapped error message differs from cause: %q vs %q", unclassified.Error(), cause.Error())
+	}
+	var got *backendUnclassifiedProbeError
+	if !errors.As(unclassified, &got) {
+		t.Fatal("errors.As could not recover the unclassified error")
+	}
+	if !errors.Is(unclassified, cause) {
+		t.Fatal("errors.Is on the cause failed")
+	}
+	if got.LogExcerpt == "" {
+		t.Fatal("log excerpt was not carried on the wrapped error")
+	}
+}
+
 func TestBackendAdjustmentFromLogDisablesUnsupportedKHadamard(t *testing.T) {
 	log := "DeepSeek4 K-cache Hadamard is not supported; use an untransformed K-cache\n"
 	got := backendAdjustmentFromLog(log)
@@ -339,6 +399,30 @@ func TestBackendAdjustmentFromLogIgnoresHarmlessVCacheWarning(t *testing.T) {
 	log := "DeepSeek4 has no independent V-cache; ignoring requested V-cache type q4_0\n"
 	if got := backendAdjustmentFromLog(log); got != nil {
 		t.Fatalf("harmless warning produced adjustment: %#v", got)
+	}
+}
+
+// TestBackendAdjustmentFromLogPromotesUnsupportedQuantizedVCache reproduces the
+// Inkling-Small launch failure: the backend rejects a compressed V cache
+// outright, and the retry must promote only the V leg to f16 while leaving K at
+// its requested quant.
+func TestBackendAdjustmentFromLogPromotesUnsupportedQuantizedVCache(t *testing.T) {
+	logs := []string{
+		"model does not support a quantized V cache (q4_0)\n",
+		"error: quantized V cache is not supported by this model\n",
+		"GGML_ASSERT: quantized V cache unsupported\n",
+	}
+	for _, log := range logs {
+		got := backendAdjustmentFromLog(log)
+		if got == nil {
+			t.Fatalf("quantized V cache error %q produced no adjustment", log)
+		}
+		if got.KVQualityV != "f16" {
+			t.Fatalf("quantized V cache error %q = %#v, want KVQualityV=f16", log, got)
+		}
+		if got.KVQuality != "" || got.RemoveFlag != "" {
+			t.Fatalf("quantized V cache adjustment must not touch K or remove flags: %#v", got)
+		}
 	}
 }
 

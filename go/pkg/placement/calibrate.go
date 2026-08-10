@@ -23,6 +23,14 @@ const CalibrationSchemaVersion = 3
 type CalibrationDecision struct {
 	SchemaVersion    int     `json:"schema_version"`
 	ScopeKey         string  `json:"scope_key"`
+	// ModelBasename is the basename of the model this decision measured, written
+	// beside the scope hash so a "clear caches" action can find every decision a
+	// model created. The scope key is an opaque hash of model+backend+hardware
+	// that cannot be reversed into a model identity, so clearing by model needs
+	// this explicit marker. Old decisions without the field stay valid for
+	// loading (scope-key validation is unchanged); they just cannot be matched
+	// for clearing.
+	ModelBasename    string  `json:"model_basename,omitempty"`
 	Winner           string  `json:"winner"` // candidate Name, e.g. "default" or "kv-alternate"
 	DefaultTPS       float64 `json:"default_tps"`
 	DefaultPromptTPS float64 `json:"default_prompt_tps"`

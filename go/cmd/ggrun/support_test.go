@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -48,6 +49,102 @@ func TestLaunchFailureIncidentContainsTypedEvidenceOnly(t *testing.T) {
 		if containsAdvisorAction(incident.AllowedActions, unsupported) {
 			t.Fatalf("incident advertised controller action %q that launch retry cannot execute", unsupported)
 		}
+	}
+}
+
+// The crash-diagnosis incident is advisory-only: no_action is the ONLY allowed
+// action, so even if the advisor model recommends a flag or placement change,
+// ValidateDecision rejects it and nothing reaches a launch. The backend's log
+// excerpt is carried as evidence (bounded), never as a shellable string.
+func TestUnclassifiedFailureIncidentIsAdvisoryOnly(t *testing.T) {
+	req := &launchRequest{CtxFlag: "131072", KVPlacement: "gpu", KVQuality: "q8_0", Parallel: 1}
+	model := &placement.ModelProfile{ModelArch: "inkling"}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "GPU", VRAMTotalMB: 24576}}, RAM: detect.RAMInfo{TotalMB: 128000, FreeMB: 64000}}
+	logExcerpt := "GGML_ASSERT: quantized V cache not supported by this model"
+	incident := unclassifiedFailureIncident(req, model, &backendInfo{Tag: "ik_llama", Identity: "build"}, caps, logExcerpt)
+
+	if len(incident.AllowedActions) != 1 || incident.AllowedActions[0] != advisor.ActionNoAction {
+		t.Fatalf("crash-diagnosis incident must allow only no_action, got %v", incident.AllowedActions)
+	}
+	if incident.ProfileState != "crash_diagnosis_advisory" {
+		t.Fatalf("profile state = %q, want crash_diagnosis_advisory", incident.ProfileState)
+	}
+	if incident.Settings["role"] != "crash_diagnosis_advisory" {
+		t.Fatalf("settings role = %q, want crash_diagnosis_advisory", incident.Settings["role"])
+	}
+	found := false
+	for _, obs := range incident.Observations {
+		if strings.Contains(obs.Attributes["backend_log_excerpt"], "quantized V cache") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("backend log excerpt was not carried as typed evidence")
+	}
+
+	// Any recommendation the model makes must be rejected by ValidateDecision
+	// against this incident — the consultation is diagnostic by construction.
+	if err := advisor.ValidateDecision(incident, advisor.Decision{
+		SchemaVersion: advisor.IncidentSchemaVersion, Action: advisor.ActionLowerUBatch, UBatch: 128, Confidence: 0.9,
+		Rationale: "drop ubatch",
+	}); err == nil {
+		t.Fatal("advisory-only incident accepted a placement-changing action")
+	}
+	if err := advisor.ValidateDecision(incident, advisor.Decision{
+		SchemaVersion: advisor.IncidentSchemaVersion, Action: advisor.ActionNoAction, Confidence: 0.9, Rationale: "unsupported feature",
+	}); err != nil {
+		t.Fatalf("no_action decision rejected: %v", err)
+	}
+}
+
+// adviseUnclassifiedLaunchFailure must respect the support_expert policy: off
+// never consults, and auto consults only when an artifact is already verified.
+// With support on, the seam is consulted and only the rationale is surfaced —
+// the request and its argv are untouched.
+func TestAdviseUnclassifiedLaunchFailurePolicyAndAdvisory(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.CacheDir = t.TempDir()
+	cfg.SupportExpert = "off"
+	req := &launchRequest{CtxFlag: "131072", KVPlacement: "gpu", KVQuality: "q8_0", Parallel: 1, ExtraArgs: []string{"--ctx-size", "131072"}}
+	model := &placement.ModelProfile{ModelArch: "inkling"}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "GPU", VRAMTotalMB: 24576}}, RAM: detect.RAMInfo{TotalMB: 128000, FreeMB: 64000}}
+	be := &backendInfo{Tag: "ik_llama", Identity: "build"}
+	before := fmt.Sprintf("%v", req.ExtraArgs)
+
+	original := runSupportIncidentFn
+	defer func() { runSupportIncidentFn = original }()
+	called := 0
+	runSupportIncidentFn = func(_ context.Context, _ *config.Config, _ *detect.Capabilities, _ string, incident advisor.Incident, _ bool) (advisor.Decision, advisor.RunReport, error) {
+		called++
+		if len(incident.AllowedActions) != 1 || incident.AllowedActions[0] != advisor.ActionNoAction {
+			t.Fatalf("seam received an incident that could change a launch: %v", incident.AllowedActions)
+		}
+		return advisor.Decision{
+			Action: advisor.ActionNoAction, Confidence: 0.5,
+			Rationale: "unsupported V cache", EvidenceCodes: []string{"internal:seam"},
+		}, advisor.RunReport{ReleaseVerified: true}, nil
+	}
+
+	// off: no consultation, request untouched.
+	adviseUnclassifiedLaunchFailure(req, cfg, model, be, caps, "log excerpt")
+	if called != 0 {
+		t.Fatalf("advisor consulted %d times with support off", called)
+	}
+	if fmt.Sprintf("%v", req.ExtraArgs) != before {
+		t.Fatalf("advisory consultation mutated request argv: %v", req.ExtraArgs)
+	}
+
+	// on: consultation happens through the seam, still advisory.
+	cfg.SupportExpert = "on"
+	adviseUnclassifiedLaunchFailure(req, cfg, model, be, caps, "log excerpt")
+	if called != 1 {
+		t.Fatalf("advisor consulted %d times with support on, want 1", called)
+	}
+	if fmt.Sprintf("%v", req.ExtraArgs) != before {
+		t.Fatalf("advisory consultation mutated request argv: %v", req.ExtraArgs)
+	}
+	if req.AdvisorVRAMPenaltyMB != nil || req.UBatchSizeSet {
+		t.Fatal("advisory consultation changed typed placement state")
 	}
 }
 

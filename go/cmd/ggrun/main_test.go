@@ -2968,3 +2968,20 @@ func TestComputeServerArgsAppliesCachedCalibrationWinner(t *testing.T) {
 		t.Fatal("daemon compute path did not consume the cached calibration winner")
 	}
 }
+
+// --no-cached-config must reach placement as SkipCachedConfig so the launch
+// derives fresh (placement cache, probe caches, and measured KV all ignored).
+func TestParseLaunchArgsNoCachedConfigFeedsPlacement(t *testing.T) {
+	isolateConfig(t)
+	req, err := parseLaunchArgs([]string{"model.gguf", "--no-cached-config"})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !req.NoCachedConfig {
+		t.Fatalf("expected --no-cached-config to set the launch request")
+	}
+	opts := placementOptionsFromRequest(req, &placement.ModelProfile{CTXTrain: 32768}, &backendInfo{Tag: "llama"}, t.TempDir())
+	if !opts.SkipCachedConfig {
+		t.Fatalf("expected placement options to receive SkipCachedConfig")
+	}
+}

@@ -72,6 +72,14 @@ type Strategy struct {
 	KVPlacement string       `json:"kv_placement"`        // gpu, cpu, auto
 	KVQuality   string       `json:"kv_quality"`          // high, mid, low
 	KVType      string       `json:"kv_type"`             // f16, q8_0, q4_0
+	// KVTypeV, when non-empty, overrides the V-cache leg emitted by Args. It
+	// carries a mixed K/V pair that placement sized under the unified estimate:
+	// the context fit is computed as if both legs used KVType, and only the
+	// emitted --cache-type-v differs (V promoted to f16). The estimate for a
+	// mixed pair is the same formula as a unified q8_0 V leg because the backend
+	// refuses compressed V for the architectures that set it, so the K leg is
+	// the only one the fitting logic may compress.
+	KVTypeV string `json:"kv_type_v,omitempty"`
 	NCPUMoE     int          `json:"n_cpu_moe,omitempty"` // for MoE offload
 	OTString    string       `json:"ot_string,omitempty"` // -ot override-tensor flags
 	// PlacementCachePath is the keyed file where this exact placement (model +
@@ -107,8 +115,14 @@ type Strategy struct {
 	BatchSize                    int    `json:"batch_size"`
 	UBatchSize                   int    `json:"ubatch_size"`
 	BackendTag                   string `json:"backend_tag,omitempty"` // "llama" or "ik_llama"
-	IsMoE                        bool   `json:"is_moe"`
-	ReasoningOff                 bool   `json:"reasoning_off"`      // default off for OpenAI compat
+	// ModelBasename is the basename of the model this placement was computed for
+	// (filepath.Base of the primary shard). Persisted alongside the placement
+	// cache so a "clear caches" action can match every .place file a model
+	// created without reconstructing the opaque cache key. Runtime-only; not part
+	// of the serialized strategy JSON.
+	ModelBasename string `json:"-"`
+	IsMoE         bool   `json:"is_moe"`
+	ReasoningOff  bool   `json:"reasoning_off"`      // default off for OpenAI compat
 	NoJinja                      bool   `json:"no_jinja,omitempty"` // omit `--jinja`; model template unparseable by the backend Jinja engine
 	ThreadsBatch                 int    `json:"threads_batch"`      // batch threads (logical cores)
 	Parallel                     int    `json:"parallel,omitempty"`
@@ -341,7 +355,11 @@ type Options struct {
 	ContextSize int
 	KVPlacement string // auto, gpu, cpu
 	KVQuality   string // high, mid, low
-	GPUs        []int  // restrict to specific GPUs
+	// KVQualityV forces the V-cache leg (--cache-type-v) to a specific type
+	// while KVQuality still sizes the unified plan. Used when a backend rejects
+	// a quantized V cache for an architecture whose K leg may still compress.
+	KVQualityV string
+	GPUs       []int // restrict to specific GPUs
 	// Companions reserves VRAM for co-launched helper models before the main
 	// model's split is computed, so the main plan packs around real helper
 	// footprints instead of discovering them after launch.
@@ -412,6 +430,14 @@ type Options struct {
 	// Set during a corrective OOM re-plan so it derives fresh from the penalized
 	// VRAM instead of reloading the placement that just OOM'd.
 	SkipPlacementCache bool
+	// SkipCachedConfig disables every cached measurement for this Compute — the
+	// keyed .place placement cache (implies SkipPlacementCache), probe caches
+	// (compute buffers, runtime growth, prompt cache), and measured KV
+	// rate/geometry — so the launch derives fresh from the model and hardware.
+	// Set by the TUI's "launch without cached config" toggle. Unlike clearing the
+	// files (ClearModelCaches), this is non-destructive: only this Compute
+	// ignores the caches, which are left on disk for later launches.
+	SkipCachedConfig bool
 }
 
 // ScopedBackendCacheTag returns the cache/probe namespace for a backend and
@@ -630,14 +656,18 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 
 	// Load any KV cache size llama.cpp measured for this model on a prior launch,
 	// so context sizing uses measured truth (exact for compressed attention).
-	if model.MeasuredKVBytesPerTok == nil {
-		if rates := loadMeasuredKVRates(opts.CacheDir, model); rates != nil {
-			model.MeasuredKVBytesPerTok = rates
+	// A "launch without cached config" skips measured KV too: it derives context
+	// and KV sizing fresh from the GGUF formula.
+	if !opts.SkipCachedConfig {
+		if model.MeasuredKVBytesPerTok == nil {
+			if rates := loadMeasuredKVRates(opts.CacheDir, model); rates != nil {
+				model.MeasuredKVBytesPerTok = rates
+			}
 		}
-	}
-	if model.MeasuredKVGeometry == nil {
-		if g := loadMeasuredKVGeometry(opts.CacheDir, model); g != nil {
-			model.MeasuredKVGeometry = g
+		if model.MeasuredKVGeometry == nil {
+			if g := loadMeasuredKVGeometry(opts.CacheDir, model); g != nil {
+				model.MeasuredKVGeometry = g
+			}
 		}
 	}
 
@@ -657,6 +687,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		Threads:        caps.CPU.Cores, // physical cores
 		ThreadsBatch:   caps.CPU.Cores, // physical cores
 		BackendTag:     opts.BackendTag,
+		ModelBasename:  filepath.Base(model.Path),
 		IsMoE:          model.IsMoE,
 		GPULayers:      999,
 		FlashAttention: true, // finalized against the resolved KV placement before each return
@@ -732,6 +763,25 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	s.KVType, kvErr = NormalizeKVType(s.KVQuality)
 	if kvErr != nil {
 		return nil, fmt.Errorf("KV cache type: %w", kvErr)
+	}
+
+	// Inkling-Small's backend refuses a quantized V cache ("model does not
+	// support a quantized V cache (q4_0)"), so the V leg is forced to f16 even
+	// when K is compressed. The memory plan and the context fit still price the
+	// unified KVType (the K leg is where compression lives; an f16 V leg on the
+	// models that need it is a fixed small overhead), and Args emits the V
+	// override so the backend never sees a compressed --cache-type-v. A retry
+	// adjustment that detected the same backend error at runtime arrives via
+	// opts.KVQualityV and takes the same path.
+	if model != nil && strings.EqualFold(model.ModelArch, "inkling") {
+		s.KVTypeV = "f16"
+	}
+	if opts.KVQualityV != "" {
+		if vType, verr := NormalizeKVType(opts.KVQualityV); verr != nil {
+			return nil, fmt.Errorf("KV V-cache type: %w", verr)
+		} else {
+			s.KVTypeV = vType
+		}
 	}
 
 	// Resolve KV placement "auto" → concrete value up-front so every caller and
@@ -886,7 +936,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			placeFile = s.PlacementCachePath
 		}
 	}
-	if opts.SkipPlacementCache {
+	if opts.SkipPlacementCache || opts.SkipCachedConfig {
 		placeFile = ""
 	}
 	if placeFile != "" && model.IsMoE {
@@ -955,7 +1005,9 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			// cache policy depends on current free RAM, slot count, and architecture,
 			// so recompute it on every launch instead of inheriting the zero-value
 			// checkpoint policy from the early cache-hit return.
-			LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+			if !opts.SkipCachedConfig {
+				LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+			}
 			s.CRAM, s.MaxCheckpoints = computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
 			s.CheckpointMinStep = checkpointMinStep(model, s.UBatchSize)
 			if opts.CacheRAMMB > 0 {
@@ -1012,7 +1064,9 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 
 	// Compute CRAM (prompt cache)
-	LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+	if !opts.SkipCachedConfig {
+		LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+	}
 	cram, maxCheckpoints := computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
 	if opts.CacheRAMMB > 0 {
 		cram = opts.CacheRAMMB
@@ -1060,6 +1114,21 @@ func resolveKVQuality(model *ModelProfile, requested, backendTag string) (string
 		}
 		if kvType != "f16" && kvType != "bf16" && kvType != "q8_0" {
 			return "", fmt.Errorf("DeepSeek-V4 on ik_llama supports only f16, bf16, or q8_0 K-cache; %s is unsupported", kvType)
+		}
+	}
+	// Inkling-Small's backend rejects a quantized V cache outright
+	// ("model does not support a quantized V cache (q4_0)"), so the V cache
+	// must stay f16 even when the K cache is compressed. K compression is still
+	// welcome — that is where the memory lives — so the unified quality returned
+	// here only chooses the K leg; Compute pins Strategy.KVTypeV to f16 for the
+	// inkling arch so Args emits --cache-type-v f16 alongside a compressed K.
+	// A compressed quality request must therefore NOT fail here: it compresses
+	// K, which is the point.
+	if model != nil && strings.EqualFold(model.ModelArch, "inkling") {
+		if requested != "" && !strings.EqualFold(requested, "auto") && !strings.EqualFold(requested, "high") {
+			if _, err := NormalizeKVType(requested); err != nil {
+				return "", fmt.Errorf("KV cache type: %w", err)
+			}
 		}
 	}
 	if requested == "" || strings.EqualFold(requested, "auto") {
@@ -1148,7 +1217,7 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 	if opts.RequireMeasuredBuffers {
 		computeBufMB = 0
 	}
-	pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
+	pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
 	if pc != nil && pc.ComputeBufMB > 0 {
 		computeBufMB = pc.ComputeBufMB
 	}
@@ -1210,7 +1279,7 @@ func buildSingleGPU(s *Strategy, caps *detect.Capabilities, model *ModelProfile,
 	if opts.RequireMeasuredBuffers {
 		computeBufMB = 0
 	}
-	if pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel); pc != nil {
+	if pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs); pc != nil {
 		if pc.ComputeBufMB > 0 {
 			computeBufMB = pc.ComputeBufMB
 		}
@@ -1237,7 +1306,7 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	if opts.RequireMeasuredBuffers {
 		computeBufMB = 0
 	}
-	pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
+	pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
 	if pc != nil && pc.ComputeBufMB > 0 {
 		probeHit = true
 		computeBufMB = pc.ComputeBufMB
@@ -1348,7 +1417,7 @@ func buildDenseCPUOffload(s *Strategy, caps *detect.Capabilities, model *ModelPr
 		if opts.RequireMeasuredBuffers {
 			computeBufMB = 0
 		}
-		pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
+		pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
 		if pc != nil && pc.ComputeBufMB > 0 {
 			computeBufMB = pc.ComputeBufMB
 		}
@@ -1694,7 +1763,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// Load per-model/runtime probe cache. Until a model has completed one launch
 	// with these settings, use a first-launch fallback that keeps the main GPU
 	// conservative without charging the full prompt graph to every secondary GPU.
-	pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
+	pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
 	fixedPerGPU := make([]int, numGPUs)
 	expertOnlyFixedPerGPU := make([]int, numGPUs)
 	for i, g := range caps.GPUs {
@@ -3192,6 +3261,20 @@ func kvTypeFromQuality(quality string) string {
 	return typeName
 }
 
+// vCacheType returns the V-cache type Args should emit for a strategy. A
+// strategy built with an explicit KVTypeV override (V promoted to f16 for a
+// model whose backend rejects compressed V) emits that type; otherwise K and V
+// stay the unified planned KVType.
+func vCacheType(s *Strategy) string {
+	if s != nil && s.KVTypeV != "" {
+		return s.KVTypeV
+	}
+	if s == nil {
+		return "q8_0"
+	}
+	return s.KVType
+}
+
 func exactKVTypeRequested(quality string) bool {
 	switch strings.ToLower(strings.TrimSpace(quality)) {
 	case "", "high", "mid", "low":
@@ -3661,7 +3744,7 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 	if opts.RequireMeasuredBuffers {
 		computeBufMB = 0
 	}
-	pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
+	pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
 	if pc != nil && pc.ComputeBufMB > 0 {
 		computeBufMB = pc.ComputeBufMB
 	}
@@ -4148,7 +4231,7 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 		"-b", fmt.Sprintf("%d", s.BatchSize),
 		"-ub", fmt.Sprintf("%d", s.UBatchSize),
 		"--cache-type-k", s.KVType,
-		"--cache-type-v", s.KVType,
+		"--cache-type-v", vCacheType(s),
 	)
 	// Tool calls require --jinja (the backend returns "tools param requires
 	// --jinja flag" without it). A model whose template the Jinja engine cannot
@@ -6019,6 +6102,17 @@ func parseMiB(line string) float64 {
 		return 0
 	}
 	return v
+}
+
+// loadProbeCacheForStrategy loads the probe cache for the given strategy under
+// these options. A "launch without cached config" (SkipCachedConfig) returns nil
+// so the launch derives fresh from the model and hardware instead of reusing
+// measured compute buffers, runtime growth, or prompt-cache sizes.
+func (o Options) loadProbeCacheForStrategy(model *ModelProfile, s *Strategy, gpus []detect.GPU) *probeCache {
+	if o.SkipCachedConfig {
+		return nil
+	}
+	return loadProbeCache(o.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(o), gpus, s.Parallel)
 }
 
 // loadProbeCache tries to load per-model/runtime probe data.

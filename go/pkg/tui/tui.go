@@ -101,6 +101,9 @@ type Model struct {
 	claudeCode     bool
 	supportExpert  string
 	supportOnline  bool
+	// noCachedConfig derives this launch fresh, ignoring cached placement/probe
+	// measurements (--no-cached-config). Per-launch; never persisted.
+	noCachedConfig bool
 	// claudeProfile is deliberately per-launch: an empty value preserves the
 	// CLI default instead of writing a scheduling policy into user config.
 	claudeProfile string
@@ -115,10 +118,11 @@ type Model struct {
 	inputMode string
 
 	// Settings screen (arrow-navigable list of all config options)
-	settingsCfg     *config.Config
-	swaFullTouched  bool
-	settingsCursor  int
-	ramLimitPercent int
+	settingsCfg      *config.Config
+	swaFullTouched   bool
+	kvQualityTouched bool
+	settingsCursor   int
+	ramLimitPercent  int
 
 	// Advanced (per-launch) config screen cursor
 	cfgCursor int
@@ -790,6 +794,7 @@ func (m *Model) applyLaunchRequestFields(req *LaunchRequest) {
 		m.supportExpert = req.SupportExpert
 		m.supportOnline = req.SupportOnline
 	}
+	m.noCachedConfig = req.NoCachedConfig
 	m.resumeSession, m.resumeRun, m.resumeCached = req.ResumeSession, "", 0
 	m.refreshTunedCounts()
 }
@@ -800,7 +805,7 @@ func (m Model) cfgRows() []string {
 	if m.selectedBackendRecipe() != nil {
 		rows = append(rows, "backend-install")
 	}
-	rows = append(rows, "context", "parallel", "kv", "swa", "tuned", "aitune")
+	rows = append(rows, "context", "parallel", "kv", "kvq", "swa", "tuned", "aitune")
 	if m.aitune {
 		rows = append(rows, "rounds")
 	}
@@ -929,6 +934,20 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 		} else {
 			m.kvPlacement = nextOption(order, m.kvPlacement)
 		}
+	case "kvq":
+		// Same ordering as the Settings screen's "KV quality" enum, so arrow
+		// cycling and the saved setting agree.
+		order := []string{"auto", "high", "bf16", "mid", "q8_0", "q5_1", "q5_0", "q4_1", "low", "q4_0", "iq4_nl", "f32"}
+		if dir < 0 {
+			m.kvQuality = prevOption(order, m.kvQuality)
+		} else {
+			m.kvQuality = nextOption(order, m.kvQuality)
+		}
+		// Cycling this row is a deliberate per-launch choice, so it goes out as
+		// an explicit flag. Merely inheriting the saved setting does not: that
+		// stays in config, where ggrun still applies it but may withdraw it on a
+		// memory failure.
+		m.kvQualityTouched = true
 	case "swa":
 		m.swaFull = !m.swaFull
 		// Cycling this row is a deliberate per-launch choice, so it goes out as
@@ -982,6 +1001,8 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 		m.openCfgInput("parallel", m.parallel, "Parallel slots (blank = let placement decide)")
 	case "kv":
 		m.cycleCfgRow("kv", 1)
+	case "kvq":
+		m.cycleCfgRow("kvq", 1)
 	case "swa":
 		m.cycleCfgRow("swa", 1)
 	case "tuned":
@@ -1087,6 +1108,8 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openCfgInput("parallel", m.parallel, "Parallel slots (blank = let placement decide)")
 	case "K":
 		m.cycleCfgRow("kv", 1)
+	case "k":
+		m.cycleCfgRow("kvq", 1)
 	case "w", "W":
 		m.cycleCfgRow("swa", 1)
 	case "a", "A":
@@ -1122,6 +1145,10 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openSelectedBackendInstall()
 	case "t", "T":
 		m.openTunedPicker()
+	case "y", "Y":
+		m.openClearCachesChoice(m.selectedModel)
+	case "g", "G":
+		m.noCachedConfig = !m.noCachedConfig
 	case "q", "Q":
 		return m, tea.Quit
 	}
@@ -1483,7 +1510,7 @@ func (m Model) viewModelConfig() string {
 	line("context", "[c] Context size", ctxLabel)
 	line("parallel", "[p] Parallel slots", parallelLabel)
 	line("kv", "[K] KV placement", kvLabel)
-	line("kvq", "KV quality", kvQualityLabel+"  (change in Settings)")
+	line("kvq", "[k] KV quality", kvQualityLabel)
 	swaLabel := m.swaLabel(model)
 	line("swa", "[w] Full SWA cache", swaLabel)
 
@@ -1505,10 +1532,16 @@ func (m Model) viewModelConfig() string {
 		line("claudeprofile", "Claude profile", claudeProfileLabel(m.claudeProfile))
 	}
 	line("benchmark", "[b] Benchmark mode", boolLabel(m.benchmark))
+	nocacheLabel := "off (reuse cached placement/probes)"
+	if m.noCachedConfig {
+		nocacheLabel = "on (derive fresh, ignore cached config)"
+	}
+	line("nocached", "[g] Launch without cached config", nocacheLabel)
 
 	section("Actions")
 	line("launch", "[L] Launch", "▶ start the server")
 	line("dryrun", "[D] Dry run", "print the command, don't run")
+	line("clearcaches", "[y] Clear caches", "drop cached placement/calibration for this model (keep GGUF)")
 
 	b.WriteString("\n" + mutedStyle.Render("  Enter on Launch to start · Esc to go back"))
 
@@ -2358,6 +2391,11 @@ func kvProfileFromGGUF(info *gguf.Info) *placement.ModelProfile {
 		FullAttnInterval: info.FullAttnInterval,
 		SlidingWindow:    info.SlidingWindow,
 		ModelArch:        info.Architecture,
+		// The KV rate/geometry cache (kvCachePath) is keyed on the model's exact
+		// byte size. Without it, the profile built here produces kv_<basename>_0
+		// which never matches the kv_<basename>_<actualsize> written at launch,
+		// so the TUI "Clear caches" action silently leaves the stale KV rate.
+		SizeBytes: info.NonExpertBytes + info.ExpertBytes,
 	}
 }
 
@@ -2816,6 +2854,52 @@ matched:
 	m.messageType = "info"
 }
 
+// openClearCachesChoice confirms before removing the selected model's cached
+// measurements (probe caches, KV rate/geometry, calibration decisions,
+// placement caches) while keeping the GGUF itself. Default cursor on Cancel.
+func (m *Model) openClearCachesChoice(idx int) {
+	if idx < 0 || idx >= len(m.models) {
+		return
+	}
+	name := m.models[idx].Name
+	m.openChoice("Clear caches for "+name+"?", []string{"Cancel", "Confirm: clear caches for " + name}, "Cancel", ScreenModelConfig, func(cm *Model, confirm string) {
+		if confirm == "Cancel" {
+			return
+		}
+		cm.clearModelCachesAt(idx)
+	})
+}
+
+// clearModelCachesAt removes the selected model's cached configs via
+// placement.ClearModelCaches (probe/KV/calibration/placement caches), keeps the
+// GGUF, and reports how many files were removed. Discovery can be stale (the
+// model may no longer be on disk), so build the model profile from the path
+// with whatever metadata the scanner already parsed; ClearModelCaches only
+// needs the basename identity to match cache headers.
+func (m *Model) clearModelCachesAt(idx int) {
+	if idx < 0 || idx >= len(m.models) {
+		return
+	}
+	item := m.models[idx]
+	profile := &placement.ModelProfile{Path: item.Path, Basename: filepath.Base(item.Path)}
+	if item.KVProfile != nil {
+		copy := *item.KVProfile
+		copy.Path = item.Path
+		if copy.Basename == "" {
+			copy.Basename = filepath.Base(item.Path)
+		}
+		profile = &copy
+	}
+	removed, err := placement.ClearModelCaches(m.cacheDir, profile)
+	if err != nil {
+		m.message = fmt.Sprintf("Error clearing caches for %s: %v", item.Name, err)
+		m.messageType = "error"
+		return
+	}
+	m.message = fmt.Sprintf("Cleared %d cached config(s) for %s. Next launch re-measures placement.", removed, item.Name)
+	m.messageType = "info"
+}
+
 func indexOf(opts []string, v string) int {
 	for i, o := range opts {
 		if o == v {
@@ -3029,8 +3113,9 @@ func (m Model) buildLaunchRequest() *LaunchRequest {
 		// The configured KV quality, not a hardcoded default: passing a fixed
 		// "mid" here overrode the user's saved setting with --kv-quality mid
 		// on every TUI launch (settings appeared to save but never applied).
-		KVQuality: m.kvQuality,
-		SWAFull:   m.swaFull,
+		KVQuality:    m.kvQuality,
+		KVQualitySet: m.kvQualityTouched,
+		SWAFull:      m.swaFull,
 		// Only emit --swa-full/--no-swa-full when this launch actually deviates
 		// from the saved setting. Emitting it unconditionally turned a stored
 		// preference into a command-line flag, and ggrun treats a typed flag as
@@ -3053,9 +3138,10 @@ func (m Model) buildLaunchRequest() *LaunchRequest {
 		Benchmark:     m.benchmark,
 		ClaudeCode:    m.claudeCode,
 		ClaudeProfile: m.claudeProfile,
-		SupportExpert: m.supportExpert,
-		SupportOnline: m.supportOnline,
-		SupportSet:    true,
+		SupportExpert:  m.supportExpert,
+		SupportOnline:  m.supportOnline,
+		SupportSet:     true,
+		NoCachedConfig: m.noCachedConfig,
 	}
 }
 
@@ -3083,10 +3169,11 @@ type LaunchRequest struct {
 	Port          int
 	CtxSize       int
 	CtxFlag       string
-	KVPlacement   string
-	KVQuality     string
-	SWAFull       bool
-	SWAFullSet    bool // TUI explicitly selected on/off; emit an override either way
+	KVPlacement    string
+	KVQuality      string
+	KVQualitySet   bool // TUI explicitly cycled KV quality; emit an explicit override
+	SWAFull        bool
+	SWAFullSet     bool // TUI explicitly selected on/off; emit an override either way
 	FlashAttn     bool
 	Parallel      int
 	ParallelSet   bool // user typed a parallel value (claude-code mode must not override)
@@ -3102,6 +3189,10 @@ type LaunchRequest struct {
 	SupportExpert string // optional native support/optimizer policy: off, auto, on
 	SupportOnline bool   // allow typed official llama.cpp research
 	SupportSet    bool   // TUI explicitly selected the support and research policy
+	// NoCachedConfig derives this launch fresh, skipping cached placement/probe
+	// measurements without deleting them (the "launch without cached config"
+	// escape hatch for a stale placement or probe).
+	NoCachedConfig bool
 }
 
 func (req *LaunchRequest) LaunchArgs() []string {
@@ -3122,7 +3213,11 @@ func (req *LaunchRequest) LaunchArgs() []string {
 	if req.KVPlacement != "" {
 		args = append(args, "--kv-placement", req.KVPlacement)
 	}
-	if req.KVQuality != "" {
+	// Only emit --kv-quality when this launch actually deviates from the saved
+	// setting, mirroring --swa-full above: a stored preference belongs in config,
+	// where ggrun still applies it but may withdraw it on a memory failure. A
+	// cycled row is an explicit per-launch choice and goes out as a typed flag.
+	if req.KVQualitySet && req.KVQuality != "" {
 		args = append(args, "--kv-quality", req.KVQuality)
 	}
 	if req.SWAFullSet {
@@ -3159,6 +3254,9 @@ func (req *LaunchRequest) LaunchArgs() []string {
 		} else {
 			args = append(args, "--no-support-online")
 		}
+	}
+	if req.NoCachedConfig {
+		args = append(args, "--no-cached-config")
 	}
 	if req.ClaudeCode {
 		args = append(args, "--claude-code")

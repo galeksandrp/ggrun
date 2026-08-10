@@ -1016,6 +1016,62 @@ func TestClaudeProfileSelectorCyclesPerLaunchOptions(t *testing.T) {
 	}
 }
 
+func TestKVQualityRowCyclesAndMarksTouched(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{{Name: "Laguna", Path: "/models/laguna.gguf"}},
+		selectedModel: 0,
+		backend:       "auto",
+		kvPlacement:   "auto",
+		kvQuality:     "auto",
+	}
+	if indexOf(m.cfgRows(), "kvq") < 0 {
+		t.Fatal("KV quality row missing from the Advanced config screen")
+	}
+
+	// Cycling the row advances through the option list and is a deliberate
+	// per-launch choice, so the launch request must emit it explicitly.
+	m.cycleCfgRow("kvq", 1)
+	if m.kvQuality != "high" || !m.kvQualityTouched {
+		t.Fatalf("next KV quality = %q touched=%v, want high/true", m.kvQuality, m.kvQualityTouched)
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || !req.KVQualitySet || req.KVQuality != "high" {
+		t.Fatalf("cycled KV quality did not reach launch request: %#v", req)
+	}
+	joined := strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(joined, "--kv-quality high") {
+		t.Fatalf("touched KV quality must be an explicit launch flag: %q", joined)
+	}
+
+	// Cycling left (dir -1) walks back toward auto.
+	m.cycleCfgRow("kvq", -1)
+	if m.kvQuality != "auto" {
+		t.Fatalf("prev KV quality = %q, want auto", m.kvQuality)
+	}
+}
+
+func TestLaunchArgsCarriesInheritedKVQualityWithoutFlag(t *testing.T) {
+	// A setting inherited from config must still reach the request value, but an
+	// untouched launch must not type --kv-quality: ggrun treats a typed flag as
+	// inviolable and would lock the recovery ladder out of withdrawing a quality
+	// that no longer fits. Mirror the --swa-full provenance rule.
+	m := Model{
+		models:        []ModelItem{{Name: "Laguna", Path: "/models/laguna.gguf"}},
+		selectedModel: 0,
+		backend:       "auto",
+		kvPlacement:   "auto",
+		kvQuality:     "q4_0",
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || req.KVQuality != "q4_0" || req.KVQualitySet {
+		t.Fatalf("inherited KV quality must reach the value without being marked explicit: %#v", req)
+	}
+	joined := strings.Join(req.LaunchArgs(), " ")
+	if strings.Contains(joined, "kv-quality") {
+		t.Fatalf("untouched KV quality must stay in config, not argv: %q", joined)
+	}
+}
+
 func TestLaunchArgsCarriesClaudeProfileOnlyForClaudeCode(t *testing.T) {
 	interactive := &LaunchRequest{
 		ModelPath:     "/models/test.gguf",
@@ -1413,5 +1469,209 @@ func TestRecommendedDownloadPromptsForDestination(t *testing.T) {
 	}
 	if m.pendingDownload.DownloadQuant != "UD-Q3_K_XL" {
 		t.Fatalf("selected quant not carried, got %q", m.pendingDownload.DownloadQuant)
+	}
+}
+
+// The model config screen's "y" shortcut must open the confirm-first clear
+// screen defaulting to Cancel, and confirming must remove only that model's
+// cached configs while keeping the GGUF and staying on the config screen.
+func TestClearCachesKeyOpensConfirmDefaultedToCancelAndClearsCaches(t *testing.T) {
+	cacheDir := t.TempDir()
+	modelDir := t.TempDir()
+	ggufPath := filepath.Join(modelDir, "cache-test-Q4_K_M.gguf")
+	if err := os.WriteFile(ggufPath, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A probe cache and a placement cache for this model, plus one for another.
+	// WriteProbeCacheForModel lands at the exact hashed path loadProbeCache reads,
+	// so the clear helper's header match is exercised against a real file.
+	profile := &placement.ModelProfile{Path: ggufPath, Basename: "cache-test-Q4_K_M", SizeBytes: 4, TotalSizeMB: 1,
+		NumLayers: 12, NumExperts: 16, EmbeddingLength: 2048, FeedForwardLength: 4096}
+	if err := placement.WriteProbeCacheForModel(cacheDir, profile, 4096, 512, "mid", "gpu", "llama", nil, map[int]int{0: 2048}, 128); err != nil {
+		t.Fatal(err)
+	}
+	other := &placement.ModelProfile{Path: "/models/Other.gguf", Basename: "Other", SizeBytes: 4, TotalSizeMB: 1,
+		NumLayers: 12, NumExperts: 16, EmbeddingLength: 2048, FeedForwardLength: 4096}
+	if err := placement.WriteProbeCacheForModel(cacheDir, other, 4096, 512, "mid", "gpu", "llama", nil, map[int]int{0: 2048}, 128); err != nil {
+		t.Fatal(err)
+	}
+	// A placement cache tagged with this model's basename (the same form
+	// Compute's StrategyToCacheEntry writes: filepath.Base(model.Path)).
+	place := placement.PlacementCachePathFor(cacheDir, profile, 4096, 512, "mid", "gpu", "llama", nil, 1, "", false)
+	if err := placement.SavePlacementCache(place, &placement.CacheEntry{
+		OTString: "exps=CPU", TensorSplit: []float64{1}, SplitMode: "layer",
+		NCPUMoE: 30, BatchSize: 2048, UBatchSize: 512, Parallel: 1, MMap: true, ModelBasename: filepath.Base(ggufPath),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Find the exact file paths the writers produced.
+	var probe, otherProbe string
+	entries, _ := os.ReadDir(cacheDir)
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".probe") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(cacheDir, ent.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), "cache-test-Q4_K_M") {
+			probe = filepath.Join(cacheDir, ent.Name())
+		} else if strings.Contains(string(data), "Other.gguf") {
+			otherProbe = filepath.Join(cacheDir, ent.Name())
+		}
+	}
+	if probe == "" || otherProbe == "" {
+		t.Fatalf("probe caches not written as expected: probe=%q other=%q", probe, otherProbe)
+	}
+
+	m := Model{
+		screen:        ScreenModelConfig,
+		modelDir:      modelDir,
+		cacheDir:      cacheDir,
+		models:        []ModelItem{{Name: "cache-test-Q4_K_M.gguf", Path: ggufPath}},
+		selectedModel: 0,
+	}
+	m.input = textinput.New()
+
+	// 'y' opens the confirm screen, cursor on Cancel.
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = nm.(Model)
+	if m.screen != ScreenChoice {
+		t.Fatalf("expected the 'y' shortcut to open the confirm screen, got screen=%v", m.screen)
+	}
+	if !strings.Contains(m.choiceTitle, "cache-test-Q4_K_M") {
+		t.Fatalf("confirm title should name the model, got %q", m.choiceTitle)
+	}
+	if m.choiceOptions[m.choiceCursor] != "Cancel" {
+		t.Fatalf("confirm cursor must default to Cancel, got %q", m.choiceOptions[m.choiceCursor])
+	}
+
+	// Cancel leaves everything in place.
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if _, err := os.Stat(probe); err != nil {
+		t.Fatalf("Cancel must not clear caches: %v", err)
+	}
+
+	// Reopen and confirm.
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = nm.(Model)
+	for i, opt := range m.choiceOptions {
+		if strings.HasPrefix(opt, "Confirm: clear caches for ") {
+			m.choiceCursor = i
+			break
+		}
+	}
+	nm, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if cmd != nil {
+		t.Fatal("clearing caches must not quit the TUI")
+	}
+	if m.screen != ScreenModelConfig {
+		t.Fatalf("expected to return to the model config screen, got %v", m.screen)
+	}
+	if _, err := os.Stat(probe); !os.IsNotExist(err) {
+		t.Errorf("model probe cache was not cleared (stat err=%v)", err)
+	}
+	if _, err := os.Stat(place); !os.IsNotExist(err) {
+		t.Errorf("model placement cache was not cleared (stat err=%v)", err)
+	}
+	if _, err := os.Stat(otherProbe); err != nil {
+		t.Errorf("other model's probe cache must survive: %v", err)
+	}
+	if _, err := os.Stat(ggufPath); err != nil {
+		t.Errorf("the GGUF must be kept: %v", err)
+	}
+	if m.messageType != "info" || !strings.Contains(m.message, "Cleared") {
+		t.Fatalf("expected an info message about clearing caches, got type=%q msg=%q", m.messageType, m.message)
+	}
+}
+
+// The lower-level clear path is guarded against an out-of-range index.
+func TestClearModelCachesAtOutOfRangeIsNoop(t *testing.T) {
+	m := Model{cacheDir: t.TempDir(), models: []ModelItem{{Name: "test.gguf"}}}
+	m.clearModelCachesAt(5)
+	if m.messageType == "error" {
+		t.Fatalf("out-of-range clear must be a silent no-op, got %q", m.message)
+	}
+}
+
+// The "g" shortcut on the model config screen toggles "launch without cached
+// config", which must reach the LaunchRequest as --no-cached-config.
+func TestNoCachedConfigToggleEmitsFlag(t *testing.T) {
+	m := Model{
+		screen:        ScreenModelConfig,
+		models:        []ModelItem{{Name: "test.gguf", Path: "/models/test.gguf"}},
+		selectedModel: 0,
+		kvPlacement:   "auto",
+		ctxMode:       "fit",
+		ctxSize:       "fit",
+	}
+	m.input = textinput.New()
+
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = nm.(Model)
+	if !m.noCachedConfig {
+		t.Fatal("'g' should enable launch-without-cached-config")
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || !req.NoCachedConfig {
+		t.Fatalf("launch request must carry NoCachedConfig, got %#v", req)
+	}
+	args := req.LaunchArgs()
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "--no-cached-config") {
+		t.Fatalf("expected --no-cached-config in launch args, got %q", joined)
+	}
+
+	// Toggling again restores the default.
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+	m = nm.(Model)
+	if m.noCachedConfig {
+		t.Fatal("'g' again should disable launch-without-cached-config")
+	}
+	req = m.buildLaunchRequest()
+	if req == nil || req.NoCachedConfig {
+		t.Fatalf("launch request must drop NoCachedConfig after toggling off, got %#v", req)
+	}
+}
+
+// "Launch without cached config" must round-trip through a replayed launch
+// request (Run latest configuration).
+func TestNoCachedConfigSurvivesReplay(t *testing.T) {
+	req := &LaunchRequest{ModelPath: "/models/test.gguf", NoCachedConfig: true}
+	m := Model{}
+	m.applyLaunchRequestFields(req)
+	if !m.noCachedConfig {
+		t.Fatal("replayed request must restore the no-cached-config toggle")
+	}
+}
+
+// The model config screen must advertise both cache-management actions: the
+// destructive "[y] Clear caches" and the per-launch "[g] Launch without cached
+// config" toggle, with the toggle reflecting its off state.
+func TestModelConfigViewAdvertisesCacheActions(t *testing.T) {
+	m := Model{
+		screen:        ScreenModelConfig,
+		models:        []ModelItem{{Name: "test.gguf", Path: "/models/test.gguf"}},
+		selectedModel: 0,
+		kvPlacement:   "auto",
+		kvQuality:     "mid",
+		ctxMode:       "fit",
+		ctxSize:       "fit",
+	}
+	v := m.viewModelConfig()
+	for _, want := range []string{"[y] Clear caches", "[g] Launch without cached config", "reuse cached placement/probes"} {
+		if !strings.Contains(v, want) {
+			t.Fatalf("model config view missing %q", want)
+		}
+	}
+	// The on state renders too.
+	m.noCachedConfig = true
+	v = m.viewModelConfig()
+	if !strings.Contains(v, "derive fresh, ignore cached config") {
+		t.Fatalf("model config view missing the no-cached-config on state")
 	}
 }
