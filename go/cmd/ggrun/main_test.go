@@ -1270,7 +1270,7 @@ func TestChooseAutoBackendPrefersCanonicalWhenBothSupportArchitecture(t *testing
 	got := chooseAutoBackend([]autoBackendCandidate{
 		{info: global},
 		{info: canonical, canonical: true},
-	}, "deepseek4", probe)
+	}, "deepseek4", probe, nil)
 	if got != canonical {
 		t.Fatalf("auto backend = %#v, want canonical %#v", got, canonical)
 	}
@@ -1285,7 +1285,7 @@ func TestChooseAutoBackendArchitectureSupportBeatsCanonicalPath(t *testing.T) {
 	got := chooseAutoBackend([]autoBackendCandidate{
 		{info: canonical, canonical: true},
 		{info: fork},
-	}, "future-arch", probe)
+	}, "future-arch", probe, nil)
 	if got != fork {
 		t.Fatalf("auto backend = %#v, want supporting fork %#v", got, fork)
 	}
@@ -1298,7 +1298,7 @@ func TestChooseAutoBackendHonoursRequiredIKFamily(t *testing.T) {
 	got := chooseAutoBackend([]autoBackendCandidate{
 		{info: mainline, canonical: true},
 		{info: ik, canonical: true},
-	}, "minimax-m3", unknownProbe)
+	}, "minimax-m3", unknownProbe, nil)
 	if got != ik {
 		t.Fatalf("auto backend = %#v, want required ik %#v", got, ik)
 	}
@@ -1310,9 +1310,88 @@ func TestChooseAutoBackendRejectsProfileIncompatibleCandidate(t *testing.T) {
 	got := chooseAutoBackend([]autoBackendCandidate{
 		{info: mainline, canonical: true, incompatible: true},
 		{info: ik, canonical: true},
-	}, "deepseek4", func(string, string) (bool, bool) { return true, true })
+	}, "deepseek4", func(string, string) (bool, bool) { return true, true }, nil)
 	if got != ik {
 		t.Fatalf("q4-compatible V4 backend = %#v, want ik %#v", got, ik)
+	}
+}
+
+// TestChooseAutoBackendPrefersFileBackedForLargeMoE guards FIX 2: for a
+// large-CPU-expert MoE (like the ~94GB-CPU-expert DeepSeek-V4 that was
+// OOM-killed under ik_llama's anonymous CUDA-host experts), auto selection must
+// prefer the file-backed mainline backend when both it and ik_llama are in the
+// same support class. This is exactly the case that previously lost: mainline
+// was marked incompatible for bf16 by resolveKVQuality, so ik_llama won by
+// default and the cgroup killed the launch.
+func TestChooseAutoBackendPrefersFileBackedForLargeMoE(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama", Dialect: "llama"}
+	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", Dialect: "ik_llama", IsIK: true}
+	probe := func(string, string) (bool, bool) { return true, true }
+
+	// Large MoE (94 GiB) with both backends viable: file-backed mainline wins
+	// over anonymous ik_llama even though ik_llama is listed first.
+	largeMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 94 * 1024}
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: ik},
+		{info: mainline},
+	}, "deepseek4", probe, largeMoE)
+	if got != mainline {
+		t.Fatalf("auto backend for large-CPU-expert MoE = %#v, want file-backed mainline %#v", got, mainline)
+	}
+
+	// A small MoE (below the threshold) keeps the pre-existing behavior:
+	// discovery order wins when nothing else separates the candidates, so ik_llama
+	// listed first is chosen.
+	smallMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 4 * 1024}
+	got = chooseAutoBackend([]autoBackendCandidate{
+		{info: ik},
+		{info: mainline},
+	}, "deepseek4", probe, smallMoE)
+	if got != ik {
+		t.Fatalf("auto backend for small MoE = %#v, want discovery-order ik %#v", got, ik)
+	}
+
+	// A large non-MoE model does not engage the tie-break either.
+	largeDense := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: false, TotalSizeMB: 94 * 1024}
+	got = chooseAutoBackend([]autoBackendCandidate{
+		{info: ik},
+		{info: mainline},
+	}, "deepseek4", probe, largeDense)
+	if got != ik {
+		t.Fatalf("auto backend for large dense = %#v, want discovery-order ik %#v", got, ik)
+	}
+}
+
+// TestChooseAutoBackendFileBackedBeatsCanonicalForLargeMoE verifies that the
+// memory tie-break outranks canonical locality for a large-CPU-expert MoE:
+// survival under the cgroup is more important than which path is under
+// APP_HOME, so a file-backed non-canonical backend beats a canonical anonymous
+// one. The tie-break is scoped to the same support class, and to the
+// large-CPU-expert-MoE case only.
+func TestChooseAutoBackendFileBackedBeatsCanonicalForLargeMoE(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama", Dialect: "llama"}
+	ikCanonical := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", Dialect: "ik_llama", IsIK: true}
+	probe := func(string, string) (bool, bool) { return true, true }
+	largeMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 94 * 1024}
+
+	// File-backed non-canonical mainline beats canonical anonymous ik for a
+	// large-CPU-expert MoE.
+	got := chooseAutoBackend([]autoBackendCandidate{
+		{info: ikCanonical, canonical: true},
+		{info: mainline},
+	}, "deepseek4", probe, largeMoE)
+	if got != mainline {
+		t.Fatalf("file-backed mainline must beat canonical anonymous ik for large MoE, got %#v", got)
+	}
+
+	// Without the tie-break (small MoE), canonical locality wins as before.
+	smallMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 4 * 1024}
+	got = chooseAutoBackend([]autoBackendCandidate{
+		{info: ikCanonical, canonical: true},
+		{info: mainline},
+	}, "deepseek4", probe, smallMoE)
+	if got != ikCanonical {
+		t.Fatalf("canonical ik must win over non-canonical mainline when tie-break not engaged, got %#v", got)
 	}
 }
 
@@ -2856,6 +2935,13 @@ func TestValidateHostMemoryContainmentFailClosed(t *testing.T) {
 	over := &placement.Strategy{Type: placement.MoEOffload, MMap: false, PlannedHostFootprintMB: 111000}
 	if err := validateHostMemoryContainment(req, caps, over); err == nil {
 		t.Fatal("over-ceiling --no-mmap plan must be refused")
+	}
+	// A large future prompt cache must also fit. The old headroom-only gate
+	// accepted this plan, then the post-canary resize silently clamped away part
+	// of CRAM and exposed the backend to another late cache-save OOM.
+	cacheOver := &placement.Strategy{Type: placement.MoEOffload, MMap: false, PlannedHostFootprintMB: 108000, CRAM: 8192}
+	if err := validateHostMemoryContainment(req, caps, cacheOver); err == nil {
+		t.Fatal("host footprint + CRAM above the ceiling must be refused")
 	}
 	// An mmap-backed plan is NOT refused: page cache can be reclaimed, so the
 	// mmap reclaim band absorbs overshoot (backendStartOptions moves the hard

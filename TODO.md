@@ -153,6 +153,187 @@ them. Default local launches use fail-closed Auto, never bypass mode.
 
 Sources: `db3f32cc/1`, `db3f32cc/2`, `db3f32cc/3`, user request 2026-07-12.
 
+## P1 — detach/attach: decouple Claude sessions from the backend
+
+Decouple the Claude Code frontend lifecycle from the backend process so N Claude
+sessions can connect to one persistent ggrun backend, closing a frontend must not
+kill the backend, and reopening connects back to the same backend instead of
+paying a 2–3 minute cold reload plus a full re-prefill.
+
+**Design summary.** Add a `--serve` mode to the existing `--claude-code` launch
+path and a `ggrun attach` / implicit-detach pair. `serve` runs the full,
+battle-tested `cmdLaunch` lifecycle (placement, reviewer companion, router,
+calibration, OOM recovery) but skips the foreground client: after
+`verifyAndActivateLaunch` it registers the backend in a small on-disk registry and
+blocks on the signal loop. `attach` reads the registry, probes the live backend,
+starts a fresh per-session `claudeauto` router pointed at it, resolves the session
+(fresh or `--resume`), and runs the client; on close it refreshes the session
+record and exits WITHOUT touching the backend.
+
+**1. Architecture: a persistent shared backend.**
+
+- Chosen form: `ggrun serve --model <model> [--port N]` — a foreground persistent
+  process, not a new supervisor. It is literally the existing Claude launch path
+  minus the client: placement computation through `verifyAndActivateLaunch`
+  (`go/cmd/ggrun/main.go:4499–4802`) is reused verbatim, including the reviewer
+  companion (`startClaudeAutoReviewer`), the Auto router (`claudeAuto.startRouter`),
+  calibration and the CUDA-OOM recovery/relaunch machinery.
+- `serve` hosts ONE model + placement, exactly like today's single-backend launch.
+  A second serve on the same port is refused by the existing `guardPortFree`
+  (`main.go:6631`). Multiple backends = multiple ports, one serve process each.
+- Registry: `serve` writes `<cacheDir>/serving-backends.json` atomically (mirroring
+  `claudesession.Save`): backend key → {model_path, port, server_args, reviewer_port,
+  started_at, attached_sessions[]}. This is the attach-discovery handle and the
+  ownership/refcount store.
+- The existing `ggrun daemon` (`go/pkg/daemon/daemon.go`) is the alternative
+  substrate but is deliberately stripped of the launch lifecycle (comment at
+  `main.go:6777`); extending it means hand-re-adding placement/calibration/OOM
+  recovery. `serve` gets all of that for free by reusing cmdLaunch. Leave the
+  daemon as-is; it remains the lightweight control-only path.
+
+**2. Connection model.**
+
+- Each session connects to its OWN loopback `claudeauto` router on an ephemeral
+  port (already per-launch, `main.go:4781`); N sessions run N routers, all pointing
+  `mainBaseURL` at the shared backend. The router is the per-client adapter
+  (message delimiters, image sanitization, classifier/utility lanes, per-session
+  admission + metrics — `go/pkg/claudeauto/claudeauto.go:297`), so sharing the
+  backend does not share session policy. `claudeCodeEnv` / `ANTHROPIC_BASE_URL`
+  are unchanged.
+- Slots: llama.cpp `--parallel N` divides `--ctx-size` into N slots of ctx/N.
+  Multiple sessions interleave over the shared slots; each session is a distinct
+  conversation (the router's scheduler already keys by `conversationKey`). More
+  sessions = smaller slots = earlier per-session compaction; the total context
+  budget is fixed. `--claude-max-active` per router caps each session's in-flight
+  requests.
+- Conversation state on frontend close: the DURABLE state is Claude Code's
+  transcript JSONL + workflow journal (what `--resume` restores). The backend KV /
+  prompt cache is an ephemeral performance cache only. A live backend retains the
+  KV for a detached session, so reattach re-prefills from prompt cache
+  (`--cache-reuse`) — fast but not guaranteed (other sessions or checkpoint
+  compaction can evict it). Correctness never depends on the backend surviving:
+  reattach degrades to full re-prefill, never to lost state.
+
+**3. Detach.**
+
+- What stops it today: `runClaudeCodeClient` returns, then `main.go:4935 p.Stop()`
+  kills the backend, `claudeAuto.stop()` (4938) tears the router down, and
+  `os.Exit(code)` (4939) leaves nothing behind. The backend is a child of the same
+  process, so even skipping Stop() leaves it in the terminal's process group
+  writing to the terminal — SIGHUP on terminal close kills it.
+- Detach = `--detach` on the `--claude-code` path (and the default behavior of
+  sessions started by `attach`): skip `p.Stop()`/`claudeAuto.stop()`, refresh the
+  session record (`refreshClaudeSessionRecord`), decrement the backend's attached
+  count, exit. Net-new: under `serve`, the backend is a child of `serve` (which
+  owns the terminal), so the SIGHUP problem only bites the
+  `--claude-code --detach` variant, which must setsid + redirect backend output to
+  a log file so closing the frontend's terminal cannot signal the backend.
+
+**4. Reattach.**
+
+- `ggrun attach [session-id | latest | <model>]`: read the registry (or probe a
+  recorded `Record.Port` via `isServerRunning`/`waitForHealth`, `main.go:6236`),
+  start a fresh router against the live backend (reuse
+  `claudeAutoRuntime.startRouter` with the serve-registered reviewer port), resolve
+  the session through the existing `claudeResumeSpec` so the `ShapeMismatches`
+  guard still applies against the LIVE backend's `server_args`, and run the client
+  with `--resume <id>`.
+- `Record.Port`/`ServerArgs` (`go/pkg/claudesession/claudesession.go:40`) finally
+  get a consumer: attach resolves the backend by model+placement, then uses the
+  recorded shape to guard the attach — exactly what `claude_resume.go:62` does for
+  a relaunch.
+- What the backend contributes to reattach: warm KV/prompt cache (speed only).
+  What the Record contributes: session identity, resume handle, shape guard.
+
+**5. Multi-session.**
+
+- Supported: SEPARATE conversations (different sessions/transcripts) on one
+  backend via shared slots. This is the primary goal — multiple ggrun sessions
+  onto one backend, each with its own transcript.
+- Not supported in phase 1: two frontends on the SAME session ID (parallel writers
+  to one transcript JSONL). Enforced by a per-session-ID lockfile next to the
+  record; launch/attach refuse while a client holds it. Same-conversation parallel
+  slots would also thrash the shared KV (two tails on one prefix).
+- The llama.cpp slot model is the boundary: sessions are not pinned to slots (slots
+  are assigned dynamically by prefix match), and a detached session's KV is
+  reclaimed by other traffic over time.
+
+**6. Lifecycle / ownership.**
+
+- `serve` owns the backend and stays up after the last session detaches (the
+  requested default). Opt-in `--stop-when-idle` stops the backend when the
+  attached count hits zero.
+- Refcounting: serve derives the attached count from the registry's session list
+  (attach POSTs a lease, detach releases it). serve's signal loop — already the
+  non-claude branch, `main.go:4945+` — keeps the process alive; its backend
+  crash/OOM relaunch loop and the health-monitor goroutine (`main.go:4856`) are
+  reused as-is, so a serve backend that dies relaunches with OOM evidence recorded.
+- UX: `ggrun serve ...` (start), `ggrun attach <session|model>` (reopen), closing
+  claude (implicit detach), `ggrun serve status` (backends + attached sessions).
+
+**7. Interaction with existing code — reuse vs net-new.**
+
+Reuse (existing code, no new logic):
+- Full launch lifecycle in `cmdLaunch` (`main.go:4475–4802`): placement, reviewer,
+  router, calibration, OOM recovery — `serve` gates on a `req.Serve` flag.
+- `claudeauto.StartRouter` + scheduler + `conversationKey`
+  (`go/pkg/claudeauto/`): per-session routers already multi-conversation-safe.
+- `claudesession.Record`, `claudeResumeSpec`, `ShapeMismatches`
+  (`go/pkg/claudesession`, `go/cmd/ggrun/claude_resume.go`): the attach shape guard.
+- `isServerRunning` / `waitForHealth` (`main.go:6236/6212`): attach probe.
+- `runClaudeCodeClient`, `claudeCodeEnv`, `claudeSessionArgs`,
+  `refreshClaudeSessionRecord`: client launch + session refresh.
+- `guardPortFree` for serve (kept as refusal); bypassed on attach.
+
+Net-new (the real work):
+- `--serve` flag handling in cmdLaunch: skip the client block, write
+  `<cacheDir>/serving-backends.json`, block on the signal loop.
+- `ggrun attach` command + a `connectClaudeSessionToBackend(cfg, backend, spec)`
+  helper that extracts the client block (`main.go:4843–4943`) into a reusable
+  connect path with backend teardown swapped for detach.
+- Detach plumbing: skip Stop, refresh record, decrement refcount; backend output
+  to a log file; setsid/process-group separation for `--claude-code --detach`.
+- Registry read/write + per-session-ID lockfile + `serve status` +
+  `--stop-when-idle`.
+
+**8. Risks.**
+
+- Session isolation: two frontends sharing one backend share slots; one session's
+  context growth evicts another's prompt cache and can starve it. Mitigation:
+  per-router admission limits (existing), per-session compaction windows (existing
+  env, derived from serverArgs), and surfacing slot/context per session in
+  `serve status`.
+- Same-conversation multi-writer: forbidden by the session-ID lockfile; must be
+  enforced in both `launch` and `attach`, not just documented.
+- Port contention: the registry can go stale (serve died, port reused by another
+  process). Attach must probe (`isServerRunning`) and refuse on shape mismatch
+  rather than trust the registry blindly; serve keeps `guardPortFree`.
+- Backend crash with sessions attached: 502s to live frontends; durable transcripts
+  survive so reattach recovers, but live sessions do not transparently re-home.
+  serve's relaunch (existing OOM loop) recovers the backend; frontends re-run the
+  failed turn from the transcript.
+- Context growth: total context is fixed; each extra session shrinks the effective
+  per-session budget. `--parallel` should be chosen for the expected session count
+  and per-session compaction tuned to the real slot.
+- RAM: a shared prompt cache grows with the number of distinct sessions' prefixes;
+  bounded by the existing MemoryMax/MemoryHigh cgroup band.
+
+Phases:
+- [ ] Phase 1 — `serve` + single-session `attach`/`detach`: `--serve` flag +
+  registry write + `connectClaudeSessionToBackend` + detach (skip stop, log-to-file)
+  + `ggrun attach <session-id|latest>`. Verify: start serve, attach, work, close
+  frontend, attach again against the SAME backend PID, second turn re-prefills fast
+  (prompt cache) — no cold reload.
+- [ ] Phase 2 — multi-session + ownership: `serve status`, refcount,
+  `--stop-when-idle`, per-session-ID lockfile, multiple concurrent frontends on one
+  backend. Verify: two sessions interleave on one backend, isolation via per-router
+  admission, per-session compaction windows.
+- [ ] Phase 3 — resilience: attach shape guard against the live backend (reuse
+  ShapeMismatches), stale-registry recovery (port re-resolution by model), serve
+  crash-relaunch with sessions notified, backend log rotation.
+
+Sources: current-architecture audit 2026-08-11 (detach/attach design task).
+
 ## P1 — finish existing product foundations
 
 - [ ] **TUI extra parameters:** add a free-text field to the model configuration

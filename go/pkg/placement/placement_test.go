@@ -782,7 +782,7 @@ func TestComputeDeepSeekV4FlashFirstLaunchExactBudget(t *testing.T) {
 		BackendTag:  "llama",
 		Parallel:    1,
 		CacheDir:    t.TempDir(),
-	}); err == nil || !strings.Contains(err.Error(), "requires f16 KV") {
+	}); err == nil || !strings.Contains(err.Error(), "requires f16 or bf16 KV") {
 		t.Fatalf("compressed mainline V4 KV must fail before planning, got %v", err)
 	}
 
@@ -1403,7 +1403,7 @@ func TestResolveKVQualityDeepSeekV4MainlineRequiresF16(t *testing.T) {
 		t.Fatalf("legacy/default mid V4 KV quality = %q, %v; want safe high/f16", got, err)
 	}
 
-	if _, err := resolveKVQuality(model, "q8_0", "llama"); err == nil || !strings.Contains(err.Error(), "requires f16 KV") {
+	if _, err := resolveKVQuality(model, "q8_0", "llama"); err == nil || !strings.Contains(err.Error(), "requires f16 or bf16 KV") {
 		t.Fatalf("exact compressed V4 KV must fail with correctness error, got %v", err)
 	}
 
@@ -1414,6 +1414,51 @@ func TestResolveKVQualityDeepSeekV4MainlineRequiresF16(t *testing.T) {
 	got, err = resolveKVQuality(&ModelProfile{ModelArch: "qwen3"}, "auto", "llama")
 	if err != nil || got != "mid" {
 		t.Fatalf("generic auto KV quality = %q, %v; want mid", got, err)
+	}
+}
+
+// TestResolveKVQualityDeepSeekV4MainlineAllowsBF16 guards FIX 1: mainline
+// llama.cpp must accept a bf16 K-cache for deepseek4, mirroring the reviewed
+// arch rule (pkg/backends/archconstraints.go permits f16 and bf16). bf16
+// carries no requantization loss on the FP8 attention weights, so it is as
+// correct as f16. Before this test, the mainline branch rejected bf16 with a
+// "requires f16 KV" error, which made ik_llama the only viable auto backend for
+// a bf16 launch and routed the large-CPU-expert model to a loader whose
+// anonymous CUDA-host experts OOM-killed it.
+func TestResolveKVQualityDeepSeekV4MainlineAllowsBF16(t *testing.T) {
+	model := &ModelProfile{ModelArch: "deepseek4"}
+
+	got, err := resolveKVQuality(model, "bf16", "llama")
+	if err != nil {
+		t.Fatalf("explicit bf16 V4 KV rejected by mainline: %v", err)
+	}
+	if got != "bf16" {
+		t.Fatalf("explicit bf16 V4 KV = %q, want bf16 preserved", got)
+	}
+
+	// bf16 must stay accepted across the whole mainline family (vulkan, metal).
+	for _, backendTag := range []string{"vulkan", "metal"} {
+		got, err := resolveKVQuality(model, "bf16", backendTag)
+		if err != nil || got != "bf16" {
+			t.Errorf("bf16 V4 KV on %s = %q, %v; want bf16 preserved", backendTag, got, err)
+		}
+	}
+
+	// f16 still maps to the f16 default "high", and compressed KV is still
+	// rejected on mainline for correctness.
+	got, err = resolveKVQuality(model, "f16", "llama")
+	if err != nil || got != "high" {
+		t.Fatalf("f16 V4 KV = %q, %v; want high/f16", got, err)
+	}
+	for _, compressed := range []string{"q8_0", "q4_0", "low"} {
+		if _, err := resolveKVQuality(model, compressed, "llama"); err == nil {
+			t.Errorf("compressed V4 KV %q accepted by mainline; must fail for correctness", compressed)
+		}
+	}
+	// Legacy presets auto/mid are promoted to f16, not rejected.
+	got, err = resolveKVQuality(model, "mid", "llama")
+	if err != nil || got != "high" {
+		t.Fatalf("legacy mid V4 KV = %q, %v; want safe high/f16", got, err)
 	}
 }
 
@@ -1433,7 +1478,7 @@ func TestResolveKVQualityDeepSeekV4IKRejectsUnsupportedKCache(t *testing.T) {
 
 func TestResolveKVQualityDeepSeekV4VulkanUsesMainlineSafetyRule(t *testing.T) {
 	model := &ModelProfile{ModelArch: "deepseek4"}
-	if _, err := resolveKVQuality(model, "q8_0", "vulkan"); err == nil || !strings.Contains(err.Error(), "requires f16 KV") {
+	if _, err := resolveKVQuality(model, "q8_0", "vulkan"); err == nil || !strings.Contains(err.Error(), "requires f16 or bf16 KV") {
 		t.Fatalf("Vulkan mainline accepted compressed DeepSeek4 KV: %v", err)
 	}
 	if got, err := resolveKVQuality(model, "f16", "vulkan"); err != nil || got != "high" {

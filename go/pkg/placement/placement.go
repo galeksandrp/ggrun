@@ -1132,7 +1132,9 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 // generic memory-quality policy. DeepSeek-V4's current mainline llama.cpp path
 // (CUDA, Vulkan, or Metal) produces incorrect output with compressed KV; a
 // configuration that fits but returns garbage must fail before placement or
-// launch.
+// launch. The reviewed correctness rule (pkg/backends/archconstraints.go)
+// permits f16 and bf16 for deepseek4 — bf16 carries no requantization loss, so
+// it is as safe as f16 — and rejects anything compressed (q8_0 and below).
 func resolveKVQuality(model *ModelProfile, requested, backendTag string) (string, error) {
 	requested = strings.TrimSpace(requested)
 	if model != nil && strings.EqualFold(model.ModelArch, "deepseek4") &&
@@ -1142,9 +1144,18 @@ func resolveKVQuality(model *ModelProfile, requested, backendTag string) (string
 			if err != nil {
 				return "", fmt.Errorf("KV cache type: %w", err)
 			}
-			if kvType != "f16" {
-				return "", fmt.Errorf("DeepSeek-V4 on mainline llama.cpp requires f16 KV for correct output; %s is unsupported", kvType)
+			if kvType != "f16" && kvType != "bf16" {
+				return "", fmt.Errorf("DeepSeek-V4 on mainline llama.cpp requires f16 or bf16 KV for correct output; %s is unsupported", kvType)
 			}
+			// "high" is the f16 default and the promoted value for legacy auto/mid
+			// requests, so an explicit f16 request falls through to it unchanged.
+			// bf16 must be preserved exactly: NormalizeKVType("high") is f16, so
+			// collapsing bf16 to "high" here would silently drop the caller's
+			// bf16 request back to f16 before placement.
+			if kvType == "bf16" {
+				return "bf16", nil
+			}
+			return "high", nil
 		}
 		return "high", nil
 	}
@@ -1538,6 +1549,15 @@ func backendUsesAnonymousCPUExperts(backendTag string) bool {
 	return t == "ik" || t == "ik_llama" ||
 		strings.Contains(t, "ik_llama") ||
 		t == "hy3" // noonr48/ik_llama-hy3 recipe (reviewed built-in)
+}
+
+// BackendUsesAnonymousCPUExperts exposes the loader-family predicate so backend
+// selection can prefer a backend whose CPU experts stay file-backed
+// (reclaimable) for large-CPU-expert MoE models. Anonymous CUDA-host experts
+// cannot be paged out under cgroup pressure; file-backed ones survive via the
+// mmap reclaim band.
+func BackendUsesAnonymousCPUExperts(backendTag string) bool {
+	return backendUsesAnonymousCPUExperts(backendTag)
 }
 
 func mmapCanPageCPUExperts(opts Options) bool {

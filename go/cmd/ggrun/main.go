@@ -1748,15 +1748,45 @@ func pathInsideDir(path, dir string) bool {
 
 type backendArchProbe func(binaryPath, arch string) (supported, probed bool)
 
+// autoBackendLargeMoEMinMB is the smallest MoE model for which the file-backed
+// CPU-expert tie-break in chooseAutoBackend engages. Below this an MoE either
+// fits on GPU or its CPU-expert footprint is small enough that anonymous versus
+// file-backed allocation does not decide survival under the cgroup.
+const autoBackendLargeMoEMinMB = 48 * 1024 // 48 GiB
+
+// cpuExpertsFileBacked reports whether a backend leaves CPU-offloaded expert
+// tensors file-backed (reclaimable) rather than in anonymous CUDA-host memory.
+// It mirrors placement.mmapCanPageCPUExperts, which makes the same distinction
+// through the loader-family predicate.
+func cpuExpertsFileBacked(be *backendInfo) bool {
+	if be == nil {
+		return false
+	}
+	return !placement.BackendUsesAnonymousCPUExperts(backendDialect(be))
+}
+
+// largeCPUMoEPrefersFileBacked reports whether this model is a large-CPU-expert
+// MoE for which the backend's memory behavior decides survival: a ~94GB
+// CPU-expert DeepSeek-V4 launch under ik_llama (anonymous CUDA-host experts,
+// unpagable under cgroup pressure) was OOM-killed, while mainline's file-backed
+// experts survive via the mmap reclaim band.
+func largeCPUMoEPrefersFileBacked(model *placement.ModelProfile) bool {
+	return model != nil && model.IsMoE && model.TotalSizeMB >= autoBackendLargeMoEMinMB
+}
+
 // chooseAutoBackend ranks candidates using facts from the parsed GGUF. A
 // proven-supporting backend wins over an unprobeable one, which wins over a
-// proven-unsupported backend. Within the same support class the canonical
-// production path wins, then discovery order keeps the result stable.
-func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe backendArchProbe) *backendInfo {
+// proven-unsupported backend. Within the same support class the memory behavior
+// of the loader wins for large-CPU-expert MoE models — file-backed experts stay
+// reclaimable under cgroup pressure, anonymous CUDA-host ones have OOM-killed
+// launches — then the canonical production path wins, then discovery order keeps
+// the result stable.
+func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe backendArchProbe, model *placement.ModelProfile) *backendInfo {
 	arch = strings.ToLower(strings.TrimSpace(arch))
 	required := backends.RequiredBackendForArch(arch)
 	recipeBacked := len(backends.RecipesForArch(arch)) > 0
-	bestIndex, bestSupport, bestCanonical := -1, -1, false
+	tieBreakFileBacked := largeCPUMoEPrefersFileBacked(model)
+	bestIndex, bestSupport, bestCanonical, bestFileBacked := -1, -1, false, false
 	for i, candidate := range candidates {
 		if candidate.info == nil {
 			continue
@@ -1783,9 +1813,31 @@ func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe bac
 				}
 			}
 		}
-		if bestIndex < 0 || support > bestSupport ||
-			(support == bestSupport && candidate.canonical && !bestCanonical) {
-			bestIndex, bestSupport, bestCanonical = i, support, candidate.canonical
+		candFileBacked := !candidate.incompatible && cpuExpertsFileBacked(candidate.info)
+		if bestIndex < 0 || support > bestSupport {
+			bestIndex, bestSupport, bestCanonical, bestFileBacked = i, support, candidate.canonical, candFileBacked
+			continue
+		}
+		if support != bestSupport {
+			continue
+		}
+		// Same support class. For a large-CPU-expert MoE the loader's memory
+		// behavior outranks canonical locality: file-backed experts stay
+		// reclaimable via the mmap reclaim band, while anonymous CUDA-host
+		// experts cannot be paged out and have OOM-killed launches. When the
+		// tie-break is not engaged, or both sides agree, fall through to the
+		// existing canonical-path preference.
+		if tieBreakFileBacked {
+			if candFileBacked && !bestFileBacked {
+				bestIndex, bestCanonical, bestFileBacked = i, candidate.canonical, true
+				continue
+			}
+			if !candFileBacked && bestFileBacked {
+				continue
+			}
+		}
+		if candidate.canonical && !bestCanonical {
+			bestIndex, bestCanonical = i, true
 		}
 	}
 	if bestIndex < 0 {
@@ -1888,7 +1940,7 @@ func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model 
 			candidates[i].incompatible = err != nil
 		}
 	}
-	chosen := chooseAutoBackend(candidates, arch, backends.BackendSupportsArch)
+	chosen := chooseAutoBackend(candidates, arch, backends.BackendSupportsArch, model)
 	if chosen != nil {
 		hasCanonical, chosenCanonical := false, false
 		for _, candidate := range candidates {
@@ -2664,8 +2716,9 @@ func validateHostMemoryContainment(req *launchRequest, caps *detect.Capabilities
 		return fmt.Errorf("host-memory containment limit is not positive")
 	}
 	// Fail-closed pre-launch gate (Fix B.4): refuse to start when the plan's own
-	// resident footprint plus the measured-footprint headroom would exceed the
-	// whole-host ceiling. The plan's expert bytes are exact, so a plan that can
+	// resident footprint plus its larger future reserve (measured-footprint
+	// headroom or CRAM) would exceed the whole-host ceiling. The plan's expert
+	// bytes are exact, so a plan that can
 	// only run by blowing past the ceiling is a plan that would OOM its own
 	// scope at runtime (the 41-layer V4 crash: planned ~116 GB vs a ~111 GB
 	// ceiling, --ctx-checkpoints 16). Refusing here forces a Fix-A re-plan (more
@@ -2677,10 +2730,14 @@ func validateHostMemoryContainment(req *launchRequest, caps *detect.Capabilities
 	// footprint, so the mmap reclaim band absorbs it (see backendStartOptions).
 	if req.CgroupHeadroomMB > 0 && strategy.PlannedHostFootprintMB > 0 && !strategy.MMap {
 		ceiling := backendMemoryMaxMB(req, caps)
-		if strategy.PlannedHostFootprintMB+req.CgroupHeadroomMB > ceiling {
+		plannedReserve := req.CgroupHeadroomMB
+		if strategy.CRAM > plannedReserve {
+			plannedReserve = strategy.CRAM
+		}
+		if strategy.PlannedHostFootprintMB+plannedReserve > ceiling {
 			return fmt.Errorf(
-				"planned host footprint %d MiB + cgroup headroom %d MiB exceeds the %d MiB whole-host ceiling; refusing to launch a server that cannot be contained (re-plan with fewer CPU expert layers)",
-				strategy.PlannedHostFootprintMB, req.CgroupHeadroomMB, ceiling,
+				"planned host footprint %d MiB + required reserve %d MiB (cgroup headroom %d MiB, CRAM %d MiB) exceeds the %d MiB whole-host ceiling; refusing to launch a server that cannot be contained (re-plan with fewer CPU expert layers)",
+				strategy.PlannedHostFootprintMB, plannedReserve, req.CgroupHeadroomMB, strategy.CRAM, ceiling,
 			)
 		}
 	}
