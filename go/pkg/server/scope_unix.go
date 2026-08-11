@@ -208,6 +208,34 @@ func scopeMemoryOOMKillCount(unit string) (uint64, error) {
 	return scopeMemoryOOMKillCountAt(cgroup)
 }
 
+// ScopeNonReclaimableMB reports the backend's current non-reclaimable host
+// footprint (anon + shmem + slab) from its own cgroup's memory.stat. This is
+// the measured post-launch footprint Fix B sizes the running scope's MemoryMax
+// against: model/server anon RSS, CPU-expert CUDA host buffers (shmem), KV,
+// context checkpoints, and prompt cache. Page cache is excluded as reclaimable.
+func (p *Process) ScopeNonReclaimableMB() (int, error) {
+	if p == nil || p.scopeUnit == "" {
+		return 0, fmt.Errorf("backend has no memory scope")
+	}
+	cgroup, err := scopeControlGroup(p.scopeUnit)
+	if err != nil {
+		return 0, err
+	}
+	return scopeNonReclaimableMB(cgroup)
+}
+
+// SetMemoryMaxMB raises the running backend scope's hard ceiling to memoryMaxMB
+// MiB. It is the post-launch half of measured-footprint containment: once the
+// backend is healthy and the canary has run, ggrun re-sizes the scope to the
+// real measured footprint plus headroom instead of the pre-launch plan estimate.
+// The clamp to the whole-host ceiling is the caller's responsibility.
+func (p *Process) SetMemoryMaxMB(memoryMaxMB int) error {
+	if p == nil || p.scopeUnit == "" {
+		return fmt.Errorf("backend has no memory scope")
+	}
+	return setScopeMemoryMaxMB(p.scopeUnit, memoryMaxMB)
+}
+
 func scopeMemoryOOMKillCountAt(cgroup string) (uint64, error) {
 	data, err := os.ReadFile("/sys/fs/cgroup" + cgroup + "/memory.events")
 	if err != nil {
@@ -221,4 +249,64 @@ func scopeMemoryOOMKillCountAt(cgroup string) (uint64, error) {
 		return strconv.ParseUint(fields[1], 10, 64)
 	}
 	return 0, nil
+}
+
+// scopeNonReclaimableMB reports the scope's non-reclaimable host memory:
+// anon + shmem + slab from memory.stat. This is exactly what the backend's
+// resident footprint is -- model/server anonymous RSS, CUDA host buffers for
+// CPU experts (shmem), KV, context checkpoints, and prompt cache. Page cache
+// (file-backed experts) is deliberately excluded: the kernel can evict it
+// under pressure, so no plan or limit should reserve it.
+func scopeNonReclaimableMB(cgroup string) (int, error) {
+	if cgroup == "" {
+		return 0, fmt.Errorf("empty scope control group")
+	}
+	statData, err := os.ReadFile("/sys/fs/cgroup" + cgroup + "/memory.stat")
+	if err != nil {
+		return 0, fmt.Errorf("read scope memory.stat: %w", err)
+	}
+	var totalBytes int64
+	for _, line := range strings.Split(string(statData), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		switch fields[0] {
+		case "anon", "shmem", "slab":
+			if v, convErr := strconv.ParseInt(fields[1], 10, 64); convErr == nil && v > 0 {
+				totalBytes += v
+			}
+		}
+	}
+	return int(totalBytes / (1024 * 1024)), nil
+}
+
+// setScopeMemoryMaxMB raises the running scope's hard memory ceiling by writing
+// the cgroup's memory.max directly. The user owns the scope, so a direct write
+// is allowed and avoids systemd's transient-unit set-property quirks; a
+// systemctl --user set-property fallback keeps DBus in the loop when the
+// direct write is not permitted.
+func setScopeMemoryMaxMB(unit string, memoryMaxMB int) error {
+	if unit == "" {
+		return fmt.Errorf("empty scope unit")
+	}
+	if memoryMaxMB <= 0 {
+		return fmt.Errorf("invalid memory max %d MiB", memoryMaxMB)
+	}
+	cgroup, err := scopeControlGroup(unit)
+	if err != nil {
+		return err
+	}
+	bytes := uint64(memoryMaxMB) * 1024 * 1024
+	path := "/sys/fs/cgroup" + cgroup + "/memory.max"
+	if err := os.WriteFile(path, []byte(strconv.FormatUint(bytes, 10)), 0o644); err == nil {
+		return nil
+	}
+	// Fallback: systemctl set-property on the transient unit. This goes through
+	// DBus and may fail for a scope that was never fully registered, which the
+	// caller treats as a non-fatal signal.
+	if exec.Command("systemctl", "--user", "set-property", unit, "MemoryMax", fmt.Sprintf("%d", bytes)).Run() == nil {
+		return nil
+	}
+	return fmt.Errorf("raise scope memory.max at %s", path)
 }

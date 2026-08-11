@@ -42,3 +42,11 @@ func scopeMemoryStats(string) (uint64, uint64, error, error) {
 	err := fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
 	return 0, 0, err, err
 }
+
+func scopeNonReclaimableMB(string) (int, error) {
+	return 0, fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
+}
+
+func setScopeMemoryMaxMB(string, int) error {
+	return fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
+}

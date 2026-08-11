@@ -24,6 +24,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.SWAFull {
 		t.Fatal("full SWA cache should default off")
 	}
+	if cfg.CgroupHeadroomMB != 4096 {
+		t.Fatalf("expected default cgroup headroom 4096 MiB, got %d", cfg.CgroupHeadroomMB)
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -91,6 +94,7 @@ func TestSaveAndLoad(t *testing.T) {
 		Host:            "0.0.0.0",
 		Spec:            "ngram",
 		RAMLimitPercent: 87,
+		CgroupHeadroomMB: 2048,
 	}
 
 	if err := cfg.Save(); err != nil {
@@ -104,6 +108,9 @@ func TestSaveAndLoad(t *testing.T) {
 
 	if loaded.Port != 9090 {
 		t.Fatalf("port mismatch: %d", loaded.Port)
+	}
+	if loaded.CgroupHeadroomMB != 2048 {
+		t.Fatalf("cgroup headroom mismatch: %d", loaded.CgroupHeadroomMB)
 	}
 	if loaded.ModelDir != "/test/models" {
 		t.Fatalf("model dir mismatch: %s", loaded.ModelDir)

@@ -254,6 +254,87 @@ func TestWaitReadyTimeout(t *testing.T) {
 	}
 }
 
+// TestScopeSetMemoryMaxMBAndNonReclaimable guards Fix B's server-side methods:
+// a real scoped launch can be re-sized by direct cgroup write (SetMemoryMaxMB)
+// and its measured non-reclaimable footprint (ScopeNonReclaimableMB) reads
+// anon+shmem+slab from the scope's own memory.stat. Both are what the launcher
+// uses to set the ceiling to measured+headroom after the canary.
+func TestScopeSetMemoryMaxMBAndNonReclaimable(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("systemd-run memory scopes are Linux-only")
+	}
+	if _, err := exec.LookPath("systemd-run"); err != nil {
+		t.Skip("systemd-run not installed")
+	}
+	if _, err := os.Stat("/sys/fs/cgroup/memory.stat"); err != nil {
+		t.Skip("cgroup v2 not available")
+	}
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not installed")
+	}
+	// Bind a dynamically-allocated port so parallel package tests never collide.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate test port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "srv.py")
+	content := "import http.server, socketserver, sys\n" +
+		"class H(http.server.BaseHTTPRequestHandler):\n" +
+		"    def do_GET(self):\n" +
+		"        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n" +
+		"    def log_message(self, *a): pass\n" +
+		"with socketserver.TCPServer(('127.0.0.1', " + strconv.Itoa(port) + "), H) as httpd:\n" +
+		"    httpd.serve_forever()\n"
+	if err := os.WriteFile(script, []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A healthy scoped server: readiness passes so the scope stays up (a failed
+	// start tears the scope down before the re-size could be observed).
+	p, err := StartWithTimeoutToOptions(
+		[]string{python, script},
+		port,
+		15*time.Second,
+		io.Discard,
+		io.Discard,
+		StartOptions{MemoryMaxMB: 1024},
+	)
+	if err != nil {
+		t.Fatalf("start healthy scoped server: %v", err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	// Re-size the running scope to a higher ceiling (the post-launch measured
+	// footprint + headroom path).
+	if err := p.SetMemoryMaxMB(2048); err != nil {
+		t.Fatalf("SetMemoryMaxMB: %v", err)
+	}
+	// The scope's own cgroup should now show the raised ceiling.
+	cgroup, cgErr := scopeControlGroup(p.scopeUnit)
+	if cgErr != nil {
+		t.Fatalf("scope control group: %v", cgErr)
+	}
+	data, readErr := os.ReadFile("/sys/fs/cgroup" + cgroup + "/memory.max")
+	if readErr != nil {
+		t.Fatalf("read memory.max: %v", readErr)
+	}
+	if got := strings.TrimSpace(string(data)); got != "2147483648" {
+		t.Fatalf("scope memory.max = %s, want 2147483648 (2048 MiB)", got)
+	}
+
+	// The non-reclaimable footprint must be readable and sane for a live scope.
+	nonReclaim, nrErr := p.ScopeNonReclaimableMB()
+	if nrErr != nil {
+		t.Fatalf("ScopeNonReclaimableMB: %v", nrErr)
+	}
+	if nonReclaim <= 0 {
+		t.Fatalf("expected a positive non-reclaimable footprint, got %d", nonReclaim)
+	}
+}
+
 func TestWaitReadyBoundsStalledHTTPRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()

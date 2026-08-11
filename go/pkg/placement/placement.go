@@ -69,9 +69,9 @@ type Strategy struct {
 	TensorSplit []float64    `json:"tensor_split,omitempty"`
 	SplitMode   string       `json:"split_mode,omitempty"` // graph, layer, row
 	MainGPU     int          `json:"main_gpu,omitempty"`
-	KVPlacement string       `json:"kv_placement"`        // gpu, cpu, auto
-	KVQuality   string       `json:"kv_quality"`          // high, mid, low
-	KVType      string       `json:"kv_type"`             // f16, q8_0, q4_0
+	KVPlacement string       `json:"kv_placement"` // gpu, cpu, auto
+	KVQuality   string       `json:"kv_quality"`   // high, mid, low
+	KVType      string       `json:"kv_type"`      // f16, q8_0, q4_0
 	// KVTypeV, when non-empty, overrides the V-cache leg emitted by Args. It
 	// carries a mixed K/V pair that placement sized under the unified estimate:
 	// the context fit is computed as if both legs used KVType, and only the
@@ -79,9 +79,9 @@ type Strategy struct {
 	// mixed pair is the same formula as a unified q8_0 V leg because the backend
 	// refuses compressed V for the architectures that set it, so the K leg is
 	// the only one the fitting logic may compress.
-	KVTypeV string `json:"kv_type_v,omitempty"`
-	NCPUMoE     int          `json:"n_cpu_moe,omitempty"` // for MoE offload
-	OTString    string       `json:"ot_string,omitempty"` // -ot override-tensor flags
+	KVTypeV  string `json:"kv_type_v,omitempty"`
+	NCPUMoE  int    `json:"n_cpu_moe,omitempty"` // for MoE offload
+	OTString string `json:"ot_string,omitempty"` // -ot override-tensor flags
 	// PlacementCachePath is the keyed file where this exact placement (model +
 	// ctx + ubatch + kv placement + backend + GPU set) is persisted, so a load
 	// that lands right — or is corrected by OOM-recovery — is reused next launch
@@ -123,10 +123,10 @@ type Strategy struct {
 	ModelBasename string `json:"-"`
 	IsMoE         bool   `json:"is_moe"`
 	ReasoningOff  bool   `json:"reasoning_off"`      // default off for OpenAI compat
-	NoJinja                      bool   `json:"no_jinja,omitempty"` // omit `--jinja`; model template unparseable by the backend Jinja engine
-	ThreadsBatch                 int    `json:"threads_batch"`      // batch threads (logical cores)
-	Parallel                     int    `json:"parallel,omitempty"`
-	CRAM                         int    `json:"cram,omitempty"` // prompt cache MB
+	NoJinja       bool   `json:"no_jinja,omitempty"` // omit `--jinja`; model template unparseable by the backend Jinja engine
+	ThreadsBatch  int    `json:"threads_batch"`      // batch threads (logical cores)
+	Parallel      int    `json:"parallel,omitempty"`
+	CRAM          int    `json:"cram,omitempty"` // prompt cache MB
 	// VRAMLedger explains, per GPU, how the expert placement was arrived at.
 	// Every question of the form "why is that card not full?" has been answered
 	// by reverse-engineering this arithmetic from the emitted -ot string and
@@ -330,6 +330,49 @@ func checkpointMinStep(model *ModelProfile, ubatch int) int {
 // MiB measured on this project) and --ctx-checkpoints caps how many survive, so
 // spacing far below the depth buys nothing but eviction churn.
 const checkpointMinStepFloor = 512
+
+// checkpointFootprintMB estimates the anonymous host RAM llama-server's
+// context-checkpoint state can add at runtime. create_checkpoint
+// (tools/server/server-context.cpp) saves slot state outside
+// llama_context::sched_reserve(), so neither our probe nor llama.cpp's own
+// --fit ever sees it. The span is 2*n_swa tokens (the checkpoint width used by
+// checkpointMinStep); a checkpoint holds the KV cells for that span, so its
+// cost scales with the model's measured KV bytes per token. The DeepSeek-V4
+// crash trace (~1050 MiB each at --ctx-checkpoints 16, up to ~16 GiB) is the
+// scale the plan must reserve against.
+//
+// kvTotalMB is the full-context KV the plan already prices; the per-checkpoint
+// share is kvTotalMB * (2*SlidingWindow / ContextSize). maxCheckpoints is the
+// --ctx-checkpoints cap (computeCRAM's 4..16 range); inside buildMoEOffload it
+// is not yet derived, so a caller passes 0 and the worst case the cache allows
+// (16) is reserved — a plan that survives 16 checkpoints survives any smaller
+// cap. Bounded so a pathological geometry cannot over-reserve.
+//
+// Returns 0 when the model has no sliding window (no checkpoint machinery in
+// this backend path).
+func checkpointFootprintMB(model *ModelProfile, maxCheckpoints, slots, kvTotalMB, ctxSize int) int {
+	if model == nil || model.SlidingWindow <= 0 || kvTotalMB <= 0 || ctxSize <= 0 {
+		return 0
+	}
+	if maxCheckpoints <= 0 {
+		maxCheckpoints = 16
+	}
+	if maxCheckpoints > 16 {
+		maxCheckpoints = 16
+	}
+	if slots < 1 {
+		slots = 1
+	}
+	perCheckpoint := kvTotalMB * (2 * model.SlidingWindow) / ctxSize
+	if perCheckpoint < 20 {
+		perCheckpoint = 20
+	}
+	reserve := maxCheckpoints * slots * perCheckpoint
+	if reserve > 16*1024 {
+		reserve = 16 * 1024
+	}
+	return reserve
+}
 
 // CompanionReservation reserves VRAM on one GPU for a co-launched helper model
 // (e.g. the Claude Auto safety reviewer) inside the same placement ledger as the
@@ -1789,19 +1832,23 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		}
 		runtimeGrowthMB := 0
 		if pc != nil {
-			// Use the aggregate (primary) compute buffer for split-owner cost
-			// accounting. The per-GPU values in the probe cache are measured
-			// for the specific placement that ran (e.g. GPU1 expert-only =
-			// 299 MB, GPU0 split-owner = 33 GB at ub=256). When the placement
-			// changes between measurement and this computation — which is
-			// exactly what a re-plan does — the per-GPU values are wrong: a
-			// GPU that was expert-only (299 MB) might become a split-owner
-			// (needing the full ~33 GB), or vice versa. The aggregate
-			// (primary's compute buffer) is the maximum any split-owner would
-			// need, so using it for all GPUs is conservative but correct.
-			// Expert-only GPUs use expertOnlyComputeReserveMB which caps at
-			// the compute floor, so the aggregate doesn't affect them.
-			if pc.ComputeBufMB > 0 {
+			// Charge a split-owner the compute buffer MEASURED for THIS device
+			// in the placement that ran (pc.ComputeBufByGPU), falling back to
+			// the primary's aggregate only when this GPU has no per-GPU reading
+			// (a role transition from expert-only to split-owner, where no
+			// split-owner measurement exists yet).
+			//
+			// The old code charged every split-owner the primary's aggregate
+			// (pc.ComputeBufMB), which for DeepSeek-V4 ub=512 was 9022 MiB
+			// oracle-planned while GPU2's real per-GPU value was 599 — collapsing
+			// a card that could hold 3 expert layers to 0. The per-GPU value is
+			// exactly right for a GPU staying in the same role, and that is the
+			// common case after a re-plan (the split shifts modestly, the role
+			// does not). Expert-only GPUs use expertOnlyComputeReserveMB which
+			// caps at the compute floor, so the aggregate never affects them.
+			if measuredPerGPU := pc.ComputeBufByGPU[g.Index]; measuredPerGPU > 0 {
+				computeBufMB = measuredPerGPU
+			} else if pc.ComputeBufMB > 0 {
 				computeBufMB = pc.ComputeBufMB
 			}
 			// Restore the expert-only compute buffer from the measured per-GPU
@@ -1863,6 +1910,22 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// must be free to fill that VRAM instead — otherwise every GPU sits half-empty
 	// holding room for a KV cache that's in system RAM.
 	gpuKVTotalMB := kvTotalMB
+	// Prefer the backend-MEASURED context total when this launch signature has
+	// observed evidence (scopedContextAllocationMB reads the exact key, so it
+	// never extrapolates across ctx/ubatch/slots). The crash trace showed the
+	// packer charging the computed kvTotalMB (2056 MiB on GPU0) while the probe
+	// measured CONTEXT_TOTAL_MB=5504 and the log showed `CUDA0 KV buffer size =
+	// 5376` — once Fix A makes rooms large enough to matter, under-charging KV
+	// OOMs the GPU at load. Only observed/guarded evidence replaces the estimate;
+	// an oracle prediction stays on the formula (the oracle estimates the startup
+	// graph, not the real allocation).
+	if s.KVPlacement != "cpu" {
+		if allocation, ok := LoadMeasuredAllocation(opts.CacheDir, model, s.ContextSize, s.UBatchSize,
+			s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel); ok &&
+			allocation.ContextTotalMB > 0 && observedAllocationEvidence(allocation.Evidence) {
+			gpuKVTotalMB = allocation.ContextTotalMB
+		}
+	}
 	if s.KVPlacement == "cpu" {
 		gpuKVTotalMB = 0
 	}
@@ -2229,7 +2292,15 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	if kvPlacementEffective == "cpu" {
 		cpuKVMB = kvTotalMB
 	}
-	ramNeeded := cpuExpertMB + cpuKVMB + ramOverheadMB + tokenEmbdMB
+	// Context-checkpoint state is anonymous runtime that no probe or --fit ever
+	// sees (create_checkpoint lives outside sched_reserve), so reserve it here in
+	// the plan footprint. Without this a plan that *just* passes the strict CPU
+	// ceiling can still blow past it once checkpoints accumulate -- the
+	// 41-layer V4 crash (plan ~116 GB vs 111 GB ceiling, --ctx-checkpoints 16).
+	// The reserve is an estimate; Fix B's measured re-size then clamps to the
+	// real footprint once the canary has grown the graph.
+	checkpointReserve := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
+	ramNeeded := cpuExpertMB + cpuKVMB + ramOverheadMB + tokenEmbdMB + checkpointReserve
 	ramAvailMB := caps.RAM.FreeMB
 
 	// Mmap decision for MoE — VRAM-aware, no guessed margin.
@@ -2343,6 +2414,16 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 // heuristic for ubatch values that were never actually measured.
 var UBatchFitLadder = []int{256, 128, 64}
 
+// maxCPUMoEFraction is the largest fraction of MoE layers a plan may leave on
+// CPU before the ubatch ladder descends to buy GPU residency. It replaces the
+// old "any usable plan" criterion, which accepted a plan putting 2 of 43 MoE
+// layers on GPU (a massive CPU over-fill) as healthy. A smaller ubatch's compute
+// buffer is far smaller (2.5-2.8 GB at ub=64 vs 17-20 GB at ub=512 measured on
+// DeepSeek-V4), so descending up to the point where >=75% of MoE layers sit on
+// GPU cuts anonymous CPU RAM -- the thing that OOM-kills --no-mmap -- without
+// chasing maximum GPU fill (which measurably loses prefill throughput).
+const maxCPUMoEFraction = 0.25
+
 // Automatic partial expert projection pins are intentionally disabled. Live
 // parallel-4 benchmarks showed that gate+up-only packing raised serial decode
 // 2.4% but reduced prompt-heavy aggregate throughput 17-19% because every
@@ -2409,20 +2490,22 @@ func maximizeMoEGPUFitByUBatch(base, s *Strategy, err error, caps *detect.Capabi
 		gpus = caps.GPUs
 	}
 	baseExcluded := numGPUsExcluded(s, gpus, model.NumLayers)
-	if err == nil && s != nil && s.NCPUMoE < moeCount {
-		// The largest ubatch already has a usable whole-layer plan. More GPU
-		// experts do not automatically mean a faster service: live MoE tests
-		// showed the smaller ubatch/denser placement can lose prompt and parallel
-		// throughput. Preserve the largest proven-fit prefill batch.
-		//
-		// A stranded GPU deliberately does NOT reopen the ladder. Descending a
-		// rung costs real prefill throughput on every request for the life of
-		// the server, while the GPU it rescues contributes at most a couple of
-		// expert layers. Measured 2026-08-02 on DeepSeek-V4-Flash: chasing
-		// "3/3 GPUs used" drove ubatch 512 -> 64, an 8x smaller prefill batch
-		// (47 t/s -> 16 t/s, a 30k-token prompt going from ~11 to 31 minutes),
-		// and the plan it settled on still left the third GPU with no expert
-		// range at all. Fit the weights around the ubatch, not the reverse.
+	// Descend the ladder when the base plan leaves a pathological fraction of MoE
+	// layers on CPU (more than ~25% of MoE layers off-GPU) even though it "fits".
+	// A smaller ubatch's compute buffer is far smaller (2.5-2.8 GB at ub=64 vs
+	// 17-20 GB at ub=512 measured on V4), buying real GPU residency and cutting
+	// anonymous CPU RAM -- the thing that OOM-kills --no-mmap.
+	//
+	// This deliberately replaces part of the old "any usable plan returns" early
+	// exit, which judged a plan that put only 2 of 43 MoE layers on GPU (a
+	// massive CPU over-fill) as "usable" and kept the largest ubatch's giant
+	// compute reserve. More GPU experts still do not automatically mean a faster
+	// service, so the ladder preserves as much prefill batching as the VRAM
+	// allows: it descends only until >=75% of MoE layers sit on GPU, never
+	// chasing "3/3 GPUs used" down to ub=64 on a rig where ub=128 suffices
+	// (measured 2026-08-02 on DeepSeek-V4-Flash: 47 t/s -> 16 t/s for an 8x
+	// smaller prefill batch). Fit the weights around the ubatch, not the reverse.
+	if err == nil && s != nil && s.NCPUMoE <= int(float64(moeCount)*maxCPUMoEFraction) {
 		return s, nil
 	}
 	best, bestErr, bestExcluded := s, err, baseExcluded
@@ -3901,7 +3984,14 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 	// count at all, which is why it could not be compared across slot settings:
 	// the same 9728 MiB came out at one slot and at four.
 	if measured := measuredPromptCacheBudgetMB(s, slots); measured > cram {
+		// A measured target is a capacity requirement, not an estimate that is
+		// safe to shave. Round it up here so the final round-down below cannot
+		// leave the cache a few MiB short of the slots+spare working set and
+		// recreate the exact eviction cycle the measurement was meant to fix.
 		cram = measured
+		if rem := cram % cramQuantumMB; rem != 0 {
+			cram += cramQuantumMB - rem
+		}
 	}
 	// Never take RAM the weights and their working set need: the backend runs
 	// inside a memory scope, and a cache that pushes it over the limit trades a
@@ -5032,7 +5122,11 @@ func RecordMeasuredComputeBuffers(cacheDir string, model *ModelProfile, ctxSize,
 		}
 		kvPerLayerMB = pc.KVPerLayerMB
 	}
-	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, growth, estimatedByGPU, kvPerLayerMB)
+	// This recorder is the no-alloc fit ORACLE. Its numbers are predictions, so
+	// they are always tagged oracle-planned regardless of what the key already
+	// holds; the merge then lets a prior observed (guarded/live) measurement win
+	// over them (see writeProbeCacheForModel evidence priority).
+	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, growth, estimatedByGPU, kvPerLayerMB, probeMeasurements{ComputeBufEvidence: "oracle-planned"})
 }
 
 // RunPostLaunchModelProbe records measured compute-buffer data for the exact
@@ -5474,7 +5568,10 @@ func RunPostLaunchModelProbe(cacheDir string, model *ModelProfile, ctxSize, ubat
 	if len(computeByGPU) == 0 && kvPerLayerMB <= 0 {
 		return false
 	}
-	if err := writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, nil, nil, kvPerLayerMB); err == nil {
+	// A live launch is a real backend observation: tag the compute buffers as
+	// live-allocated so they stay authoritative over any fit-oracle prediction
+	// that later runs for the same key.
+	if err := writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel, computeByGPU, nil, nil, kvPerLayerMB, probeMeasurements{ComputeBufEvidence: "live-allocated"}); err == nil {
 		if len(computeByGPU) == 0 {
 			return true
 		}
@@ -6184,6 +6281,8 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			}
 		case k == "PROBED_ALLOCATION_EVIDENCE":
 			pc.AllocationEvidence = val
+		case k == "PROBED_COMPUTE_BUF_EVIDENCE":
+			pc.ComputeBufEvidence = val
 		case strings.HasPrefix(k, "PROBED_CONTEXT_MB_CUDA"):
 			idxRaw := strings.TrimPrefix(k, "PROBED_CONTEXT_MB_CUDA")
 			idx, idxErr := strconv.Atoi(idxRaw)
@@ -6403,6 +6502,11 @@ func hostOverheadMB(liveNonReclaimableMB, accountedHostMB int) (int, bool) {
 type probeCache struct {
 	ComputeBufMB    int
 	ComputeBufByGPU map[int]int
+	// ComputeBufEvidence is the evidence class of the ComputeBuf values:
+	// "oracle-planned", "guarded-allocated", "live-allocated", or another
+	// backend-reported level. On read, observed evidence is preferred over
+	// oracle-planned when both could apply.
+	ComputeBufEvidence string
 	// ContextTotalMB is the backend-authoritative context allocation for this
 	// exact runtime signature. Unlike the legacy model-wide bytes/token cache it
 	// is never extrapolated to another context, backend build, slot count, KV
@@ -6537,7 +6641,28 @@ type probeMeasurements struct {
 	UnaccountedByGPU   map[int]int
 	UnaccountedHostMB  int
 	AllocationEvidence string
+	// ComputeBufEvidence tags the computeByGPU values this write carries, so the
+	// merge can keep an observed (guarded/live) measurement authoritative over a
+	// later fit-oracle prediction. Empty means the caller gave no tag; the merge
+	// then treats the incoming values as oracle-planned (the conservative choice:
+	// they never clobber observed evidence). See observedAllocationEvidence.
+	ComputeBufEvidence string
 	ClearRuntimeGrowth bool
+}
+
+// observedAllocationEvidence reports whether evidence came from a real backend
+// observation (guarded/live allocation, an allocation-verified guarded probe, or
+// a backend-reported ledger) rather than the no-alloc fit oracle's prediction.
+// Observed values are authoritative over oracle-planned ones on write and read:
+// the oracle estimates the startup graph, a launch measures what the backend
+// actually reserved. "fit-params" is deliberately NOT observed — it is the same
+// oracle under a legacy name.
+func observedAllocationEvidence(evidence string) bool {
+	switch evidence {
+	case "live-allocated", "guarded-allocated", "allocation-verified", "backend-measured":
+		return true
+	}
+	return false
 }
 
 // probeCacheSchema 7 is the first version that records the conditions its
@@ -6661,9 +6786,42 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	mergedGrowth := map[int]int{}
 	mergedEstimated := map[int]bool{}
 	if existing := previous; existing != nil {
-		for idx, v := range existing.ComputeBufByGPU {
-			if v > mergedCompute[idx] {
-				mergedCompute[idx] = v
+		// Evidence priority on merge: an OBSERVED compute-buffer measurement for
+		// this key (guarded/live allocation, allocation-verified probe, or a
+		// backend-reported ledger) beats an oracle-planned prediction from a
+		// fit run, in EITHER direction. The oracle estimates the startup graph; a
+		// launch measures what the backend really reserved. Without this an
+		// oracle-planned 9022 MiB (DeepSeek-V4 ub=512) wrote over a
+		// live-allocated 3649 MiB from the crash launch and was replayed forever,
+		// and a later fit run would keep re-predicting over the real observation.
+		incomingObserved := observedAllocationEvidence(measured.ComputeBufEvidence)
+		priorObserved := observedAllocationEvidence(existing.ComputeBufEvidence)
+		if incomingObserved && !priorObserved {
+			// A real observation supersedes the prior oracle prediction even when
+			// smaller. mergedCompute starts from the incoming observed rows; add
+			// only the prior rows this observation did not cover (fallback-only).
+			for idx, v := range existing.ComputeBufByGPU {
+				if _, live := computeByGPU[idx]; !live && v > mergedCompute[idx] {
+					mergedCompute[idx] = v
+				}
+			}
+		} else if !incomingObserved && priorObserved {
+			// The oracle must not overwrite a prior observation. Start from the
+			// prior observed rows; keep oracle predictions only for devices the
+			// observed run never covered.
+			mergedCompute = copyProbeIntMap(existing.ComputeBufByGPU)
+			for idx, v := range computeByGPU {
+				if _, prior := existing.ComputeBufByGPU[idx]; !prior && v > mergedCompute[idx] {
+					mergedCompute[idx] = v
+				}
+			}
+		} else {
+			// Like-for-like (both observed or both oracle/unknown): retain the
+			// larger reserve for each device.
+			for idx, v := range existing.ComputeBufByGPU {
+				if v > mergedCompute[idx] {
+					mergedCompute[idx] = v
+				}
 			}
 		}
 		if !measured.ClearRuntimeGrowth {
@@ -6717,6 +6875,24 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	}
 	if maxCompute > 0 {
 		fmt.Fprintf(&b, "PROBED_COMPUTE_BUF_MB=%d\n", maxCompute)
+	}
+	// Persist the evidence class for the compute-buffer values so a later reader
+	// can prefer observed measurements over oracle predictions. The tag must
+	// describe what actually dominates the merged rows: an observed incoming
+	// measurement (or a retained prior observation that beat a fresh oracle) is
+	// observed; only when nothing observed is present does the file fall back to
+	// oracle-planned.
+	if len(mergedCompute) > 0 {
+		evidence := "oracle-planned"
+		incomingObserved := observedAllocationEvidence(measured.ComputeBufEvidence)
+		priorObserved := previous != nil && observedAllocationEvidence(previous.ComputeBufEvidence)
+		switch {
+		case incomingObserved:
+			evidence = measured.ComputeBufEvidence
+		case priorObserved:
+			evidence = previous.ComputeBufEvidence
+		}
+		fmt.Fprintf(&b, "PROBED_COMPUTE_BUF_EVIDENCE=%s\n", evidence)
 	}
 	// Outside the compute-buffer branch on purpose: these were nested inside it,
 	// so a prompt-cache measurement was discarded on every write that had no

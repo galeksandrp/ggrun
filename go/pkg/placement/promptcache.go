@@ -43,6 +43,21 @@ var promptCacheEntryRe = regexp.MustCompile(`entry \(size = ([0-9.]+) MiB\)`)
 var promptCacheSkipRe = regexp.MustCompile(
 	`prompt state size ([0-9.]+) MiB exceeds cache size limit ([0-9.]+) MiB`)
 
+// Some compatible backends (notably ik_llama) log the sequence state size
+// before allocating a prompt-cache entry, but do not reject an over-limit
+// entry before copying it. If that copy exhausts the memory scope there is no
+// cache-state, eviction, or skip line for the next launch to learn from.
+//
+// A cache entry is the sequence state plus every context checkpoint copied
+// with the prompt. Both quantities are printed before the copy, so reconstruct
+// the full entry from those backend-authoritative figures. This also lets a
+// healthy first save teach the next launch without waiting for cache pressure.
+var promptCacheSaveRe = regexp.MustCompile(
+	`saving prompt with length\s+\d+,\s+total state size\s*=\s*([0-9.]+)\s*MiB`)
+
+var promptCheckpointCreateRe = regexp.MustCompile(
+	`created context checkpoint\s+(\d+)\s+of\s+\d+.*size\s*=\s*([0-9.]+)\s*MiB`)
+
 // PromptCacheObservation is what a backend log revealed about the prompt cache.
 type PromptCacheObservation struct {
 	// BytesPerToken is total cached bytes over total cached tokens. Zero when
@@ -99,6 +114,40 @@ func ObservePromptCache(logText string) PromptCacheObservation {
 		obs.Skipped++
 		if v, err := strconv.ParseFloat(m[1], 64); err == nil && v > obs.LargestEntryMB {
 			obs.LargestEntryMB = v
+		}
+	}
+
+	// Reconstruct saved-entry size in log order. Use the largest checkpoint
+	// ordinal and size observed in the run: a branch can reduce the current count
+	// immediately before the first cache save, but the cache must still be able
+	// to hold the larger state this same workload already demonstrated. Combining
+	// the maxima can overestimate a little; that is bounded by computeCRAM's host
+	// ceiling, while underestimating can make the backend die during the very save
+	// needed to produce better evidence.
+	checkpointCount := 0
+	checkpointSizeMB := 0.0
+	for _, line := range strings.Split(logText, "\n") {
+		if m := promptCheckpointCreateRe.FindStringSubmatch(line); m != nil {
+			count, err1 := strconv.Atoi(m[1])
+			sizeMB, err2 := strconv.ParseFloat(m[2], 64)
+			if err1 == nil && err2 == nil && count >= 0 && sizeMB > 0 {
+				if count > checkpointCount {
+					checkpointCount = count
+				}
+				if sizeMB > checkpointSizeMB {
+					checkpointSizeMB = sizeMB
+				}
+			}
+		}
+		if m := promptCacheSaveRe.FindStringSubmatch(line); m != nil {
+			stateMB, err := strconv.ParseFloat(m[1], 64)
+			if err != nil || stateMB <= 0 {
+				continue
+			}
+			entryMB := stateMB + float64(checkpointCount)*checkpointSizeMB
+			if entryMB > obs.LargestEntryMB {
+				obs.LargestEntryMB = entryMB
+			}
 		}
 	}
 	return obs

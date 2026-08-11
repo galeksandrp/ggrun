@@ -526,36 +526,41 @@ func cmdDetect() {
 }
 
 type launchRequest struct {
-	ModelPath            string
-	Port                 int
-	CtxFlag              string
-	KVPlacement          string
-	KVQuality            string
+	ModelPath   string
+	Port        int
+	CtxFlag     string
+	KVPlacement string
+	KVQuality   string
 	// KVQualityV forces the V-cache leg (--cache-type-v) to a fixed type while
 	// KVQuality still sizes the unified plan. Set by the backend-compatibility
 	// retry when a backend rejects a quantized V cache for a model whose K leg
 	// may stay compressed; persisted on the request so every later re-plan
 	// (OOM recovery, measured-evidence recompute) keeps the override.
-	KVQualityV           string
-	KVTypeK              string // explicit llama.cpp --cache-type-k override
-	KVTypeV              string // explicit llama.cpp --cache-type-v override
-	CPUMode              bool
-	GPUsFlag             string
-	Host                 string
-	VisionAuto           bool
-	MMProjPath           string
-	ServerBin            string
-	ServerBinExplicit    bool
-	AppHome              string
-	Backend              string
-	BackendExplicit      bool
-	TuneCache            string
-	SpecMode             string
-	ForceSpecMoE         bool
-	RamBudgetMB          int
-	RAMLimitPercent      int
-	VRAMHeadroomMB       int
-	RAMHeadroomMB        int
+	KVQualityV        string
+	KVTypeK           string // explicit llama.cpp --cache-type-k override
+	KVTypeV           string // explicit llama.cpp --cache-type-v override
+	CPUMode           bool
+	GPUsFlag          string
+	Host              string
+	VisionAuto        bool
+	MMProjPath        string
+	ServerBin         string
+	ServerBinExplicit bool
+	AppHome           string
+	Backend           string
+	BackendExplicit   bool
+	TuneCache         string
+	SpecMode          string
+	ForceSpecMoE      bool
+	RamBudgetMB       int
+	RAMLimitPercent   int
+	VRAMHeadroomMB    int
+	RAMHeadroomMB     int
+	// CgroupHeadroomMB is the headroom the post-launch measured-footprint sizing
+	// keeps between the backend's measured non-reclaimable footprint and its hard
+	// MemoryMax. 0 keeps the pre-launch plan-derived ceiling (auto re-size off).
+	// -1 means unset; the config default applies.
+	CgroupHeadroomMB     int
 	AllowLiveMemoryProbe bool
 	NoMMap               bool
 	ForceMMap            bool
@@ -636,25 +641,26 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 	backendExplicit := configuredBackendExplicit(cfg.Backend)
 	originalArgs := append([]string(nil), args...)
 	req := &launchRequest{
-		Port:            cfg.Port,
-		CtxFlag:         cfg.CtxValue(),
-		KVPlacement:     cfg.KVPlacement,
-		KVQuality:       cfg.KVQuality,
-		Host:            cfg.Host,
-		VisionAuto:      cfg.Vision,
-		ServerBin:       cfg.LlamaServer,
-		AppHome:         cfg.AppHome,
-		Backend:         cfg.Backend,
-		BackendExplicit: backendExplicit,
-		SpecMode:        cfg.Spec,
-		Parallel:        cfg.Parallel,
-		RamBudgetMB:     parseBudgetMB(cfg.RamBudget),
-		RAMLimitPercent: cfg.RAMLimitPercent,
-		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
-		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
-		OriginalArgs:    originalArgs,
-		SupportExpert:   cfg.SupportExpert,
-		SupportOnline:   cfg.SupportOnline,
+		Port:             cfg.Port,
+		CtxFlag:          cfg.CtxValue(),
+		KVPlacement:      cfg.KVPlacement,
+		KVQuality:        cfg.KVQuality,
+		Host:             cfg.Host,
+		VisionAuto:       cfg.Vision,
+		ServerBin:        cfg.LlamaServer,
+		AppHome:          cfg.AppHome,
+		Backend:          cfg.Backend,
+		BackendExplicit:  backendExplicit,
+		SpecMode:         cfg.Spec,
+		Parallel:         cfg.Parallel,
+		RamBudgetMB:      parseBudgetMB(cfg.RamBudget),
+		RAMLimitPercent:  cfg.RAMLimitPercent,
+		VRAMHeadroomMB:   parseBudgetMB(cfg.VRAMHeadroom),
+		RAMHeadroomMB:    parseBudgetMB(cfg.RAMHeadroom),
+		CgroupHeadroomMB: cfg.CgroupHeadroomMB,
+		OriginalArgs:     originalArgs,
+		SupportExpert:    cfg.SupportExpert,
+		SupportOnline:    cfg.SupportOnline,
 	}
 	if cfg.SWAFull {
 		req.ExtraArgs = append(req.ExtraArgs, "--swa-full")
@@ -1076,6 +1082,16 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				return nil, err
 			}
 			req.RAMHeadroomMB = budget
+		case "--cgroup-headroom":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("%s: must be a non-negative MiB amount (0 disables the post-launch measured re-size)", a)
+			}
+			req.CgroupHeadroomMB = n
 		case "--spec":
 			v, err := next()
 			if err != nil {
@@ -2647,6 +2663,27 @@ func validateHostMemoryContainment(req *launchRequest, caps *detect.Capabilities
 	if backendMemoryMaxMB(req, caps) <= 0 {
 		return fmt.Errorf("host-memory containment limit is not positive")
 	}
+	// Fail-closed pre-launch gate (Fix B.4): refuse to start when the plan's own
+	// resident footprint plus the measured-footprint headroom would exceed the
+	// whole-host ceiling. The plan's expert bytes are exact, so a plan that can
+	// only run by blowing past the ceiling is a plan that would OOM its own
+	// scope at runtime (the 41-layer V4 crash: planned ~116 GB vs a ~111 GB
+	// ceiling, --ctx-checkpoints 16). Refusing here forces a Fix-A re-plan (more
+	// GPU layers, fewer CPU layers) instead of launching into a guaranteed death.
+	// A 0 headroom disables the gate (--cgroup-headroom 0).
+	//
+	// Scoped to --no-mmap (anonymous) plans: file-backed expert pages are
+	// reclaimable page cache that can legitimately overshoot the resident
+	// footprint, so the mmap reclaim band absorbs it (see backendStartOptions).
+	if req.CgroupHeadroomMB > 0 && strategy.PlannedHostFootprintMB > 0 && !strategy.MMap {
+		ceiling := backendMemoryMaxMB(req, caps)
+		if strategy.PlannedHostFootprintMB+req.CgroupHeadroomMB > ceiling {
+			return fmt.Errorf(
+				"planned host footprint %d MiB + cgroup headroom %d MiB exceeds the %d MiB whole-host ceiling; refusing to launch a server that cannot be contained (re-plan with fewer CPU expert layers)",
+				strategy.PlannedHostFootprintMB, req.CgroupHeadroomMB, ceiling,
+			)
+		}
+	}
 	return nil
 }
 
@@ -2854,6 +2891,69 @@ func backendStartOptions(req *launchRequest, caps *detect.Capabilities, envOverr
 		}
 	}
 	return server.StartOptions{EnvOverrides: envOverrides, MemoryHighMB: highMB, MemoryMaxMB: maxMB}
+}
+
+// resizeScopeToMeasuredFootprint re-sizes the running backend scope's hard
+// memory ceiling to the measured non-reclaimable footprint plus headroom
+// (Fix B). The pre-launch MemoryMax is a plan estimate; after health + canary
+// the backend's real anon+shmem+slab is known, so the ceiling is tightened to
+// measured+headroom. A runaway consumer (or a wrong plan) then dies inside its
+// own per-instance scope, never the shared server or the machine.
+//
+// The value is clamped to the whole-host ceiling the user configured (the same
+// backendMemoryMaxMB the pre-launch scope used), so this can only tighten
+// containment, never loosen it past the safety limit. When --ram-budget is set
+// the user named an explicit ceiling and the auto re-size is skipped.
+func resizeScopeToMeasuredFootprint(req *launchRequest, caps *detect.Capabilities, strategy *placement.Strategy, p *server.Process) {
+	if req == nil || caps == nil || p == nil || runtime.GOOS != "linux" {
+		return
+	}
+	if req.CgroupHeadroomMB <= 0 || req.RamBudgetMB > 0 {
+		return
+	}
+	ceiling := backendMemoryMaxMB(req, caps)
+	if ceiling <= 0 {
+		return
+	}
+	measured, err := p.ScopeNonReclaimableMB()
+	if err != nil || measured <= 0 {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[launch] measured-footprint cgroup re-size skipped: %v\n", err)
+		}
+		return
+	}
+	plannedFloor := 0
+	if strategy != nil {
+		// The canary has not populated the prompt cache yet. Preserve the host
+		// footprint the plan priced (including checkpoint reserve) plus the CRAM
+		// capacity it deliberately left available for later conversations.
+		plannedFloor = strategy.PlannedHostFootprintMB + strategy.CRAM
+	}
+	newMax := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, plannedFloor, ceiling)
+	if err := p.SetMemoryMaxMB(newMax); err != nil {
+		fmt.Fprintf(os.Stderr, "[launch] measured-footprint cgroup re-size to %d MiB failed: %v\n", newMax, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[launch] memory scope re-sized to %d MiB (measured %d MiB + headroom, planned floor %d MiB, ceiling %d MiB)\n",
+		newMax, measured, plannedFloor, ceiling)
+}
+
+// measuredFootprintCgroupMaxMB is the pure sizing rule for the measured-footprint
+// cgroup (Fix B): the larger of measured non-reclaimable footprint + headroom
+// and the plan's future capacity requirement, clamped to the whole-host ceiling.
+// The plan floor matters because the first canary has not filled CRAM yet.
+func measuredFootprintCgroupMaxMB(measuredMB, headroomMB, plannedFloorMB, ceilingMB int) int {
+	if measuredMB <= 0 || headroomMB <= 0 {
+		return 0
+	}
+	newMax := measuredMB + headroomMB
+	if plannedFloorMB > newMax {
+		newMax = plannedFloorMB
+	}
+	if newMax > ceilingMB {
+		return ceilingMB
+	}
+	return newMax
 }
 
 // hostReclaimCeilingMB is the hard ceiling an mmap-backed plan may reach before
@@ -4643,6 +4743,12 @@ func cmdLaunch(args []string) {
 		fmt.Fprintf(os.Stderr, "Error verifying server profile: %v\n", err)
 		os.Exit(1)
 	}
+	// The functional canary is the first real request: it grows the graph and
+	// allocates the first context checkpoints, so this is the earliest honest
+	// measurement of the backend's resident footprint. Re-size the scope to
+	// measured+headroom now that a wrong pre-launch plan would have already
+	// failed.
+	resizeScopeToMeasuredFootprint(req, runtimeCaps, strategy, p)
 	if pendingCalibration != nil {
 		scope := launchProfileScope(req, model, be, runtimeCaps)
 		active := controller.Store{CacheDir: cfg.CacheDir}.IsActive(scope, controller.HashArgs(serverArgs))

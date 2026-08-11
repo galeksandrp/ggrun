@@ -29,6 +29,11 @@ type Config struct {
 	RAMLimitPercent int    `json:"ram_limit_percent"` // maximum whole-host RAM use, 1-100
 	VRAMHeadroom    string `json:"vram_headroom"`     // VRAM to hold back, e.g. "2G"
 	RAMHeadroom     string `json:"ram_headroom"`      // system RAM to hold back, e.g. "8G"
+	// CgroupHeadroomMB is how much headroom the measured-footprint cgroup sizing
+	// keeps between the backend's measured non-reclaimable footprint and its hard
+	// MemoryMax. 0 disables the automatic post-launch re-size (the pre-launch
+	// plan-derived ceiling stands).
+	CgroupHeadroomMB int `json:"cgroup_headroom_mb,omitempty"`
 	KVPlacement     string `json:"kv_placement"`
 	KVQuality       string `json:"kv_quality"`
 	SWAFull         bool   `json:"swa_full"`
@@ -55,7 +60,7 @@ type Config struct {
 var DefaultKeys = []string{
 	"PORT", "CTX_SIZE", "MAX_RESTARTS", "KEEP_ALIVE", "HEALTH_TIMEOUT",
 	"MODEL_DIR", "CACHE_DIR", "LOG_DIR",
-	"RAM_BUDGET", "RAM_LIMIT_PERCENT", "VRAM_HEADROOM", "RAM_HEADROOM", "KV_PLACEMENT", "KV_QUALITY", "SWA_FULL",
+	"RAM_BUDGET", "RAM_LIMIT_PERCENT", "VRAM_HEADROOM", "RAM_HEADROOM", "CGROUP_HEADROOM_MB", "KV_PLACEMENT", "KV_QUALITY", "SWA_FULL",
 	"ASSUME_YES",
 	"BACKEND", "LLAMA_SERVER", "APP_HOME",
 	"TUNE_ROUNDS", "VISION", "PARALLEL", "HOST", "SPEC",
@@ -78,6 +83,12 @@ func Defaults() *Config {
 		RAMLimitPercent: 95,
 		VRAMHeadroom:    "",
 		RAMHeadroom:     "",
+		// The default headroom keeps a correct plan comfortably under its hard
+		// ceiling after the post-launch re-size: 4 GiB covers allocator jitter,
+		// checkpoint growth, and host staging without being so large that a
+		// genuinely oversized plan sneaks under the whole-host clamp. 0 disables
+		// the auto re-size (see --cgroup-headroom).
+		CgroupHeadroomMB: 4096,
 		KVPlacement:     "auto",
 		KVQuality:       "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
 		SWAFull:         false,
@@ -246,7 +257,7 @@ func snapshotEnv() map[string]string {
 	for _, k := range []string{
 		"LLM_PORT", "LLM_CTX_SIZE", "LLM_MAX_RESTARTS", "LLM_KEEP_ALIVE",
 		"LLM_HEALTH_TIMEOUT", "LLM_MODEL_DIR", "LLM_CACHE_DIR", "LLM_LOG_DIR",
-		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_SWA_FULL", "LLM_ASSUME_YES",
+		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_CGROUP_HEADROOM_MB", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_SWA_FULL", "LLM_ASSUME_YES",
 		"LLM_BACKEND", "LLAMA_SERVER", "LLM_APP_HOME", "LLM_TUNE_ROUNDS",
 		"LLM_VISION", "LLM_PARALLEL", "LLM_HOST", "LLM_SPEC",
 		"LLM_SUPPORT_EXPERT", "LLM_SUPPORT_ONLINE", "LLM_SUPPORT_MODEL",
@@ -355,6 +366,12 @@ func setConfigValue(cfg *Config, key, raw, source string) error {
 			return err
 		}
 		cfg.RAMHeadroom = val
+	case "CGROUP_HEADROOM_MB":
+		n, err := parseNonNegativeInt(val)
+		if err != nil {
+			return err
+		}
+		cfg.CgroupHeadroomMB = n
 	case "KV_PLACEMENT":
 		cfg.KVPlacement = val
 	case "KV_QUALITY":
@@ -505,6 +522,9 @@ func (c *Config) Save() error {
 			return fmt.Errorf("%s: %w", budget.key, err)
 		}
 	}
+	if c.CgroupHeadroomMB < 0 {
+		return fmt.Errorf("CGROUP_HEADROOM_MB: must be a non-negative integer")
+	}
 	for _, numeric := range []struct {
 		key string
 		val int
@@ -550,6 +570,7 @@ func (c *Config) Save() error {
 	fmt.Fprintf(f, "LLM_RAM_LIMIT_PERCENT=%d\n", c.RAMLimitPercent)
 	fmt.Fprintf(f, "LLM_VRAM_HEADROOM=%q\n", c.VRAMHeadroom)
 	fmt.Fprintf(f, "LLM_RAM_HEADROOM=%q\n", c.RAMHeadroom)
+	fmt.Fprintf(f, "LLM_CGROUP_HEADROOM_MB=%d\n", c.CgroupHeadroomMB)
 	fmt.Fprintf(f, "LLM_KV_PLACEMENT=%q\n", c.KVPlacement)
 	fmt.Fprintf(f, "LLM_KV_QUALITY=%q\n", c.KVQuality)
 	fmt.Fprintf(f, "LLM_SWA_FULL=%v\n", c.SWAFull)
@@ -600,6 +621,8 @@ func (c *Config) Show() string {
 			val = c.VRAMHeadroom
 		case "RAM_HEADROOM":
 			val = c.RAMHeadroom
+		case "CGROUP_HEADROOM_MB":
+			val = strconv.Itoa(c.CgroupHeadroomMB)
 		case "KV_PLACEMENT":
 			val = c.KVPlacement
 		case "KV_QUALITY":

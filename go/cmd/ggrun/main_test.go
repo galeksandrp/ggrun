@@ -2774,6 +2774,108 @@ func TestMMapBackedPlanGetsAReclaimBandBeforeTheKillThreshold(t *testing.T) {
 	}
 }
 
+// TestMeasuredFootprintCgroupMaxMB guards Fix B's sizing rule: the cgroup limit
+// is set to the measured post-launch non-reclaimable footprint + headroom,
+// clamped to the whole-host ceiling. This is what keeps a correct plan from
+// dying (headroom absorbs jitter and checkpoint growth) while still containing a
+// runaway to its own scope (the limit never exceeds the user's ceiling).
+func TestMeasuredFootprintCgroupMaxMB(t *testing.T) {
+	// A measured footprint comfortably under the ceiling gets measured+headroom.
+	if got := measuredFootprintCgroupMaxMB(90000, 4096, 0, 111500); got != 94096 {
+		t.Fatalf("measured+headroom sizing: got %d, want 94096", got)
+	}
+	// measured+headroom over the ceiling is clamped to the ceiling (fail-closed).
+	if got := measuredFootprintCgroupMaxMB(110000, 4096, 0, 111500); got != 111500 {
+		t.Fatalf("over-ceiling must clamp to ceiling: got %d, want 111500", got)
+	}
+	// Zero headroom disables the auto re-size entirely.
+	if got := measuredFootprintCgroupMaxMB(90000, 0, 0, 111500); got != 0 {
+		t.Fatalf("zero headroom must disable auto re-size, got %d", got)
+	}
+	// A zero/invalid measured footprint disables the re-size.
+	if got := measuredFootprintCgroupMaxMB(0, 4096, 0, 111500); got != 0 {
+		t.Fatalf("zero measured footprint must disable auto re-size, got %d", got)
+	}
+	// The canary has not filled the prompt cache yet, so a larger planned
+	// host-footprint+CRAM requirement remains available for later requests.
+	if got := measuredFootprintCgroupMaxMB(70000, 4096, 82000, 100000); got != 82000 {
+		t.Fatalf("planned cache-capacity floor: got %d, want 82000", got)
+	}
+	// The whole-host ceiling remains absolute even when the plan asks for more.
+	if got := measuredFootprintCgroupMaxMB(70000, 4096, 82000, 80000); got != 80000 {
+		t.Fatalf("planned floor must clamp to ceiling: got %d, want 80000", got)
+	}
+}
+
+// TestMeasuredFootprintCgroupResizeMath guards the end-to-end sizing path through
+// the launch request: headroom wiring (config default 4096) feeds the pure sizing
+// rule, and an explicit --ram-budget disables it.
+func TestMeasuredFootprintCgroupResizeMath(t *testing.T) {
+	req := &launchRequest{RAMLimitPercent: 95, CgroupHeadroomMB: 4096}
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	ceiling := backendMemoryMaxMB(req, caps)
+	if ceiling <= 0 {
+		t.Fatalf("expected a positive whole-host ceiling, got %d", ceiling)
+	}
+	// A footprint just under the ceiling gets measured+headroom; the ceiling is
+	// only ever the clamp, never loosened.
+	measured := ceiling - 8192
+	got := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, 0, ceiling)
+	if got != measured+req.CgroupHeadroomMB {
+		t.Fatalf("measured+headroom under the ceiling: got %d, want %d", got, measured+req.CgroupHeadroomMB)
+	}
+	// A footprint whose +headroom overshoots the ceiling is clamped to it.
+	if got := measuredFootprintCgroupMaxMB(ceiling-1024, req.CgroupHeadroomMB, 0, ceiling); got != ceiling {
+		t.Fatalf("overshoot must clamp to ceiling: got %d, want %d", got, ceiling)
+	}
+}
+
+// TestValidateHostMemoryContainmentFailClosed guards Fix B.4: a --no-mmap plan
+// whose planned footprint + cgroup headroom exceeds the whole-host ceiling is
+// refused BEFORE launch, converting the 41-layer V4 crash (planned ~116 GB vs a
+// ~111 GB ceiling) into a pre-launch error instead of an OOM-killed server.
+func TestValidateHostMemoryContainmentFailClosed(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("host memory containment is Linux-only")
+	}
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	req := &launchRequest{RAMLimitPercent: 95, CgroupHeadroomMB: 4096}
+
+	// A --no-mmap plan whose footprint is inside the ceiling passes.
+	ok := &placement.Strategy{Type: placement.MoEOffload, MMap: false, PlannedHostFootprintMB: 100000}
+	if err := validateHostMemoryContainment(req, caps, ok); err != nil {
+		t.Fatalf("in-ceiling plan must pass: %v", err)
+	}
+	// A --no-mmap plan whose footprint + headroom blows the ceiling is refused.
+	over := &placement.Strategy{Type: placement.MoEOffload, MMap: false, PlannedHostFootprintMB: 111000}
+	if err := validateHostMemoryContainment(req, caps, over); err == nil {
+		t.Fatal("over-ceiling --no-mmap plan must be refused")
+	}
+	// An mmap-backed plan is NOT refused: page cache can be reclaimed, so the
+	// mmap reclaim band absorbs overshoot (backendStartOptions moves the hard
+	// ceiling up to the host reclaim ceiling).
+	mmap := &placement.Strategy{Type: placement.MoEOffload, MMap: true, PlannedHostFootprintMB: 111000}
+	if err := validateHostMemoryContainment(req, caps, mmap); err != nil {
+		t.Fatalf("mmap plan must not be fail-closed by footprint: %v", err)
+	}
+	// Zero headroom disables the gate (auto re-size off).
+	noHeadroom := &launchRequest{RAMLimitPercent: 95, CgroupHeadroomMB: 0}
+	if err := validateHostMemoryContainment(noHeadroom, caps, over); err != nil {
+		t.Fatalf("zero headroom must disable the fail-closed gate: %v", err)
+	}
+	// The planned-footprint field drives the gate; without it the gate is inert.
+	noFootprint := &placement.Strategy{Type: placement.MoEOffload, MMap: false}
+	if err := validateHostMemoryContainment(req, caps, noFootprint); err != nil {
+		t.Fatalf("no planned footprint must not trigger the gate: %v", err)
+	}
+}
+
 // MODEL_DIR is a single path, so every download landed on whichever filesystem
 // it sits on -- here the 456 GB root volume with 67 GB free, while the 1.9 TB
 // volume holding the large quants had 935 GB. The only way to put a model there

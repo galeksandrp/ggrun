@@ -1128,6 +1128,207 @@ func TestComputeDeepSeekV4SplitOwnerUsesGenericMeasuredCapacity(t *testing.T) {
 	}
 }
 
+// TestComputeSplitOwnerChargesPerGPUComputeNotAggregate guards Fix A.1: the
+// split-owner compute reserve must come from the per-GPU measurement for THIS
+// device, not the primary GPU's aggregate. The crash reproduced the failure:
+// DeepSeek-V4 at ctx 1M / ub=512 carried PROBED_COMPUTE_BUF_MB=17970
+// (oracle-planned, the primary's value) while the secondary split-owner's
+// per-GPU value was an order of magnitude smaller. Charging every split-owner
+// the primary's aggregate collapsed the secondary card to 0 expert layers;
+// charging each its own per-GPU value packs it. A model with free GPU VRAM must
+// therefore get MORE experts on GPU, not be under-filled.
+func TestComputeSplitOwnerChargesPerGPUComputeNotAggregate(t *testing.T) {
+	// Two fast (non-expert-only) GPUs so both hold real tensor-split shares. The
+	// secondary split owner (GPU1) is the card the old aggregate charge starved:
+	// it is charged the primary's 17970 instead of its own 599.
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "GPU A", VRAMTotalMB: 24564, BandwidthMBps: 16000, VRAMUsedMB: 500},
+			{Index: 1, Name: "GPU B", VRAMTotalMB: 24564, BandwidthMBps: 16000, VRAMUsedMB: 300},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128730, FreeMB: 123424},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path:      "/models/DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf",
+		SizeBytes: 137903959808, TotalSizeMB: 131515,
+		NumLayers: 43, IsMoE: true, NumExperts: 256, ExpertUsedCount: 6, ExpertFF: 2048,
+		ExpertBytes: 131240296448, NonExpertBytes: 6658320448,
+		TokenEmbdBytes: 562626560, OutputBytes: 434380800, ShexpBytes: 1149763584,
+		ContextSize: 65536, CTXTrain: 1048576, HiddenSize: 4096, EmbeddingLength: 4096,
+		HeadCountKV: 1, KeyLength: 512, ValueLength: 512, ModelArch: "deepseek4",
+		MeasuredKVBytesPerTok: map[string]float64{"f16": 6912.25},
+	}
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(caps.GPUs))),
+		[]byte("SYS_CUDA_OVERHEAD_MB_CUDA0=488\nSYS_CUDA_OVERHEAD_MB_CUDA1=311\nSYS_CUDA_OVERHEAD_MB=488\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{
+		ContextSize: 65536, KVPlacement: "gpu", KVQuality: "high",
+		BackendTag: "llama", Parallel: 1, CacheDir: cacheDir,
+	}
+	// Seed the probe cache with a LARGE aggregate compute buffer (17970, the
+	// primary's real ctx-1M value) and a small per-GPU value for the secondary
+	// split owner. Under the old aggregate charge GPU1 pays 17970 for compute;
+	// with the fix it pays 599.
+	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", caps.GPUs, 1,
+		map[int]int{0: 17970, 1: 599}, nil, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call buildMoEOffload directly (bypassing the ubatch ladder) so the test
+	// isolates the split-owner compute charge at ub=512 rather than letting the
+	// ladder descend to a smaller ubatch whose compute buffer would mask the bug.
+	kvTotalMB := computeKVTotalMB(model, 65536, "f16", false)
+	base := &Strategy{
+		Type: MoEOffload, ContextSize: 65536, KVPlacement: "gpu", KVQuality: "high",
+		UBatchSize: 512, BatchSize: 512, Parallel: 1, BackendTag: "llama",
+	}
+	strat, err := buildMoEOffload(base, caps, model, model.TotalSizeMB, kvTotalMB, opts)
+	if err != nil {
+		t.Fatalf("buildMoEOffload should fit: %v", err)
+	}
+	layers := parseOTLayersByDevice(t, strat.OTString)
+	// GPU1 must hold a real tensor-split share (both links are fast, so neither
+	// is demoted to expert-only) AND pack expert layers. Under the old
+	// aggregate-to-all charge it paid 17970 MiB of compute and got 0 layers; with
+	// its per-GPU 599 it packs. This is the regression's core assertion: a
+	// split-owner with free VRAM is filled, not under-filled.
+	if len(layers[1]) == 0 {
+		t.Fatalf("GPU1 under-filled: got 0 expert layers (OT=%s); per-GPU compute charge must leave room", strat.OTString)
+	}
+	if strat.TensorSplit[1] <= 0 {
+		t.Fatalf("GPU1 should hold a tensor-split share, got split=%v (test setup)", strat.TensorSplit)
+	}
+	// The primary split-owner must also hold whole layers.
+	if len(layers[0]) == 0 {
+		t.Fatalf("GPU0 under-filled: got 0 expert layers (OT=%s)", strat.OTString)
+	}
+	// With the compute charged per-GPU the plan packs more GPU layers than a plan
+	// that charged every split-owner the full 17970 aggregate would. Verify the
+	// plan is not degenerate.
+	totalGPU := len(layers[0]) + len(layers[1])
+	if totalGPU <= 2 {
+		t.Fatalf("GPU under-fill: only %d expert layers on all GPUs (OT=%s)", totalGPU, strat.OTString)
+	}
+}
+
+// TestWriteProbeEvidencePriorityLiveBeatsOracle guards Fix A.2: a live-allocated
+// compute-buffer measurement must supersede a later oracle-planned prediction for
+// the same key, in EITHER direction — and a fresh oracle must not clobber a prior
+// live observation.
+func TestWriteProbeEvidencePriorityLiveBeatsOracle(t *testing.T) {
+	cacheDir := t.TempDir()
+	model := &ModelProfile{Path: "evidence-model.gguf", NumLayers: 43, NumExperts: 256}
+	gpus := []detect.GPU{{Index: 0, VRAMTotalMB: 24564}, {Index: 1, VRAMTotalMB: 12288}, {Index: 2, VRAMTotalMB: 12282}}
+
+	// 1. Oracle runs first: writes 9022 (prediction).
+	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1,
+		map[int]int{0: 9022, 1: 599, 2: 599}, nil, nil, 0, probeMeasurements{ComputeBufEvidence: "oracle-planned"}); err != nil {
+		t.Fatal(err)
+	}
+	// 2. A live launch measures the real buffers: smaller values, observed.
+	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1,
+		map[int]int{0: 3649, 1: 121, 2: 599}, nil, nil, 0, probeMeasurements{ComputeBufEvidence: "live-allocated"}); err != nil {
+		t.Fatal(err)
+	}
+	pc := loadProbeCache(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1)
+	if pc == nil {
+		t.Fatal("expected a probe cache entry")
+	}
+	if got := pc.ComputeBufByGPU[0]; got != 3649 {
+		t.Fatalf("live-allocated GPU0 must supersede oracle 9022, got %d", got)
+	}
+	if got := pc.ComputeBufByGPU[1]; got != 121 {
+		t.Fatalf("live-allocated GPU1 must supersede oracle 599, got %d", got)
+	}
+	if !observedAllocationEvidence(pc.ComputeBufEvidence) {
+		t.Fatalf("file evidence must remain observed after a live measurement, got %q", pc.ComputeBufEvidence)
+	}
+
+	// 3. A later fit-oracle run must NOT clobber the observed measurement.
+	if err := writeProbeCacheForModel(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1,
+		map[int]int{0: 9022, 1: 599, 2: 599}, nil, nil, 0, probeMeasurements{ComputeBufEvidence: "oracle-planned"}); err != nil {
+		t.Fatal(err)
+	}
+	pc = loadProbeCache(cacheDir, model, 65536, 512, "high", "gpu", "llama", gpus, 1)
+	if pc == nil {
+		t.Fatal("expected a probe cache entry")
+	}
+	if got := pc.ComputeBufByGPU[0]; got != 3649 {
+		t.Fatalf("later oracle-planned must not clobber live-allocated GPU0: got %d, want 3649", got)
+	}
+	if !observedAllocationEvidence(pc.ComputeBufEvidence) {
+		t.Fatalf("file evidence must stay observed after an oracle attempt, got %q", pc.ComputeBufEvidence)
+	}
+}
+
+// TestLadderDescentsWhenBasePlanCPUOverFills guards Fix A.5: the ubatch ladder
+// must descend when the base plan leaves a pathological fraction of MoE layers
+// on CPU even though it "fits", instead of returning the under-filled plan.
+func TestLadderDescentsWhenBasePlanCPUOverFills(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060 x1", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070 x4", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128730, FreeMB: 123424},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path:      "/models/DeepSeek-V4-Flash-UD-IQ4_XS-00001-of-00004.gguf",
+		SizeBytes: 137903959808, TotalSizeMB: 131515,
+		NumLayers: 43, IsMoE: true, NumExperts: 256, ExpertUsedCount: 6, ExpertFF: 2048,
+		ExpertBytes: 131240296448, NonExpertBytes: 6658320448,
+		TokenEmbdBytes: 562626560, OutputBytes: 434380800, ShexpBytes: 1149763584,
+		ContextSize: 65536, CTXTrain: 1048576, HiddenSize: 4096, EmbeddingLength: 4096,
+		HeadCountKV: 1, KeyLength: 512, ValueLength: 512, ModelArch: "deepseek4",
+		MeasuredKVBytesPerTok: map[string]float64{"f16": 6912.25},
+	}
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(caps.GPUs))),
+		[]byte("SYS_CUDA_OVERHEAD_MB_CUDA0=488\nSYS_CUDA_OVERHEAD_MB_CUDA1=311\nSYS_CUDA_OVERHEAD_MB_CUDA2=367\nSYS_CUDA_OVERHEAD_MB=488\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A probe whose aggregate compute buffer is huge at ub=512 (forcing a CPU
+	// over-fill) but smaller at ub=256/128. The ladder must descend to a rung
+	// that puts >=75% of MoE layers on GPU.
+	for _, ub := range []int{512, 256, 128, 64} {
+		compute := 9022
+		if ub <= 256 {
+			compute = 2500
+		}
+		if err := writeProbeCacheForModel(cacheDir, model, 65536, ub, "high", "gpu", "llama", caps.GPUs, 1,
+			map[int]int{0: compute, 1: 121, 2: 121}, nil, nil, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := Options{
+		ContextSize: 65536, KVPlacement: "gpu", KVQuality: "high",
+		BackendTag: "llama", Parallel: 1, CacheDir: cacheDir,
+	}
+	strat, err := Compute(caps, model, opts)
+	if err != nil {
+		t.Fatalf("placement should fit: %v", err)
+	}
+	// The base ub=512 plan's compute buffer (9022) starves GPU capacity and
+	// produces a pathological CPU over-fill. The ladder must descend to a smaller
+	// ubatch whose compute buffer is smaller. This is the regression's core
+	// assertion: the plan must NOT keep the 41-layer-ish ub=512 CPU over-fill.
+	if strat.UBatchSize >= 512 {
+		t.Fatalf("ladder kept the over-filled ubatch=512 plan (n-cpu-moe=%d)", strat.NCPUMoE)
+	}
+	// The descend rung's smaller compute buffer must buy at least ONE more GPU
+	// layer than the base ub=512 plan's ~2-3. Compare against the well-known
+	// healthy V4 footprint: n-cpu-moe must be strictly below the base's count,
+	// and comfortably below a plan that never descended.
+	if strat.NCPUMoE >= 41 {
+		t.Fatalf("ladder did not reduce the CPU over-fill: n-cpu-moe=%d (OT=%s)", strat.NCPUMoE, strat.OTString)
+	}
+}
+
 func TestComputeHybridMoEPacksEverySplitOwnerByCapacity(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
@@ -3727,9 +3928,10 @@ func TestPromptCacheBudgetScalesWithSlotsOnceMeasured(t *testing.T) {
 	}
 	// Four slots need one resident entry each, plus one so a conversation is
 	// stored before the one it replaces is dropped.
-	want := int(math.Floor(entryMB * 5))
-	if measured[4] < want-cramQuantumMB || measured[4] > want {
-		t.Errorf("4-slot budget %d MiB, want ~%d (5 x %.0f MiB entry)", measured[4], want, entryMB)
+	wantRaw := int(math.Ceil(entryMB * 5))
+	want := ((wantRaw + cramQuantumMB - 1) / cramQuantumMB) * cramQuantumMB
+	if measured[4] != want {
+		t.Errorf("4-slot budget %d MiB, want %d (ceiling of 5 x %.0f MiB entry)", measured[4], want, entryMB)
 	}
 	// It still may not exceed the host budget the weights need.
 	ramAfterLoad := 120000 - (70000 - caps.TotalVRAM())
