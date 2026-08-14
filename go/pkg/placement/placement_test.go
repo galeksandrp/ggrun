@@ -2465,16 +2465,20 @@ func TestComputeMoEMultiGPUFullyFitsExpertsOnGPU(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compute failed: %v", err)
 	}
-	assignments := parseOTLayersByDevice(t, strat.OTString)
-	totalPinned := 0
-	for _, layers := range assignments {
-		totalPinned += len(layers)
-	}
-	if totalPinned != model.NumLayers {
-		t.Fatalf("expected all %d expert layers on GPU, got %d via %s", model.NumLayers, totalPinned, strat.OTString)
-	}
+	// A small MoE that fits across GPUs now goes to MultiGPUDense (all layers
+	// on GPU via tensor-split + split-mode layer), not MoEOffload — so there is
+	// no -ot/exps=CPU and no CPU MoE layers.
 	if strat.NCPUMoE != 0 {
 		t.Fatalf("expected no CPU MoE layers when experts fit, got %d", strat.NCPUMoE)
+	}
+	if strat.OTString != "" {
+		t.Fatalf("a fitting multi-GPU MoE must not emit -ot (would imply CPU experts), got %q", strat.OTString)
+	}
+	if len(strat.TensorSplit) < 2 {
+		t.Fatalf("a fitting multi-GPU MoE must use a tensor split, got %v", strat.TensorSplit)
+	}
+	if strat.Type != MultiGPUDense {
+		t.Fatalf("a fitting multi-GPU MoE must be MultiGPUDense, got %s", strat.Type)
 	}
 }
 
@@ -4776,5 +4780,244 @@ func TestMMapBandDeniedForIKDerivedFork(t *testing.T) {
 	}
 	if !mmapCanPageCPUExperts(Options{BackendTag: "llama"}) {
 		t.Error("mainline maps CPU experts: mmap reclaimability must be kept")
+	}
+}
+
+// --- Dense auto-context reduction (dense models must fit on GPU) ---
+
+// denseReduceCaps is the 24/12/12 GB test rig (CUDA1 partially occupied, mirroring
+// the real box) with a combined ~41.5 GB of free VRAM.
+func denseReduceCaps() *detect.Capabilities {
+	return &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, VRAMUsedMB: 736},
+			{Index: 1, VRAMTotalMB: 12288, VRAMUsedMB: 6329},
+			{Index: 2, VRAMTotalMB: 12288, VRAMUsedMB: 578},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+}
+
+// denseReduceModel builds a dense model whose KV geometry is expensive enough that
+// an auto (RAM-pool-sized) context overflows GPU memory while a smaller context
+// fits. free = 41509 MiB; model + 3*1024 overhead = 33876 MiB leaves ~7633 MiB of
+// KV headroom, so ctx=65536 (KV ~4250 MiB) fits but ctx=131072 (KV ~8500 MiB)
+// does not.
+func denseReduceModel() *ModelProfile {
+	bpc := 8000.0 * 1024 * 1024 / (52.0 * 65536)
+	return &ModelProfile{
+		Path:        "DenseBig.gguf",
+		TotalSizeMB: 30804,
+		SizeBytes:   30804 << 20,
+		NumLayers:   53,
+		HiddenSize:  5120,
+		CTXTrain:    1048576,
+		MeasuredKVGeometry: map[string]KVGeometry{
+			"f16": {FullLayers: 52, SWALayers: 0, BytesPerCellPerLayer: bpc},
+		},
+	}
+}
+
+// TestComputeDenseAutoReduceFitsGPU verifies that a dense model whose auto context
+// would spill to host RAM is reduced to a context that fits entirely on GPU.
+func TestComputeDenseAutoReduceFitsGPU(t *testing.T) {
+	caps := denseReduceCaps()
+	model := denseReduceModel()
+	strat, err := Compute(caps, model, Options{KVPlacement: "auto", KVQuality: "mid", SWAFull: true, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("compute failed: %v", err)
+	}
+	if strat.Type != MultiGPUDense {
+		t.Fatalf("expected multi_gpu_dense (dense model must fit on GPU after auto ctx reduction), got %s", strat.Type)
+	}
+	kv := computeKVTotalMB(model, strat.ContextSize, strat.KVType, true)
+	// model + 3 * computeFloor overhead + KV must fit in free VRAM.
+	if 30804+3*computeFloorMB+kv > caps.GPUs[0].VRAMFreeMB()+caps.GPUs[1].VRAMFreeMB()+caps.GPUs[2].VRAMFreeMB() {
+		t.Fatalf("reduced ctx=%d still does not fit on GPU: model+overhead+kv = %d > free", strat.ContextSize, 30804+3*computeFloorMB+kv)
+	}
+}
+
+// TestComputeDenseAutoReducePicksLargestFit verifies the reduction chooses the
+// LARGEST context rung that still fits entirely on GPU (reduces as little as
+// needed), not the smallest.
+func TestComputeDenseAutoReducePicksLargestFit(t *testing.T) {
+	caps := denseReduceCaps()
+	model := denseReduceModel()
+	strat, err := Compute(caps, model, Options{KVPlacement: "auto", KVQuality: "mid", SWAFull: true, CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("compute failed: %v", err)
+	}
+	// 65536 fits (KV ~4250, total ~38126 <= 41509); 131072 does not (total ~42376).
+	if strat.ContextSize != 65536 {
+		t.Fatalf("expected the largest fitting context 65536, got %d", strat.ContextSize)
+	}
+	// The next rung up must NOT fit, proving 65536 is the largest.
+	nextKV := computeKVTotalMB(model, 131072, strat.KVType, true)
+	if 30804+3*computeFloorMB+nextKV <= caps.GPUs[0].VRAMFreeMB()+caps.GPUs[1].VRAMFreeMB()+caps.GPUs[2].VRAMFreeMB() {
+		t.Fatalf("expected ctx=131072 to overflow GPU, but it fits; the reduction test setup is wrong")
+	}
+}
+
+// TestComputeDenseAutoReduceDeclinedFailsHard verifies that when a dense model
+// cannot fit on GPU even at minimum context and the user declines host offload,
+// Compute returns a hard error instead of silently launching into system RAM.
+func TestComputeDenseAutoReduceDeclinedFailsHard(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, VRAMUsedMB: 736},
+			{Index: 1, VRAMTotalMB: 12288, VRAMUsedMB: 6329},
+			{Index: 2, VRAMTotalMB: 12288, VRAMUsedMB: 578},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	// 40 GB dense on ~41.5 GB free: even at 32768 ctx the model weights +
+	// 3*1024 overhead already approach the pool, and the compute-buffer probe
+	// reserve pushes it over at every context.
+	model := &ModelProfile{
+		Path: "DenseTooBig.gguf", TotalSizeMB: 40000, SizeBytes: 40000 << 20, NumLayers: 53, HiddenSize: 5120, CTXTrain: 1048576,
+		MeasuredKVGeometry: map[string]KVGeometry{"f16": {FullLayers: 52, SWALayers: 0, BytesPerCellPerLayer: 64}},
+	}
+	dir := t.TempDir()
+	for _, ctx := range []int{32768, 65536, 131072, 262144, 524288} {
+		WriteProbeCacheForModel(dir, model, ctx, 512, "mid", "gpu", "llama", caps.GPUs, map[int]int{0: 4000, 1: 2000, 2: 2000}, 0)
+	}
+	declined := false
+	_, err := Compute(caps, model, Options{
+		KVPlacement: "gpu", KVQuality: "mid", CacheDir: dir,
+		RequireMeasuredBuffers: true, BatchSize: 512, UBatchSize: 512,
+		DenseCPUOffloadPrompt: func(totalSizeMB, freeGPUVRAMMB int) bool {
+			declined = true
+			return false
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected a hard error when the user declines host offload for a model too big for GPU")
+	}
+	if !declined {
+		t.Fatalf("expected the DenseCPUOffloadPrompt hook to be consulted")
+	}
+}
+
+// TestComputeDenseAutoReduceAcceptedOffload verifies that when a dense model
+// cannot fit on GPU at any context but the user accepts host offload (or the
+// caller is non-terminal / assume-yes), today's DenseCPUOffload behavior is
+// preserved.
+func TestComputeDenseAutoReduceAcceptedOffload(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, VRAMUsedMB: 736},
+			{Index: 1, VRAMTotalMB: 12288, VRAMUsedMB: 6329},
+			{Index: 2, VRAMTotalMB: 12288, VRAMUsedMB: 578},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path: "DenseTooBig.gguf", TotalSizeMB: 40000, SizeBytes: 40000 << 20, NumLayers: 53, HiddenSize: 5120, CTXTrain: 1048576,
+		MeasuredKVGeometry: map[string]KVGeometry{"f16": {FullLayers: 52, SWALayers: 0, BytesPerCellPerLayer: 64}},
+	}
+	dir := t.TempDir()
+	for _, ctx := range []int{32768, 65536, 131072, 262144, 524288} {
+		WriteProbeCacheForModel(dir, model, ctx, 512, "mid", "gpu", "llama", caps.GPUs, map[int]int{0: 4000, 1: 2000, 2: 2000}, 0)
+	}
+	accepted := false
+	strat, err := Compute(caps, model, Options{
+		KVPlacement: "gpu", KVQuality: "mid", CacheDir: dir,
+		RequireMeasuredBuffers: true, BatchSize: 512, UBatchSize: 512,
+		DenseCPUOffloadPrompt: func(totalSizeMB, freeGPUVRAMMB int) bool {
+			accepted = true
+			return true
+		},
+	})
+	if err != nil {
+		t.Fatalf("accepted host offload should compute: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("expected the prompt hook to fire")
+	}
+	if strat.Type != DenseCPUOffload {
+		t.Fatalf("expected dense_cpu_offload when the user accepts host offload, got %s", strat.Type)
+	}
+	// No prompt (nil hook) = non-terminal/assume-yes default: silent host offload.
+	strat2, err := Compute(caps, model, Options{
+		KVPlacement: "gpu", KVQuality: "mid", CacheDir: dir,
+		RequireMeasuredBuffers: true, BatchSize: 512, UBatchSize: 512,
+	})
+	if err != nil {
+		t.Fatalf("nil-prompt host offload should compute: %v", err)
+	}
+	if strat2.Type != DenseCPUOffload {
+		t.Fatalf("expected silent dense_cpu_offload without a prompt hook, got %s", strat2.Type)
+	}
+}
+
+// TestComputeDenseAutoReduceHonorsExplicitCtx verifies that an explicit --ctx-size
+// is a user choice and is honored unchanged: the auto-reduction must not fire.
+func TestComputeDenseAutoReduceHonorsExplicitCtx(t *testing.T) {
+	caps := denseReduceCaps()
+	model := denseReduceModel()
+	dir := t.TempDir()
+	// The reduction would reduce 262144 to 65536; an explicit 262144 must survive.
+	for _, ctx := range []int{32768, 65536, 131072, 262144, 524288} {
+		WriteProbeCacheForModel(dir, model, ctx, 512, "mid", "gpu", "llama", caps.GPUs, map[int]int{0: 4000, 1: 2000, 2: 2000}, 0)
+	}
+	strat, err := Compute(caps, model, Options{
+		ContextSize: 262144, KVPlacement: "gpu", KVQuality: "mid", CacheDir: dir,
+		RequireMeasuredBuffers: true, BatchSize: 512, UBatchSize: 512,
+		DenseCPUOffloadPrompt: func(totalSizeMB, freeGPUVRAMMB int) bool {
+			t.Fatalf("prompt must not fire for an explicit --ctx-size")
+			return false
+		},
+	})
+	if err != nil {
+		t.Fatalf("explicit ctx compute failed: %v", err)
+	}
+	if strat.ContextSize != 262144 {
+		t.Fatalf("explicit ctx=262144 must be honored unchanged, got %d", strat.ContextSize)
+	}
+}
+
+// TestComputeDenseAutoReduceMoEUnchanged verifies the MoE path is untouched: MoE
+// models keep their existing MoEOffload strategy and never go through the dense
+// reduction (which is gated on !IsMoE).
+func TestComputeDenseAutoReduceMoEUnchanged(t *testing.T) {
+	caps := denseReduceCaps()
+	model := &ModelProfile{
+		Path: "MoE.gguf", TotalSizeMB: 30000, SizeBytes: 30000 << 20, NumLayers: 32, HiddenSize: 4096, CTXTrain: 1048576,
+		HeadCountKV: 4, KeyLength: 128, ValueLength: 128,
+		IsMoE: true, NumExperts: 64, ExpertUsedCount: 6, ExpertFF: 4096,
+		NonExpertBytes: 10 << 30,
+	}
+	strat, err := Compute(caps, model, Options{KVPlacement: "auto", KVQuality: "mid", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("MoE compute failed: %v", err)
+	}
+	if strat.Type != MoEOffload {
+		t.Fatalf("expected MoE to keep moe_offload, got %s", strat.Type)
+	}
+}
+
+// TestComputeDenseAutoReduceSingleGPUUnchanged verifies the single-GPU path is
+// untouched: a dense model that fits on one GPU stays SingleGPU.
+func TestComputeDenseAutoReduceSingleGPUUnchanged(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, VRAMUsedMB: 736},
+		},
+		RAM: detect.RAMInfo{TotalMB: 65536, FreeMB: 65536},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path: "DenseSmall.gguf", TotalSizeMB: 20000, SizeBytes: 20000 << 20, NumLayers: 32, HiddenSize: 4096, CTXTrain: 1048576,
+		HeadCountKV: 4, KeyLength: 128, ValueLength: 128,
+	}
+	strat, err := Compute(caps, model, Options{KVPlacement: "gpu", KVQuality: "mid", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("single-GPU compute failed: %v", err)
+	}
+	if strat.Type != SingleGPU {
+		t.Fatalf("expected single_gpu, got %s", strat.Type)
 	}
 }

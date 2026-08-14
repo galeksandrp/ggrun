@@ -393,6 +393,14 @@ type CompanionReservation struct {
 	AllowCPU bool
 }
 
+// DenseCPUOffloadPromptFunc is the hook a launcher installs so placement can
+// ASK before silently offloading a dense model to system RAM. It is invoked
+// when no reduced context fits on GPU: the model's total size in MB and the
+// GPUs' combined free VRAM in MB. It must return whether to accept host
+// offload. assumeYes / non-terminal callers leave the hook nil (or return true)
+// to preserve today's silent behavior.
+type DenseCPUOffloadPromptFunc func(totalSizeMB, freeGPUVRAMMB int) bool
+
 // Options allows user overrides.
 type Options struct {
 	ContextSize int
@@ -473,6 +481,14 @@ type Options struct {
 	// Set during a corrective OOM re-plan so it derives fresh from the penalized
 	// VRAM instead of reloading the placement that just OOM'd.
 	SkipPlacementCache bool
+	// DenseCPUOffloadPrompt, when set, is consulted when a dense model's auto
+	// context cannot be reduced far enough to fit entirely on GPU. It is invoked
+	// with the model's total size in MB and the GPUs' combined free VRAM in MB,
+	// and must return whether to accept host (system RAM) offload. The launcher
+	// installs it to ASK the user on a terminal; assumeYes / non-terminal callers
+	// leave it nil (or return true) so today's silent host-offload behavior is
+	// preserved.
+	DenseCPUOffloadPrompt DenseCPUOffloadPromptFunc
 	// SkipCachedConfig disables every cached measurement for this Compute — the
 	// keyed .place placement cache (implies SkipPlacementCache), probe caches
 	// (compute buffers, runtime growth, prompt cache), and measured KV
@@ -1067,6 +1083,29 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	strategy := chooseStrategy(caps, model, s, totalSizeMB, kvTotalMB, opts)
 	s.Type = strategy
 
+	// Dense auto-ctx reduction: a dense model that would silently offload to
+	// system RAM is brought back onto GPU by reducing an AUTO-sized context to
+	// the largest value that fits entirely in GPU memory. Explicit --ctx-size
+	// (opts.ContextSize > 0) and the MoE/single-GPU paths are untouched.
+	if strategy == DenseCPUOffload {
+		var reduced bool
+		s, kvTotalMB, reduced = maybeReduceDenseAutoContext(s, caps, model, totalSizeMB, kvTotalMB, opts)
+		if s == nil {
+			// The user declined host offload for a dense model that cannot fit on
+			// GPU. Surface a hard error instead of silently launching into RAM.
+			name := model.Name
+			if name == "" {
+				name = filepath.Base(model.Path)
+			}
+			return nil, fmt.Errorf(
+				"model %s does not fit on GPU even at minimum context; refusing to offload to system RAM (use --ctx-size to force a larger context, or allow offloading)", name)
+		}
+		if reduced {
+			strategy = MultiGPUDense
+			s.Type = strategy
+		}
+	}
+
 	// Vision override: mmproj needs extra VRAM — force multi-GPU
 	if s.MMProjPath != "" && strategy == SingleGPU && len(caps.GPUs) > 1 {
 		if model.IsMoE {
@@ -1262,19 +1301,10 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 		return CPUOnly
 	}
 
-	// Load measured CUDA overhead. Missing probe data is unknown and contributes 0;
-	// preflight/startup OOM recording supplies measured data for later launches.
-	cudaOverheadMB := measuredCUDAOverheadMB(loadSystemProbe(opts.CacheDir, caps.GPUs))
-
-	// Load model probe for compute buffer
-	computeBufMB := computeFloorMB // 1024 default
-	if opts.RequireMeasuredBuffers {
-		computeBufMB = 0
-	}
-	pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs)
-	if pc != nil && pc.ComputeBufMB > 0 {
-		computeBufMB = pc.ComputeBufMB
-	}
+	// Per-GPU non-weight VRAM overhead: measured CUDA context overhead plus the
+	// compute buffer reserve. Shared with the dense auto-ctx reduction so both
+	// feasibility tests price the same bytes.
+	cudaOverheadMB, computeBufMB := perGPUOverheadMB(caps, model, s, opts)
 
 	// Single GPU: model + overhead fits in best GPU
 	// Use FREE VRAM (desktop/compositor uses some VRAM)
@@ -1292,15 +1322,26 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 		return SingleGPU
 	}
 
-	// Multi-GPU dense: model fits across ALL GPUs (sum of FREE VRAM)
+	// Multi-GPU dense: model fits across ALL GPUs (sum of FREE VRAM). Both
+	// dense and MoE take this path. A small MoE that fits entirely on the GPU
+	// set is placed as MultiGPUDense — all layers on GPU, no CPU expert offload —
+	// rather than MoEOffload, which reserves CPU experts only for models that
+	// genuinely do not fit on GPU.
 	if !model.IsMoE {
-		totalFreeVRAM := 0
-		for _, g := range caps.GPUs {
-			totalFreeVRAM += g.VRAMFreeMB()
+		if denseMultiGPUFit(caps, model, totalSizeMB, kvTotalMB, cudaOverheadMB, computeBufMB) {
+			return MultiGPUDense
 		}
-		// Use measured overhead per GPU: model + (cudaOverhead + computeBuf) * numGPUs + KV
-		vramNeeded := totalSizeMB + (cudaOverheadMB+computeBufMB)*numGPUs + kvTotalMB
-		if vramNeeded <= totalFreeVRAM {
+	} else {
+		// MoE compute graphs are larger than the dense 1024 MiB floor (they
+		// scale with ubatch, parallel slots, and context). Charge the MoE-aware
+		// per-GPU estimate so a fitting MoE is routed to MultiGPUDense only when
+		// it really fits WITH its compute reserve — never on an under-priced
+		// reserve that would OOM at runtime.
+		moeComputeBufMB := firstLaunchComputeBufMBForGPUParallelAtContext(model, s.UBatchSize, s.Parallel, s.ContextSize, 0, nil)
+		if moeComputeBufMB < computeBufMB {
+			moeComputeBufMB = computeBufMB
+		}
+		if denseMultiGPUFit(caps, model, totalSizeMB, kvTotalMB, cudaOverheadMB, moeComputeBufMB) {
 			return MultiGPUDense
 		}
 	}
@@ -1312,6 +1353,113 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 
 	// Dense model with CPU spill
 	return DenseCPUOffload
+}
+
+// perGPUOverheadMB returns the per-GPU non-weight VRAM overhead charged by
+// strategy selection and the dense auto-ctx reduction: the measured CUDA
+// context overhead plus the compute-buffer reserve. Missing probe data is
+// unknown and contributes 0 for the CUDA overhead; the compute buffer defaults
+// to the llama.cpp compute floor unless RequireMeasuredBuffers demands
+// measured evidence (in which case it is 0 and the contained preflight is the
+// authority).
+func perGPUOverheadMB(caps *detect.Capabilities, model *ModelProfile, s *Strategy, opts Options) (cudaOverheadMB, computeBufMB int) {
+	cudaOverheadMB = measuredCUDAOverheadMB(loadSystemProbe(opts.CacheDir, caps.GPUs))
+	computeBufMB = computeFloorMB // 1024 default
+	if opts.RequireMeasuredBuffers {
+		computeBufMB = 0
+	}
+	if s != nil {
+		if pc := opts.loadProbeCacheForStrategy(model, s, caps.GPUs); pc != nil && pc.ComputeBufMB > 0 {
+			computeBufMB = pc.ComputeBufMB
+		}
+	}
+	return cudaOverheadMB, computeBufMB
+}
+
+// denseMultiGPUFit reports whether a dense model with the given KV size fits
+// across ALL GPUs, charging per-GPU overhead: model + (cudaOverhead +
+// computeBuf) * numGPUs + KV <= sum of free VRAM. It is the exact MultiGPUDense
+// boundary from chooseStrategy, factored out so the dense auto-ctx reduction
+// reuses the same arithmetic instead of drifting a second copy.
+func denseMultiGPUFit(caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB, cudaOverheadMB, computeBufMB int) bool {
+	if model == nil {
+		return false
+	}
+	numGPUs := len(caps.GPUs)
+	if numGPUs == 0 {
+		return false
+	}
+	totalFreeVRAM := 0
+	for _, g := range caps.GPUs {
+		totalFreeVRAM += g.VRAMFreeMB()
+	}
+	vramNeeded := totalSizeMB + (cudaOverheadMB+computeBufMB)*numGPUs + kvTotalMB
+	return vramNeeded <= totalFreeVRAM
+}
+
+// maybeReduceDenseAutoContext closes the dense "fits in GPU" gap: a dense model
+// whose auto-sized context pushes it into host offload (DenseCPUOffload) is
+// reduced to the largest context that keeps it fully on GPU (MultiGPUDense).
+// The point of a dense model is that it fits in GPU memory; silently spilling
+// it into CUDA_Host because an auto ctx was sized against the system-RAM pool
+// defeats that. It only fires on AUTO context (opts.ContextSize <= 0): an
+// explicit --ctx-size is a user choice and is honored unchanged.
+//
+// The strategy is mutated in place; the bool return reports whether the context
+// was reduced so the caller can flip the strategy to MultiGPUDense. A nil
+// strategy return means the user declined host offload for a model that cannot
+// fit on GPU at any reduced context. When even the smallest rung does not fit,
+// opts.DenseCPUOffloadPrompt is consulted — the launcher uses it to ASK the
+// user whether to accept host offload or bail. A nil/absent prompt (or one that
+// returns true) preserves today's behavior: host offload proceeds.
+func maybeReduceDenseAutoContext(s *Strategy, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, int, bool) {
+	if s == nil || model == nil || model.IsMoE {
+		return s, kvTotalMB, false
+	}
+	numGPUs := len(caps.GPUs)
+	if numGPUs == 0 || opts.CPUMode || opts.ContextSize > 0 {
+		return s, kvTotalMB, false
+	}
+	cudaOverheadMB, computeBufMB := perGPUOverheadMB(caps, model, s, opts)
+
+	// Try the largest context rung that still fits entirely on GPU. Walk
+	// smallest-first so the last fit we record is the LARGEST fitting rung,
+	// mirroring the "reduce as little as needed" intent of retryMoEWithLowerAutoContext.
+	// Evaluate on a copy: scopedContextAllocationMB mutates the strategy's
+	// diagnostic fields, and a failed reduction must leave the original (which
+	// still goes to DenseCPUOffload) untouched.
+	best := 0
+	bestKV := 0
+	for _, rung := range lowerContextRungs(s.ContextSize) {
+		cand := *s
+		cand.ContextSize = rung
+		rungKV := computeKVTotalMB(model, rung, s.KVType, opts.SWAFull)
+		rungKV = scopedContextAllocationMB(rungKV, model, &cand, caps, opts)
+		if denseMultiGPUFit(caps, model, totalSizeMB, rungKV, cudaOverheadMB, computeBufMB) {
+			best = rung
+			bestKV = rungKV
+		}
+	}
+
+	if best > 0 {
+		fmt.Fprintf(os.Stderr, "[placement] auto context lowered to %d so the dense model fits on GPU instead of offloading to system RAM\n", best)
+		s.ContextSize = best
+		return s, bestKV, true
+	}
+
+	// Genuinely too big for GPU even at the smallest context. The user has a say
+	// only when they are at a terminal; assumeYes / non-terminal keeps the
+	// historical silent host-offload behavior.
+	if opts.DenseCPUOffloadPrompt != nil {
+		freeGPUVRAM := 0
+		for _, g := range caps.GPUs {
+			freeGPUVRAM += g.VRAMFreeMB()
+		}
+		if !opts.DenseCPUOffloadPrompt(totalSizeMB, freeGPUVRAM) {
+			return nil, kvTotalMB, false
+		}
+	}
+	return s, kvTotalMB, false
 }
 
 func buildCPUOnly(s *Strategy, caps *detect.Capabilities, model *ModelProfile, opts Options) (*Strategy, error) {
@@ -1364,6 +1512,18 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	if pc != nil && pc.ComputeBufMB > 0 {
 		probeHit = true
 		computeBufMB = pc.ComputeBufMB
+	}
+	// A MoE routed to MultiGPUDense (it fits entirely on GPU) carries the same
+	// larger compute graph as the MoE offload path, not the dense floor. Without
+	// this cold-start fallback the split would reserve only 1024 MiB of compute
+	// per GPU and over-pack the cards; the MoE estimate is charged so a fitting
+	// MoE's split leaves room for its real graph. Measured probe values (when a
+	// launch has already measured them) still win.
+	if model.IsMoE && pc == nil && !opts.RequireMeasuredBuffers {
+		moeCompute := firstLaunchComputeBufMBForGPUParallelAtContext(model, s.UBatchSize, s.Parallel, s.ContextSize, 0, nil)
+		if moeCompute > computeBufMB {
+			computeBufMB = moeCompute
+		}
 	}
 	// computeBufForGPU returns the per-GPU compute-buffer reserve for the given
 	// CUDA index. Mirrors the MoE per-GPU fix (buildMoEOffload): a split-owner
