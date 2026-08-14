@@ -211,6 +211,38 @@ func TestReviewerConstantsPointToQwen4B(t *testing.T) {
 	}
 }
 
+// TestSmallReviewerConstantsPointToQwen2B pins the small/light review-only
+// profile to the Qwen3.5-2B Q4_K_M artifact. Size and SHA256 are real values
+// computed from the locally installed 2B artifact, so an upstream branch update
+// cannot silently change the review-only lane.
+func TestSmallReviewerConstantsPointToQwen2B(t *testing.T) {
+	if DefaultSmallReviewerDisplayName != "Qwen3.5-2B" {
+		t.Fatalf("DefaultSmallReviewerDisplayName = %q, want Qwen3.5-2B", DefaultSmallReviewerDisplayName)
+	}
+	if DefaultSmallReviewerFile != "Qwen_Qwen3.5-2B-Q4_K_M.gguf" {
+		t.Fatalf("DefaultSmallReviewerFile = %q, want the 2B GGUF", DefaultSmallReviewerFile)
+	}
+	if DefaultSmallReviewerSize != int64(1396198496) {
+		t.Fatalf("DefaultSmallReviewerSize = %d, want 1396198496", DefaultSmallReviewerSize)
+	}
+	if DefaultSmallReviewerSHA != "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8" {
+		t.Fatalf("DefaultSmallReviewerSHA changed: %q", DefaultSmallReviewerSHA)
+	}
+	if !strings.Contains(DefaultSmallReviewerURL, "Qwen3.5-2B-GGUF") {
+		t.Fatalf("DefaultSmallReviewerURL must target the 2B repo, got %q", DefaultSmallReviewerURL)
+	}
+}
+
+// TestSmallReviewerModelPathResolvesCachePins the 2B review-only artifact path
+// under the private reviewer cache.
+func TestSmallReviewerModelPathResolvesCache(t *testing.T) {
+	appHome := t.TempDir()
+	want := filepath.Join(appHome, ".cache", "claude-reviewer", DefaultSmallReviewerFile)
+	if got := SmallReviewerModelPath(appHome); got != want {
+		t.Fatalf("SmallReviewerModelPath = %q, want %q", got, want)
+	}
+}
+
 // TestLocalReviewerModelPathFindsInstalled4B verifies that a model directory
 // holding the pinned Qwen3.5-4B artifact is resolved without any download.
 func TestLocalReviewerModelPathFindsInstalled4B(t *testing.T) {

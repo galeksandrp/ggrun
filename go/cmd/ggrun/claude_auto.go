@@ -67,6 +67,11 @@ const claudeReviewerCompanionName = "claude-auto-reviewer"
 
 const claudeNanoCompanionName = "claude-worker-nanbeige42"
 
+// claudeSmallReviewerCompanionName names the small/light Qwen3.5-2B review-only
+// lane. It is distinct from the worker/reviewer so the placement ledger keeps
+// separate VRAM footprints for the two Qwen profiles.
+const claudeSmallReviewerCompanionName = "claude-auto-small-reviewer"
+
 type claudeCompanionProfile struct {
 	Name              string
 	DisplayName       string
@@ -95,6 +100,12 @@ func (p *claudeCompanionProfile) companionMeasurementKey() string {
 // real launch the reviewer's actual usage is visible in the normal probe paths,
 // and the seat is re-planned on every launch anyway.
 const claudeReviewerReservationVRAMMB = 4600
+
+// claudeSmallReviewerReservationVRAMMB is the small/light Qwen3.5-2B review-only
+// footprint reserved in the placement ledger. The 2B Q4_K_M weights are
+// 1331 MiB (1396198496 bytes); the historical reservation for the 2B was 2600 MB
+// (measured ~2096 MiB resident) — roughly half of the 4B's 4600 MB seat.
+const claudeSmallReviewerReservationVRAMMB = 2600
 
 // claudeNanoReservationVRAMMB covers the measured 8843 MiB peak for the real
 // 64k/Q8 worker profile on the RTX 3090 Ti, rounded up before per-host samples
@@ -131,16 +142,25 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 	// --claude-reviewer flag.
 	envOverride := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" ||
 		strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) != ""
-	// --claude-reviewer qwen forces the historical Qwen profile even when a
-	// verified NanoBeige artifact is installed (the small dense reviewer is the
-	// cheap choice for dense main models).
-	forceQwen := !envOverride && req != nil && strings.TrimSpace(req.ClaudeReviewerOverride) == claudeReviewerQwen
-	// --claude-reviewer nanbeige prefers the NanoBeige4.2 worker; the default
-	// (empty or "auto") already prefers it whenever a verified artifact and a
-	// GPU-capable backend are present, so both agree. The readiness checks below
-	// always gate: a forced NanoBeige with no installed artifact degrades to the
-	// Qwen profile rather than launching a broken worker.
-	if !forceQwen && !envOverride && cacheDir != "" && claudeNanoArtifactReady(advisor.DefaultModelPath(cacheDir)) {
+	override := ""
+	if req != nil {
+		override = strings.TrimSpace(req.ClaudeReviewerOverride)
+	}
+	// --claude-reviewer nanbeige forces the NanoBeige4.2 MoE worker. It is an
+	// explicit opt-in: auto mode no longer defaults to NanoBeige. The readiness
+	// checks always gate — a forced NanoBeige with no installed artifact degrades
+	// to the Qwen profile rather than launching a broken worker.
+	forceNano := !envOverride && override == claudeReviewerNanbeige
+	// --claude-reviewer qwen2b forces the small/light Qwen3.5-2B review-only
+	// profile (the cheap safety-review lane). It is the one role with no worker
+	// duty: only the classifier/security-monitor lane targets the small reviewer.
+	forceSmall := !envOverride && override == claudeReviewerQwen2B
+	// auto (the default) and --claude-reviewer qwen both resolve to the Qwen3.5-4B
+	// worker/reviewer: the big/fast dense companion that handles BOTH the
+	// safety-review calls and the cheap-tier worker calls (the user's measured
+	// best). NanoBeige is never the automatic choice — it needs the explicit
+	// --claude-reviewer nanbeige opt-in above.
+	if forceNano && cacheDir != "" && claudeNanoArtifactReady(advisor.DefaultModelPath(cacheDir)) {
 		modelPath := advisor.DefaultModelPath(cacheDir)
 		if backendPath, err := claudeNanoBackend(); err == nil && claudeNanoGPUCapable(backendPath) {
 			profile = &claudeCompanionProfile{
@@ -152,6 +172,21 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			}
 		}
 	}
+	if profile == nil && forceSmall {
+		modelPath := claudeauto.SmallReviewerModelPath(appHome)
+		profile = &claudeCompanionProfile{
+			Name: claudeSmallReviewerCompanionName, DisplayName: claudeauto.DefaultSmallReviewerDisplayName,
+			ModelPath: modelPath, ModelMarker: modelPath,
+			// The 2B profile owns its own measurement key so it never collides with
+			// the 4B footprint or the stale legacy-name measurement.
+			MeasurementKey:    "claude-reviewer-qwen35-2b-q4-k-m",
+			KVType:            "q8_0",
+			ReservationVRAMMB: claudeSmallReviewerReservationVRAMMB,
+		}
+	}
+	// Fallback (env override, degraded NanoBeige, or any unmapped value): the
+	// Qwen3.5-4B worker/reviewer. An env override carries its own model path and
+	// backend through the helper functions, so the placeholder profile is enough.
 	if profile == nil {
 		modelPath := claudeauto.ReviewerModelPath(appHome)
 		profile = &claudeCompanionProfile{

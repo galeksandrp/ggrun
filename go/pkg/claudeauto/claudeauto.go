@@ -55,6 +55,18 @@ const (
 	// not download the same bytes into the private reviewer cache.
 	DefaultReviewerLocalDir = "Qwen3.5-4B-Q4_K_M"
 
+	// DefaultSmallReviewer* pins the small/light review-only Qwen3.5-2B profile.
+	// Auto mode routes the classifier (security-review) lane to the 4B worker/
+	// reviewer; the 2B is the explicit --claude-reviewer qwen2b choice for hosts
+	// that want the cheapest possible safety-review lane. Size and SHA256 are the
+	// real values of the locally installed artifact at
+	// .cache/claude-reviewer/Qwen_Qwen3.5-2B-Q4_K_M.gguf.
+	DefaultSmallReviewerDisplayName = "Qwen3.5-2B"
+	DefaultSmallReviewerFile        = "Qwen_Qwen3.5-2B-Q4_K_M.gguf"
+	DefaultSmallReviewerSize        = int64(1396198496)
+	DefaultSmallReviewerSHA         = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
+	DefaultSmallReviewerURL         = "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/" + DefaultSmallReviewerFile
+
 	maxRoutedRequestBytes = 16 << 20
 
 	// Route labels recorded per request.
@@ -85,6 +97,14 @@ func ReviewerModelPath(appHome string) string {
 		return path
 	}
 	return filepath.Join(appHome, ".cache", "claude-reviewer", DefaultReviewerFile)
+}
+
+// SmallReviewerModelPath returns the small/light review-only Qwen3.5-2B
+// artifact path. The small reviewer has no env override: the single
+// GGRUN_CLAUDE_REVIEWER_MODEL override selects the worker/reviewer, and the 2B
+// is a distinct, deliberately small profile for the review-only lane.
+func SmallReviewerModelPath(appHome string) string {
+	return filepath.Join(appHome, ".cache", "claude-reviewer", DefaultSmallReviewerFile)
 }
 
 // LocalReviewerModelPath looks for the pinned artifact under the model

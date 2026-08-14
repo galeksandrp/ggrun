@@ -314,6 +314,10 @@ func TestClaudeReviewerReservationBuildsCompanion(t *testing.T) {
 	}
 }
 
+// TestClaudeCompanionPrefersVerifiedNanoAndFreezesChoice verifies the explicit
+// --claude-reviewer nanbeige opt-in: with a verified NanoBeige artifact and a
+// GPU-capable backend, the forced selection returns the NanoBeige worker profile
+// (Q4 KV, its own measurement key), and the choice freezes once made.
 func TestClaudeCompanionPrefersVerifiedNanoAndFreezesChoice(t *testing.T) {
 	cacheDir := t.TempDir()
 	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
@@ -325,7 +329,7 @@ func TestClaudeCompanionPrefersVerifiedNanoAndFreezesChoice(t *testing.T) {
 	}
 	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
 	claudeNanoGPUCapable = func(string) bool { return true }
-	req := &launchRequest{AppHome: t.TempDir()}
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerNanbeige}
 	profile := resolveClaudeCompanionProfile(req, cacheDir)
 	if !profile.NanoBeige || profile.Name != claudeNanoCompanionName || profile.BackendPath == "" || profile.KVType != "q4_0" {
 		t.Fatalf("verified NanoBeige pair was not selected: %+v", profile)
@@ -337,6 +341,13 @@ func TestClaudeCompanionPrefersVerifiedNanoAndFreezesChoice(t *testing.T) {
 	claudeNanoArtifactReady = func(string) bool { return false }
 	if again := resolveClaudeCompanionProfile(req, cacheDir); again != profile {
 		t.Fatalf("companion changed after launch choice: before=%p after=%p", profile, again)
+	}
+	// Auto (no explicit override) must NOT pick NanoBeige even when it is ready:
+	// Nano is a --claude-reviewer nanbeige opt-in, never the automatic choice.
+	autoReq := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerAuto}
+	autoProfile := resolveClaudeCompanionProfile(autoReq, cacheDir)
+	if autoProfile.NanoBeige || autoProfile.Name != claudeReviewerCompanionName {
+		t.Fatalf("auto must resolve to the Qwen4B worker/reviewer, not NanoBeige: %+v", autoProfile)
 	}
 }
 
@@ -614,7 +625,12 @@ func TestClaudeReviewerQwenProfileResolvesQwen4B(t *testing.T) {
 	}
 }
 
-func TestClaudeReviewerFlagAutoKeepsCurrentBehavior(t *testing.T) {
+// TestClaudeReviewerFlagAutoResolvesQwen4B pins the corrected default: auto
+// (and empty) must resolve to the Qwen3.5-4B worker/reviewer — the big/fast
+// dense companion that handles BOTH safety reviews and cheap-tier worker calls —
+// even when a verified NanoBeige artifact and backend are present. NanoBeige is
+// now an explicit --claude-reviewer nanbeige opt-in, never the automatic choice.
+func TestClaudeReviewerFlagAutoResolvesQwen4B(t *testing.T) {
 	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
 	defer func() {
 		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
@@ -622,21 +638,49 @@ func TestClaudeReviewerFlagAutoKeepsCurrentBehavior(t *testing.T) {
 	claudeNanoArtifactReady = func(string) bool { return true }
 	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
 	claudeNanoGPUCapable = func(string) bool { return true }
-	// auto must behave exactly like the default (no flag): Nano wins when ready.
+	// auto must resolve to the Qwen4B worker/reviewer even when Nano is ready.
 	autoReq := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerAuto}
 	profile := resolveClaudeCompanionProfile(autoReq, t.TempDir())
-	if !profile.NanoBeige || profile.Name != claudeNanoCompanionName {
-		t.Fatalf("auto must keep the automatic NanoBeige choice: %+v", profile)
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("auto must resolve to the Qwen4B worker/reviewer: %+v", profile)
+	}
+	if profile.DisplayName != "Qwen3.5-4B" {
+		t.Fatalf("auto reviewer display name = %q, want Qwen3.5-4B", profile.DisplayName)
 	}
 	// Empty override (the historical default) picks the same profile.
 	emptyReq := &launchRequest{AppHome: t.TempDir()}
 	if again := resolveClaudeCompanionProfile(emptyReq, t.TempDir()); again.Name != profile.Name {
 		t.Fatalf("auto and empty override diverged: auto=%q empty=%q", profile.Name, again.Name)
 	}
-	// With the artifact missing, auto degrades to Qwen (unchanged behavior).
+	// With the artifact missing, auto stays on Qwen (unchanged behavior).
 	claudeNanoArtifactReady = func(string) bool { return false }
 	fallback := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerAuto}, t.TempDir())
 	if fallback.NanoBeige || fallback.Name != claudeReviewerCompanionName {
-		t.Fatalf("auto without an artifact must degrade to Qwen: %+v", fallback)
+		t.Fatalf("auto without an artifact must stay on Qwen: %+v", fallback)
+	}
+}
+
+// TestClaudeReviewerFlagQwen2BResolvesSmallReviewer pins the small/light
+// review-only profile: --claude-reviewer qwen2b must force the Qwen3.5-2B
+// artifact (the cheap safety-review lane) even when NanoBeige is ready.
+func TestClaudeReviewerFlagQwen2BResolvesSmallReviewer(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerQwen2B}
+	profile := resolveClaudeCompanionProfile(req, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeSmallReviewerCompanionName {
+		t.Fatalf("--claude-reviewer qwen2b must force the small reviewer: %+v", profile)
+	}
+	if profile.DisplayName != "Qwen3.5-2B" {
+		t.Fatalf("small reviewer display name = %q, want Qwen3.5-2B", profile.DisplayName)
+	}
+	wantPath := filepath.Join(req.AppHome, ".cache", "claude-reviewer", claudeauto.DefaultSmallReviewerFile)
+	if profile.ModelPath != wantPath {
+		t.Fatalf("small reviewer path = %q, want %q", profile.ModelPath, wantPath)
 	}
 }
