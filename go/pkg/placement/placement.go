@@ -753,10 +753,11 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 		// Thinking stays ON for normal serving (backend default `--reasoning auto`);
 		// only benchmark/tune opt in to `--reasoning off` for clean, fast measurement.
 		ReasoningOff: opts.ReasoningOff,
-		// Nanbeige's chat template contains a Jinja `raise_exception` macro the
-		// backend's Jinja engine cannot parse, so the model 400s on every request
-		// when --jinja is passed. The built-in (non-Jinja) template path handles
-		// it fine, so nanbeige launches omit --jinja.
+		// NoJinja is legacy placement metadata (kept for cached-strategy JSON
+		// stability). The current fix for models whose embedded template carries a
+		// raise_exception guard (nanbeige, Qwen3.5/3.8) is the data-driven
+		// chat-template catalog: keep --jinja and serve a corrected template via
+		// --chat-template-file (see pkg/chattemplate / catalogTemplateArgs).
 		NoJinja: strings.EqualFold(model.ModelArch, "nanbeige"),
 		// DeepSeek4 uses non-shiftable recurrent memory even though current GGUFs
 		// do not expose the generic SSM metadata bit. Treat it like other hybrid
@@ -4537,9 +4538,10 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 	)
 	// Tool calls require --jinja (the backend returns "tools param requires
 	// --jinja flag" without it). A model whose template the Jinja engine cannot
-	// auto-parse (nanbeige: raise_exception macro) gets a corrected template
-	// override via --chat-template-file (see nanbeigeTemplateArgs in main.go),
-	// keeping --jinja on. Always pass --jinja here.
+	// auto-parse (a raise_exception macro such as nanbeige's or Qwen3.5/3.8's)
+	// gets a corrected template override via --chat-template-file (see
+	// catalogTemplateArgs in main.go / pkg/chattemplate), keeping --jinja on.
+	// Always pass --jinja here.
 	args = append(args, "--jinja")
 	args = append(args,
 		"--threads", fmt.Sprintf("%d", s.Threads),

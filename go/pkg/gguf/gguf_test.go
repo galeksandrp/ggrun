@@ -253,3 +253,53 @@ func TestEstimateParams(t *testing.T) {
 		t.Fatalf("expected ~596M params, got %d", got)
 	}
 }
+
+// writeChatTemplateFixture writes a minimal GGUF whose metadata section carries
+// a tokenizer.chat_template string (type 8) plus a preceding architecture key.
+func writeChatTemplateFixture(t *testing.T, path, arch, template string) {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	buf.WriteString("GGUF")
+	binary.Write(buf, binary.LittleEndian, uint32(3))
+	binary.Write(buf, binary.LittleEndian, uint64(0)) // tensor count
+	binary.Write(buf, binary.LittleEndian, uint64(2)) // kv count
+
+	writeStr := func(s string) {
+		binary.Write(buf, binary.LittleEndian, uint64(len(s)))
+		buf.WriteString(s)
+	}
+	writeStr("general.architecture")
+	binary.Write(buf, binary.LittleEndian, uint32(8))
+	writeStr(arch)
+
+	writeStr("tokenizer.chat_template")
+	binary.Write(buf, binary.LittleEndian, uint32(8))
+	writeStr(template)
+
+	if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+}
+
+func TestChatTemplateReadsEmbeddedTemplate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	writeChatTemplateFixture(t, path, "qwen35",
+		"{%- if not messages %}{{- raise_exception('No messages provided.') }}{%- endif %}")
+	if got := ChatTemplate(path); got == "" || !strings.Contains(got, "raise_exception") {
+		t.Fatalf("ChatTemplate = %q, want embedded raise_exception template", got)
+	}
+}
+
+func TestChatTemplateAbsentReturnsEmpty(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model.gguf")
+	writeChatTemplateFixture(t, path, "deepseek4", "")
+	if got := ChatTemplate(path); got != "" {
+		t.Fatalf("ChatTemplate with empty template = %q, want \"\"", got)
+	}
+	if got := ChatTemplate(filepath.Join(t.TempDir(), "missing.gguf")); got != "" {
+		t.Fatalf("ChatTemplate of missing file = %q, want \"\"", got)
+	}
+	if got := ChatTemplate(""); got != "" {
+		t.Fatalf("ChatTemplate of empty path = %q, want \"\"", got)
+	}
+}

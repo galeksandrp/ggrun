@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "comment": "Data-driven chat-template override catalog. A model whose GGUF-embedded chat template llama.cpp's minja engine cannot parse (any template carrying a Jinja raise_exception guard such as 'System message must be at the beginning') is fixed by adding an entry here - no Go code change. Match fields: arch (GGUF general.architecture, case-insensitive) or basename (filepath.Base of the model file, case-insensitive substring). The first enabled entry whose arch or basename matches wins. 'template_file' names a .jinja file in this package's templates/ directory, embedded into the binary. 'enabled: false' disables an entry without deleting it.",
+  "entries": [
+    {
+      "name": "nanbeige4.2-3b",
+      "arch": "nanbeige",
+      "basename": "nanbeige",
+      "template_file": "Nanbeige4.2-3B.jinja",
+      "enabled": true
+    },
+    {
+      "name": "qwen3.8-27b",
+      "arch": "qwen35",
+      "basename": "qwen3.8",
+      "template_file": "Qwen3.8-27B.jinja",
+      "enabled": true
+    }
+  ]
+}

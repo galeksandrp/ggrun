@@ -14,6 +14,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/config"
 	modelstore "github.com/raketenkater/ggrun/pkg/models"
+	"github.com/raketenkater/ggrun/pkg/modelusage"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/recommend"
 )
@@ -1673,5 +1674,42 @@ func TestModelConfigViewAdvertisesCacheActions(t *testing.T) {
 	v = m.viewModelConfig()
 	if !strings.Contains(v, "derive fresh, ignore cached config") {
 		t.Fatalf("model config view missing the no-cached-config on state")
+	}
+}
+
+func TestSortModelsByUsageDesc(t *testing.T) {
+	items := []ModelItem{
+		{Name: "zeta.gguf", Path: "/models/zeta.gguf"},
+		{Name: "alpha.gguf", Path: "/models/alpha.gguf"},
+		{Name: "mid.gguf", Path: "/models/mid.gguf"},
+	}
+	usage := map[string]modelusage.Record{
+		"/models/alpha.gguf": {Launches: 5, LastUsedAt: time.Now().Add(-2 * time.Hour)},
+		"/models/mid.gguf":   {Launches: 3, LastUsedAt: time.Now().Add(-1 * time.Hour)},
+		"/models/zeta.gguf":  {Launches: 5, LastUsedAt: time.Now().Add(-3 * time.Hour)},
+	}
+	sortModels(items, usage)
+	got := []string{items[0].Name, items[1].Name, items[2].Name}
+	want := []string{"alpha.gguf", "zeta.gguf", "mid.gguf"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortModels[%d] = %q, want %q (full order %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestSortModelsFallsBackToNameWhenNoUsage(t *testing.T) {
+	items := []ModelItem{
+		{Name: "zeta.gguf", Path: "/models/zeta.gguf"},
+		{Name: "alpha.gguf", Path: "/models/alpha.gguf"},
+		{Name: "mid.gguf", Path: "/models/mid.gguf"},
+	}
+	sortModels(items, nil)
+	got := []string{items[0].Name, items[1].Name, items[2].Name}
+	want := []string{"alpha.gguf", "mid.gguf", "zeta.gguf"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortModels no-usage[%d] = %q, want %q (full order %v)", i, got[i], want[i], got)
+		}
 	}
 }

@@ -24,6 +24,7 @@ import (
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/benchmark"
+	"github.com/raketenkater/ggrun/pkg/chattemplate"
 	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/controller"
@@ -33,6 +34,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/gguf"
 	"github.com/raketenkater/ggrun/pkg/libhub"
 	modelstore "github.com/raketenkater/ggrun/pkg/models"
+	"github.com/raketenkater/ggrun/pkg/modelusage"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/probe"
 	"github.com/raketenkater/ggrun/pkg/recommend"
@@ -201,6 +203,12 @@ Launch flags:
   --vision, -vision    Enable vision (auto-detect mmproj)
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
+  --claude-reviewer str  Local reviewer/worker for Claude Code (requires --claude-code):
+                       auto|qwen|nanbeige (default auto)
+  --chat-template str   Force a corrected chat template from the data-driven catalog
+                       by entry name (e.g. nanbeige4.2-3b, qwen3.8-27b) for models whose
+                       embedded template llama.cpp's minja engine cannot parse; a value
+                       that is not a catalog entry is passed through as a backend flag
   --claude-resume str  Reopen a recorded Claude Code session (id or "latest") and resume
                        its interrupted workflow from the cached journal
   --claude-resume-force  Resume even though the backend shape changed (unsafe)
@@ -577,6 +585,12 @@ type launchRequest struct {
 	Benchmark            bool
 	WorkerBenchmark      bool // task-specific support/reviewer quality plus throughput
 	ClaudeCode           bool
+	// ClaudeReviewerOverride selects the local reviewer/worker model when
+	// Claude Code mode starts its Auto companion: "auto" keeps ggrun's
+	// automatic choice (Qwen for dense, Nanbeige4.2 for big MoE), "qwen"
+	// forces the historical Qwen profile, and "nanbeige" forces the Nanbeige4.2
+	// profile. Empty means auto. Set via --claude-reviewer.
+	ClaudeReviewerOverride string
 	// ClaudeReviewerDisabled is set only after the user accepts the resident
 	// fallback that routes Auto reviews through the main model. It is runtime
 	// state, not a placement-policy flag exposed on the command line.
@@ -604,6 +618,11 @@ type launchRequest struct {
 	EmitServerArgvJSON    bool // dry-run machine interface for reproducible benchmark harnesses
 	SpecDraftMax          int  // internal spec-test ceiling; not a public launch override
 	ExtraArgs             []string
+	// ChatTemplateOverride names a chat-template catalog entry (pkg/chattemplate)
+	// the user explicitly selected with --chat-template. It forces that entry's
+	// corrected template regardless of the model's arch/basename, and overrides
+	// any automatic catalog match.
+	ChatTemplateOverride string
 	// DisabledBackendFlags records generated optimizations that this exact
 	// model/backend pairing is known (or measured) not to support. It is launch
 	// state rather than configuration: applying it after every argument rebuild
@@ -866,9 +885,26 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 				}
 				req.ClaudeProfile = profile
 				continue
+			case "--claude-reviewer":
+				reviewer, err := parseClaudeReviewer(key, val)
+				if err != nil {
+					return nil, err
+				}
+				req.ClaudeReviewerOverride = reviewer
+				continue
 			case "--claude-resume":
 				req.ClaudeResume, req.ClaudeCode = val, true
 				continue
+			case "--chat-template":
+				// --chat-template doubles as llama.cpp's built-in template selector
+				// (e.g. "--chat-template chatml"). When the value names a
+				// chat-template catalog entry, it forces that corrected template;
+				// otherwise it stays a passthrough backend flag like today.
+				if entry, ok := chattemplate.ResolveOverride(val); ok {
+					req.ChatTemplateOverride = entry.Name
+					continue
+				}
+				req.ExtraArgs = append(req.ExtraArgs, a)
 			}
 		}
 		next := func() (string, error) {
@@ -987,6 +1023,26 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			req.VisionAuto = true
 		case "--claude-code":
 			req.ClaudeCode = true
+		case "--claude-reviewer":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			reviewer, err := parseClaudeReviewer(a, v)
+			if err != nil {
+				return nil, err
+			}
+			req.ClaudeReviewerOverride = reviewer
+		case "--chat-template":
+			v, err := next()
+			if err != nil {
+				return nil, err
+			}
+			if entry, ok := chattemplate.ResolveOverride(v); ok {
+				req.ChatTemplateOverride = entry.Name
+				break
+			}
+			req.ExtraArgs = append(req.ExtraArgs, a, v)
 		case "--claude-resume":
 			v, err := next()
 			if err != nil {
@@ -1198,6 +1254,9 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 	if req.ClaudeProfile != "" && !req.ClaudeCode {
 		return nil, fmt.Errorf("--claude-profile requires --claude-code")
 	}
+	if req.ClaudeReviewerOverride != "" && req.ClaudeReviewerOverride != claudeReviewerAuto && !req.ClaudeCode {
+		return nil, fmt.Errorf("--claude-reviewer requires --claude-code")
+	}
 	if err := resolveKVCacheTypeFlags(req); err != nil {
 		return nil, err
 	}
@@ -1215,6 +1274,22 @@ func parseClaudeProfile(flag, value string) (string, error) {
 		return profile, nil
 	default:
 		return "", fmt.Errorf("%s must be %q or %q, got %q", flag, claudeProfileInteractive, claudeProfileParallel, value)
+	}
+}
+
+const (
+	claudeReviewerAuto     = "auto"
+	claudeReviewerQwen     = "qwen"
+	claudeReviewerNanbeige = "nanbeige"
+)
+
+func parseClaudeReviewer(flag, value string) (string, error) {
+	reviewer := strings.ToLower(strings.TrimSpace(value))
+	switch reviewer {
+	case claudeReviewerAuto, claudeReviewerQwen, claudeReviewerNanbeige:
+		return reviewer, nil
+	default:
+		return "", fmt.Errorf("%s must be %q, %q or %q, got %q", flag, claudeReviewerAuto, claudeReviewerQwen, claudeReviewerNanbeige, value)
 	}
 }
 
@@ -2417,7 +2492,7 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 	serverArgs := append([]string{be.Path}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, hy3CompatibilityArgs(req.ExtraArgs, model, be)...)
 	serverArgs = append(serverArgs, hy3TemplateArgs(req.ExtraArgs, be)...)
-	serverArgs = append(serverArgs, nanbeigeTemplateArgs(req.ExtraArgs, be)...)
+	serverArgs = append(serverArgs, catalogTemplateArgs(req, cfg, model)...)
 	serverArgs = append(serverArgs, req.ExtraArgs...)
 	serverArgs = applyTuneCache(req, serverArgs, cfg.CacheDir, be.Tag, strategy.MMProjPath != "", caps)
 	serverArgs = claudeCodeAliasArgs(serverArgs, req.ClaudeCode)
@@ -2704,42 +2779,60 @@ func hasChatTemplateOverride(args []string) bool {
 	return false
 }
 
-// nanbeigeTemplateArgs overrides the GGUF's embedded chat template with the
-// corrected copy shipped by the reviewed nanbeige42 backend. The embedded
-// template contains a Jinja `raise_exception('System message must be at the
-// beginning.')` guard that fires when a system message is not the first message
-// (llama.cpp appends its own tool-instruction system message during tool-call
-// parser generation), 400ing every such request under --jinja with "Unable to
-// generate parser for this template." Tool calls REQUIRE --jinja, so the fix is
-// to keep --jinja and serve the corrected template instead of dropping the flag.
-// Deliberately recipe-scoped and never overrides a user's explicit chat template
-// choice.
-func nanbeigeTemplateArgs(extra []string, be *backendInfo) []string {
-	if be == nil || !strings.EqualFold(be.Tag, "nanbeige42") || hasChatTemplateOverride(extra) {
+// catalogTemplateArgs overrides the GGUF's embedded chat template with a
+// corrected copy from the data-driven chat-template catalog (pkg/chattemplate).
+// Some models ship GGUFs whose embedded template contains a Jinja
+// `raise_exception('System message must be at the beginning.')` guard that
+// fires when a system message is not the first message (llama.cpp appends its
+// own tool-instruction system message during tool-call parser generation),
+// 400ing every such request under --jinja with "Unable to generate parser for
+// this template." Tool calls REQUIRE --jinja, so the fix is to keep --jinja and
+// serve a corrected template instead of dropping the flag.
+//
+// Which model gets which corrected template is pure catalog data: adding an
+// entry to pkg/chattemplate/catalog.json fixes any future broken model with no
+// code change. The corrected template is materialized into the ggrun cache dir
+// so the backend receives a real --chat-template-file path. A user's explicit
+// chat template choice (--chat-template or --chat-template-file) always wins.
+func catalogTemplateArgs(req *launchRequest, cfg *config.Config, model *placement.ModelProfile) []string {
+	if req == nil || cfg == nil || model == nil {
 		return nil
 	}
-	if tpl := nanbeigeTemplatePath(be.Path); tpl != "" {
-		return []string{"--chat-template-file", tpl}
+	// A passthrough --chat-template/--chat-template-file (e.g. after a --) is a
+	// direct backend flag: it wins over both the catalog auto-match and the
+	// --chat-template name override.
+	if hasChatTemplateOverride(req.ExtraArgs) {
+		return nil
 	}
-	return nil
-}
-
-// nanbeigeTemplatePath resolves the corrected chat template shipped by the
-// reviewed nanbeige42 backend for a given backend binary path, or "" when the
-// binary's tree does not carry it. The backend is built into
-// <fork-root>/build-cuda/bin/llama-server, so three directory hops up from the
-// binary lands on <fork-root>, whose models/templates mirrors llama.cpp's own
-// layout (same convention as hy3TemplateArgs/Hy3.jinja).
-func nanbeigeTemplatePath(binary string) string {
-	if strings.TrimSpace(binary) == "" {
-		return ""
+	var entry chattemplate.Entry
+	var ok bool
+	if override := strings.TrimSpace(req.ChatTemplateOverride); override != "" {
+		// Explicit user selection by catalog name forces that entry regardless
+		// of arch/basename and regardless of whether the embedded template is
+		// broken.
+		entry, ok = chattemplate.ResolveOverride(override)
+		if !ok {
+			return nil
+		}
+	} else {
+		arch := model.ModelArch
+		basename := model.Basename
+		if basename == "" {
+			basename = filepath.Base(model.Path)
+		}
+		// Detect the raise_exception guard in the model's own embedded template.
+		embedded := gguf.ChatTemplate(model.Path)
+		entry, ok = chattemplate.Resolve(arch, basename, embedded, true)
+		if !ok {
+			return nil
+		}
 	}
-	root := filepath.Dir(filepath.Dir(filepath.Dir(binary)))
-	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
-	if info, err := os.Stat(template); err != nil || info.IsDir() {
-		return ""
+	path, err := chattemplate.Materialize(cfg.CacheDir, entry)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[launch] warning: chat-template override for %s unavailable: %v\n", entry.Name, err)
+		return nil
 	}
-	return template
+	return []string{"--chat-template-file", path}
 }
 
 // specLaunchIdentity fingerprints the final runtime argv after tune caches,
@@ -4862,6 +4955,9 @@ func cmdLaunch(args []string) {
 	}
 
 	fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
+	// Record launch usage once per successful launch (never per request) so the
+	// TUI can sort its model list by real history. Best-effort write.
+	modelusage.RecordLaunch(cfg.CacheDir, req.ModelPath)
 	if p.LogBuf != nil {
 		recordMeasuredLaunchProbes(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String(), baselineVRAM, serverProcessPID(p))
 	}
@@ -5777,6 +5873,9 @@ func cmdGUI() {
 		if err := tui.SaveLatestLaunch(cfg.CacheDir, req); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: could not save latest TUI launch configuration: %v\n", err)
 		}
+		// Launch usage is recorded inside cmdLaunch (the shared real-server
+		// path for both CLI and TUI launches), so no record is needed here; the
+		// AI-tune path below intentionally skips a server launch.
 		if req.AITune {
 			cmdTune(launchArgs)
 			return

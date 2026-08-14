@@ -15,9 +15,11 @@ import (
 
 	"github.com/raketenkater/ggrun/pkg/advisor"
 	"github.com/raketenkater/ggrun/pkg/backends"
+	"github.com/raketenkater/ggrun/pkg/chattemplate"
 	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/raketenkater/ggrun/pkg/gguf"
 	"github.com/raketenkater/ggrun/pkg/libhub"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/server"
@@ -124,20 +126,29 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 	}
 
 	var profile *claudeCompanionProfile
-	// Explicit reviewer overrides retain their historical behavior and always
-	// outrank ggrun's automatic worker selection.
-	if strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) == "" &&
-		strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) == "" && cacheDir != "" {
+	// An explicit reviewer model/backend override (env) retains its historical
+	// behavior and always outranks both ggrun's automatic choice and the
+	// --claude-reviewer flag.
+	envOverride := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" ||
+		strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) != ""
+	// --claude-reviewer qwen forces the historical Qwen profile even when a
+	// verified NanoBeige artifact is installed (the small dense reviewer is the
+	// cheap choice for dense main models).
+	forceQwen := !envOverride && req != nil && strings.TrimSpace(req.ClaudeReviewerOverride) == claudeReviewerQwen
+	// --claude-reviewer nanbeige prefers the NanoBeige4.2 worker; the default
+	// (empty or "auto") already prefers it whenever a verified artifact and a
+	// GPU-capable backend are present, so both agree. The readiness checks below
+	// always gate: a forced NanoBeige with no installed artifact degrades to the
+	// Qwen profile rather than launching a broken worker.
+	if !forceQwen && !envOverride && cacheDir != "" && claudeNanoArtifactReady(advisor.DefaultModelPath(cacheDir)) {
 		modelPath := advisor.DefaultModelPath(cacheDir)
-		if claudeNanoArtifactReady(modelPath) {
-			if backendPath, err := claudeNanoBackend(); err == nil && claudeNanoGPUCapable(backendPath) {
-				profile = &claudeCompanionProfile{
-					Name: claudeNanoCompanionName, DisplayName: "Nanbeige4.2-3B",
-					ModelPath: modelPath, BackendPath: backendPath, ModelMarker: modelPath,
-					MeasurementKey:    claudeNanoCompanionName + "-ctx65536-kv-q4_0",
-					KVType:            "q4_0",
-					ReservationVRAMMB: claudeNanoReservationVRAMMB, NanoBeige: true,
-				}
+		if backendPath, err := claudeNanoBackend(); err == nil && claudeNanoGPUCapable(backendPath) {
+			profile = &claudeCompanionProfile{
+				Name: claudeNanoCompanionName, DisplayName: "Nanbeige4.2-3B",
+				ModelPath: modelPath, BackendPath: backendPath, ModelMarker: modelPath,
+				MeasurementKey:    claudeNanoCompanionName + "-ctx65536-kv-q4_0",
+				KVType:            "q4_0",
+				ReservationVRAMMB: claudeNanoReservationVRAMMB, NanoBeige: true,
 			}
 		}
 	}
@@ -348,7 +359,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		// tensors live on the selected device (observed: +262 MiB on the main
 		// CUDA0 during a DeepSeek-V4 run). Ask the backend for the device name it
 		// exposes after isolation instead of assuming every fork uses CUDA0.
-		args := claudeReviewerArgsWithKV(be.Path, modelPath, port, device, be.Help, profile.KVType, profile.NanoBeige)
+		args := claudeReviewerArgsWithKV(be.Path, modelPath, port, device, be.Help, profile.KVType, cacheDir)
 		p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, env)
 		if err == nil {
 			fmt.Printf("[claude-code] Auto worker/reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, profile.DisplayName)
@@ -370,7 +381,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 
 	// CPU is slower, but it preserves autonomous/fail-closed behavior on systems
 	// whose GPUs are already full. It is also the normal path on CPU-only hosts.
-	args := claudeReviewerArgsWithKV(be.Path, modelPath, port, "", be.Help, profile.KVType, profile.NanoBeige)
+	args := claudeReviewerArgsWithKV(be.Path, modelPath, port, "", be.Help, profile.KVType, cacheDir)
 	p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, claudeReviewerBackendEnv(be.Path, claudeReviewerCPUEnv()))
 	if err != nil {
 		if logCloser != nil {
@@ -386,10 +397,58 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 }
 
 func claudeReviewerArgs(binary, modelPath string, port int, device, help string) []string {
-	return claudeReviewerArgsWithKV(binary, modelPath, port, device, help, "q8_0", false)
+	return claudeReviewerArgsWithKV(binary, modelPath, port, device, help, "q8_0", "")
 }
 
-func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, kvType string, noJinja bool) []string {
+// reviewerCatalogTemplate resolves a corrected chat template for a reviewer
+// model from the data-driven catalog. It matches on the reviewer GGUF's own
+// architecture/basename (read from the model file), only applying when the
+// embedded template carries the raise_exception marker. cacheDir is where the
+// corrected template is materialized; an empty cacheDir (legacy callers) skips
+// the override entirely rather than writing to an unknown location.
+func reviewerCatalogTemplate(cacheDir, modelPath string) string {
+	if strings.TrimSpace(cacheDir) == "" || strings.TrimSpace(modelPath) == "" {
+		return ""
+	}
+	embedded := gguf.ChatTemplate(modelPath)
+	arch, basename := reviewerModelIdentity(modelPath)
+	entry, ok := chattemplate.Resolve(arch, basename, embedded, true)
+	if !ok {
+		return ""
+	}
+	path, err := chattemplate.Materialize(cacheDir, entry)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[claude-code] warning: chat-template override for reviewer %s unavailable: %v\n", entry.Name, err)
+		return ""
+	}
+	return path
+}
+
+// reviewerModelIdentity returns the GGUF architecture and file basename for a
+// reviewer model. The architecture is probed from the filename (reviewer
+// artifacts carry the family in their name); unknown names yield "" and the
+// catalog falls through to basename matching.
+func reviewerModelIdentity(modelPath string) (string, string) {
+	basename := strings.ToLower(filepath.Base(modelPath))
+	return reviewerArchFromName(basename), basename
+}
+
+// reviewerArchFromName guesses a GGUF architecture from a model filename when
+// the full header parse is too heavy for the reviewer arg builder. Known
+// reviewer models carry the family in the name; unknown names yield "" and the
+// catalog falls through to basename matching.
+func reviewerArchFromName(basename string) string {
+	switch {
+	case strings.Contains(basename, "nanbeige"):
+		return "nanbeige"
+	case strings.Contains(basename, "qwen3"):
+		return "qwen35"
+	default:
+		return ""
+	}
+}
+
+func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, kvType string, cacheDir string) []string {
 	args := []string{
 		binary, "-m", modelPath,
 		"--host", "127.0.0.1", "--port", strconv.Itoa(port),
@@ -397,21 +456,18 @@ func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, 
 		"--alias", "local",
 		"--temp", "0", "--presence-penalty", "0", "--repeat-penalty", "1",
 	}
-	// Nanbeige's chat template contains a Jinja `raise_exception` macro that
-	// llama.cpp's Jinja engine cannot parse ("Unable to generate parser for this
-	// template. System message must be at the beginning"), so requests against
-	// the worker/reviewer 400 under --jinja. Tool calls REQUIRE --jinja (the
-	// backend returns "tools param requires --jinja flag" without it), so the
-	// fix is NOT to drop --jinja but to override the broken template with a
-	// corrected one (see nanbeigeTemplateArgs). Keep --jinja on for tool calls.
+	// A broken chat template (e.g. a Jinja `raise_exception` macro the backend
+	// Jinja engine cannot parse — "Unable to generate parser for this template.
+	// System message must be at the beginning") 400s every request under --jinja.
+	// Tool calls REQUIRE --jinja (the backend returns "tools param requires
+	// --jinja flag" without it), so the fix is NOT to drop --jinja but to serve
+	// a corrected template from the data-driven chat-template catalog via
+	// --chat-template-file. The worker/reviewer never receives user chat-template
+	// overrides (its args are built from scratch here), so the catalog applies
+	// directly whenever the reviewer model's arch/basename has a catalog entry.
 	args = append(args, "--jinja")
-	// The worker/reviewer never receives user chat-template overrides (its args
-	// are built from scratch here), so the nanbeige template override is applied
-	// directly whenever the NanoBeige profile selected the nanbeige42 backend.
-	if noJinja {
-		if tpl := nanbeigeTemplatePath(binary); tpl != "" {
-			args = append(args, "--chat-template-file", tpl)
-		}
+	if tpl := reviewerCatalogTemplate(cacheDir, modelPath); tpl != "" {
+		args = append(args, "--chat-template-file", tpl)
 	}
 	// Exact-flag matching, not substring: mainline's --reasoning-format and
 	// --reasoning-budget both contain "--reasoning" but reject `--reasoning off`,

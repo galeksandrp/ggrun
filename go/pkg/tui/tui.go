@@ -23,6 +23,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/gguf"
 	modelstore "github.com/raketenkater/ggrun/pkg/models"
+	"github.com/raketenkater/ggrun/pkg/modelusage"
 	"github.com/raketenkater/ggrun/pkg/placement"
 	"github.com/raketenkater/ggrun/pkg/probe"
 	"github.com/raketenkater/ggrun/pkg/recommend"
@@ -63,8 +64,12 @@ type Model struct {
 	height int
 
 	// Data
-	caps                   *detect.Capabilities
-	models                 []ModelItem
+	caps   *detect.Capabilities
+	models []ModelItem
+	// modelUsage holds per-model launch usage (count + last-used), used to sort
+	// the main list so the most-used and most-recent models surface first. It is
+	// loaded once at startup; launch records are written by the CLI launcher.
+	modelUsage             map[string]modelusage.Record
 	backend                string
 	modelDir               string
 	settingsPath           string
@@ -99,6 +104,10 @@ type Model struct {
 	benchmark      bool
 	vision         bool
 	claudeCode     bool
+	// claudeReviewer picks the local worker/reviewer model for Claude Code:
+	// "auto" keeps ggrun's automatic choice, "qwen" forces the Qwen profile,
+	// "nanbeige" forces the NanoBeige4.2 worker. Empty means auto.
+	claudeReviewer string
 	supportExpert  string
 	supportOnline  bool
 	// noCachedConfig derives this launch fresh, ignoring cached placement/probe
@@ -238,6 +247,7 @@ func InitialModel() Model {
 		aituneRounds:    rounds,
 		ramLimitPercent: cfg.RAMLimitPercent,
 	}
+	m.modelUsage = modelusage.Load(cfg.CacheDir)
 	if m.port <= 0 {
 		m.port = 8081
 	}
@@ -346,6 +356,7 @@ func (m *Model) rebuildMainList() {
 	prevFilterState := m.mainList.FilterState()
 	prevFilterValue := m.mainList.FilterValue()
 
+	sortModels(m.models, m.modelUsage)
 	m.mainList = newMainList(m.models)
 	if m.width > 0 {
 		m.mainList.SetWidth(m.width - 4)
@@ -790,6 +801,7 @@ func (m *Model) applyLaunchRequestFields(req *LaunchRequest) {
 	m.benchmark = req.Benchmark
 	m.claudeCode = req.ClaudeCode
 	m.claudeProfile = req.ClaudeProfile
+	m.claudeReviewer = req.ClaudeReviewerOverride
 	if req.SupportSet || req.SupportExpert != "" {
 		m.supportExpert = req.SupportExpert
 		m.supportOnline = req.SupportOnline
@@ -811,7 +823,7 @@ func (m Model) cfgRows() []string {
 	}
 	rows = append(rows, "vision", "claudecode")
 	if m.claudeCode {
-		rows = append(rows, "claudeprofile")
+		rows = append(rows, "claudereviewer", "claudeprofile")
 	}
 	return append(rows, "benchmark", "launch", "dryrun")
 }
@@ -975,6 +987,13 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 		m.vision = !m.vision
 	case "claudecode":
 		m.claudeCode = !m.claudeCode
+	case "claudereviewer":
+		order := []string{"auto", "qwen", "nanbeige"}
+		if dir < 0 {
+			m.claudeReviewer = prevOption(order, m.claudeReviewer)
+		} else {
+			m.claudeReviewer = nextOption(order, m.claudeReviewer)
+		}
 	case "claudeprofile":
 		profiles := []string{"", "agent-interactive", "agent-parallel"}
 		if dir < 0 {
@@ -1018,6 +1037,8 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 		m.vision = !m.vision
 	case "claudecode":
 		m.claudeCode = !m.claudeCode
+	case "claudereviewer":
+		m.cycleCfgRow("claudereviewer", 1)
 	case "claudeprofile":
 		m.cycleCfgRow("claudeprofile", 1)
 	case "benchmark":
@@ -1529,6 +1550,7 @@ func (m Model) viewModelConfig() string {
 	}
 	line("claudecode", "[x] Claude Code", ccLabel)
 	if m.claudeCode {
+		line("claudereviewer", "Reviewer/worker", claudeReviewerLabel(m.claudeReviewer))
 		line("claudeprofile", "Claude profile", claudeProfileLabel(m.claudeProfile))
 	}
 	line("benchmark", "[b] Benchmark mode", boolLabel(m.benchmark))
@@ -1693,6 +1715,7 @@ func (m Model) viewPrelaunch() string {
 	b.WriteString(fmt.Sprintf("  Online research: %s\n", boolLabel(m.supportOnline)))
 	b.WriteString(fmt.Sprintf("  Claude Code:    %s\n", boolLabel(m.claudeCode)))
 	if m.claudeCode {
+		b.WriteString(fmt.Sprintf("  Reviewer/worker: %s\n", claudeReviewerLabel(m.claudeReviewer)))
 		b.WriteString(fmt.Sprintf("  Claude profile: %s\n", claudeProfileLabel(m.claudeProfile)))
 	}
 	if m.tunePath != "" {
@@ -2301,6 +2324,30 @@ func modelIdentity(path string) string {
 	return path
 }
 
+// sortModels orders the list for display. When usage records are available the
+// most-used and most-recently-used models float to the top; everything still
+// falls back to a stable name sort so the list stays deterministic.
+func sortModels(items []ModelItem, usage map[string]modelusage.Record) {
+	sort.SliceStable(items, func(i, j int) bool {
+		var left, right modelusage.Record
+		if usage != nil {
+			left = usage[modelIdentity(items[i].Path)]
+			right = usage[modelIdentity(items[j].Path)]
+		}
+		if left.Launches != right.Launches {
+			return left.Launches > right.Launches
+		}
+		if !left.LastUsedAt.Equal(right.LastUsedAt) {
+			return left.LastUsedAt.After(right.LastUsedAt)
+		}
+		lname, rname := strings.ToLower(items[i].Name), strings.ToLower(items[j].Name)
+		if lname != rname {
+			return lname < rname
+		}
+		return strings.ToLower(items[i].Path) < strings.ToLower(items[j].Path)
+	})
+}
+
 func mergeModelItems(groups ...[]ModelItem) []ModelItem {
 	seen := make(map[string]bool)
 	var merged []ModelItem
@@ -2314,13 +2361,7 @@ func mergeModelItems(groups ...[]ModelItem) []ModelItem {
 			merged = append(merged, item)
 		}
 	}
-	sort.SliceStable(merged, func(i, j int) bool {
-		left, right := strings.ToLower(merged[i].Name), strings.ToLower(merged[j].Name)
-		if left != right {
-			return left < right
-		}
-		return strings.ToLower(merged[i].Path) < strings.ToLower(merged[j].Path)
-	})
+	sortModels(merged, nil)
 	return merged
 }
 
@@ -2470,7 +2511,11 @@ func loadRecognizedModels(dir, cacheDir, backend string, caps *detect.Capabiliti
 		discoverModels(dir),
 		discoverModelsFromPaths(modelstore.LoadDiscoveredPaths(cacheDir)),
 	)
-	return enrichModelItems(items, cacheDir, backend, caps)
+	items = enrichModelItems(items, cacheDir, backend, caps)
+	// Re-apply the usage sort after enrichment: display order must reflect real
+	// launch history, not discovery order.
+	sortModels(items, modelusage.Load(cacheDir))
+	return items
 }
 
 func (m Model) backendTag() string {
@@ -3138,10 +3183,13 @@ func (m Model) buildLaunchRequest() *LaunchRequest {
 		Benchmark:     m.benchmark,
 		ClaudeCode:    m.claudeCode,
 		ClaudeProfile: m.claudeProfile,
-		SupportExpert:  m.supportExpert,
-		SupportOnline:  m.supportOnline,
-		SupportSet:     true,
-		NoCachedConfig: m.noCachedConfig,
+		// Only emit the reviewer override when the user explicitly deviated from
+		// the automatic choice; an empty value keeps the CLI default.
+		ClaudeReviewerOverride: m.claudeReviewer,
+		SupportExpert:          m.supportExpert,
+		SupportOnline:          m.supportOnline,
+		SupportSet:             true,
+		NoCachedConfig:         m.noCachedConfig,
 	}
 }
 
@@ -3164,16 +3212,16 @@ type LaunchRequest struct {
 	// have to land on a different disk than the default one, and making the
 	// user repoint ModelDir and then remember to put it back is both tedious
 	// and easy to get wrong.
-	DownloadDir string
-	ModelPath   string
+	DownloadDir   string
+	ModelPath     string
 	Port          int
 	CtxSize       int
 	CtxFlag       string
-	KVPlacement    string
-	KVQuality      string
-	KVQualitySet   bool // TUI explicitly cycled KV quality; emit an explicit override
-	SWAFull        bool
-	SWAFullSet     bool // TUI explicitly selected on/off; emit an override either way
+	KVPlacement   string
+	KVQuality     string
+	KVQualitySet  bool // TUI explicitly cycled KV quality; emit an explicit override
+	SWAFull       bool
+	SWAFullSet    bool // TUI explicitly selected on/off; emit an override either way
 	FlashAttn     bool
 	Parallel      int
 	ParallelSet   bool // user typed a parallel value (claude-code mode must not override)
@@ -3185,10 +3233,14 @@ type LaunchRequest struct {
 	Benchmark     bool
 	ClaudeCode    bool
 	ClaudeProfile string
-	ResumeSession string // reopen this recorded Claude Code session
-	SupportExpert string // optional native support/optimizer policy: off, auto, on
-	SupportOnline bool   // allow typed official llama.cpp research
-	SupportSet    bool   // TUI explicitly selected the support and research policy
+	// ClaudeReviewerOverride picks the local worker/reviewer model in Claude
+	// Code mode: empty/"auto" keeps ggrun's automatic choice, "qwen" forces the
+	// Qwen profile, "nanbeige" forces the NanoBeige4.2 worker.
+	ClaudeReviewerOverride string
+	ResumeSession          string // reopen this recorded Claude Code session
+	SupportExpert          string // optional native support/optimizer policy: off, auto, on
+	SupportOnline          bool   // allow typed official llama.cpp research
+	SupportSet             bool   // TUI explicitly selected the support and research policy
 	// NoCachedConfig derives this launch fresh, skipping cached placement/probe
 	// measurements without deleting them (the "launch without cached config"
 	// escape hatch for a stale placement or probe).
@@ -3263,6 +3315,11 @@ func (req *LaunchRequest) LaunchArgs() []string {
 		if req.ClaudeProfile != "" {
 			args = append(args, "--claude-profile", req.ClaudeProfile)
 		}
+		// Only emit the reviewer override when the user explicitly picked one;
+		// an empty or "auto" value keeps the CLI default.
+		if v := strings.TrimSpace(req.ClaudeReviewerOverride); v != "" && v != "auto" {
+			args = append(args, "--claude-reviewer", v)
+		}
 		// Resume goes through the same launch argv as the CLI, so the TUI and
 		// the command line share one implementation.
 		if req.ResumeSession != "" {
@@ -3280,6 +3337,19 @@ func supportExpertLabel(mode string) string {
 		return "on (required, ephemeral)"
 	default:
 		return "auto (installed-only, ephemeral)"
+	}
+}
+
+// claudeReviewerLabel describes the reviewer/worker selector value without
+// converting its empty default into an explicit launch flag.
+func claudeReviewerLabel(reviewer string) string {
+	switch strings.TrimSpace(reviewer) {
+	case "qwen":
+		return "qwen (Qwen3.5-2B dense)"
+	case "nanbeige":
+		return "nanbeige (Nanbeige4.2-3B worker)"
+	default:
+		return "auto (automatic)"
 	}
 }
 

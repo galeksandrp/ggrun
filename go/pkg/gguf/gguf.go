@@ -1,8 +1,10 @@
 package gguf
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -214,4 +216,108 @@ func (i *Info) EstimateParams() int64 {
 	layers := int64(i.BlockCount)
 	ffn := int64(i.FeedForwardLength)
 	return 2*vocab*embed + layers*(4*embed*embed+3*embed*ffn)
+}
+
+// ChatTemplate reads just the `tokenizer.chat_template` metadata string from a
+// GGUF header, without shelling out to parse_gguf.py or walking the tensor
+// table. It is a fast, pure-Go probe used by the chat-template catalog to
+// detect a raise_exception guard in the model's embedded template. Returns ""
+// when the key is absent, the file is unreadable, or the header is corrupt.
+func ChatTemplate(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	var buf [8]byte
+	readFull := func(dst []byte) bool {
+		_, err := io.ReadFull(f, dst)
+		return err == nil
+	}
+	if !readFull(buf[:4]) || string(buf[:4]) != "GGUF" {
+		return ""
+	}
+	if !readFull(buf[:4]) { // version
+		return ""
+	}
+	if !readFull(buf[:8]) { // tensor_count
+		return ""
+	}
+	var kvCount uint64
+	if !readFull(buf[:8]) {
+		return ""
+	}
+	kvCount = binary.LittleEndian.Uint64(buf[:8])
+
+	for i := uint64(0); i < kvCount; i++ {
+		if !readFull(buf[:8]) {
+			return ""
+		}
+		keyLen := binary.LittleEndian.Uint64(buf[:8])
+		key := make([]byte, keyLen)
+		if !readFull(key) {
+			return ""
+		}
+		if !readFull(buf[:4]) {
+			return ""
+		}
+		valType := binary.LittleEndian.Uint32(buf[:4])
+		switch valType {
+		case 8: // string
+			if !readFull(buf[:8]) {
+				return ""
+			}
+			valLen := binary.LittleEndian.Uint64(buf[:8])
+			val := make([]byte, valLen)
+			if !readFull(val) {
+				return ""
+			}
+			if string(key) == "tokenizer.chat_template" {
+				return string(val)
+			}
+		case 9: // array — skip element type + count, then each element
+			if !readFull(buf[:4]) {
+				return ""
+			}
+			elemType := binary.LittleEndian.Uint32(buf[:4])
+			if !readFull(buf[:8]) {
+				return ""
+			}
+			arrLen := binary.LittleEndian.Uint64(buf[:8])
+			for j := uint64(0); j < arrLen; j++ {
+				if !skipGGUFValue(f, elemType) {
+					return ""
+				}
+			}
+		default:
+			if !skipGGUFValue(f, valType) {
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+// skipGGUFValue advances the reader past one GGUF metadata value of the given
+// type id. Returns false on EOF/truncation.
+func skipGGUFValue(r io.Reader, valType uint32) bool {
+	fixed := map[uint32]uint64{0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+	if n, ok := fixed[valType]; ok {
+		_, err := io.CopyN(io.Discard, r, int64(n))
+		return err == nil
+	}
+	if valType == 8 { // string
+		var buf [8]byte
+		if _, err := io.ReadFull(r, buf[:]); err != nil {
+			return false
+		}
+		n := binary.LittleEndian.Uint64(buf[:])
+		_, err := io.CopyN(io.Discard, r, int64(n))
+		return err == nil
+	}
+	return true
 }

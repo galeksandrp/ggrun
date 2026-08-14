@@ -122,7 +122,7 @@ func TestClaudeReviewerArgsUsesIsolatedDeviceAsLocalMain(t *testing.T) {
 func TestClaudeNanoReviewerArgsUsesQ4KV(t *testing.T) {
 	args := claudeReviewerArgsWithKV(
 		"server", "nanbeige.gguf", 1234, "CUDA0",
-		"--cache-type-k TYPE --cache-type-v TYPE", "q4_0", true,
+		"--cache-type-k TYPE --cache-type-v TYPE", "q4_0", "",
 	)
 	for _, flag := range []string{"--cache-type-k", "--cache-type-v"} {
 		if !hasArgValue(args, flag, "q4_0") {
@@ -141,29 +141,36 @@ func TestClaudeReviewerArgsKeepsOlderBackendCompatibility(t *testing.T) {
 }
 
 func TestClaudeNanoReviewerArgsOverridesNanbeigeTemplate(t *testing.T) {
-	root := t.TempDir()
-	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
-	if err := os.MkdirAll(filepath.Dir(template), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(template, []byte("template"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	bin := filepath.Join(root, "build-cuda", "bin", "llama-server")
+	cacheDir := t.TempDir()
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "Nanbeige4.2-3B-Q4_K_M.gguf")
+	writeGGUFWithTemplate(t, modelPath, "nanbeige", "<broken raise_exception('System message must be at the beginning.')>")
+	bin := filepath.Join(dir, "build-cuda", "bin", "llama-server")
 	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	args := claudeReviewerArgsWithKV(
-		bin, "nanbeige.gguf", 1234, "CUDA0",
-		"--cache-type-k TYPE --cache-type-v TYPE --reasoning ARG", "q4_0", true,
+		bin, modelPath, 1234, "CUDA0",
+		"--cache-type-k TYPE --cache-type-v TYPE --reasoning ARG", "q4_0", cacheDir,
 	)
-	if !hasArgValue(args, "--chat-template-file", template) {
-		t.Fatalf("nanbeige reviewer args must include --chat-template-file %s, got %v", template, args)
+	got := valueAfter(args, "--chat-template-file")
+	if got == "" || !strings.HasSuffix(got, ".jinja") {
+		t.Fatalf("nanbeige reviewer args must include --chat-template-file with a .jinja path, got %v", args)
 	}
-	// The non-nanbeige reviewer (noJinja=false) must not receive the override.
-	plain := claudeReviewerArgs(bin, "reviewer.gguf", 1234, "", "--reasoning ARG")
+	data, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Fatal("materialized reviewer template is empty")
+	}
+	// A reviewer with no catalog entry (unknown basename, no arch probe) must not
+	// receive the override.
+	otherPath := filepath.Join(dir, "reviewer.gguf")
+	writeGGUFWithTemplate(t, otherPath, "some-arch", "<broken raise_exception>")
+	plain := claudeReviewerArgs(bin, otherPath, 1234, "", "--reasoning ARG")
 	if hasArg(plain, "--chat-template-file") {
-		t.Fatalf("non-nanbeige reviewer must not receive template override, got %v", plain)
+		t.Fatalf("non-catalog reviewer must not receive template override, got %v", plain)
 	}
 }
 
@@ -504,5 +511,82 @@ func TestReviewerBinaryOverrideWinsResolution(t *testing.T) {
 	be := findClaudeReviewerBackend(&detect.Capabilities{})
 	if be == nil || be.Path != stub {
 		t.Fatalf("GGRUN_CLAUDE_REVIEWER_BIN was not honoured: %+v", be)
+	}
+}
+
+func TestClaudeReviewerFlagQwenForcesQwenProfile(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	// NanoBeige is fully available — auto would pick it — but --claude-reviewer
+	// qwen must force the historical Qwen profile regardless.
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerQwen}
+	profile := resolveClaudeCompanionProfile(req, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("--claude-reviewer qwen did not force the Qwen profile: %+v", profile)
+	}
+	if profile.KVType != "q8_0" {
+		t.Fatalf("--claude-reviewer qwen must keep the Qwen Q8 KV profile, got %q", profile.KVType)
+	}
+}
+
+func TestClaudeReviewerFlagNanbeigeForcesNanoProfile(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerNanbeige}
+	profile := resolveClaudeCompanionProfile(req, t.TempDir())
+	if !profile.NanoBeige || profile.Name != claudeNanoCompanionName {
+		t.Fatalf("--claude-reviewer nanbeige did not force the NanoBeige profile: %+v", profile)
+	}
+}
+
+func TestClaudeReviewerFlagNanbeigeFallsBackWhenArtifactMissing(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return false }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerNanbeige}
+	profile := resolveClaudeCompanionProfile(req, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("forced NanoBeige without an installed artifact must degrade to Qwen: %+v", profile)
+	}
+}
+
+func TestClaudeReviewerFlagAutoKeepsCurrentBehavior(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return true }
+	claudeNanoBackend = func() (string, error) { return "/reviewed/nanbeige/llama-server", nil }
+	claudeNanoGPUCapable = func(string) bool { return true }
+	// auto must behave exactly like the default (no flag): Nano wins when ready.
+	autoReq := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerAuto}
+	profile := resolveClaudeCompanionProfile(autoReq, t.TempDir())
+	if !profile.NanoBeige || profile.Name != claudeNanoCompanionName {
+		t.Fatalf("auto must keep the automatic NanoBeige choice: %+v", profile)
+	}
+	// Empty override (the historical default) picks the same profile.
+	emptyReq := &launchRequest{AppHome: t.TempDir()}
+	if again := resolveClaudeCompanionProfile(emptyReq, t.TempDir()); again.Name != profile.Name {
+		t.Fatalf("auto and empty override diverged: auto=%q empty=%q", profile.Name, again.Name)
+	}
+	// With the artifact missing, auto degrades to Qwen (unchanged behavior).
+	claudeNanoArtifactReady = func(string) bool { return false }
+	fallback := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerAuto}, t.TempDir())
+	if fallback.NanoBeige || fallback.Name != claudeReviewerCompanionName {
+		t.Fatalf("auto without an artifact must degrade to Qwen: %+v", fallback)
 	}
 }

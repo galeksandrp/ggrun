@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -437,6 +438,40 @@ func TestParseClaudeProfile(t *testing.T) {
 	}
 }
 
+func TestParseClaudeReviewer(t *testing.T) {
+	isolateConfig(t)
+	req, err := parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer", "nanbeige"})
+	if err != nil {
+		t.Fatalf("parse --claude-reviewer nanbeige: %v", err)
+	}
+	if req.ClaudeReviewerOverride != claudeReviewerNanbeige {
+		t.Fatalf("reviewer override = %q, want %q", req.ClaudeReviewerOverride, claudeReviewerNanbeige)
+	}
+	req, err = parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer=QWEN"})
+	if err != nil {
+		t.Fatalf("parse --claude-reviewer=QWEN: %v", err)
+	}
+	if req.ClaudeReviewerOverride != claudeReviewerQwen {
+		t.Fatalf("reviewer override = %q, want %q", req.ClaudeReviewerOverride, claudeReviewerQwen)
+	}
+	// auto is a valid explicit value and keeps the default selection behavior.
+	req, err = parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer", "auto"})
+	if err != nil {
+		t.Fatalf("parse --claude-reviewer auto: %v", err)
+	}
+	if req.ClaudeReviewerOverride != claudeReviewerAuto {
+		t.Fatalf("reviewer override = %q, want %q", req.ClaudeReviewerOverride, claudeReviewerAuto)
+	}
+	// Invalid values are rejected.
+	if _, err := parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer", "mistral"}); err == nil {
+		t.Fatal("invalid --claude-reviewer value was accepted")
+	}
+	// A non-auto override requires --claude-code.
+	if _, err := parseLaunchArgs([]string{"model.gguf", "--claude-reviewer", "qwen"}); err == nil {
+		t.Fatal("--claude-reviewer without --claude-code was accepted")
+	}
+}
+
 func TestParseEmitServerArgvJSON(t *testing.T) {
 	isolateConfig(t)
 	req, err := parseLaunchArgs([]string{"model.gguf", "--emit-server-argv-json"})
@@ -811,38 +846,176 @@ func TestHY3TemplateArgsUseBundledTemplateWithoutOverridingUser(t *testing.T) {
 	}
 }
 
-func TestNanbeigeTemplateArgsUseBundledTemplateWithoutOverridingUser(t *testing.T) {
-	root := t.TempDir()
-	template := filepath.Join(root, "models", "templates", "Nanbeige4.2-3B.jinja")
-	if err := os.MkdirAll(filepath.Dir(template), 0o755); err != nil {
-		t.Fatal(err)
+// writeGGUFWithTemplate writes a minimal GGUF whose metadata carries
+// general.architecture and tokenizer.chat_template, so catalogTemplateArgs can
+// detect a raise_exception guard in the model's own embedded template.
+func writeGGUFWithTemplate(t *testing.T, path, arch, template string) {
+	t.Helper()
+	buf := new(bytes.Buffer)
+	buf.WriteString("GGUF")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(3))
+	_ = binary.Write(buf, binary.LittleEndian, uint64(0)) // tensor count
+	_ = binary.Write(buf, binary.LittleEndian, uint64(2)) // kv count
+	writeStr := func(s string) {
+		_ = binary.Write(buf, binary.LittleEndian, uint64(len(s)))
+		buf.WriteString(s)
 	}
-	if err := os.WriteFile(template, []byte("template"), 0o644); err != nil {
-		t.Fatal(err)
+	writeStr("general.architecture")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(8))
+	writeStr(arch)
+	writeStr("tokenizer.chat_template")
+	_ = binary.Write(buf, binary.LittleEndian, uint32(8))
+	writeStr(template)
+	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
 	}
-	bin := filepath.Join(root, "build-cuda", "bin", "llama-server")
-	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
-		t.Fatal(err)
+}
+
+func TestCatalogTemplateArgsAppliesForQwen38AndNanbeige(t *testing.T) {
+	cacheDir := t.TempDir()
+	for _, tc := range []struct {
+		name  string
+		arch  string
+		model string
+	}{
+		{"qwen35", "qwen35", "Qwen3.8-27B-UD-Q8_K_XL.gguf"},
+		{"nanbeige", "nanbeige", "Nanbeige4.2-3B-Q4_K_M.gguf"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			modelPath := filepath.Join(t.TempDir(), tc.model)
+			writeGGUFWithTemplate(t, modelPath, tc.arch, "<broken raise_exception('System message must be at the beginning.')>")
+			model := &placement.ModelProfile{Path: modelPath, Basename: tc.model, ModelArch: tc.arch}
+			req := &launchRequest{ModelPath: modelPath}
+			cfg := &config.Config{CacheDir: cacheDir}
+			got := catalogTemplateArgs(req, cfg, model)
+			if len(got) != 2 || got[0] != "--chat-template-file" {
+				t.Fatalf("catalog template args = %#v, want --chat-template-file", got)
+			}
+			if !strings.HasSuffix(got[1], ".jinja") {
+				t.Fatalf("materialized template path %q must end in .jinja", got[1])
+			}
+			data, err := os.ReadFile(got[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(data) == 0 {
+				t.Fatal("materialized template is empty")
+			}
+		})
 	}
-	got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "nanbeige42", Path: bin})
-	want := []string{"--chat-template-file", template}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("nanbeige template args = %#v, want %#v", got, want)
-	}
-	if got := nanbeigeTemplateArgs([]string{"--chat-template-file", "x.jinja"}, &backendInfo{Tag: "nanbeige42", Path: bin}); got != nil {
+}
+
+func TestCatalogTemplateArgsUserOverrideWins(t *testing.T) {
+	cacheDir := t.TempDir()
+	modelPath := filepath.Join(t.TempDir(), "Qwen3.8-27B.gguf")
+	writeGGUFWithTemplate(t, modelPath, "qwen35", "<broken raise_exception>")
+	model := &placement.ModelProfile{Path: modelPath, Basename: "Qwen3.8-27B.gguf", ModelArch: "qwen35"}
+	req := &launchRequest{ModelPath: modelPath, ExtraArgs: []string{"--chat-template", "chatml"}}
+	if got := catalogTemplateArgs(req, &config.Config{CacheDir: cacheDir}, model); got != nil {
 		t.Fatalf("explicit user chat template must win: %#v", got)
 	}
-	// Not the nanbeige42 backend, or missing template, must be a no-op.
-	if got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "llama", Path: bin}); got != nil {
-		t.Fatalf("non-nanbeige backend must not receive template args: %#v", got)
+}
+
+func TestCatalogTemplateArgsUnknownModelUntouched(t *testing.T) {
+	cacheDir := t.TempDir()
+	modelPath := filepath.Join(t.TempDir(), "DeepSeek-V4.gguf")
+	writeGGUFWithTemplate(t, modelPath, "deepseek4", "<broken raise_exception>")
+	model := &placement.ModelProfile{Path: modelPath, Basename: "DeepSeek-V4.gguf", ModelArch: "deepseek4"}
+	req := &launchRequest{ModelPath: modelPath}
+	if got := catalogTemplateArgs(req, &config.Config{CacheDir: cacheDir}, model); got != nil {
+		t.Fatalf("model with no catalog entry must be untouched: %#v", got)
 	}
-	emptyRoot := filepath.Join(t.TempDir(), "src", "fork")
-	if err := os.MkdirAll(filepath.Join(emptyRoot, "build-cuda", "bin"), 0o755); err != nil {
+}
+
+func TestCatalogTemplateArgsHealthyTemplateUntouched(t *testing.T) {
+	cacheDir := t.TempDir()
+	modelPath := filepath.Join(t.TempDir(), "Qwen3.8-27B.gguf")
+	// Arch matches the catalog but the embedded template is healthy (no
+	// raise_exception): the override must NOT be applied.
+	writeGGUFWithTemplate(t, modelPath, "qwen35", "<healthy template>")
+	model := &placement.ModelProfile{Path: modelPath, Basename: "Qwen3.8-27B.gguf", ModelArch: "qwen35"}
+	req := &launchRequest{ModelPath: modelPath}
+	if got := catalogTemplateArgs(req, &config.Config{CacheDir: cacheDir}, model); got != nil {
+		t.Fatalf("healthy template must not be overridden: %#v", got)
+	}
+}
+
+func TestCatalogTemplateArgsOverrideByName(t *testing.T) {
+	cacheDir := t.TempDir()
+	// A model with no catalog match (deepseek4) but an explicit --chat-template
+	// override naming a catalog entry must force that entry's template.
+	modelPath := filepath.Join(t.TempDir(), "DeepSeek-V4.gguf")
+	writeGGUFWithTemplate(t, modelPath, "deepseek4", "<broken raise_exception>")
+	model := &placement.ModelProfile{Path: modelPath, Basename: "DeepSeek-V4.gguf", ModelArch: "deepseek4"}
+	req := &launchRequest{ModelPath: modelPath, ChatTemplateOverride: "qwen3.8-27b"}
+	got := catalogTemplateArgs(req, &config.Config{CacheDir: cacheDir}, model)
+	if len(got) != 2 || got[0] != "--chat-template-file" {
+		t.Fatalf("catalog override must emit --chat-template-file, got %#v", got)
+	}
+	data, err := os.ReadFile(got[1])
+	if err != nil {
 		t.Fatal(err)
 	}
-	emptyBin := filepath.Join(emptyRoot, "build-cuda", "bin", "llama-server")
-	if got := nanbeigeTemplateArgs(nil, &backendInfo{Tag: "nanbeige42", Path: emptyBin}); got != nil {
-		t.Fatalf("missing template must be a no-op: %#v", got)
+	if len(data) == 0 {
+		t.Fatal("overridden template is empty")
+	}
+	// Unknown override name must be a no-op (validated at parse time).
+	req.ChatTemplateOverride = "no-such-entry"
+	if got := catalogTemplateArgs(req, &config.Config{CacheDir: cacheDir}, model); got != nil {
+		t.Fatalf("unknown override must be a no-op: %#v", got)
+	}
+}
+
+func TestParseLaunchArgsChatTemplateOverride(t *testing.T) {
+	req, err := parseLaunchArgs([]string{"model.gguf", "--chat-template", "qwen3.8-27b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.ChatTemplateOverride != "qwen3.8-27b" {
+		t.Fatalf("ChatTemplateOverride = %q, want qwen3.8-27b", req.ChatTemplateOverride)
+	}
+	if hasChatTemplateOverride(req.ExtraArgs) {
+		t.Fatalf("catalog override must not leak into ExtraArgs: %#v", req.ExtraArgs)
+	}
+	// A value that is NOT a catalog entry stays a passthrough backend flag.
+	req2, err := parseLaunchArgs([]string{"model.gguf", "--chat-template", "chatml"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req2.ChatTemplateOverride != "" {
+		t.Fatalf("chatml is not a catalog entry, must not set override: %q", req2.ChatTemplateOverride)
+	}
+	if !hasChatTemplateOverride(req2.ExtraArgs) {
+		t.Fatalf("--chat-template chatml must stay a passthrough flag: %#v", req2.ExtraArgs)
+	}
+}
+
+// TestLaunchServerArgsEmitsCatalogTemplateForMatchedModel verifies the full
+// launch arg assembly passes --chat-template-file for a catalog-matched model
+// whose embedded template carries a raise_exception guard.
+func TestLaunchServerArgsEmitsCatalogTemplateForMatchedModel(t *testing.T) {
+	cacheDir := t.TempDir()
+	modelPath := filepath.Join(t.TempDir(), "Qwen3.8-27B-UD-Q8_K_XL.gguf")
+	writeGGUFWithTemplate(t, modelPath, "qwen35", "<broken raise_exception('System message must be at the beginning.')>")
+	req := &launchRequest{ModelPath: modelPath}
+	cfg := &config.Config{CacheDir: cacheDir}
+	be := &backendInfo{Path: "llama-server", Tag: "llama", Help: ""}
+	model := &placement.ModelProfile{Path: modelPath, Basename: filepath.Base(modelPath), ModelArch: "qwen35"}
+	strategy := &placement.Strategy{
+		ContextSize: 65536, KVType: "q8_0", KVQuality: "high",
+		FlashAttention: true, Threads: 16, ThreadsBatch: 16, Parallel: 1,
+	}
+	args := buildLaunchServerArgs(req, cfg, be, nil, model, strategy)
+	tpl := valueAfter(args, "--chat-template-file")
+	if tpl == "" || !strings.HasSuffix(tpl, ".jinja") {
+		t.Fatalf("launch must emit --chat-template-file with a .jinja path for a catalog-matched model, got %v", args)
+	}
+	data, err := os.ReadFile(tpl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) == 0 {
+		t.Fatal("emitted template file is empty")
 	}
 }
 
@@ -2013,6 +2186,17 @@ func hasArgValue(args []string, flag, value string) bool {
 		}
 	}
 	return false
+}
+
+// valueAfter returns the argument immediately following flag, or "" when flag
+// is the last argument or absent.
+func valueAfter(args []string, flag string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 func TestBackendSearchPathsIncludeAppHomeBackend(t *testing.T) {
