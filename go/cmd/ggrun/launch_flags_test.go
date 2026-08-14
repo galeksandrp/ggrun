@@ -305,7 +305,7 @@ func TestUpdatePromptSkipsQuietCommands(t *testing.T) {
 // pos_next = 0, and 0% reuse of 60,127 prompt tokens while the checkpoint
 // machinery itself worked correctly throughout.
 func TestClaudeClientEnvDisablesAttributionHeader(t *testing.T) {
-	env := claudeCodeEnv("127.0.0.1", 8081, nil)
+	env := claudeCodeEnv("127.0.0.1", 8081, nil, 0)
 	var got string
 	seen := 0
 	for _, kv := range env {

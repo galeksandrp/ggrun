@@ -2297,18 +2297,36 @@ func TestClaudeCodeAutocompactWindow(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := claudeCodeAutocompactWindow(tc.args); got != tc.want {
+			if got := claudeCodeAutocompactWindow(tc.args, 0); got != tc.want {
 				t.Fatalf("claudeCodeAutocompactWindow(%v) = %d, want %d", tc.args, got, tc.want)
 			}
 		})
 	}
 }
 
+func TestClaudeCodeAutocompactWindowCapsAtActualCtx(t *testing.T) {
+	// A requested ctx that the model's native context_length caps must not size
+	// the autocompact window: sizing it off the raw --ctx-size let a Muse request
+	// overflow the real 131k slot before compaction fired (250k requested, 131k
+	// actual). The actual strategy context is the true ceiling.
+	if got := claudeCodeAutocompactWindow([]string{"--ctx-size", "250000"}, 131072); got != 131072 {
+		t.Fatalf("window must cap at the actual context: got %d, want 131072", got)
+	}
+	if got := claudeCodeAutocompactWindow([]string{"--ctx-size", "250000", "--parallel", "2"}, 131072); got != 65536 {
+		t.Fatalf("window must divide the capped actual ctx by parallel: got %d, want 65536", got)
+	}
+	// When no actual ctx is known (diagnostic path), the raw --ctx-size is used
+	// (rounded to a 256-multiple, the existing behavior).
+	if got := claudeCodeAutocompactWindow([]string{"--ctx-size", "250000"}, 0); got != 249856 {
+		t.Fatalf("no actual ctx must keep the raw window: got %d, want 249856", got)
+	}
+}
+
 func TestClaudeCodeAutocompactPct(t *testing.T) {
-	if got := claudeCodeAutocompactPct([]string{"--ctx-size", "262144", "--parallel", "4"}); got != 75 {
+	if got := claudeCodeAutocompactPct([]string{"--ctx-size", "262144", "--parallel", "4"}, 0); got != 75 {
 		t.Fatalf("known-window autocompact pct = %d, want 75", got)
 	}
-	if got := claudeCodeAutocompactPct([]string{"--parallel", "4"}); got != 25 {
+	if got := claudeCodeAutocompactPct([]string{"--parallel", "4"}, 0); got != 25 {
 		t.Fatalf("unknown-window autocompact pct = %d, want 25", got)
 	}
 }
@@ -2343,7 +2361,7 @@ func TestArgIntValue(t *testing.T) {
 func TestClaudeCodeAutocompactWindowLastWinsOnUserOverride(t *testing.T) {
 	// The backend honors the final context value, so the explicit window must too.
 	args := []string{"--ctx-size", "262144", "--parallel", "4", "--ctx-size", "16384"}
-	if got := claudeCodeAutocompactWindow(args); got != 4096 {
+	if got := claudeCodeAutocompactWindow(args, 0); got != 4096 {
 		t.Fatalf("autocompact window with user override = %d, want 4096", got)
 	}
 }
@@ -2487,7 +2505,7 @@ func TestClaudeCodeEnvDisablesIdleTimeoutForLocalBackend(t *testing.T) {
 	t.Setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "")
 	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
 	t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "")
-	env := claudeCodeEnv("0.0.0.0", 8081, []string{"llama-server", "--ctx-size", "1048576", "--parallel", "4"})
+	env := claudeCodeEnv("0.0.0.0", 8081, []string{"llama-server", "--ctx-size", "1048576", "--parallel", "4"}, 1048576)
 
 	if envHasPrefix(env, "ANTHROPIC_API_KEY=") {
 		t.Fatalf("claude-code env must drop real ANTHROPIC_API_KEY: %v", env)
@@ -2509,7 +2527,7 @@ func TestClaudeCodeEnvDisablesIdleTimeoutForLocalBackend(t *testing.T) {
 	}
 
 	t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", "max")
-	overridden := claudeCodeEnv("127.0.0.1", 8081, nil)
+	overridden := claudeCodeEnv("127.0.0.1", 8081, nil, 0)
 	if !envContains(overridden, "CLAUDE_CODE_EFFORT_LEVEL=max") {
 		t.Fatalf("explicit Claude effort override was not preserved: %v", overridden)
 	}

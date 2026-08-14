@@ -617,6 +617,12 @@ type launchRequest struct {
 	// Compute — including OOM/preflight/spec re-plans — so the reviewer's VRAM
 	// stays reserved no matter which path recomputes the strategy.
 	ReviewerReservation *placement.CompanionReservation
+	// DenseOffloadPrompt, when set, is attached to every Compute via
+	// placementOptionsFromRequest so placement can ASK the user before silently
+	// offloading a dense model to system RAM. The launcher installs it once in
+	// cmdLaunch; assumeYes / non-terminal callers leave it nil and keep the
+	// historical silent host-offload behavior.
+	DenseOffloadPrompt placement.DenseCPUOffloadPromptFunc
 	// ReviewerProfile freezes the verified worker/model/backend choice before
 	// placement so downloads or backend updates cannot change seats mid-launch.
 	ReviewerProfile *claudeCompanionProfile
@@ -1924,6 +1930,34 @@ func confirmReviewedBackendInstall(recipe *backends.Recipe, arch string, assumeY
 	return answer == "y" || answer == "yes"
 }
 
+// confirmDenseCPUOffloadWith returns the placement.DenseCPUOffloadPrompt hook
+// the launcher installs so placement can ASK before silently offloading a dense
+// model to system RAM. When even a minimum context cannot keep the model on
+// GPU, placement invokes this with the model's total size and the GPUs' free
+// VRAM in MB; it returns whether to accept host offload. assumeYes and
+// non-terminal callers preserve today's silent behavior (accept), matching
+// confirmReviewedBackendInstall.
+//
+// The reader/writer/terminal shape mirrors confirmReviewedBackendInstall so the
+// decision can be unit-tested without a real terminal.
+func confirmDenseCPUOffloadWith(assumeYes bool, in io.Reader, out io.Writer, terminal bool) placement.DenseCPUOffloadPromptFunc {
+	return func(totalSizeMB, freeGPUVRAMMB int) bool {
+		if assumeYes || !terminal {
+			return true
+		}
+		fmt.Fprintf(out, "The dense model needs %d MB but the GPUs have only %d MB free even at minimum context. Reduce context to fit on GPU, or accept offloading to system RAM? [y/N] ", totalSizeMB, freeGPUVRAMMB)
+		line, _ := bufio.NewReader(in).ReadString('\n')
+		answer := strings.ToLower(strings.TrimSpace(line))
+		return answer == "y" || answer == "yes"
+	}
+}
+
+// confirmDenseCPUOffload returns the DenseCPUOffloadPrompt hook wired to
+// os.Stdin/os.Stderr and the real terminal state.
+func confirmDenseCPUOffload(assumeYes bool) placement.DenseCPUOffloadPromptFunc {
+	return confirmDenseCPUOffloadWith(assumeYes, os.Stdin, os.Stderr, stdinIsTerminal())
+}
+
 func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model *placement.ModelProfile) *backendInfo {
 	if req == nil {
 		return nil
@@ -2225,6 +2259,10 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 	if req.ReviewerReservation != nil {
 		opts.Companions = []placement.CompanionReservation{*req.ReviewerReservation}
 	}
+	// Attach the dense-offload prompt on every Compute path so a re-plan that
+	// could still land on DenseCPUOffload asks the user instead of silently
+	// spilling the model into system RAM.
+	opts.DenseCPUOffloadPrompt = req.DenseOffloadPrompt
 	opts.Parallel = claudeCodeSlotsForPlacement(
 		claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile),
 		opts.ContextSize, req.ClaudeCode, req.ParallelSet,
@@ -4660,6 +4698,11 @@ func cmdLaunch(args []string) {
 	// request so every placement.Compute path — first plan and every re-plan —
 	// keeps the reviewer's VRAM accounted.
 	req.ReviewerReservation = claudeReviewerReservation(req, caps, cfg.CacheDir)
+	// A dense model that cannot fit on GPU even at reduced context should not be
+	// silently spilled into system RAM. Ask the user; assumeYes / non-terminal
+	// keeps the historical silent behavior. The hook rides the request so every
+	// Compute path — first plan and every re-plan — asks the same question.
+	req.DenseOffloadPrompt = confirmDenseCPUOffload(cfg.AssumeYes)
 
 	computeStrategy := func(candidateReq *launchRequest) (*placement.Strategy, error) {
 		candidate, computeErr := placement.Compute(caps, model, placementOptionsFromRequest(candidateReq, model, be, cfg.CacheDir))
@@ -5022,7 +5065,7 @@ func cmdLaunch(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", sessionErr)
 			os.Exit(1)
 		}
-		if code := runClaudeCodeClient(clientHost, claudeClientPort, serverArgs, clientArgs, sessionSpec); code >= 0 {
+		if code := runClaudeCodeClient(clientHost, claudeClientPort, serverArgs, clientArgs, sessionSpec, strategy.ContextSize); code >= 0 {
 			progressStop()
 			healthCancel()
 			// Record on exit as well as on launch: the workflow run ID is
@@ -5880,8 +5923,8 @@ func printClaudeCodeRecipe(host string, port int, serverArgs []string) {
 	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
 		clientHost = "127.0.0.1"
 	}
-	window := claudeCodeAutocompactWindow(serverArgs)
-	pct := claudeCodeAutocompactPct(serverArgs)
+	window := claudeCodeAutocompactWindow(serverArgs, 0)
+	pct := claudeCodeAutocompactPct(serverArgs, 0)
 	slot := ""
 	if ctx := argIntValue(serverArgs, "--ctx-size", "-c", "--ctx"); ctx > 0 {
 		par := argIntValue(serverArgs, "--parallel", "-np")
@@ -5924,7 +5967,7 @@ func printClaudeCodeRecipe(host string, port int, serverArgs []string) {
 // locally-served models. Foreground tiers map to "local" and the cheap tier to
 // local-fast; ANTHROPIC_API_KEY is dropped so the dummy auth token + base URL
 // take effect.
-func claudeCodeEnv(host string, port int, serverArgs []string) []string {
+func claudeCodeEnv(host string, port int, serverArgs []string, actualCtx int) []string {
 	clientHost := host
 	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
 		clientHost = "127.0.0.1"
@@ -5983,10 +6026,15 @@ func claudeCodeEnv(host string, port int, serverArgs []string) []string {
 		// Compatibility with Claude Code versions that predate the named watchdogs.
 		"API_FORCE_IDLE_TIMEOUT=0",
 		// Claude Code's assumed window has changed across releases and model aliases.
-		// Give it the backend's real per-slot capacity directly, then compact at 75%
-		// so an in-flight reply and tool output cannot overflow the slot. User values win.
-		"CLAUDE_CODE_AUTO_COMPACT_WINDOW="+envOr("CLAUDE_CODE_AUTO_COMPACT_WINDOW", strconv.Itoa(claudeCodeAutocompactWindow(serverArgs))),
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", strconv.Itoa(claudeCodeAutocompactPct(serverArgs))),
+		// Give it the backend's REAL per-slot capacity directly, then compact at 75%
+		// so an in-flight reply and tool output cannot overflow the slot. The actual
+		// context is the resolved strategy context (which the model's native
+		// context_length may have capped below the requested --ctx-size) — sizing the
+		// autocompact window off the raw --ctx-size lets a request overflow the real
+		// slot before compaction fires (the Muse 250k-requested/131k-actual crash).
+		// User values win.
+		"CLAUDE_CODE_AUTO_COMPACT_WINDOW="+envOr("CLAUDE_CODE_AUTO_COMPACT_WINDOW", strconv.Itoa(claudeCodeAutocompactWindow(serverArgs, actualCtx))),
+		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", strconv.Itoa(claudeCodeAutocompactPct(serverArgs, actualCtx))),
 	)
 }
 
@@ -6065,10 +6113,16 @@ func argIntValue(args []string, names ...string) int {
 // llama.cpp/ik_llama divide --ctx-size across --parallel slots. Passing this value
 // explicitly avoids depending on Claude Code's changing assumed window for custom
 // model aliases. The 256-token alignment mirrors the backend's slot allocation.
-func claudeCodeAutocompactWindow(serverArgs []string) int {
+func claudeCodeAutocompactWindow(serverArgs []string, actualCtx int) int {
 	ctx := argIntValue(serverArgs, "--ctx-size", "-c", "--ctx")
 	if ctx <= 0 {
 		return 200000
+	}
+	// The real per-slot capacity is what can actually overflow. When the resolved
+	// strategy context (post model-native-cap) is available and smaller, it is the
+	// true ceiling — a requested ctx that got capped must not size the window.
+	if actualCtx > 0 && actualCtx < ctx {
+		ctx = actualCtx
 	}
 	parallel := argIntValue(serverArgs, "--parallel", "-np")
 	if parallel < 1 {
@@ -6081,8 +6135,8 @@ func claudeCodeAutocompactWindow(serverArgs []string) int {
 	return slot
 }
 
-func claudeCodeAutocompactPct(serverArgs []string) int {
-	if argIntValue(serverArgs, "--ctx-size", "-c", "--ctx") <= 0 {
+func claudeCodeAutocompactPct(serverArgs []string, actualCtx int) int {
+	if argIntValue(serverArgs, "--ctx-size", "-c", "--ctx") <= 0 && actualCtx <= 0 {
 		return 25 // unknown ctx: preserve the historical ~50k fallback
 	}
 	return 75
@@ -6258,7 +6312,7 @@ func claudeCodeShiftableContext(model *placement.ModelProfile, strategy *placeme
 // runClaudeCodeClient launches Claude Code in the foreground wired to the local
 // server, inheriting the terminal. It returns claude's exit code, or -1 if the
 // `claude` CLI isn't installed (so the caller can fall back to the recipe).
-func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string, spec *claudeSessionSpec) int {
+func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string, spec *claudeSessionSpec, actualCtx int) int {
 	claudePath, err := exec.LookPath("claude")
 	if err != nil {
 		return -1
@@ -6306,7 +6360,7 @@ func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string, 
 	releaseInterrupt := holdInterruptForClaude()
 	defer releaseInterrupt()
 	cmd := exec.Command(claudePath, args...)
-	cmd.Env = claudeCodeEnv(host, port, serverArgs)
+	cmd.Env = claudeCodeEnv(host, port, serverArgs, actualCtx)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
