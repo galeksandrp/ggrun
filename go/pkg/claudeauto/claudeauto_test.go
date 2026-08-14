@@ -188,6 +188,56 @@ func TestRouterLimitsConcurrentMainRequests(t *testing.T) {
 	}
 }
 
+// TestReviewerConstantsPointToQwen4B pins the reviewer constants to the
+// Qwen3.5-4B Q4_K_M artifact. Size and SHA256 are real values computed from
+// the locally installed model file, so an upstream branch update cannot
+// silently change the artifact that makes local permission decisions.
+func TestReviewerConstantsPointToQwen4B(t *testing.T) {
+	if DefaultReviewerDisplayName != "Qwen3.5-4B" {
+		t.Fatalf("DefaultReviewerDisplayName = %q, want Qwen3.5-4B", DefaultReviewerDisplayName)
+	}
+	if DefaultReviewerFile != "Qwen3.5-4B-Q4_K_M-00001-of-00001.gguf" {
+		t.Fatalf("DefaultReviewerFile = %q, want the 4B split GGUF", DefaultReviewerFile)
+	}
+	// The pinned size is the actual locally installed 4B Q4_K_M artifact.
+	if DefaultReviewerSize != int64(2740937888) {
+		t.Fatalf("DefaultReviewerSize = %d, want 2740937888", DefaultReviewerSize)
+	}
+	if DefaultReviewerSHA != "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4" {
+		t.Fatalf("DefaultReviewerSHA changed: %q", DefaultReviewerSHA)
+	}
+	if !strings.Contains(DefaultReviewerURL, "Qwen3.5-4B-GGUF") {
+		t.Fatalf("DefaultReviewerURL must target the 4B repo, got %q", DefaultReviewerURL)
+	}
+}
+
+// TestLocalReviewerModelPathFindsInstalled4B verifies that a model directory
+// holding the pinned Qwen3.5-4B artifact is resolved without any download.
+func TestLocalReviewerModelPathFindsInstalled4B(t *testing.T) {
+	modelDir := t.TempDir()
+	sub := filepath.Join(modelDir, DefaultReviewerLocalDir)
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A minimal GGUF (magic header) under the pinned basename.
+	payload := append([]byte("GGUF"), []byte(" fake reviewer")...)
+	path := filepath.Join(sub, DefaultReviewerFile)
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := LocalReviewerModelPath(modelDir)
+	if !ok {
+		t.Fatal("installed 4B was not found under the model directory")
+	}
+	if got != path {
+		t.Fatalf("resolved %q, want %q", got, path)
+	}
+	// Missing folder yields nothing.
+	if _, ok := LocalReviewerModelPath(filepath.Join(t.TempDir(), "nope")); ok {
+		t.Fatal("empty model directory must not resolve a reviewer")
+	}
+}
+
 func TestDownloadModelVerifiesArtifact(t *testing.T) {
 	payload := append([]byte("GGUF"), []byte(" reviewer")...)
 	sum := sha256.Sum256(payload)

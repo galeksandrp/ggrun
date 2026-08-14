@@ -35,11 +35,25 @@ const (
 	// not leave the main coding model.
 	ClassifierMarker = "You are a security monitor for autonomous AI coding agents."
 
-	DefaultReviewerDisplayName = "Qwen3.5-2B"
-	DefaultReviewerFile        = "Qwen_Qwen3.5-2B-Q4_K_M.gguf"
-	DefaultReviewerSize        = int64(1396198496)
-	DefaultReviewerSHA         = "57a1085840f497d764a7fc5d346922dbde961efb54cc792ea81d694fd846a1d8"
-	DefaultReviewerURL         = "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/7d26695454df6de5fbcce2e58681e62dae06ce43/" + DefaultReviewerFile
+	DefaultReviewerDisplayName = "Qwen3.5-4B"
+	DefaultReviewerFile        = "Qwen3.5-4B-Q4_K_M-00001-of-00001.gguf"
+	// DefaultReviewerSize and DefaultReviewerSHA pin the exact Q4_K_M artifact
+	// installed locally at models/Qwen3.5-4B-Q4_K_M/ (a symlink to
+	// /home/mik/2tb-disk/AI_Models/Qwen3.5-4B-Q4_K_M.gguf), so an upstream branch
+	// update cannot silently change local permission decisions.
+	DefaultReviewerSize = int64(2740937888)
+	DefaultReviewerSHA  = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+	// DefaultReviewerURL is the remote mirror for first-use installs; when the
+	// exact 4B Q4_K_M GGUF is not present on the hub under this path, the pinned
+	// primary source is the local model directory and downloads only happen for
+	// the URL that actually resolves. The 4B is already present locally, so the
+	// reviewer uses it without downloading.
+	DefaultReviewerURL = "https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF/resolve/main/" + DefaultReviewerFile
+
+	// DefaultReviewerLocalDir is the model-directory subfolder that already holds
+	// the pinned Q4_K_M artifact (models/Qwen3.5-4B-Q4_K_M/), so first use does
+	// not download the same bytes into the private reviewer cache.
+	DefaultReviewerLocalDir = "Qwen3.5-4B-Q4_K_M"
 
 	maxRoutedRequestBytes = 16 << 20
 
@@ -73,9 +87,53 @@ func ReviewerModelPath(appHome string) string {
 	return filepath.Join(appHome, ".cache", "claude-reviewer", DefaultReviewerFile)
 }
 
+// LocalReviewerModelPath looks for the pinned artifact under the model
+// directory's matching subfolder (e.g. models/Qwen3.5-4B-Q4_K_M/), where it is
+// already present and verified, so first use does not re-download it into the
+// private reviewer cache. The subfolder holds a plain GGUF or a split-name
+// symlink to it; validatePinnedGGUF runs on the returned path.
+func LocalReviewerModelPath(modelDir string) (string, bool) {
+	if strings.TrimSpace(modelDir) == "" {
+		return "", false
+	}
+	dir := filepath.Join(modelDir, DefaultReviewerLocalDir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".gguf") {
+			continue
+		}
+		// Prefer the file that carries the pinned basename, falling back to the
+		// first GGUF in the folder (e.g. a single-split symlink target).
+		if strings.EqualFold(name, DefaultReviewerFile) {
+			return filepath.Join(dir, name), true
+		}
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") {
+			return filepath.Join(dir, e.Name()), true
+		}
+	}
+	return "", false
+}
+
 // EnsureReviewerModel validates a user-supplied model, or downloads and
 // verifies the pinned default artifact on first use.
 func EnsureReviewerModel(ctx context.Context, appHome string, progress io.Writer) (string, error) {
+	return EnsureReviewerModelWithModelDir(ctx, appHome, "", progress)
+}
+
+// EnsureReviewerModelWithModelDir is EnsureReviewerModel plus a local model
+// directory: when the pinned artifact is already installed there (matching the
+// folder name in DefaultReviewerLocalDir), it is verified and used directly
+// instead of downloading a private copy.
+func EnsureReviewerModelWithModelDir(ctx context.Context, appHome, modelDir string, progress io.Writer) (string, error) {
 	path := ReviewerModelPath(appHome)
 	if strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" {
 		if err := validateGGUF(path, 0); err != nil {
@@ -85,6 +143,13 @@ func EnsureReviewerModel(ctx context.Context, appHome string, progress io.Writer
 	}
 	if err := validatePinnedGGUF(path, defaultModel); err == nil {
 		return path, nil
+	}
+	// The model directory already holds the pinned artifact: use it without
+	// downloading (the 4B ships with ggrun's model set).
+	if local, ok := LocalReviewerModelPath(modelDir); ok {
+		if err := validatePinnedGGUF(local, defaultModel); err == nil {
+			return local, nil
+		}
 	}
 	if progress != nil {
 		fmt.Fprintf(progress, "[claude-code] downloading pinned local Auto reviewer (%.1f GB)...\n", float64(defaultModel.Size)/(1024*1024*1024))

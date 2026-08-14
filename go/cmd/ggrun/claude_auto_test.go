@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/raketenkater/ggrun/pkg/advisor"
+	"github.com/raketenkater/ggrun/pkg/claudeauto"
 	"github.com/raketenkater/ggrun/pkg/detect"
 	"github.com/raketenkater/ggrun/pkg/placement"
 )
@@ -429,9 +430,15 @@ func TestReviewerReservationIsNotChargedTwice(t *testing.T) {
 		t.Fatalf("with no reviewer running, reservation = %+v, want %d MiB", got, claudeReviewerReservationVRAMMB)
 	}
 
-	// A stored measurement supersedes the constant.
+	// A stored measurement supersedes the constant. The Qwen3.5-4B profile
+	// records under its own MeasurementKey so it never inherits the 2B footprint
+	// stored under the legacy companion name.
 	dir := t.TempDir()
-	if err := placement.RecordCompanionVRAM(dir, claudeReviewerCompanionName, 2096); err != nil {
+	key := resolveClaudeCompanionProfile(req, dir).companionMeasurementKey()
+	if key == claudeReviewerCompanionName {
+		t.Fatal("Qwen4B profile must not measure under the legacy 2B key")
+	}
+	if err := placement.RecordCompanionVRAM(dir, key, 2096); err != nil {
 		t.Fatal(err)
 	}
 	if got := claudeReviewerReservation(req, caps, dir); got == nil || got.VRAMMB != 2096 {
@@ -561,6 +568,49 @@ func TestClaudeReviewerFlagNanbeigeFallsBackWhenArtifactMissing(t *testing.T) {
 	profile := resolveClaudeCompanionProfile(req, t.TempDir())
 	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
 		t.Fatalf("forced NanoBeige without an installed artifact must degrade to Qwen: %+v", profile)
+	}
+}
+
+// TestClaudeReviewerQwenProfileResolvesQwen4B verifies the forced-Qwen profile
+// carries the Qwen3.5-4B display name and a model path that resolves to the 4B
+// artifact (the pinned reviewer cache path, and the local model directory when
+// the artifact is installed there).
+func TestClaudeReviewerQwenProfileResolvesQwen4B(t *testing.T) {
+	restoreReady, restoreBackend, restoreGPU := claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable
+	defer func() {
+		claudeNanoArtifactReady, claudeNanoBackend, claudeNanoGPUCapable = restoreReady, restoreBackend, restoreGPU
+	}()
+	claudeNanoArtifactReady = func(string) bool { return false }
+	req := &launchRequest{AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerQwen}
+	profile := resolveClaudeCompanionProfile(req, t.TempDir())
+	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
+		t.Fatalf("qwen override must force the Qwen profile: %+v", profile)
+	}
+	if profile.DisplayName != claudeauto.DefaultReviewerDisplayName {
+		t.Fatalf("Qwen reviewer display name = %q, want %q", profile.DisplayName, claudeauto.DefaultReviewerDisplayName)
+	}
+	if profile.DisplayName != "Qwen3.5-4B" {
+		t.Fatalf("Qwen reviewer display name = %q, want Qwen3.5-4B", profile.DisplayName)
+	}
+	// The reviewer model path resolves to the pinned 4B cache artifact.
+	wantPath := filepath.Join(req.AppHome, ".cache", "claude-reviewer", claudeauto.DefaultReviewerFile)
+	if profile.ModelPath != wantPath {
+		t.Fatalf("Qwen reviewer path = %q, want %q", profile.ModelPath, wantPath)
+	}
+	// When the artifact is already installed in the model directory, the local
+	// model dir lookup resolves it without a download.
+	modelDir := t.TempDir()
+	sub := filepath.Join(modelDir, claudeauto.DefaultReviewerLocalDir)
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	localPath := filepath.Join(sub, claudeauto.DefaultReviewerFile)
+	if err := os.WriteFile(localPath, []byte("GGUF fake"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := claudeauto.LocalReviewerModelPath(modelDir)
+	if !ok || got != localPath {
+		t.Fatalf("local 4B lookup = %q ok=%v, want %q", got, ok, localPath)
 	}
 }
 

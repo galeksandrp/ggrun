@@ -90,11 +90,11 @@ func (p *claudeCompanionProfile) companionMeasurementKey() string {
 }
 
 // claudeReviewerReservationVRAMMB is the reviewer's on-device footprint reserved
-// in the placement ledger: ~1.4 GB Q4_K_M weights + 64k Q8 KV + CUDA context and
-// compute. The planner only needs a conservative bound — after a real launch the
-// reviewer's actual usage is visible in the normal probe paths, and the seat is
-// re-planned on every launch anyway.
-const claudeReviewerReservationVRAMMB = 2600
+// in the placement ledger: ~2.6 GB Q4_K_M weights (Qwen3.5-4B, 2740937888 bytes)
+// + 64k Q8 KV + CUDA context and compute. This is a conservative bound — after a
+// real launch the reviewer's actual usage is visible in the normal probe paths,
+// and the seat is re-planned on every launch anyway.
+const claudeReviewerReservationVRAMMB = 4600
 
 // claudeNanoReservationVRAMMB covers the measured 8843 MiB peak for the real
 // 64k/Q8 worker profile on the RTX 3090 Ti, rounded up before per-host samples
@@ -157,6 +157,9 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 		profile = &claudeCompanionProfile{
 			Name: claudeReviewerCompanionName, DisplayName: claudeauto.DefaultReviewerDisplayName,
 			ModelPath: modelPath, ModelMarker: modelPath,
+			// The Qwen3.5-4B profile owns its own measurement key so it never
+			// inherits the stale 2B footprint stored under the legacy name.
+			MeasurementKey:    "claude-reviewer-qwen35-4b-q4-k-m",
 			KVType:            "q8_0",
 			ReservationVRAMMB: claudeReviewerReservationVRAMMB,
 		}
@@ -295,8 +298,10 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		appHome = backends.AppHome()
 	}
 	cacheDir := ""
+	modelDir := ""
 	if cfg != nil {
 		cacheDir = cfg.CacheDir
+		modelDir = cfg.ModelDir
 	}
 	profile := resolveClaudeCompanionProfile(req, cacheDir)
 	modelPath := profile.ModelPath
@@ -306,7 +311,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		}
 	} else {
 		var err error
-		modelPath, err = claudeauto.EnsureReviewerModel(context.Background(), appHome, os.Stdout)
+		modelPath, err = claudeauto.EnsureReviewerModelWithModelDir(context.Background(), appHome, modelDir, os.Stdout)
 		if err != nil {
 			return nil, fmt.Errorf("prepare local Auto reviewer: %w", err)
 		}

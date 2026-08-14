@@ -3345,7 +3345,7 @@ func supportExpertLabel(mode string) string {
 func claudeReviewerLabel(reviewer string) string {
 	switch strings.TrimSpace(reviewer) {
 	case "qwen":
-		return "qwen (Qwen3.5-2B dense)"
+		return "qwen (Qwen3.5-4B dense)"
 	case "nanbeige":
 		return "nanbeige (Nanbeige4.2-3B worker)"
 	default:
