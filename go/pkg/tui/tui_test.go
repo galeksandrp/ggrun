@@ -13,6 +13,7 @@ import (
 
 	"github.com/raketenkater/ggrun/pkg/backends"
 	"github.com/raketenkater/ggrun/pkg/config"
+	"github.com/raketenkater/ggrun/pkg/detect"
 	modelstore "github.com/raketenkater/ggrun/pkg/models"
 	"github.com/raketenkater/ggrun/pkg/modelusage"
 	"github.com/raketenkater/ggrun/pkg/placement"
@@ -1013,6 +1014,129 @@ func TestClaudeProfileSelectorCyclesPerLaunchOptions(t *testing.T) {
 		m.cycleCfgRow("claudeprofile", 1)
 		if m.claudeProfile != want {
 			t.Fatalf("profile=%q, want %q", m.claudeProfile, want)
+		}
+	}
+}
+
+// denseTestModel builds a dense (non-MoE) model whose KV cache grows ~8.5 GiB at
+// 131072 context on q8_0: 32 layers, 8 KV heads, 128+128 dims →
+// 32*8*256*1.0625 B/token. At 250000 that is ~16 GiB of KV, enough to spill off
+// a single 30 GiB-free GPU once the ~20 GiB weights are counted.
+func denseTestModel() ModelItem {
+	return ModelItem{
+		Name:   "Dense.gguf",
+		Path:   "/models/dense.gguf",
+		MaxCtx: 262144,
+		KVProfile: &placement.ModelProfile{
+			TotalSizeMB: 20000,
+			SizeBytes:   20000 * 1048576,
+			NumLayers:   32,
+			HeadCountKV: 8,
+			KeyLength:   128,
+			ValueLength: 128,
+			ModelArch:   "llama3",
+		},
+	}
+}
+
+func TestPrelaunchShowsKVContextSuggestionForDenseModel(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{denseTestModel()},
+		selectedModel: 0,
+		kvPlacement:   "gpu",
+		kvQuality:     "q8_0",
+		ctxMode:       "manual",
+		ctxSize:       "250000",
+		backend:       "llama",
+		caps: &detect.Capabilities{
+			GPUs: []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 30000}},
+			RAM:  detect.RAMInfo{TotalMB: 128000, FreeMB: 120000},
+			CPU:  detect.CPUInfo{Cores: 8},
+		},
+		cacheDir: "", // no system probe → zero CUDA overhead
+	}
+	view := m.viewPrelaunch()
+	for _, want := range []string{
+		"KV/ctx steps:",
+		"ctx 131072 → ~",
+		"ctx 65536 → ~",
+		"ctx 32768 → ~",
+		"fits all-GPU at ctx 131072",
+		"needs ~",
+		"host offload",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("pre-launch KV/ctx suggestion missing %q in:\n%s", want, view)
+		}
+	}
+}
+
+func TestPrelaunchHidesKVContextSuggestionWhenDenseFitsAllGPU(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{denseTestModel()},
+		selectedModel: 0,
+		kvPlacement:   "gpu",
+		kvQuality:     "q8_0",
+		ctxMode:       "manual",
+		ctxSize:       "131072", // fits: 20000 + 1024 + ~8.5 GiB <= 30000
+		backend:       "llama",
+		caps: &detect.Capabilities{
+			GPUs: []detect.GPU{{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 30000}},
+			RAM:  detect.RAMInfo{TotalMB: 128000, FreeMB: 120000},
+			CPU:  detect.CPUInfo{Cores: 8},
+		},
+		cacheDir: "",
+	}
+	if hint := m.denseKVHint(m.models[0]); hint != "" {
+		t.Fatalf("dense model that fits all-GPU must not get a suggestion, got %q", hint)
+	}
+	view := m.viewPrelaunch()
+	if strings.Contains(view, "KV/ctx steps:") {
+		t.Fatalf("pre-launch must not show a suggestion when the model fits all-GPU:\n%s", view)
+	}
+}
+
+func TestClaudeReviewerLabelPresentsProfilesByTradeoff(t *testing.T) {
+	for reviewer, wantParts := range map[string][]string{
+		"nanbeige": {"big/fast worker", "Nanbeige4.2", "reviews + works"},
+		"qwen":     {"small/light", "Qwen3.5-4B", "review-only"},
+		"auto":     {"auto", "automatic"},
+	} {
+		label := claudeReviewerLabel(reviewer)
+		for _, part := range wantParts {
+			if !strings.Contains(label, part) {
+				t.Fatalf("reviewer %q label %q missing %q", reviewer, label, part)
+			}
+		}
+		// The big profile must name a WORKER model (Nanbeige), never a reviewer-only model.
+		if reviewer == "nanbeige" && strings.Contains(label, "review-only") {
+			t.Fatalf("big/fast worker profile must not be labelled review-only: %q", label)
+		}
+	}
+}
+
+func TestClaudeReviewerSelectorStillCyclesAndReachesLaunch(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{{Name: "DeepSeek", Path: "/models/deepseek.gguf"}},
+		selectedModel: 0,
+		kvPlacement:   "auto",
+		ctxMode:       "fit",
+		ctxSize:       "fit",
+		claudeCode:    true,
+	}
+	// Cycle from the empty (auto) default: auto -> qwen -> qwen2b -> nanbeige -> auto.
+	for _, want := range []string{"auto", "qwen", "qwen2b", "nanbeige"} {
+		m.cycleCfgRow("claudereviewer", 1)
+		if m.claudeReviewer != want {
+			t.Fatalf("reviewer=%q, want %q", m.claudeReviewer, want)
+		}
+	}
+	// The explicit pick reaches the launch request unchanged (qwen/nanbeige/auto).
+	for _, want := range []string{"qwen", "nanbeige", "auto"} {
+		m.claudeReviewer = want
+		req := m.buildLaunchRequest()
+		if req == nil || req.ClaudeReviewerOverride != want {
+			t.Fatalf("reviewer %q did not reach launch request: %#v", want, req)
 		}
 	}
 }

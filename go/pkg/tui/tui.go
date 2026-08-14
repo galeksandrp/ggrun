@@ -105,8 +105,9 @@ type Model struct {
 	vision         bool
 	claudeCode     bool
 	// claudeReviewer picks the local worker/reviewer model for Claude Code:
-	// "auto" keeps ggrun's automatic choice, "qwen" forces the Qwen profile,
-	// "nanbeige" forces the NanoBeige4.2 worker. Empty means auto.
+	// "auto" (and "qwen") resolve to the Qwen3.5-4B worker/reviewer, "qwen2b"
+	// forces the small/light Qwen3.5-2B review-only profile, and "nanbeige"
+	// forces the NanoBeige4.2 big-MoE worker. Empty means auto.
 	claudeReviewer string
 	supportExpert  string
 	supportOnline  bool
@@ -988,7 +989,7 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 	case "claudecode":
 		m.claudeCode = !m.claudeCode
 	case "claudereviewer":
-		order := []string{"auto", "qwen", "nanbeige"}
+		order := []string{"auto", "qwen", "qwen2b", "nanbeige"}
 		if dir < 0 {
 			m.claudeReviewer = prevOption(order, m.claudeReviewer)
 		} else {
@@ -1700,6 +1701,15 @@ func (m Model) viewPrelaunch() string {
 	}
 	if model.MaxCtx > 0 {
 		b.WriteString(fmt.Sprintf("  Train max:      %d tokens\n", model.MaxCtx))
+	}
+	if hint := m.denseKVHint(model); hint != "" {
+		for i, hl := range strings.Split(hint, "\n") {
+			if i == 0 {
+				b.WriteString("  KV/ctx:         " + hl + "\n")
+			} else {
+				b.WriteString("                  " + hl + "\n")
+			}
+		}
 	}
 	b.WriteString(fmt.Sprintf("  Parallel:       %s\n", m.prelaunchParallelLabel()))
 	b.WriteString(fmt.Sprintf("  KV placement:   %s\n", m.kvPlacement))
@@ -2502,6 +2512,91 @@ func (m Model) swaLabel(model ModelItem) string {
 	return "off (enable cache hits; " + delta + ")"
 }
 
+// denseKVHint suggests useful context/KV steps for a DENSE model whose current
+// context would push it into host offload: the 131k/64k/32k rungs with their KV
+// sizes, plus the max-vs-fit tradeoff. It returns "" for MoE models, models with
+// no KV geometry, or when the estimated context already fits entirely on GPU
+// (the pre-launch Fit estimate already covers that case). It mirrors placement's
+// denseMultiGPUFit boundary: model + (CUDA overhead + compute floor) per GPU +
+// KV <= free VRAM.
+func (m Model) denseKVHint(model ModelItem) string {
+	if model.IsMoE || model.KVProfile == nil || m.caps == nil || len(m.caps.GPUs) == 0 {
+		return ""
+	}
+	kvType, err := placement.NormalizeKVType(m.kvQuality)
+	if err != nil {
+		kvType = "q8_0"
+	}
+	baseMB := model.KVProfile.TotalSizeMB
+	if baseMB <= 0 && model.KVProfile.SizeBytes > 0 {
+		baseMB = int(model.KVProfile.SizeBytes / 1048576)
+	}
+	if baseMB <= 0 {
+		return ""
+	}
+
+	numGPUs := len(m.caps.GPUs)
+	totalFree := 0
+	for _, g := range m.caps.GPUs {
+		totalFree += g.VRAMFreeMB()
+	}
+	// computeFloorMB (1024 MiB per GPU) mirrors placement's cited llama.cpp
+	// compute-graph floor; kept as a literal here because the constant is not
+	// exported. It is deliberately NOT the measured compute-buffer figure — a
+	// hint should be conservative so it suggests a rung that really fits.
+	overheadMB := placement.SystemCUDAOverheadMB(m.cacheDir, m.caps.GPUs) + 1024*numGPUs
+
+	kvAt := func(ctx int) int {
+		if ctx <= 0 {
+			return 0
+		}
+		return placement.EstimateKVCacheMB(model.KVProfile, ctx, kvType, m.swaFull)
+	}
+	fits := func(ctx int) bool {
+		if ctx <= 0 {
+			return false
+		}
+		return baseMB+overheadMB+kvAt(ctx) <= totalFree
+	}
+
+	cur := m.swaEstimateContext(model)
+	if cur <= 0 {
+		cur = model.FitCtx
+	}
+	if cur <= 0 || fits(cur) {
+		return ""
+	}
+
+	rungs := placement.DenseContextRungs(cur + 1)
+	rungParts := make([]string, 0, 3)
+	bestFit := 0
+	for _, r := range rungs {
+		if len(rungParts) >= 3 {
+			break
+		}
+		rungParts = append(rungParts, fmt.Sprintf("ctx %d → ~%s KV", r, gibString(kvAt(r))))
+		if fits(r) && bestFit == 0 {
+			bestFit = r
+		}
+	}
+	lines := []string{"KV/ctx steps: " + strings.Join(rungParts, " · ")}
+	if bestFit > 0 {
+		deficit := baseMB + overheadMB + kvAt(cur) - totalFree
+		if deficit < 0 {
+			deficit = 0
+		}
+		lines = append(lines, fmt.Sprintf("fits all-GPU at ctx %d; at ctx %d needs ~%s host offload", bestFit, cur, gibString(deficit)))
+	} else {
+		lines = append(lines, fmt.Sprintf("does not fit all-GPU even at ctx %d (host offload)", rungs[len(rungs)-1]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// gibString renders an MiB figure as a compact "N.N GB" string.
+func gibString(mb int) string {
+	return fmt.Sprintf("%.1f GB", float64(mb)/1024.0)
+}
+
 func loadModels(dir, cacheDir, backend string, caps *detect.Capabilities) []ModelItem {
 	return enrichModelItems(discoverModels(dir), cacheDir, backend, caps)
 }
@@ -3234,8 +3329,9 @@ type LaunchRequest struct {
 	ClaudeCode    bool
 	ClaudeProfile string
 	// ClaudeReviewerOverride picks the local worker/reviewer model in Claude
-	// Code mode: empty/"auto" keeps ggrun's automatic choice, "qwen" forces the
-	// Qwen profile, "nanbeige" forces the NanoBeige4.2 worker.
+	// Code mode: empty/"auto" and "qwen" resolve to the Qwen3.5-4B
+	// worker/reviewer, "qwen2b" forces the small/light Qwen3.5-2B review-only
+	// profile, and "nanbeige" forces the NanoBeige4.2 big-MoE worker.
 	ClaudeReviewerOverride string
 	ResumeSession          string // reopen this recorded Claude Code session
 	SupportExpert          string // optional native support/optimizer policy: off, auto, on
@@ -3341,13 +3437,19 @@ func supportExpertLabel(mode string) string {
 }
 
 // claudeReviewerLabel describes the reviewer/worker selector value without
-// converting its empty default into an explicit launch flag.
+// converting its empty default into an explicit launch flag. The profiles are
+// presented by tradeoff rather than raw model names: the "big/fast worker"
+// profile is Nanbeige4.2 — a WORKER model that both reviews and does real work
+// (heavier, stays resident); the "small/light" profile is the Qwen3.5-4B
+// reviewer (cheaper, review-only). "auto" keeps ggrun's automatic choice.
 func claudeReviewerLabel(reviewer string) string {
 	switch strings.TrimSpace(reviewer) {
 	case "qwen":
-		return "qwen (Qwen3.5-4B dense)"
+		return "small/light (Qwen3.5-4B, review-only)"
+	case "qwen2b":
+		return "lightest (Qwen3.5-2B, review-only)"
 	case "nanbeige":
-		return "nanbeige (Nanbeige4.2-3B worker)"
+		return "big/fast worker (Nanbeige4.2, reviews + works)"
 	default:
 		return "auto (automatic)"
 	}
