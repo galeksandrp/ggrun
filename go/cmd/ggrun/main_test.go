@@ -1648,7 +1648,7 @@ func TestSelectBackendMissingExplicitNameNeverFallsBack(t *testing.T) {
 // found" fallback. This is the message the user sees instead of the cryptic
 // "unknown model architecture" loader error.
 func TestBackendUnavailableMessageSurfacesProvenUnsupportedReason(t *testing.T) {
-	req := &launchRequest{BackendUnavailableReason: "No installed backend supports the muse-glimmer architecture. The /x/llama-server backend does not support it.\n  Update the backend or install a fork that adds muse-glimmer (ggrun backend install <recipe>)."}
+	req := &launchRequest{BackendUnavailableReason: backendUnavailableReason("muse-glimmer", "/x/llama-server")}
 	message := backendUnavailableMessage(req)
 	if !strings.Contains(message, "muse-glimmer") {
 		t.Fatalf("FAIL-CLOSED reason was not surfaced verbatim: %q", message)
@@ -1662,6 +1662,121 @@ func TestBackendUnavailableMessageSurfacesProvenUnsupportedReason(t *testing.T) 
 	msg2 := backendUnavailableMessage(req2)
 	if !strings.Contains(msg2, "some-backend") || strings.Contains(msg2, "muse-glimmer") {
 		t.Fatalf("generic fallback changed behaviour: %q", msg2)
+	}
+}
+
+// TestBackendUnavailableReasonNovelArchNamesMainline guards the actionable hint
+// for a NOVEL architecture (one with no reviewed recipe): the message must point
+// at advancing the mainline llama.cpp backend or installing a fork, not at a
+// nonexistent recipe install line.
+func TestBackendUnavailableReasonNovelArchNamesMainline(t *testing.T) {
+	if len(backends.RecipesForArch("muse-glimmer")) > 0 {
+		t.Skip("muse-glimmer unexpectedly has a reviewed recipe; pick a novel arch for this fixture")
+	}
+	message := backendUnavailableReason("muse-glimmer", "/x/llama-server")
+	if !strings.Contains(message, "muse-glimmer") {
+		t.Fatalf("message lacks the architecture: %q", message)
+	}
+	if !strings.Contains(message, "newer llama.cpp mainline") {
+		t.Fatalf("novel-arch message does not name advancing the mainline: %q", message)
+	}
+	if !strings.Contains(message, "install a fork") {
+		t.Fatalf("novel-arch message does not offer the fork path: %q", message)
+	}
+}
+
+// TestBackendUnavailableReasonRecipeArchKeepsRecipeHint guards that an arch with
+// a reviewed recipe keeps the install-<recipe> hint rather than the mainline
+// wording.
+func TestBackendUnavailableReasonRecipeArchKeepsRecipeHint(t *testing.T) {
+	// Use a non-helper reviewed recipe: RecipesForArch excludes helper-only
+	// entries, so a helper-only arch would (correctly) take the novel-arch
+	// wording and this fixture would test the wrong branch.
+	arch := ""
+	for _, recipe := range backends.Recipes() {
+		if !recipe.HelperOnly {
+			arch = recipe.RouteArch
+			break
+		}
+	}
+	if arch == "" {
+		t.Skip("no non-helper reviewed recipe in this build")
+	}
+	message := backendUnavailableReason(arch, "/x/llama-server")
+	if !strings.Contains(message, "ggrun backend install") {
+		t.Fatalf("recipe-backed arch lost the install hint: %q", message)
+	}
+	if strings.Contains(message, "newer llama.cpp mainline") {
+		t.Fatalf("recipe-backed arch wrongly named the mainline path: %q", message)
+	}
+}
+
+// TestOfferMainlineBackendUpdate guards the interactive offer seam: an
+// unsupported NOVEL architecture with a FAIL-CLOSED reason prompts, and an
+// accepted answer runs the update; declined, non-terminal, recipe-backed, and
+// non-FAIL-CLOSED inputs never prompt or run.
+func TestOfferMainlineBackendUpdate(t *testing.T) {
+	if len(backends.RecipesForArch("muse-glimmer")) > 0 {
+		t.Skip("muse-glimmer unexpectedly has a reviewed recipe; pick a novel arch for this fixture")
+	}
+	novelReq := func() *launchRequest {
+		return &launchRequest{BackendUnavailableReason: backendUnavailableReason("muse-glimmer", "/x/llama-server")}
+	}
+	novelModel := &placement.ModelProfile{ModelArch: "muse-glimmer"}
+
+	ran := 0
+	noop := func() error { ran++; return nil }
+
+	// Accept on a terminal runs the update.
+	var out bytes.Buffer
+	ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, false, strings.NewReader("y\n"), &out, true, noop)
+	if !ok || ran != 1 {
+		t.Fatalf("accepted prompt: ok=%v ran=%d (want true,1)", ok, ran)
+	}
+	if !strings.Contains(out.String(), "muse-glimmer") {
+		t.Fatalf("prompt did not name the architecture: %q", out.String())
+	}
+
+	// Decline on a terminal does not run.
+	ran = 0
+	out.Reset()
+	if ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, false, strings.NewReader("n\n"), &out, true, noop); ok || ran != 0 {
+		t.Fatalf("declined prompt: ok=%v ran=%d (want false,0)", ok, ran)
+	}
+
+	// Non-terminal never prompts nor runs.
+	ran = 0
+	if ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, false, strings.NewReader("y\n"), io.Discard, false, noop); ok || ran != 0 {
+		t.Fatalf("non-terminal: ok=%v ran=%d (want false,0)", ok, ran)
+	}
+
+	// assumeYes runs without prompting.
+	ran = 0
+	if ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, true, strings.NewReader(""), io.Discard, false, noop); !ok || ran != 1 {
+		t.Fatalf("assume-yes: ok=%v ran=%d (want true,1)", ok, ran)
+	}
+
+	// A recipe-backed architecture is not eligible (reviewedRecipeRequiredForMain
+	// handles it before this offer). hy_v3 is a non-helper reviewed recipe.
+	if len(backends.RecipesForArch("hy_v3")) == 0 {
+		t.Skip("hy_v3 reviewed recipe missing from catalog")
+	}
+	ran = 0
+	if ok := offerMainlineBackendUpdateWith(novelReq(), &placement.ModelProfile{ModelArch: "hy_v3"}, false, strings.NewReader("y\n"), io.Discard, true, noop); ok || ran != 0 {
+		t.Fatalf("recipe-backed arch should not offer a mainline update: ok=%v ran=%d", ok, ran)
+	}
+
+	// No FAIL-CLOSED reason (e.g. explicit-backend fallback) is not eligible.
+	ran = 0
+	if ok := offerMainlineBackendUpdateWith(&launchRequest{}, novelModel, false, strings.NewReader("y\n"), io.Discard, true, noop); ok || ran != 0 {
+		t.Fatalf("no FAIL-CLOSED reason should not offer: ok=%v ran=%d", ok, ran)
+	}
+
+	// An update failure returns false (caller keeps the dead-end error path).
+	ran = 0
+	fail := func() error { ran++; return errors.New("build failed") }
+	if ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, true, strings.NewReader(""), io.Discard, false, fail); ok || ran != 1 {
+		t.Fatalf("failed update: ok=%v ran=%d (want false,1)", ok, ran)
 	}
 }
 

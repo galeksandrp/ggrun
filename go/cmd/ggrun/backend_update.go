@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/raketenkater/ggrun/pkg/backends"
+	"github.com/raketenkater/ggrun/pkg/update"
 )
 
 // Updating a backend used to mean reinstalling it, which rebuilt over the only
@@ -273,6 +274,15 @@ func updateRegisteredBackend(tag string) error {
 		fmt.Printf("Roll back with: ggrun backend rollback %s\n", tag)
 	}
 	return nil
+}
+
+// updateMainlineBackend advances the mainline llama.cpp backend to its latest
+// commit. It is safe by construction: the update package compiles each build
+// variant in an isolated staging directory, smoke-tests it, and only then swaps
+// it over the active build, retaining the previous one. A failed build or pull
+// leaves the active backend untouched.
+func updateMainlineBackend() error {
+	return update.UpdateMainlineBackendAtAppHome(backends.AppHome())
 }
 
 func sameStrings(left, right []string) bool {

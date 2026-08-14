@@ -289,6 +289,55 @@ func TestBackendBuildTargetsFollowCanonicalAppHomeLinks(t *testing.T) {
 	}
 }
 
+func TestUpdateMainlineBackendAtAppHomeFiltersToMainline(t *testing.T) {
+	appHome := t.TempDir()
+	binDir := filepath.Join(appHome, ".bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	makeBuild := func(repoName, variant string) string {
+		repo := filepath.Join(t.TempDir(), repoName)
+		if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		binary := filepath.Join(repo, variant, "bin", "llama-server")
+		if err := os.MkdirAll(filepath.Dir(binary), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(binary, []byte("server"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return binary
+	}
+	mainline := makeBuild("llama.cpp", "build-cuda")
+	ik := makeBuild("ik_llama.cpp", "build")
+	if err := os.Symlink(mainline, filepath.Join(binDir, "llama-server-cuda")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(ik, filepath.Join(binDir, "ik_llama-server-cuda")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The scoped update must only see the mainline llama.cpp build, never the
+	// ik_llama.cpp family. Reproduce the filter UpdateMainlineBackendAtAppHome
+	// applies to BackendBuildTargetsAt so the scope is asserted without running a
+	// real pull/build.
+	filtered := make([]BackendBuildTarget, 0)
+	for _, target := range BackendBuildTargetsAt(appHome) {
+		if strings.EqualFold(filepath.Base(target.RepoDir), "llama.cpp") {
+			filtered = append(filtered, target)
+		}
+	}
+	if len(filtered) != 1 || filepath.Base(filtered[0].RepoDir) != "llama.cpp" {
+		t.Fatalf("mainline filter = %#v, want only llama.cpp", filtered)
+	}
+	// No active mainline build (empty filtered set) is a no-op, not an error.
+	emptyHome := t.TempDir()
+	if err := UpdateMainlineBackendAtAppHome(emptyHome); err != nil {
+		t.Fatalf("empty app home should no-op, got: %v", err)
+	}
+}
+
 func TestBackendUpdateGroupsContinueAfterIndependentFailure(t *testing.T) {
 	targets := []BackendBuildTarget{
 		{Label: "mainline cuda", RepoDir: "/repo/main", BuildDir: "/repo/main/build-cuda"},

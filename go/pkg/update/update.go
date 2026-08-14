@@ -1033,6 +1033,37 @@ func UpdateBackendsAtAppHome(appHome string) error {
 	return errors.Join(updateErrs...)
 }
 
+// UpdateMainlineBackendAtAppHome advances only the mainline llama.cpp backend —
+// the .src/llama.cpp checkout and the build variants ggrun actually launches —
+// to the latest commit, preserving each build it replaces on failure. It is the
+// same safe staged update as UpdateBackendsAtAppHome but scoped to the mainline
+// family, so an unsupported-architecture offer cannot drag the ik_llama.cpp
+// family or unrelated forks into a rebuild.
+func UpdateMainlineBackendAtAppHome(appHome string) error {
+	var targets []BackendBuildTarget
+	for _, target := range BackendBuildTargetsAt(appHome) {
+		if strings.EqualFold(filepath.Base(target.RepoDir), "llama.cpp") {
+			targets = append(targets, target)
+		}
+	}
+	if len(targets) == 0 {
+		fmt.Println("No active mainline llama.cpp source build found — nothing to update.")
+		return nil
+	}
+	results := updateBackendBuildTargets(targets, 3)
+	var updateErrs []error
+	fmt.Println("\nMainline llama.cpp update summary:")
+	for _, result := range results {
+		if result.Err != nil {
+			fmt.Printf("  %-28s failed (kept previous build): %v\n", result.Target.Label, result.Err)
+			updateErrs = append(updateErrs, fmt.Errorf("%s: %w", result.Target.Label, result.Err))
+			continue
+		}
+		fmt.Printf("  %-28s %s\n", result.Target.Label, result.Status)
+	}
+	return errors.Join(updateErrs...)
+}
+
 func updateBackendBuildTargets(targets []BackendBuildTarget, walkback int) []BackendUpdateResult {
 	return updateBackendBuildTargetsWith(targets, walkback, updateBackendBuildGroup)
 }

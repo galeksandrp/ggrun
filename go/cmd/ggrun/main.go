@@ -1979,10 +1979,7 @@ func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model 
 		// rides the request so every nil-backend call site (launch, dry-run,
 		// tune, kv-probe, daemon) surfaces it instead of "no llama-server found".
 		if unsupported != nil && arch != "" {
-			req.BackendUnavailableReason = fmt.Sprintf(
-				"No installed backend supports the %s architecture. The %s backend does not support it.\n"+
-					"  Update the backend or install a fork that adds %s (ggrun backend install <recipe>).",
-				arch, unsupported.Path, arch)
+			req.BackendUnavailableReason = backendUnavailableReason(arch, unsupported.Path)
 		}
 		return nil
 	}
@@ -2023,6 +2020,65 @@ func normalizeArchKVRequest(req *launchRequest, model *placement.ModelProfile) {
 		model.ModelArch, rule.Target(), rule.Reason, rule.Target())
 	req.KVQuality = rule.Target()
 	req.KVTypeK, req.KVTypeV = "", ""
+}
+
+// backendUnavailableReason names the actionable fix for a FAIL-CLOSED auto
+// backend refusal. A reviewed recipe for the architecture means the user can
+// install exactly that fork; a novel architecture with no reviewed recipe has no
+// such install line, so the actionable path is advancing the mainline llama.cpp
+// checkout (which upstream tracks new architectures into before forks diverge)
+// or installing any fork that adds the architecture.
+func backendUnavailableReason(arch, backendPath string) string {
+	actionable := fmt.Sprintf("Update the mainline llama.cpp backend or install a fork that adds %s (ggrun backend install <recipe>).", arch)
+	if len(backends.RecipesForArch(arch)) == 0 {
+		actionable = "It requires a newer llama.cpp mainline or a fork that adds the architecture. Update the mainline backend or install a fork."
+	}
+	return fmt.Sprintf(
+		"No installed backend supports the %s architecture. The %s backend does not support it.\n  %s",
+		arch, backendPath, actionable)
+}
+
+// offerMainlineBackendUpdate asks the user whether to advance the mainline
+// llama.cpp backend when the FAIL-CLOSED refusal is an unsupported architecture
+// with NO reviewed recipe (a novel arch): there is no fork install line to
+// offer, so the actionable path is updating mainline. It returns true only when
+// the user accepts and the update ran; a declined or non-terminal call returns
+// false so the caller keeps the dead-end error path.
+func offerMainlineBackendUpdate(req *launchRequest, model *placement.ModelProfile, assumeYes bool) bool {
+	return offerMainlineBackendUpdateWith(req, model, assumeYes, os.Stdin, os.Stderr, stdinIsTerminal(), updateMainlineBackend)
+}
+
+// offerMainlineBackendUpdateWith is the injectable core: the confirmation uses
+// the same reader/writer/terminal shape as confirmReviewedBackendInstall, and
+// the update is a seam so tests can observe the decision without rebuilding a
+// llama.cpp checkout.
+func offerMainlineBackendUpdateWith(req *launchRequest, model *placement.ModelProfile, assumeYes bool, in io.Reader, out io.Writer, terminal bool, update func() error) bool {
+	if req == nil || model == nil {
+		return false
+	}
+	arch := strings.TrimSpace(model.ModelArch)
+	if arch == "" {
+		return false
+	}
+	// Only a FAIL-CLOSED unsupported-architecture refusal is eligible, and only
+	// when no reviewed recipe exists to offer instead. A recipe-backed arch is
+	// handled by the reviewedRecipeRequiredForMain flow before this point.
+	if strings.TrimSpace(req.BackendUnavailableReason) == "" || len(backends.RecipesForArch(arch)) > 0 {
+		return false
+	}
+	if assumeYes {
+		return update() == nil
+	}
+	if !terminal {
+		return false
+	}
+	fmt.Fprintf(out, "No installed backend can load this model architecture. Update the mainline llama.cpp backend to add support for %s? [y/N] ", arch)
+	line, _ := bufio.NewReader(in).ReadString('\n')
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer != "y" && answer != "yes" {
+		return false
+	}
+	return update() == nil
 }
 
 func backendUnavailableMessage(req *launchRequest) string {
@@ -4575,8 +4631,17 @@ func cmdLaunch(args []string) {
 		be = resolveLaunchBackend(req, model, caps)
 	}
 	if be == nil {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
-		os.Exit(1)
+		// A NOVEL architecture (no reviewed recipe) cannot be fixed by a recipe
+		// install; the actionable path is advancing the mainline llama.cpp
+		// checkout to a revision that added the loader. Offer it on a terminal so
+		// the dead-end error becomes a question, but never block a scripted call.
+		if offerMainlineBackendUpdate(req, model, cfg.AssumeYes) {
+			be = resolveLaunchBackend(req, model, caps)
+		}
+		if be == nil {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", backendUnavailableMessage(req))
+			os.Exit(1)
+		}
 	}
 	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
