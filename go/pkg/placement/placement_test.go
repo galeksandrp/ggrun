@@ -2139,6 +2139,168 @@ func TestComputeDenseMultiGPU(t *testing.T) {
 	}
 }
 
+// TestComputeDenseMultiGPUBalancedSplit recreates the Muse-Glimmer crash: a
+// 30 GB dense model on 24/12/12 GB GPUs where the fast pair (CUDA0 gen4x16 +
+// CUDA2 gen4x16) alone fits the model. The old subset-fit loop dropped the slow
+// gen3x1 CUDA1 (split 0.00) and then CUDA2 OOM'd on its compute buffer. The
+// balanced fix must give EVERY GPU a nonzero share so all free VRAM contributes.
+func TestComputeDenseMultiGPUBalancedSplit(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24576, VRAMUsedMB: 736, BandwidthMBps: 31504},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, VRAMUsedMB: 6329, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12288, VRAMUsedMB: 578, BandwidthMBps: 31504},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path:        "Muse-Glimmer.gguf",
+		TotalSizeMB: 30804,
+		SizeBytes:   30804 * 1024 * 1024,
+		NumLayers:   80,
+		IsMoE:       false,
+		ContextSize: 16384,
+		HiddenSize:  5120,
+		CTXTrain:    16384,
+		HeadCountKV: 8,
+		KeyLength:   128,
+		ValueLength: 128,
+	}
+	// ctx=16384 gives KV=1440, so the fast pair (CUDA0+CUDA2) fits the model in
+	// the old subset-fit loop and CUDA1 got zeroed. With ctx=32768 (KV=2880) the
+	// pair did NOT fit and the old code kept CUDA1 at 0.14 — not the crash.
+	strat, err := Compute(caps, model, Options{ContextSize: 16384, KVPlacement: "gpu", KVQuality: "low", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("compute failed: %v", err)
+	}
+	if strat.Type != MultiGPUDense {
+		t.Fatalf("expected multi_gpu_dense, got %s", strat.Type)
+	}
+	if len(strat.TensorSplit) != 3 {
+		t.Fatalf("expected a 3-GPU split, got %v", strat.TensorSplit)
+	}
+	for gi, share := range strat.TensorSplit {
+		if share <= 0 {
+			t.Fatalf("GPU%d got a zero share; every GPU must contribute, split=%v", gi, strat.TensorSplit)
+		}
+	}
+	// The split must still FIT each GPU: model+KV share + per-GPU compute reserve.
+	totalSizeMB := model.TotalSizeMB
+	kvTotal := computeKVTotalMB(model, 16384, strat.KVType, false)
+	cudaOH := measuredCUDAOverheadMB(loadSystemProbe(t.TempDir(), caps.GPUs))
+	for gi := 0; gi < 3; gi++ {
+		share := strat.TensorSplit[gi]
+		need := int(float64(totalSizeMB)*share) + int(float64(kvTotal)*share) + cudaOH + computeFloorMB
+		free := caps.GPUs[gi].VRAMFreeMB()
+		if need > free {
+			t.Fatalf("GPU%d needs %d MiB but has %d free (share=%.2f)", gi, need, free, share)
+		}
+	}
+}
+
+// TestComputeDenseComputeReservePreventsOOM verifies the per-GPU compute buffer
+// is reserved BEFORE the model split, using the Muse-Glimmer crash hardware and
+// a probe cache carrying per-GPU measured compute buffers. CUDA2 free VRAM only
+// fits its model+KV share plus ~752 MiB compute; the split must be sized so
+// CUDA2's own compute allocation fits. This exercises the per-GPU compute path
+// (ComputeBufByGPU), which the old dense code ignored — it charged the uniform
+// aggregate (752) to every GPU and gave CUDA2 a 0.33 share needing 11392 MiB of
+// its 11710, the razor-thin margin that OOM'd.
+func TestComputeDenseComputeReservePreventsOOM(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24576, VRAMUsedMB: 736, BandwidthMBps: 31504},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, VRAMUsedMB: 6329, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12288, VRAMUsedMB: 578, BandwidthMBps: 31504},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path:        "Muse-Glimmer.gguf",
+		TotalSizeMB: 30804,
+		SizeBytes:   30804 * 1024 * 1024,
+		NumLayers:   80,
+		IsMoE:       false,
+		ContextSize: 16384,
+		HiddenSize:  5120,
+		CTXTrain:    16384,
+		HeadCountKV: 8,
+		KeyLength:   128,
+		ValueLength: 128,
+	}
+	cacheDir := t.TempDir()
+	// Per-GPU measured compute buffers: CUDA0 and CUDA2 need 752 MiB, CUDA1 (the
+	// slow gen3x1 card, expert-ish role) needs only 64 MiB. A uniform aggregate
+	// charge would over-reserve CUDA1 and under-reserve CUDA2.
+	if err := writeProbeCacheForModel(cacheDir, model, 16384, 512, "low", "gpu", "llama", caps.GPUs, 1,
+		map[int]int{0: 752, 1: 64, 2: 752}, nil, nil, 0); err != nil {
+		t.Fatalf("write probe: %v", err)
+	}
+	strat, err := Compute(caps, model, Options{ContextSize: 16384, KVPlacement: "gpu", KVQuality: "low", BackendTag: "llama", CacheDir: cacheDir})
+	if err != nil {
+		t.Fatalf("compute failed: %v", err)
+	}
+	if strat.Type != MultiGPUDense {
+		t.Fatalf("expected multi_gpu_dense, got %s", strat.Type)
+	}
+	if len(strat.TensorSplit) != 3 || strat.TensorSplit[1] <= 0 {
+		t.Fatalf("expected a 3-GPU split with CUDA1 contributing, got %v", strat.TensorSplit)
+	}
+	// Every GPU must fit its own model+KV share PLUS its measured compute buffer
+	// (the per-GPU value the planner reserved before the split). CUDA2 is the
+	// crash card: its compute buffer (752 MiB) must fit alongside its share.
+	totalSizeMB := model.TotalSizeMB
+	kvTotal := computeKVTotalMB(model, 16384, strat.KVType, false)
+	measuredCompute := map[int]int{0: 752, 1: 64, 2: 752}
+	cudaOH := measuredCUDAOverheadMB(loadSystemProbe(t.TempDir(), caps.GPUs))
+	for gi := 0; gi < 3; gi++ {
+		share := strat.TensorSplit[gi]
+		need := int(float64(totalSizeMB)*share) + int(float64(kvTotal)*share) + cudaOH + measuredCompute[gi]
+		free := caps.GPUs[gi].VRAMFreeMB()
+		if need > free {
+			t.Fatalf("GPU%d needs %d MiB but has %d free (share=%.2f, compute=%d); compute reserve not accounted", gi, need, free, share, measuredCompute[gi])
+		}
+	}
+}
+
+// TestComputeDenseSmallModelStillUsesSingleGPU verifies the tiny-model case is
+// preserved: a small dense model that fits one GPU stays on SingleGPU (no split,
+// no multi-GPU). The balanced-split change must not route small models onto more
+// GPUs than needed.
+func TestComputeDenseSmallModelStillUsesSingleGPU(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, BandwidthMBps: 31504},
+			{Index: 1, VRAMTotalMB: 24576, BandwidthMBps: 31504},
+			{Index: 2, VRAMTotalMB: 24576, BandwidthMBps: 31504},
+		},
+		RAM: detect.RAMInfo{TotalMB: 65536, FreeMB: 60000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path:        "small-dense.gguf",
+		TotalSizeMB: 8192,
+		SizeBytes:   8 * 1024 * 1024 * 1024,
+		NumLayers:   32,
+		IsMoE:       false,
+		ContextSize: 32768,
+		HiddenSize:  2048,
+		CTXTrain:    32768,
+		HeadCountKV: 8,
+		KeyLength:   128,
+		ValueLength: 128,
+	}
+	strat, err := Compute(caps, model, Options{ContextSize: 32768, KVPlacement: "gpu", KVQuality: "low", CacheDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("compute failed: %v", err)
+	}
+	if strat.Type != SingleGPU {
+		t.Fatalf("expected single_gpu for a small model, got %s", strat.Type)
+	}
+}
+
 func TestComputeMoEMultiGPU(t *testing.T) {
 	// 60GB MoE on two 24GB GPUs with 128GB RAM
 	caps := &detect.Capabilities{

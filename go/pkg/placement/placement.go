@@ -1365,12 +1365,27 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 		probeHit = true
 		computeBufMB = pc.ComputeBufMB
 	}
+	// computeBufForGPU returns the per-GPU compute-buffer reserve for the given
+	// CUDA index. Mirrors the MoE per-GPU fix (buildMoEOffload): a split-owner
+	// pays the compute buffer MEASURED for its own device when available, falling
+	// back to the primary's aggregate only for role transitions with no per-GPU
+	// reading yet. Charging the aggregate uniformly over-packs a small card whose
+	// real compute graph is smaller (or, when the aggregate is the floor, leaves
+	// a card under-reserved so it OOMs on its own compute allocation after the
+	// model weights fill it).
+	computeBufForGPU := func(idx int) int {
+		if pc != nil {
+			if measuredPerGPU := pc.ComputeBufByGPU[idx]; measuredPerGPU > 0 {
+				return measuredPerGPU
+			}
+			if pc.ComputeBufMB > 0 {
+				return pc.ComputeBufMB
+			}
+		}
+		return computeBufMB
+	}
 
 	// Per-layer costs
-	weightPerLayerMB := totalSizeMB / model.NumLayers
-	if weightPerLayerMB <= 0 {
-		weightPerLayerMB = 1
-	}
 	kvPerLayerMB := kvTotalMB / model.NumLayers
 	if kvPerLayerMB < 1 && kvTotalMB > 0 {
 		kvPerLayerMB = 1
@@ -1379,61 +1394,78 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	// KV-first GPU reserve: VRAM-proportional (KV reads are VRAM-local)
 	gpuKVReserveMB := kvReserveByBandwidth(kvTotalMB, caps.GPUs, seqRange(numGPUs), kvPerLayerMB)
 
-	// Tensor-split: proportional to free VRAM only.
-	// llama-server distributes BOTH model weights AND KV cache by this ratio.
-	// Using effective free (subtracting KV reserve) causes OOM because
-	// llama-server puts KV back proportionally to the split anyway.
+	// Balanced tensor-split across ALL GPUs that can contribute. chooseStrategy
+	// already proved the whole model fits on the sum of free VRAM (model +
+	// (cudaOverhead+computeBuf)*numGPUs + KV <= totalFree), so every GPU with
+	// positive effective free must receive a share — dropping a card here (the
+	// old subset-fit loop) left a GPU idle while a smaller sibling OOM'd on its
+	// own compute buffer, and left 12 GB of CUDA1 unused for a 30 GB dense model
+	// on 24/12/12.
+	//
+	// The effective-free subtraction reserves each GPU's own compute buffer
+	// BEFORE the split: llama-server distributes BOTH model weights AND KV cache
+	// by the tensor ratio, so a GPU whose share is sized without its compute
+	// buffer OOMs on that allocation after the weights fill it (the Muse-Glimmer
+	// CUDA2 failure: 0.33 share left ~740 MiB free, the graph needed 752 MiB).
+	// Per-GPU measured compute (ComputeBufByGPU) is preferred over the aggregate,
+	// the same fix the MoE path already uses.
+	//
+	// Weighting multiplies effective free by a log-damped PCIe bandwidth factor.
+	// The MoE path uses RAW bandwidth to concentrate layer ownership on the
+	// fastest-link GPU because CPU-resident experts stream over PCIe. The
+	// fully-resident dense path has no such streaming (each GPU computes only its
+	// locally-owned layers), so raw weighting is not justified — and at realistic
+	// link ratios (985 MB/s gen3x1 vs 31504 MB/s gen4x16, 32x) it collapses a
+	// slow card's share to ~0.005, which normalizeSplit rounds to 0.00: the exact
+	// idle-GPU bug being fixed. The log-damped factor still prefers fast links
+	// but bounds the ratio (~2.4x), so every contributing GPU keeps a nonzero
+	// share.
 	gpuOrder := orderGPUsByBandwidth(caps.GPUs)
 	split := make([]float64, numGPUs)
-	totalFree := 0.0
-	for _, g := range caps.GPUs {
-		totalFree += float64(g.VRAMFreeMB())
-	}
-	if totalFree > 0 {
-		for _, gi := range gpuOrder {
-			free := float64(caps.GPUs[gi].VRAMFreeMB())
-			if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
-				free -= float64(s.MMProjSizeMB)
-				if free < 0 {
-					free = 0
-				}
-			}
-			split[gi] = free / totalFree
+	totalWeighted := 0.0
+	weightByGPU := make([]float64, numGPUs)
+	for idx := 0; idx < numGPUs; idx++ {
+		gi := gpuOrder[idx]
+		g := caps.GPUs[gi]
+		overhead := cudaOverheadMB + computeBufForGPU(g.Index) + gpuKVReserveMB[gi]
+		effective := g.VRAMFreeMB() - overhead
+		if effective < 0 {
+			effective = 0
 		}
-	}
-	s.TensorSplit = normalizeSplit(split)
-
-	// Find smallest GPU subset that fits the model
-	// Use effective capacity (free - overhead) not just total VRAM
-	gpuOrderBW := orderGPUsByBandwidth(caps.GPUs)
-	bestGPUCount := numGPUs
-	for n := 2; n <= numGPUs; n++ {
-		subsetCapacity := 0
-		for j := 0; j < n; j++ {
-			gi := gpuOrderBW[j]
-			g := caps.GPUs[gi]
-			overhead := cudaOverheadMB + computeBufMB + gpuKVReserveMB[gi]
-			effective := g.VRAMFreeMB() - overhead
+		if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
+			effective -= s.MMProjSizeMB
 			if effective < 0 {
 				effective = 0
 			}
-			subsetCapacity += effective
 		}
-		modelWeightMB := totalSizeMB + kvTotalMB/2 // model weights + partial KV overhead
-		if modelWeightMB <= subsetCapacity {
-			bestGPUCount = n
-			break
+		bwFactor := 1.0
+		if g.BandwidthMBps > 0 {
+			// 1 + log2(1 + bw/1024)/2 : 985 -> ~1.49, 31504 -> ~3.50.
+			bwFactor = 1.0 + math.Log2(1.0+float64(g.BandwidthMBps)/1024.0)/2.0
+		}
+		w := float64(effective) * bwFactor
+		weightByGPU[gi] = w
+		totalWeighted += w
+	}
+	if totalWeighted > 0 {
+		for _, gi := range gpuOrder {
+			split[gi] = weightByGPU[gi] / totalWeighted
+		}
+	} else {
+		// No GPU has usable effective VRAM after reserves. Fall back to a
+		// free-VRAM-proportional split so every GPU is still exercised; the OOM
+		// guard (checkMemoryOrDie) reports the true shortfall.
+		totalFree := 0.0
+		for _, g := range caps.GPUs {
+			totalFree += float64(g.VRAMFreeMB())
+		}
+		if totalFree > 0 {
+			for _, gi := range gpuOrder {
+				split[gi] = float64(caps.GPUs[gi].VRAMFreeMB()) / totalFree
+			}
 		}
 	}
-
-	// Zero out GPUs not in the selected subset
-	if bestGPUCount < numGPUs {
-		for idx := bestGPUCount; idx < numGPUs; idx++ {
-			gi := gpuOrderBW[idx]
-			split[gi] = 0
-		}
-		s.TensorSplit = normalizeSplit(split)
-	}
+	s.TensorSplit = normalizeSplit(split)
 
 	// Layer split is the portable default for heterogeneous GPUs. The tensor
 	// split path uses NCCL collectives during graph construction and can abort
