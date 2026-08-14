@@ -626,6 +626,11 @@ type launchRequest struct {
 	// re-packs every GPU around the reduced budget. No model-produced value ever
 	// becomes argv — only this integer, and only after ValidateDecision.
 	AdvisorVRAMPenaltyMB map[int]int
+	// BackendUnavailableReason carries why auto backend selection refused a
+	// launch, so the nil-backend callers surface the real cause instead of the
+	// generic "no llama-server binary found". Set when FAIL-CLOSED auto
+	// selection rejects every candidate for a model architecture.
+	BackendUnavailableReason string
 }
 
 const (
@@ -1781,17 +1786,28 @@ func largeCPUMoEPrefersFileBacked(model *placement.ModelProfile) bool {
 // reclaimable under cgroup pressure, anonymous CUDA-host ones have OOM-killed
 // launches — then the canonical production path wins, then discovery order keeps
 // the result stable.
-func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe backendArchProbe, model *placement.ModelProfile) *backendInfo {
+//
+// Selection FAILS CLOSED: a candidate whose loader the probe PROVED lacks the
+// model's architecture (supported=false, probed=true) is scored 0 and is never
+// launchable-by-default. When every viable candidate lands at 0 for that reason,
+// the second return names the best one and the first is nil, so the caller can
+// refuse loudly instead of letting the canonical tie-break launch a backend that
+// dies with "unknown model architecture" at model load. An unprobeable candidate
+// (probed=false) keeps support 1 and stays launchable: refusing on a failed
+// probe would be worse than the loader error it replaces.
+func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe backendArchProbe, model *placement.ModelProfile) (*backendInfo, *backendInfo) {
 	arch = strings.ToLower(strings.TrimSpace(arch))
 	required := backends.RequiredBackendForArch(arch)
 	recipeBacked := len(backends.RecipesForArch(arch)) > 0
 	tieBreakFileBacked := largeCPUMoEPrefersFileBacked(model)
 	bestIndex, bestSupport, bestCanonical, bestFileBacked := -1, -1, false, false
+	bestProbeUnsupported := false
 	for i, candidate := range candidates {
 		if candidate.info == nil {
 			continue
 		}
 		support := 1 // unknown/unprobeable remains launchable
+		probeUnsupported := false
 		if candidate.incompatible {
 			support = -1
 		} else if required == "ik_llama" && !candidate.info.IsIK {
@@ -1809,13 +1825,17 @@ func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe bac
 						support = 2
 					}
 				} else {
+					// The probe read the backend's loader and the architecture
+					// literal is absent: this backend cannot load the model.
 					support = 0
+					probeUnsupported = true
 				}
 			}
 		}
 		candFileBacked := !candidate.incompatible && cpuExpertsFileBacked(candidate.info)
 		if bestIndex < 0 || support > bestSupport {
 			bestIndex, bestSupport, bestCanonical, bestFileBacked = i, support, candidate.canonical, candFileBacked
+			bestProbeUnsupported = probeUnsupported
 			continue
 		}
 		if support != bestSupport {
@@ -1830,6 +1850,7 @@ func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe bac
 		if tieBreakFileBacked {
 			if candFileBacked && !bestFileBacked {
 				bestIndex, bestCanonical, bestFileBacked = i, candidate.canonical, true
+				bestProbeUnsupported = probeUnsupported
 				continue
 			}
 			if !candFileBacked && bestFileBacked {
@@ -1838,12 +1859,22 @@ func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe bac
 		}
 		if candidate.canonical && !bestCanonical {
 			bestIndex, bestCanonical = i, true
+			bestProbeUnsupported = probeUnsupported
 		}
 	}
 	if bestIndex < 0 {
-		return nil
+		return nil, nil
 	}
-	return candidates[bestIndex].info
+	// FAIL-CLOSED: never launch a backend the probe proved cannot serve this
+	// architecture. An all-unsupported set must refuse loudly instead of letting
+	// the canonical tie-break pick a backend that dies at model load. The
+	// mandated-ik branch (required == "ik_llama" && !IsIK) is deliberately not
+	// covered here: that case is resolved later by preflightIKOnlyArch with a
+	// more specific fix instruction.
+	if arch != "" && bestSupport < 1 && bestProbeUnsupported {
+		return nil, candidates[bestIndex].info
+	}
+	return candidates[bestIndex].info, nil
 }
 
 func reviewedRecipeRequiredForMain(arch string, be *backendInfo) *backends.Recipe {
@@ -1940,21 +1971,33 @@ func selectBackendForModel(caps *detect.Capabilities, req *launchRequest, model 
 			candidates[i].incompatible = err != nil
 		}
 	}
-	chosen := chooseAutoBackend(candidates, arch, backends.BackendSupportsArch, model)
-	if chosen != nil {
-		hasCanonical, chosenCanonical := false, false
-		for _, candidate := range candidates {
-			if candidate.canonical {
-				hasCanonical = true
-				if candidate.info != nil && candidate.info.Path == chosen.Path {
-					chosenCanonical = true
-				}
+	chosen, unsupported := chooseAutoBackend(candidates, arch, backends.BackendSupportsArch, model)
+	if chosen == nil {
+		// FAIL-CLOSED: every candidate's loader was probed and lacks this
+		// architecture. Launching any of them would die at model load with
+		// "unknown model architecture"; refuse with the fix instead. The reason
+		// rides the request so every nil-backend call site (launch, dry-run,
+		// tune, kv-probe, daemon) surfaces it instead of "no llama-server found".
+		if unsupported != nil && arch != "" {
+			req.BackendUnavailableReason = fmt.Sprintf(
+				"No installed backend supports the %s architecture. The %s backend does not support it.\n"+
+					"  Update the backend or install a fork that adds %s (ggrun backend install <recipe>).",
+				arch, unsupported.Path, arch)
+		}
+		return nil
+	}
+	hasCanonical, chosenCanonical := false, false
+	for _, candidate := range candidates {
+		if candidate.canonical {
+			hasCanonical = true
+			if candidate.info != nil && candidate.info.Path == chosen.Path {
+				chosenCanonical = true
 			}
 		}
-		if hasCanonical && !chosenCanonical && arch != "" {
-			fmt.Printf("[launch] auto selected %s outside APP_HOME because canonical backends cannot satisfy architecture/profile %s with KV %s.\n",
-				chosen.Path, arch, req.KVQuality)
-		}
+	}
+	if hasCanonical && !chosenCanonical && arch != "" {
+		fmt.Printf("[launch] auto selected %s outside APP_HOME because canonical backends cannot satisfy architecture/profile %s with KV %s.\n",
+			chosen.Path, arch, req.KVQuality)
 	}
 	return chosen
 }
@@ -1984,6 +2027,12 @@ func normalizeArchKVRequest(req *launchRequest, model *placement.ModelProfile) {
 
 func backendUnavailableMessage(req *launchRequest) string {
 	if req != nil {
+		// FAIL-CLOSED auto selection refused: the reason is specific (the chosen
+		// backend cannot load the model's architecture), so surface it verbatim
+		// instead of the generic "no binary found" fallback.
+		if reason := strings.TrimSpace(req.BackendUnavailableReason); reason != "" {
+			return reason
+		}
 		want := requestedBackendName(req)
 		if want != "" && !strings.EqualFold(want, "auto") {
 			where := strings.TrimSpace(req.AppHome)

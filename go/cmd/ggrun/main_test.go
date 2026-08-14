@@ -1267,7 +1267,7 @@ func TestChooseAutoBackendPrefersCanonicalWhenBothSupportArchitecture(t *testing
 		}
 		return true, true
 	}
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: global},
 		{info: canonical, canonical: true},
 	}, "deepseek4", probe, nil)
@@ -1282,7 +1282,7 @@ func TestChooseAutoBackendArchitectureSupportBeatsCanonicalPath(t *testing.T) {
 	probe := func(path, _ string) (bool, bool) {
 		return path == fork.Path, true
 	}
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: canonical, canonical: true},
 		{info: fork},
 	}, "future-arch", probe, nil)
@@ -1295,7 +1295,7 @@ func TestChooseAutoBackendHonoursRequiredIKFamily(t *testing.T) {
 	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
 	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", IsIK: true}
 	unknownProbe := func(string, string) (bool, bool) { return false, false }
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: mainline, canonical: true},
 		{info: ik, canonical: true},
 	}, "minimax-m3", unknownProbe, nil)
@@ -1307,7 +1307,7 @@ func TestChooseAutoBackendHonoursRequiredIKFamily(t *testing.T) {
 func TestChooseAutoBackendRejectsProfileIncompatibleCandidate(t *testing.T) {
 	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
 	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", IsIK: true}
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: mainline, canonical: true, incompatible: true},
 		{info: ik, canonical: true},
 	}, "deepseek4", func(string, string) (bool, bool) { return true, true }, nil)
@@ -1331,7 +1331,7 @@ func TestChooseAutoBackendPrefersFileBackedForLargeMoE(t *testing.T) {
 	// Large MoE (94 GiB) with both backends viable: file-backed mainline wins
 	// over anonymous ik_llama even though ik_llama is listed first.
 	largeMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 94 * 1024}
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: ik},
 		{info: mainline},
 	}, "deepseek4", probe, largeMoE)
@@ -1343,7 +1343,7 @@ func TestChooseAutoBackendPrefersFileBackedForLargeMoE(t *testing.T) {
 	// discovery order wins when nothing else separates the candidates, so ik_llama
 	// listed first is chosen.
 	smallMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 4 * 1024}
-	got = chooseAutoBackend([]autoBackendCandidate{
+	got, _ = chooseAutoBackend([]autoBackendCandidate{
 		{info: ik},
 		{info: mainline},
 	}, "deepseek4", probe, smallMoE)
@@ -1353,7 +1353,7 @@ func TestChooseAutoBackendPrefersFileBackedForLargeMoE(t *testing.T) {
 
 	// A large non-MoE model does not engage the tie-break either.
 	largeDense := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: false, TotalSizeMB: 94 * 1024}
-	got = chooseAutoBackend([]autoBackendCandidate{
+	got, _ = chooseAutoBackend([]autoBackendCandidate{
 		{info: ik},
 		{info: mainline},
 	}, "deepseek4", probe, largeDense)
@@ -1376,7 +1376,7 @@ func TestChooseAutoBackendFileBackedBeatsCanonicalForLargeMoE(t *testing.T) {
 
 	// File-backed non-canonical mainline beats canonical anonymous ik for a
 	// large-CPU-expert MoE.
-	got := chooseAutoBackend([]autoBackendCandidate{
+	got, _ := chooseAutoBackend([]autoBackendCandidate{
 		{info: ikCanonical, canonical: true},
 		{info: mainline},
 	}, "deepseek4", probe, largeMoE)
@@ -1386,12 +1386,101 @@ func TestChooseAutoBackendFileBackedBeatsCanonicalForLargeMoE(t *testing.T) {
 
 	// Without the tie-break (small MoE), canonical locality wins as before.
 	smallMoE := &placement.ModelProfile{ModelArch: "deepseek4", IsMoE: true, TotalSizeMB: 4 * 1024}
-	got = chooseAutoBackend([]autoBackendCandidate{
+	got, _ = chooseAutoBackend([]autoBackendCandidate{
 		{info: ikCanonical, canonical: true},
 		{info: mainline},
 	}, "deepseek4", probe, smallMoE)
 	if got != ikCanonical {
 		t.Fatalf("canonical ik must win over non-canonical mainline when tie-break not engaged, got %#v", got)
+	}
+}
+
+// TestChooseAutoBackendProvenUnsupportedNotSelected reproduces the muse-glimmer
+// defect: the canonical backend probes (false, true) — its loader was read and
+// does not contain the architecture literal — and must NOT be auto-selected.
+// Before the fix an all-support=0 set fell through to the canonical tie-break
+// and launched a backend that died with "unknown model architecture" at load.
+func TestChooseAutoBackendProvenUnsupportedNotSelected(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	fork := &backendInfo{Path: "/fork/build/bin/llama-server", Tag: "fork"}
+	probe := func(path, _ string) (bool, bool) {
+		return false, true // loader read, literal absent
+	}
+	got, unsupported := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true},
+		{info: fork},
+	}, "muse-glimmer", probe, nil)
+	if got != nil {
+		t.Fatalf("proven-unsupported backend was auto-selected: %#v", got)
+	}
+	if unsupported != mainline {
+		t.Fatalf("all-proven-unsupported set must name the best candidate to refuse, got %#v", unsupported)
+	}
+}
+
+// TestChooseAutoBackendAllCandidatesUnsupportedRefuses covers the FAIL-CLOSED
+// launch path: when every viable candidate proves unsupported, chooseAutoBackend
+// returns nil and the caller refuses instead of launching.
+func TestChooseAutoBackendAllCandidatesUnsupportedRefuses(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	vulkan := &backendInfo{Path: "/app/.bin/llama-server-vulkan", Tag: "vulkan"}
+	probe := func(string, string) (bool, bool) { return false, true }
+	got, unsupported := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true},
+		{info: vulkan, canonical: true},
+	}, "muse-glimmer", probe, nil)
+	if got != nil {
+		t.Fatalf("all-proven-unsupported set selected %#v instead of refusing", got)
+	}
+	if unsupported == nil {
+		t.Fatal("all-proven-unsupported set must report the candidate to name in the refusal message")
+	}
+}
+
+// TestChooseAutoBackendMixedUnsupportedAndUnprobeableKeepsUnprobeable guards the
+// fail-open side: an unprobeable backend (probe returned false, false) remains
+// launchable and must be chosen over a set where every OTHER candidate is
+// proven-unsupported. Refusing on a failed probe would be worse than the loader
+// error it replaces.
+func TestChooseAutoBackendMixedUnsupportedAndUnprobeableKeepsUnprobeable(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	unprobeable := &backendInfo{Path: "/home/me/.local/bin/llama-server", Tag: "llama"}
+	probe := func(path, _ string) (bool, bool) {
+		if path == unprobeable.Path {
+			return false, false // could not run the probe: must stay launchable
+		}
+		return false, true
+	}
+	got, unsupported := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true},
+		{info: unprobeable},
+	}, "muse-glimmer", probe, nil)
+	if got != unprobeable {
+		t.Fatalf("unprobeable backend must stay launchable and be chosen, got %#v", got)
+	}
+	if unsupported != nil {
+		t.Fatalf("launchable unprobeable candidate must not be reported as unsupported, got %#v", unsupported)
+	}
+}
+
+// TestChooseAutoBackendMandatedIKStillResolves guards the interplay with the
+// mandated-ik branch: an all-support=0 set that came from "arch requires ik but
+// the candidate is not ik" must NOT be refused by the FAIL-CLOSED gate — the
+// caller routes that to preflightIKOnlyArch, which names the exact fix. Only
+// probe-proven unsupported (false, true) is grounds for refusal.
+func TestChooseAutoBackendMandatedIKStillResolves(t *testing.T) {
+	mainline := &backendInfo{Path: "/app/.bin/llama-server-cuda", Tag: "llama"}
+	ik := &backendInfo{Path: "/app/.bin/ik_llama-server-cuda", Tag: "ik_llama", IsIK: true}
+	probe := func(string, string) (bool, bool) { return false, false }
+	got, unsupported := chooseAutoBackend([]autoBackendCandidate{
+		{info: mainline, canonical: true},
+		{info: ik, canonical: true},
+	}, "minimax-m3", probe, nil)
+	if got != ik {
+		t.Fatalf("required-ik family must still resolve to the ik candidate, got %#v", got)
+	}
+	if unsupported != nil {
+		t.Fatalf("mandated-ik set must not be reported as probe-unsupported, got %#v", unsupported)
 	}
 }
 
@@ -1549,6 +1638,30 @@ func TestSelectBackendMissingExplicitNameNeverFallsBack(t *testing.T) {
 	message := backendUnavailableMessage(req)
 	if !strings.Contains(message, req.Backend) || !strings.Contains(message, req.AppHome) {
 		t.Fatalf("explicit backend diagnostic is not actionable: %q", message)
+	}
+}
+
+// TestBackendUnavailableMessageSurfacesProvenUnsupportedReason guards the
+// FAIL-CLOSED message path: when auto selection refuses because every candidate
+// was probe-proven to lack the architecture, backendUnavailableMessage must
+// surface that specific reason instead of the generic "no llama-server binary
+// found" fallback. This is the message the user sees instead of the cryptic
+// "unknown model architecture" loader error.
+func TestBackendUnavailableMessageSurfacesProvenUnsupportedReason(t *testing.T) {
+	req := &launchRequest{BackendUnavailableReason: "No installed backend supports the muse-glimmer architecture. The /x/llama-server backend does not support it.\n  Update the backend or install a fork that adds muse-glimmer (ggrun backend install <recipe>)."}
+	message := backendUnavailableMessage(req)
+	if !strings.Contains(message, "muse-glimmer") {
+		t.Fatalf("FAIL-CLOSED reason was not surfaced verbatim: %q", message)
+	}
+	if strings.Contains(message, "no llama-server binary found") {
+		t.Fatalf("FAIL-CLOSED reason fell through to the generic fallback: %q", message)
+	}
+	// An empty reason keeps the pre-existing generic fallback for explicit
+	// backend requests.
+	req2 := &launchRequest{Backend: "some-backend", BackendExplicit: true, AppHome: "/tmp/app"}
+	msg2 := backendUnavailableMessage(req2)
+	if !strings.Contains(msg2, "some-backend") || strings.Contains(msg2, "muse-glimmer") {
+		t.Fatalf("generic fallback changed behaviour: %q", msg2)
 	}
 }
 
