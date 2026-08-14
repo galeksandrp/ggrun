@@ -427,6 +427,26 @@ func ClearModelCaches(cacheDir string, model *ModelProfile) (files int, err erro
 		}
 	}
 
+	// Verified configs: verified-<scopehash>.json under cacheDir/verified-configs.
+	// Each record stores the model basename (like the placement cache) so a
+	// "clear caches" action can remove every verified config a model created.
+	verifiedDir := filepath.Join(cacheDir, "verified-configs")
+	if entries, readErr := os.ReadDir(verifiedDir); readErr == nil {
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+				continue
+			}
+			data, readErr := os.ReadFile(filepath.Join(verifiedDir, ent.Name()))
+			if readErr != nil {
+				continue
+			}
+			var vc VerifiedConfig
+			if json.Unmarshal(data, &vc) == nil && vc.ModelBasename != "" && matchesModel(vc.ModelBasename) {
+				remove(filepath.Join(verifiedDir, ent.Name()))
+			}
+		}
+	}
+
 	return removed, nil
 }
 

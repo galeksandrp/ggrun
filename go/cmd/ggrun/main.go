@@ -204,7 +204,7 @@ Launch flags:
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
   --claude-reviewer str  Local reviewer/worker for Claude Code (requires --claude-code):
-                       auto|qwen|nanbeige (default auto)
+                       auto|qwen|qwen2b|nanbeige (default auto)
   --chat-template str   Force a corrected chat template from the data-driven catalog
                        by entry name (e.g. nanbeige4.2-3b, qwen3.8-27b) for models whose
                        embedded template llama.cpp's minja engine cannot parse; a value
@@ -586,10 +586,10 @@ type launchRequest struct {
 	WorkerBenchmark      bool // task-specific support/reviewer quality plus throughput
 	ClaudeCode           bool
 	// ClaudeReviewerOverride selects the local reviewer/worker model when
-	// Claude Code mode starts its Auto companion: "auto" keeps ggrun's
-	// automatic choice (Qwen for dense, Nanbeige4.2 for big MoE), "qwen"
-	// forces the historical Qwen profile, and "nanbeige" forces the Nanbeige4.2
-	// profile. Empty means auto. Set via --claude-reviewer.
+	// Claude Code mode starts its Auto companion: "auto" (and the historical
+	// "qwen") resolve to the Qwen3.5-4B worker/reviewer, "qwen2b" forces the
+	// small/light Qwen3.5-2B review-only profile, and "nanbeige" forces the
+	// Nanbeige4.2 big-MoE worker. Empty means auto. Set via --claude-reviewer.
 	ClaudeReviewerOverride string
 	// ClaudeReviewerDisabled is set only after the user accepts the resident
 	// fallback that routes Auto reviews through the main model. It is runtime
@@ -1280,16 +1280,17 @@ func parseClaudeProfile(flag, value string) (string, error) {
 const (
 	claudeReviewerAuto     = "auto"
 	claudeReviewerQwen     = "qwen"
+	claudeReviewerQwen2B   = "qwen2b"
 	claudeReviewerNanbeige = "nanbeige"
 )
 
 func parseClaudeReviewer(flag, value string) (string, error) {
 	reviewer := strings.ToLower(strings.TrimSpace(value))
 	switch reviewer {
-	case claudeReviewerAuto, claudeReviewerQwen, claudeReviewerNanbeige:
+	case claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige:
 		return reviewer, nil
 	default:
-		return "", fmt.Errorf("%s must be %q, %q or %q, got %q", flag, claudeReviewerAuto, claudeReviewerQwen, claudeReviewerNanbeige, value)
+		return "", fmt.Errorf("%s must be %q, %q, %q or %q, got %q", flag, claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige, value)
 	}
 }
 
@@ -2262,6 +2263,14 @@ func backendMatches(info *backendInfo, name, want string) bool {
 }
 
 func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfile, be *backendInfo, cacheDir string) placement.Options {
+	return placementOptionsFromRequestCaps(req, model, be, cacheDir, nil)
+}
+
+// placementOptionsFromRequestCaps is placementOptionsFromRequest plus an
+// optional caps argument used to derive the verified-config scope key. When
+// caps is nil the scope key is left unset (callers that do not want verified
+// config reuse, or cannot derive hardware, get today's behavior).
+func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelProfile, be *backendInfo, cacheDir string, caps *detect.Capabilities) placement.Options {
 	ctxSize := resolveCtxFlag(req.CtxFlag, model.CTXTrain)
 	if req.ClaudeCode && ctxSize <= 0 {
 		// Claude Code needs a large shared window for its main conversation plus
@@ -2323,6 +2332,10 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		// and every probe/KV/prompt measurement (SkipCachedConfig implies
 		// SkipPlacementCache inside Compute).
 		SkipCachedConfig: req.NoCachedConfig,
+		// ChatTemplate scopes placement/cache keys to the forced template entry,
+		// so a verified config measured under one template is never reused under
+		// another (different serving contract, different emitted flags).
+		ChatTemplate: req.ChatTemplateOverride,
 	}
 	if req.GPUsFlag != "" {
 		if indices, err := parseGPUIndices(req.GPUsFlag); err == nil {
@@ -2342,6 +2355,12 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile),
 		opts.ContextSize, req.ClaudeCode, req.ParallelSet,
 	)
+	// Derive the strategy-free verified-config scope key from the finalized opts.
+	// It is what the reuse lookup in placement.Compute hashes against, and the
+	// save path uses the same computation, so save and load can never disagree.
+	if caps != nil && !req.NoCachedConfig {
+		opts.VerifiedConfigScopeKey = placement.NewCalibrationScopeKey(model, caps, opts, nil).String()
+	}
 	return opts
 }
 
@@ -3215,13 +3234,7 @@ func resizeScopeToMeasuredFootprint(req *launchRequest, caps *detect.Capabilitie
 		}
 		return
 	}
-	plannedFloor := 0
-	if strategy != nil {
-		// The canary has not populated the prompt cache yet. Preserve the host
-		// footprint the plan priced (including checkpoint reserve) plus the CRAM
-		// capacity it deliberately left available for later conversations.
-		plannedFloor = strategy.PlannedHostFootprintMB + strategy.CRAM
-	}
+	plannedFloor := measuredFootprintPlannedFloor(strategy, measured, ceiling)
 	newMax := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, plannedFloor, ceiling)
 	if err := p.SetMemoryMaxMB(newMax); err != nil {
 		fmt.Fprintf(os.Stderr, "[launch] measured-footprint cgroup re-size to %d MiB failed: %v\n", newMax, err)
@@ -3229,6 +3242,43 @@ func resizeScopeToMeasuredFootprint(req *launchRequest, caps *detect.Capabilitie
 	}
 	fmt.Fprintf(os.Stderr, "[launch] memory scope re-sized to %d MiB (measured %d MiB + headroom, planned floor %d MiB, ceiling %d MiB)\n",
 		newMax, measured, plannedFloor, ceiling)
+}
+
+// measuredFootprintPlannedFloor is the plan's host-footprint floor the
+// measured-footprint resize preserves (Fix B). The canary has not populated the
+// prompt cache yet, so the ceiling must keep room for the plan's priced host
+// footprint plus the CRAM capacity it left available for later conversations.
+//
+// When the plan derived no host footprint (PlannedHostFootprintMB == 0 -- the
+// fully-resident placements priced no host cost until the dense builders started
+// deriving one; DenseCPUOffload / CPUOnly still do not), the floor must NOT
+// collapse to bare CRAM: sizing the scope to the prompt-cache budget clamps the
+// cgroup DOWN below the backend's real resident footprint and the server OOMs
+// against its own scope on a long prompt (the Qwen3.8 27B crash: Fix-B wrote
+// ~11 GB = CRAM as the ceiling, then the server was killed at 10.9 GB on a
+// 36k-token prompt). The whole-host ceiling is the only honest fallback -- the
+// resize then only ever tightens to measured+headroom, never below the
+// pre-launch plan ceiling, and the ceiling clamp keeps the user's safety limit
+// absolute. When the plan under-counts the measured backend (CRAM not yet
+// filled, checkpoint reserve below reality), measured+headroom is the honest
+// floor, not the stale plan estimate.
+func measuredFootprintPlannedFloor(strategy *placement.Strategy, measuredMB, ceilingMB int) int {
+	if strategy == nil {
+		return 0
+	}
+	if strategy.PlannedHostFootprintMB <= 0 {
+		// No plan-derived host cost: bare CRAM is not a plan floor. Preserve the
+		// pre-launch whole-host ceiling so Fix-B only ever raises/keeps it for
+		// this plan -- never clamps the scope below the plan ceiling.
+		return ceilingMB
+	}
+	plannedFloor := strategy.PlannedHostFootprintMB + strategy.CRAM
+	if measuredMB > 0 && plannedFloor < measuredMB {
+		// The plan under-counts the measured backend. measured+headroom is the
+		// honest floor, not the stale plan estimate.
+		return measuredMB
+	}
+	return plannedFloor
 }
 
 // measuredFootprintCgroupMaxMB is the pure sizing rule for the measured-footprint
@@ -3619,7 +3669,7 @@ func restoreLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Confi
 	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, true)
 }
 
-func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool) (*server.Process, *placement.Strategy, []string, error) {
+func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool) (launchProcess *server.Process, launchStrategy *placement.Strategy, launchArgs []string, launchErr error) {
 	const maxRetries = 2
 	const maxPreflightReplans = 5
 	retries := 0
@@ -3638,6 +3688,25 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		}
 		return opts
 	}
+	// A verified-config reuse hit that fails at any point in the launch boundary
+	// (preflight rejection, spec mismatch, compatibility adjustment, start error)
+	// is evidence the saved config is no longer safe. Delete the record so the
+	// next launch re-derives from scratch — "never retry a broken config blindly"
+	// holds for the full-config layer just as it does for the MoE .place cache
+	// (support.go:559-576). The deferred check covers every error return and only
+	// fires when the launch actually failed (the named launchErr is non-nil).
+	reusedFromVerified := strategy != nil && strategy.VerifiedConfigReused
+	defer func() {
+		if reusedFromVerified && launchErr != nil && req != nil && cfg != nil && model != nil && be != nil && caps != nil {
+			if key := verifiedConfigScopeKey(req, model, be, caps); key != "" {
+				if delErr := placement.DeleteVerifiedConfig(cfg.CacheDir, key); delErr != nil {
+					fmt.Fprintf(os.Stderr, "[launch] warning: could not delete stale verified config: %v\n", delErr)
+				} else {
+					fmt.Fprintln(os.Stderr, "[verified] verified config reuse hit failed to launch; record deleted, re-deriving fresh")
+				}
+			}
+		}
+	}()
 	for {
 		if !restoreExempt && memoryRecovery.isRejected(serverArgs) {
 			return nil, strategy, serverArgs, fmt.Errorf("refusing to retry a memory configuration rejected earlier in this launch lifecycle")
@@ -4480,6 +4549,9 @@ func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *plac
 		if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
 			_ = placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy))
 		}
+		// The already-active fast path is a re-validation of the same profile: the
+		// config was already promoted, so refresh the verified config record too.
+		saveVerifiedConfigForLaunch(cfg, req, model, be, caps, strategy)
 		fmt.Fprintln(os.Stderr, "[verify] exact launch profile is already active; reusing its canary result")
 		return nil
 	}
@@ -4603,9 +4675,73 @@ func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *plac
 			return fmt.Errorf("persist verified placement: %w", err)
 		}
 	}
+	// The functional canary passed and the profile reached StateActive: this is
+	// the promotion boundary. Save the full verified config so the next launch
+	// of this exact scope starts directly from it. Failure degrades to a log —
+	// the launch is already active and must not be failed by a cache write.
+	saveVerifiedConfigForLaunch(cfg, req, model, be, caps, strategy)
 	fmt.Fprintf(os.Stderr, "[verify] active profile: append cache=%d, branch cache=%d tokens\n",
 		canary.AppendCachedTokens, canary.BranchCachedTokens)
 	return nil
+}
+
+// saveVerifiedConfigForLaunch persists the full serving config at the promotion
+// boundary (StateActive / working inference). The record is scoped by the same
+// CalibrationScopeKey the reuse path hashes against, so save and load can never
+// disagree about what launch they describe. A save failure degrades to a stderr
+// log — the launch is already active and must never be failed by a cache write.
+func saveVerifiedConfigForLaunch(cfg *config.Config, req *launchRequest, model *placement.ModelProfile,
+	be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy,
+) {
+	if cfg == nil || req == nil || model == nil || be == nil || strategy == nil {
+		return
+	}
+	// --no-cached-config is the escape hatch: do not write a verified config for
+	// a launch that explicitly asked to derive fresh.
+	if req.NoCachedConfig {
+		return
+	}
+	reviewer := ""
+	if req.ReviewerProfile != nil {
+		reviewer = req.ReviewerProfile.Name
+	}
+	// The same strategy-free scope key the reuse path hashes against must be
+	// used here, so a record saved after StateActive is found by the next
+	// launch's pre-Compute lookup (which cannot know the final strategy yet).
+	scopeKey := verifiedConfigScopeKey(req, model, be, caps)
+	vc := placement.VerifiedConfigToRecord(
+		scopeKey,
+		filepath.Base(model.Path),
+		strategy,
+		be.Identity,
+		be.Path,
+		req.ChatTemplateOverride,
+		reviewer,
+	)
+	if _, err := placement.SaveVerifiedConfig(cfg.CacheDir, vc); err != nil {
+		fmt.Fprintf(os.Stderr, "[verify] verified config cache write failed (degrading, launch unaffected): %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[verify] verified config saved for this scope (direct start on next launch)\n")
+}
+
+// verifiedConfigScopeKey computes the strategy-free scope key for the
+// verified-config cache. It deliberately omits the base-placement hash: the
+// whole point of the record is that the *saved config is the placement*, so the
+// reuse lookup must be computable before placement.Compute runs (which is
+// exactly what the verified config short-circuits). The request, model, and
+// hardware fields are the scope: a change to ctx/parallel/batch/ubatch/KV/
+// mmap/memory-policy/swa-full/chat-template/backend/GPU set all produce a
+// different key and a clean miss.
+func verifiedConfigScopeKey(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) string {
+	if req == nil || model == nil || be == nil {
+		return ""
+	}
+	if req.NoCachedConfig {
+		return ""
+	}
+	opts := placementOptionsFromRequestCaps(req, model, be, "", caps)
+	return placement.NewCalibrationScopeKey(model, caps, opts, nil).String()
 }
 
 func requestedLaunchPolicyIdentity(req *launchRequest, model *placement.ModelProfile) string {
@@ -4798,7 +4934,7 @@ func cmdLaunch(args []string) {
 	req.DenseOffloadPrompt = confirmDenseCPUOffload(cfg.AssumeYes)
 
 	computeStrategy := func(candidateReq *launchRequest) (*placement.Strategy, error) {
-		candidate, computeErr := placement.Compute(caps, model, placementOptionsFromRequest(candidateReq, model, be, cfg.CacheDir))
+		candidate, computeErr := placement.Compute(caps, model, placementOptionsFromRequestCaps(candidateReq, model, be, cfg.CacheDir, caps))
 		if computeErr != nil {
 			return nil, computeErr
 		}
@@ -5333,6 +5469,15 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 	for _, key := range keys {
 		if err := placement.DeleteCalibrationDecision(cfg.CacheDir, key); err != nil {
 			return fmt.Errorf("remove stale calibration decision: %w", err)
+		}
+	}
+	// A runtime OOM is evidence the saved full config is unsafe at runtime. The
+	// verified-config record is scoped by the same strategy-free key the reuse
+	// path hashes against, so delete it so the OOM'd placement is never
+	// replayed verbatim on the next launch.
+	if key := verifiedConfigScopeKey(req, model, be, caps); key != "" {
+		if err := placement.DeleteVerifiedConfig(cfg.CacheDir, key); err != nil {
+			return fmt.Errorf("remove stale verified config: %w", err)
 		}
 	}
 	return nil

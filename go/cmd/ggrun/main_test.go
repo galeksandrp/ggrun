@@ -462,6 +462,15 @@ func TestParseClaudeReviewer(t *testing.T) {
 	if req.ClaudeReviewerOverride != claudeReviewerAuto {
 		t.Fatalf("reviewer override = %q, want %q", req.ClaudeReviewerOverride, claudeReviewerAuto)
 	}
+	// qwen2b is a valid explicit value that forces the small/light review-only
+	// Qwen3.5-2B profile.
+	req, err = parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer", "qwen2b"})
+	if err != nil {
+		t.Fatalf("parse --claude-reviewer qwen2b: %v", err)
+	}
+	if req.ClaudeReviewerOverride != claudeReviewerQwen2B {
+		t.Fatalf("reviewer override = %q, want %q", req.ClaudeReviewerOverride, claudeReviewerQwen2B)
+	}
 	// Invalid values are rejected.
 	if _, err := parseLaunchArgs([]string{"model.gguf", "--claude-code", "--claude-reviewer", "mistral"}); err == nil {
 		t.Fatal("invalid --claude-reviewer value was accepted")
@@ -3313,6 +3322,92 @@ func TestMeasuredFootprintCgroupMaxMB(t *testing.T) {
 	// The whole-host ceiling remains absolute even when the plan asks for more.
 	if got := measuredFootprintCgroupMaxMB(70000, 4096, 82000, 80000); got != 80000 {
 		t.Fatalf("planned floor must clamp to ceiling: got %d, want 80000", got)
+	}
+}
+
+// TestMeasuredFootprintPlannedFloor guards Fix-B's planned-floor for strategies
+// that derive no PlannedHostFootprintMB. The Qwen3.8 27B crash was exactly this:
+// a MultiGPUDense placement (PlannedHostFootprintMB == 0) made the floor collapse
+// to bare CRAM, so the measured-footprint resize wrote ~11 GB = the prompt-cache
+// budget as the scope ceiling and the server OOM'd against its own scope on a
+// long prompt. The floor must never shrink the scope below the pre-launch plan
+// ceiling when the plan priced no host cost.
+func TestMeasuredFootprintPlannedFloor(t *testing.T) {
+	ceiling := 122000
+	measured := 10000
+
+	// A plan with a real host footprint plus CRAM preserves that floor.
+	dense := &placement.Strategy{Type: placement.MultiGPUDense, PlannedHostFootprintMB: 6000, CRAM: 11264}
+	if got := measuredFootprintPlannedFloor(dense, measured, ceiling); got != 17264 {
+		t.Fatalf("planned host footprint + CRAM floor: got %d, want 17264", got)
+	}
+	// The same fully-resident plan with NO derived footprint must NOT collapse to
+	// CRAM: the floor becomes the whole-host ceiling, so the resize can only
+	// tighten to measured+headroom and never clamp the scope below the plan
+	// ceiling (the Qwen3.8 crash).
+	noFootprint := &placement.Strategy{Type: placement.MultiGPUDense, PlannedHostFootprintMB: 0, CRAM: 11264}
+	if got := measuredFootprintPlannedFloor(noFootprint, measured, ceiling); got != ceiling {
+		t.Fatalf("no-host-footprint floor must be the whole-host ceiling, got %d", got)
+	}
+	// A plan whose host footprint + CRAM under-counts the measured backend keeps
+	// measured as the honest floor (CRAM not yet filled, checkpoint reserve below
+	// reality), never the stale plan estimate.
+	under := &placement.Strategy{Type: placement.MoEOffload, PlannedHostFootprintMB: 2000, CRAM: 1024}
+	if got := measuredFootprintPlannedFloor(under, measured, ceiling); got != measured {
+		t.Fatalf("under-counting plan floor must be the measured footprint, got %d", got)
+	}
+	// A nil strategy yields no floor at all (pure measured+headroom sizing).
+	if got := measuredFootprintPlannedFloor(nil, measured, ceiling); got != 0 {
+		t.Fatalf("nil strategy floor must be 0, got %d", got)
+	}
+}
+
+// TestDenseScopeNotClampedToCRAM guards the end-to-end guarantee: after a
+// successful health check the cgroup must be re-sized to measured footprint +
+// headroom (not the low plan budget), and a fully-resident placement must never
+// be clamped back to its CRAM value. This is the policy promise the Qwen3.8
+// crash broke.
+func TestDenseScopeNotClampedToCRAM(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("host memory containment is Linux-only")
+	}
+	req := &launchRequest{RAMLimitPercent: 95, CgroupHeadroomMB: 4096}
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	ceiling := backendMemoryMaxMB(req, caps)
+	if ceiling <= 0 {
+		t.Fatalf("expected a positive whole-host ceiling, got %d", ceiling)
+	}
+	// A dense placement that now derives its real host footprint (Fix-B part 2).
+	// The floor preserves host footprint + CRAM, but the measured backend exceeds
+	// it, so the resize returns measured+headroom -- never the low plan budget.
+	dense := &placement.Strategy{Type: placement.MultiGPUDense, PlannedHostFootprintMB: 3000, CRAM: 11264}
+	measured := 27000 // server + CUDA host buffers + KV + checkpoints for Qwen3.8-27B
+	floor := measuredFootprintPlannedFloor(dense, measured, ceiling)
+	if floor != measured {
+		t.Fatalf("dense plan under-counting the measured backend must floor at measured, got %d", floor)
+	}
+	newMax := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, floor, ceiling)
+	if newMax != measured+req.CgroupHeadroomMB {
+		t.Fatalf("dense scope must be re-sized to measured+headroom (%d), got %d (clamped to CRAM?)",
+			measured+req.CgroupHeadroomMB, newMax)
+	}
+	if newMax <= dense.CRAM {
+		t.Fatalf("dense scope re-sized to %d MiB, at or below the CRAM budget %d MiB (the Qwen3.8 OOM)", newMax, dense.CRAM)
+	}
+	// A fully-resident placement with NO derived footprint (DenseCPUOffload /
+	// CPUOnly still do not derive one) must not collapse to bare CRAM either:
+	// the floor is the pre-launch whole-host ceiling, so Fix-B only ever keeps
+	// or raises the plan ceiling for such a plan -- never clamps it below the
+	// backend's real need.
+	noFootprint := &placement.Strategy{Type: placement.DenseCPUOffload, PlannedHostFootprintMB: 0, CRAM: 11264}
+	if floor := measuredFootprintPlannedFloor(noFootprint, measured, ceiling); floor != ceiling {
+		t.Fatalf("no-footprint dense plan must floor at the whole-host ceiling, got %d", floor)
+	}
+	if newMax := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, ceiling, ceiling); newMax != ceiling {
+		t.Fatalf("no-footprint plan must stay at the pre-launch ceiling, got %d", newMax)
 	}
 }
 

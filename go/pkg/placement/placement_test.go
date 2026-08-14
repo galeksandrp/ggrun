@@ -4531,6 +4531,117 @@ func TestPromptCacheChargesOnlyTheAnonymousWorkingSetUnderMmap(t *testing.T) {
 	}
 }
 
+// A fully-resident dense placement must derive a real PlannedHostFootprintMB
+// (runtime overhead + token embeddings + CPU-side KV + checkpoint reserve), not
+// leave it at 0. With it at 0, Fix-B's measured-footprint resize collapsed the
+// cgroup ceiling to bare CRAM -- the prompt-cache budget -- and the backend
+// OOM'd against its own scope on a long prompt (Qwen3.8 27B crash: scope capped
+// at ~11 GB = CRAM, server killed at 10.9 GB on a 36k-token prompt). The dense
+// builders (SingleGPU / MultiGPUDense) set the field; this test pins it.
+func TestDenseBuildersDerivePlannedHostFootprint(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "qwen3.gguf", Basename: "qwen3.gguf",
+		SizeBytes: 27000000000, TotalSizeMB: 27000,
+		NumLayers: 40, FeedForwardLength: 14336, EmbeddingLength: 5120,
+		TokenEmbdBytes: 50000000, ContextSize: 32768, CTXTrain: 32768,
+	}
+	kvTotalMB := computeKVTotalMB(model, 32768, "f16", false)
+
+	// MultiGPUDense with CPU-side KV must charge overhead + embeddings + KV.
+	multi := &Strategy{Type: MultiGPUDense, ContextSize: 32768, UBatchSize: 512, BatchSize: 512, Parallel: 1, KVPlacement: "cpu"}
+	s, err := buildMultiGPUDense(multi, caps, model, model.TotalSizeMB, kvTotalMB, Options{ContextSize: 32768, KVPlacement: "cpu", Parallel: 1})
+	if err != nil {
+		t.Fatalf("buildMultiGPUDense should fit: %v", err)
+	}
+	if s.PlannedHostFootprintMB <= 0 {
+		t.Fatalf("MultiGPUDense must derive a real PlannedHostFootprintMB, got 0")
+	}
+	// The footprint must cover at least the runtime overhead + token embeddings
+	// (and, with CPU KV, the KV itself) -- well above zero.
+	overhead := ramRuntimeOverheadMB(model, s.UBatchSize, model.TotalSizeMB)
+	embd := bytesToMiBCeil(model.TokenEmbdBytes)
+	if s.PlannedHostFootprintMB < overhead+embd+kvTotalMB {
+		t.Fatalf("MultiGPUDense host footprint %d < overhead %d + embeddings %d + cpuKV %d",
+			s.PlannedHostFootprintMB, overhead, embd, kvTotalMB)
+	}
+
+	// SingleGPU (KV on GPU) must charge overhead + embeddings. Use a smaller
+	// model that fits one GPU's VRAM (weights + overhead + KV on the 3090 Ti).
+	singleModel := &ModelProfile{
+		Path: "small-dense.gguf", Basename: "small-dense.gguf",
+		SizeBytes: 10000000000, TotalSizeMB: 10000,
+		NumLayers: 40, FeedForwardLength: 14336, EmbeddingLength: 5120,
+		TokenEmbdBytes: 50000000, ContextSize: 32768, CTXTrain: 32768,
+	}
+	singleKV := computeKVTotalMB(singleModel, 32768, "f16", false)
+	single := &Strategy{Type: SingleGPU, ContextSize: 32768, UBatchSize: 512, BatchSize: 512, Parallel: 1, KVPlacement: "gpu"}
+	ss, err := buildSingleGPU(single, caps, singleModel, singleModel.TotalSizeMB, singleKV, Options{ContextSize: 32768, KVPlacement: "gpu", Parallel: 1})
+	if err != nil {
+		t.Fatalf("buildSingleGPU should fit: %v", err)
+	}
+	if ss.PlannedHostFootprintMB <= 0 {
+		t.Fatalf("SingleGPU must derive a real PlannedHostFootprintMB, got 0")
+	}
+	singleOverhead := ramRuntimeOverheadMB(singleModel, ss.UBatchSize, singleModel.TotalSizeMB)
+	singleEmbd := bytesToMiBCeil(singleModel.TokenEmbdBytes)
+	if ss.PlannedHostFootprintMB < singleOverhead+singleEmbd {
+		t.Fatalf("SingleGPU host footprint %d < overhead %d + embeddings %d", ss.PlannedHostFootprintMB, singleOverhead, singleEmbd)
+	}
+}
+
+// computeCRAM must charge the dense plan's resident host footprint, not the
+// whole free RAM. The old `ramAfterLoad = FreeMB` for SingleGPU/MultiGPUDense
+// handed the prompt cache the entire free RAM, so a dense model with a large
+// CRAM shared its cgroup budget with the server's own footprint and OOM'd on a
+// long prompt (Qwen3.8 27B: -cram 11264 against an ~11 GB ceiling). Once the
+// builders derive PlannedHostFootprintMB the cache is sized against RAM that is
+// really left.
+func TestComputeCRAMChargesDensePlannedHostFootprint(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 3090 Ti", VRAMTotalMB: 24564, BandwidthMBps: 15754},
+			{Index: 1, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 985},
+			{Index: 2, Name: "RTX 4070", VRAMTotalMB: 12282, BandwidthMBps: 3938},
+		},
+		RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844},
+		CPU: detect.CPUInfo{Cores: 8},
+	}
+	model := &ModelProfile{
+		Path: "qwen3.gguf", Basename: "qwen3.gguf",
+		SizeBytes: 27000000000, TotalSizeMB: 27000,
+		NumLayers: 40, FeedForwardLength: 14336, EmbeddingLength: 5120,
+		TokenEmbdBytes: 50000000, ContextSize: 32768, CTXTrain: 32768,
+	}
+
+	// A dense plan WITH a derived host footprint must charge it.
+	footprint := 3000
+	dense := &Strategy{Type: MultiGPUDense, Parallel: 1, PlannedHostFootprintMB: footprint}
+	cram, _ := computeCRAM(caps, model, dense, 27000, 2000)
+	if cram+footprint > 114844 {
+		t.Fatalf("dense plan commits %d cache + %d footprint = %d MiB, over the %d MiB free RAM",
+			cram, footprint, cram+footprint, 114844)
+	}
+	// The cache must not be sized as if the whole free RAM were available: a
+	// dense plan with the footprint charged yields strictly less than the old
+	// free-RAM rule.
+	legacyCram, _ := computeCRAM(caps, model, &Strategy{Type: MultiGPUDense, Parallel: 1}, 27000, 2000)
+	if legacyCram == 0 {
+		t.Fatalf("legacy path disabled the cache entirely, test fixture broken")
+	}
+	if cram >= legacyCram {
+		t.Fatalf("charged footprint should reduce the cache: got %d, legacy (uncharged) %d", cram, legacyCram)
+	}
+}
+
 // A growth figure written before the post-serving gate cannot be told apart
 // from a load-time allocation that was misfiled as growth. The one measured on
 // this project was 5504 MiB on CUDA0 -- exactly that plan's

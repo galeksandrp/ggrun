@@ -92,6 +92,11 @@ type Strategy struct {
 	// immediately promote an unverified denser layout; users can still request a
 	// forced calibration explicitly.
 	PlacementCacheHit bool `json:"-"`
+	// VerifiedConfigReused is true when this strategy was reconstructed verbatim
+	// from a verified-config record (the full-config direct-start path), as
+	// opposed to a fresh estimate or a MoE .place cache hit. It lets the launcher
+	// invalidate the record when a reuse hit fails to launch. Runtime-only.
+	VerifiedConfigReused bool `json:"-"`
 	// BackendSupportsFit is true when the backend's --help lists -fit/--fit.
 	// Some backends accept an explicit on/off value while older compatible forks
 	// expose a simple boolean --fit. Keep the dialect separate: sending
@@ -433,6 +438,17 @@ type Options struct {
 	// value preserves the legacy generic-serving cache namespace; callers that
 	// select an agent/workflow profile must provide a stable non-empty value.
 	WorkloadProfile string
+	// ChatTemplate is the chat-template catalog entry Name (pkg/chattemplate)
+	// forced for this launch. It scopes placement/cache keys: a forced template
+	// is a different serving contract, so a verified config measured under one
+	// template must never be reused under another.
+	ChatTemplate string
+	// VerifiedConfigScopeKey, when non-empty, is the precomputed
+	// CalibrationScopeKey for this launch, passed in by the cmd layer (placement
+	// cannot derive it from a *launchRequest). Compute consults the verified
+	// config cache under this key before estimating. Empty disables verified
+	// config reuse.
+	VerifiedConfigScopeKey string
 	NoMMap          bool
 	ForceMMap       bool
 	Parallel        int
@@ -999,6 +1015,60 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	if opts.SkipPlacementCache || opts.SkipCachedConfig {
 		placeFile = ""
 	}
+	// Verified-config reuse: start directly from a full config that previously
+	// passed the functional canary and reached StateActive — no re-estimate, no
+	// re-probe, no re-calibrate. It is checked before the MoE .place cache (the
+	// full-config layer is broader: dense models get one too) and is a clean
+	// miss when the scope key is absent, mismatched, or the file is missing.
+	if !opts.SkipCachedConfig && opts.VerifiedConfigScopeKey != "" {
+		if vc, verr := LoadVerifiedConfig(opts.CacheDir, opts.VerifiedConfigScopeKey); verr == nil && vc != nil {
+			if _, stale := verifiedConfigFreeVRAMStale(vc, caps); !stale {
+				restored := VerifiedToStrategy(vc, opts, caps)
+				if restored != nil {
+					// Re-validate the fit against the same duress machinery the
+					// placement cache uses: the recorded free-VRAM ledger must still
+					// fit, else the config was verified under transiently tighter
+					// VRAM and is not evidence for now.
+					// For MoE, rebuild the -ot from the saved GPU assignment layout
+					// when the exact OTString was not persisted (legacy fallback).
+					if restored.Type == MoEOffload && restored.OTString == "" {
+						if ot := rebuildOTStringFromAssignments(vc, caps, model.NumLayers); ot != "" {
+							restored.OTString = ot
+						}
+					}
+					s = restored
+					s.PlacementCacheHit = true
+					s.VerifiedConfigReused = true
+					// The saved config is the complete serving decision, including
+					// prompt-cache sizing and host footprint; do not recompute it on a
+					// reuse hit. PlacementCachePath is intentionally left unset: a
+					// verified-config start must not also be treated as a MoE .place
+					// save source on the promotion boundary.
+					if !opts.SkipCachedConfig {
+						LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+					}
+					if s.CRAM == 0 {
+						cram, maxCheckpoints := computeCRAM(caps, model, s, totalSizeMB, kvTotalMB)
+						if opts.CacheRAMMB > 0 {
+							cram = opts.CacheRAMMB
+						}
+						s.CRAM = cram
+						s.MaxCheckpoints = maxCheckpoints
+						s.CheckpointMinStep = checkpointMinStep(model, s.UBatchSize)
+					}
+					if s.Host == "" {
+						s.Host = "127.0.0.1"
+					}
+					s.FlashAttention = defaultFlashAttention(model, opts, s.KVPlacement)
+					// Restore the cached mmap decision unless an explicit user
+					// --no-mmap/--force-mmap overrides it (handled inside
+					// VerifiedToStrategy).
+					fmt.Fprintf(os.Stderr, "[verified] reusing verified config for this scope (direct start, no re-measure)\n")
+					return s, nil
+				}
+			}
+		}
+	}
 	if placeFile != "" && model.IsMoE {
 		cache, err := LoadPlacementCache(placeFile, caps, kvTotalMB)
 		cacheMMap, cacheMMapRequired := false, false
@@ -1491,6 +1561,15 @@ func buildSingleGPU(s *Strategy, caps *detect.Capabilities, model *ModelProfile,
 	for _, mainIdx := range gpuOrder {
 		if caps.GPUs[mainIdx].VRAMFreeMB() >= neededMB {
 			s.MainGPU = caps.GPUs[mainIdx].Index
+			// The weights and KV live entirely in VRAM, so the host footprint is
+			// the runtime overhead + token embeddings + checkpoint reserve (and
+			// any CPU-side KV). The MoE path derives this through ramNeeded; the
+			// fully-resident dense paths never did, which left PlannedHostFootprintMB
+			// at 0 and let Fix-B's measured-footprint resize clamp the cgroup to
+			// bare CRAM (the Qwen3.8 27B crash: server OOM'd against its own ~11 GB
+			// scope). Set it so computeCRAM and the post-launch resize see the real
+			// resident host cost.
+			s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, 0, s.MaxCheckpoints, s.Parallel, s.ContextSize)
 			return s, nil
 		}
 	}
@@ -1637,6 +1716,23 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	s.SplitMode = "layer"
 
 	_ = probeHit // used for logging/debugging
+
+	// Fully-resident dense placement: the host footprint is the runtime overhead
+	// + token embeddings + CPU-side KV + checkpoint reserve (the MoE path derives
+	// this through ramNeeded). Without it PlannedHostFootprintMB stayed 0 and the
+	// post-launch measured-footprint resize collapsed the cgroup to bare CRAM
+	// (Qwen3.8 27B crash: scope capped at ~11 GB = prompt-cache budget, server
+	// OOM'd on a long prompt). This also lets computeCRAM size the prompt cache
+	// against RAM that is really left, not the whole free RAM.
+	cpuKVMB := 0
+	if s.KVPlacement == "cpu" {
+		cpuKVMB = kvTotalMB
+	}
+	s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, cpuKVMB, s.MaxCheckpoints, s.Parallel, s.ContextSize)
+	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
+		fmt.Fprintf(os.Stderr, "[trace] host footprint=%d (runtime overhead + embeddings + cpuKV=%d + checkpoints) freeRAM=%d\n",
+			s.PlannedHostFootprintMB, cpuKVMB, caps.RAM.FreeMB)
+	}
 
 	return s, nil
 }
@@ -1858,6 +1954,30 @@ func hostFootprintForCache(residentMB, workingSetMB int, mmap bool, backendTag s
 	if mmap && mmapFreesCPUExperts(backendTag) {
 		footprint = workingSetMB
 	}
+	if footprint < 0 {
+		return 0
+	}
+	return footprint
+}
+
+// residentHostFootprintMB is the host RAM a fully-resident placement genuinely
+// occupies after load: the server/runtime overhead (CUDA host staging, compute
+// graph scratch, mmap page table, CPU activation), token embeddings (always host
+// resident), any CPU-side KV, and the context-checkpoint reserve. It is the
+// dense-plan counterpart to buildMoEOffload's ramNeeded. Sized host-memory side
+// only — VRAM-resident weights cost the host nothing. MMap page cache is
+// excluded as reclaimable. Returns 0 when the model profile is not usable.
+func residentHostFootprintMB(model *ModelProfile, uBatch, totalSizeMB, cpuKVMB, maxCheckpoints, slots, ctxSize int) int {
+	if model == nil {
+		return 0
+	}
+	overheadMB := ramRuntimeOverheadMB(model, uBatch, totalSizeMB)
+	embdMB := bytesToMiBCeil(model.TokenEmbdBytes)
+	checkpointReserve := checkpointFootprintMB(model, maxCheckpoints, slots, cpuKVMB, ctxSize)
+	if cpuKVMB < 0 {
+		cpuKVMB = 0
+	}
+	footprint := overheadMB + embdMB + cpuKVMB + checkpointReserve
 	if footprint < 0 {
 		return 0
 	}
@@ -2826,6 +2946,14 @@ func lowerContextRungs(ctx int) []int {
 		}
 	}
 	return out
+}
+
+// DenseContextRungs exposes the context-reduction rung table below ctx (largest
+// first) to read-only callers such as the TUI, so KV-size suggestions describe
+// the exact steps placement's dense auto-ctx reduction would try instead of a
+// second, drifting rung list.
+func DenseContextRungs(ctx int) []int {
+	return lowerContextRungs(ctx)
 }
 
 func placementCachePathForStrategy(s *Strategy, caps *detect.Capabilities, model *ModelProfile, opts Options) string {
@@ -4136,21 +4264,19 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, totalSizeMB, kvTotalMB int) (int, int) {
 	numGPUs := len(caps.GPUs)
 
-	// Fits on GPU? (model fits entirely in VRAM)
-	fitsOnGPU := false
-	switch s.Type {
-	case SingleGPU, MultiGPUDense:
-		fitsOnGPU = true
-	}
-
 	// RAM remaining after weights load
 	var ramAfterLoad int
 	switch {
-	case fitsOnGPU:
-		ramAfterLoad = caps.RAM.FreeMB
 	case s.PlannedHostFootprintMB > 0:
 		// What this plan actually puts in host RAM, taken from the plan rather
-		// than re-derived here. See Strategy.PlannedHostFootprintMB.
+		// than re-derived here. For fully-resident placements (single-GPU / dense
+		// multi-GPU) the weights and KV live in VRAM but the runtime still
+		// occupies real host RAM (CUDA host staging, compute-graph scratch, token
+		// embeddings, CPU-side KV, context checkpoints). Sizing the prompt cache
+		// against the whole free RAM over-commits the cgroup the backend runs
+		// inside -- the cache then shares its budget with the server's own
+		// footprint and one long prompt OOMs the scope (Qwen3.8 27B crash:
+		// -cram 11264 against an ~11 GB ceiling). See Strategy.PlannedHostFootprintMB.
 		ramAfterLoad = caps.RAM.FreeMB - s.PlannedHostFootprintMB
 	default:
 		// No plan-derived figure (CPU-only, dense CPU offload, or a strategy

@@ -13,7 +13,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 3
+const CalibrationSchemaVersion = 4
 
 // CalibrationDecision records which candidate won a measured first-launch
 // calibration for one scope, with the numbers that decided it. The winner is
@@ -261,6 +261,16 @@ type CalibrationScopeKey struct {
 	GPUSet          string
 	BasePlacement   string
 	MemoryPolicy    string
+	// SWAFull is part of the scope because it changes the KV allocation without
+	// changing anything else the key already carries (see placement.go:6640-6643):
+	// a config verified at the default window sizing is not a config for a
+	// --swa-full launch, and reusing it hands the backend a layout that cannot
+	// fit.
+	SWAFull bool
+	// ChatTemplate is part of the scope because a forced chat-template override
+	// (catalog Entry.Name) is a different serving contract — the flags emitted
+	// for --chat-template-file differ from an auto-matched template.
+	ChatTemplate string
 }
 
 // NewCalibrationScopeKey builds the key from the same identity sources the
@@ -312,6 +322,8 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 		BasePlacement:   basePlacement,
 		MemoryPolicy: fmt.Sprintf("ram=%d,pct=%d,ram-head=%d,vram-head=%d,no-mmap=%t,force-mmap=%t,measured-buffers=%t",
 			opts.RamBudgetMB, opts.RAMLimitPercent, opts.RAMHeadroomMB, opts.VRAMHeadroomMB, opts.NoMMap, opts.ForceMMap, opts.RequireMeasuredBuffers),
+		SWAFull:       opts.SWAFull,
+		ChatTemplate:  opts.ChatTemplate,
 	}
 }
 
@@ -322,5 +334,6 @@ func (k CalibrationScopeKey) String() string {
 		fmt.Sprintf("%d", k.ContextSize), fmt.Sprintf("%d", k.Parallel),
 		fmt.Sprintf("%d", k.BatchSize), fmt.Sprintf("%d", k.UBatchSize),
 		k.KVQuality, k.KVType, k.GPUSet, k.BasePlacement, k.MemoryPolicy,
+		fmt.Sprintf("%t", k.SWAFull), k.ChatTemplate,
 	)
 }
