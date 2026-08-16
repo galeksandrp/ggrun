@@ -145,6 +145,71 @@ func TestListOnMissingDirectoryIsEmptyNotAnError(t *testing.T) {
 	}
 }
 
+// Recoverable must be true for a session with a recorded workflow pointer even
+// when no projects directory exists yet, and false for a fresh live session.
+func TestRecoverableSkipsALiveLaunchWithNoTranscript(t *testing.T) {
+	withWF := Record{
+		SessionID: "11111111-2222-4333-8444-555555555555",
+		WorkDir:   "/project/a",
+		Workflow:  &Workflow{RunID: "wf_894b5285-5d3"},
+	}
+	if !withWF.Recoverable() {
+		t.Error("a session with a recorded workflow pointer must be recoverable")
+	}
+	fresh := Record{SessionID: "22222222-2222-4222-8222-222222222222", WorkDir: "/project/a"}
+	if fresh.Recoverable() {
+		t.Error("a fresh live session with no transcript/workflow must not be recoverable")
+	}
+}
+
+func TestLatestRecoverableSkipsTheNewestEmptyRecord(t *testing.T) {
+	dir := t.TempDir()
+	fresh := Record{
+		SessionID: "11111111-2222-4333-8444-555555555555",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-time.Hour),
+	}
+	withWF := Record{
+		SessionID: "22222222-2222-4222-8222-222222222222",
+		WorkDir:   "/project/a", Recorded: time.Now().Add(-2 * time.Hour),
+		Workflow: &Workflow{RunID: "wf_894b5285-5d3"},
+	}
+	if err := Save(dir, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, withWF); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LatestRecoverable(dir, "/project/a")
+	if err != nil {
+		t.Fatalf("LatestRecoverable: %v", err)
+	}
+	if got.SessionID != withWF.SessionID {
+		t.Errorf("LatestRecoverable picked the empty live session %s, want %s",
+			got.SessionID, withWF.SessionID)
+	}
+	if _, err := LatestRecoverable(dir, "/project/none"); err == nil {
+		t.Error("LatestRecoverable returned a record for a workdir with nothing recoverable")
+	}
+}
+
+func TestModelPathExistsReportsAMissingModel(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(good, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !(Record{ModelPath: good}).ModelPathExists() {
+		t.Error("an existing model path must report present")
+	}
+	if (Record{ModelPath: filepath.Join(dir, "gone.gguf")}).ModelPathExists() {
+		t.Error("a missing model path must report absent")
+	}
+	// Nothing recorded means nothing to check; the launch path reports on its own.
+	if !(Record{}).ModelPathExists() {
+		t.Error("an empty recorded model path must not be reported missing")
+	}
+}
+
 func TestProjectKeyMatchesClaudeCodeLayout(t *testing.T) {
 	cases := map[string]string{
 		"/home/mik/ggrun-project/ggrun":   "-home-mik-ggrun-project-ggrun",

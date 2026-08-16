@@ -2,11 +2,14 @@ package main
 
 import (
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/raketenkater/ggrun/pkg/claudesession"
 	"github.com/raketenkater/ggrun/pkg/config"
@@ -49,17 +52,36 @@ func newClaudeSessionSpec() (*claudeSessionSpec, error) {
 
 // resolveClaudeResume loads a recorded session for --claude-resume. The value
 // is a session ID, or "latest" for the newest session in this directory.
+//
+// A record is only worth resuming when it has something to reopen: a workflow
+// journal, a transcript, or a recorded workflow pointer. A session that was
+// launched live but never ran a turn records none of these, so "latest" skips it
+// to the newest recoverable session and an explicit ID is refused with a
+// message instead of reopening an empty conversation.
 func resolveClaudeResume(cacheDir, workDir, value string) (claudesession.Record, error) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.EqualFold(value, "latest") || strings.EqualFold(value, "last") {
-		return claudesession.Latest(cacheDir, workDir)
+		return claudesession.LatestRecoverable(cacheDir, workDir)
 	}
-	return claudesession.Load(cacheDir, value)
+	rec, err := claudesession.Load(cacheDir, value)
+	if err != nil {
+		return rec, err
+	}
+	if !rec.Recoverable() {
+		return rec, fmt.Errorf("session %s has no transcript or workflow to resume", rec.SessionID)
+	}
+	return rec, nil
 }
 
 // claudeResumeSpec turns a recorded session into a launch spec, refusing only
 // when the proposed launch cannot hold the recorded conversation.
 func claudeResumeSpec(rec claudesession.Record, serverArgs []string, force bool) (*claudeSessionSpec, error) {
+	// The recorded model must still exist to be launched. The alternative is an
+	// opaque "missing shard" failure from deep inside the loader; name the stale
+	// path here instead.
+	if !rec.ModelPathExists() {
+		return nil, fmt.Errorf("recorded model no longer present: %s", rec.ModelPath)
+	}
 	if mismatches := rec.ShapeMismatches(serverArgs); len(mismatches) > 0 && !force {
 		var lines []string
 		for _, m := range mismatches {
@@ -174,6 +196,60 @@ func claudeSessionArgs(spec *claudeSessionSpec, extraArgs, args []string) ([]str
 				"session ID, which moves the workflow journal path and discards every cached agent")
 	}
 	return append([]string{"--resume", spec.ID}, args...), nil
+}
+
+// portServesLLM reports whether an HTTP endpoint answers on the port. A plain
+// TCP connect is not enough to call the port "serving": the recorded port may be
+// held by an unrelated listener, and resuming against that would hand Claude a
+// garbage base URL. The OpenAI-compatible surface is what the client actually
+// talks to, so it is the honest probe.
+func portServesLLM(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.DialTimeout("tcp", addr, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	client := &http.Client{Timeout: 1 * time.Second}
+	for _, path := range []string{"/v1/models", "/health"} {
+		resp, err := client.Get(fmt.Sprintf("http://%s%s", addr, path))
+		if err == nil {
+			resp.Body.Close()
+			return true
+		}
+	}
+	return false
+}
+
+// claudeResumeAgainstLive reopens a recorded session against a backend that is
+// already serving on the recorded port, instead of relaunching the recorded
+// launch shape only to die at guardPortFree. The server stays owned by whatever
+// started it; this process runs the client and exits with its code.
+func claudeResumeAgainstLive(cacheDir string, rec claudesession.Record) int {
+	fmt.Printf("[claude-code] A server is already running on the recorded port %d; resuming session %s against it.\n",
+		rec.Port, rec.SessionID)
+	spec := &claudeSessionSpec{ID: rec.SessionID, Resume: true, Workflow: rec.Workflow}
+	if spec.Workflow == nil {
+		if wf, cached := claudesession.LatestRun(claudeProjectsDir(), rec.WorkDir, rec.SessionID); wf != nil {
+			spec.Workflow, spec.Cached = wf, cached
+		}
+	}
+	code := runClaudeCodeClient("127.0.0.1", rec.Port, rec.ServerArgs, nil, spec, 0)
+	if code == -1 {
+		// `claude` isn't installed; match the normal launch path and print the
+		// copy-paste recipe pointed at the live server instead of exiting blank.
+		printClaudeCodeRecipe("127.0.0.1", rec.Port, rec.ServerArgs)
+		return -1
+	}
+	// Record on exit as well as on launch: the workflow run ID is assigned inside
+	// Claude Code, so only now is the resume handle complete. The live server is
+	// not owned by this process, so it is not stopped here.
+	refreshClaudeSessionRecord(cacheDir, spec, rec.ModelPath, rec.Backend, rec.Port,
+		claudeStripResumeArgs(rec.LaunchArgs), rec.ServerArgs)
+	return code
 }
 
 // claudeResumePrompt asks Claude Code to continue the recorded workflow from
@@ -434,6 +510,15 @@ func cmdClaudeResume(target string, force bool, overrides []string) {
 		fmt.Printf("[claude-code] Session %s, workflow %s (%s): %d completed agents will replay from cache.\n",
 			rec.SessionID, wf.RunID, wf.Name, cached)
 	}
+	// The recorded launch replays the model the session was recorded under. If
+	// that model is gone, the launch would die deep inside the loader with an
+	// opaque "missing shard" error. Name the stale path up front instead.
+	if !rec.ModelPathExists() {
+		fmt.Fprintf(os.Stderr, "Error: recorded model no longer present: %s\n", rec.ModelPath)
+		fmt.Fprintln(os.Stderr, "The session record points at a model that has since been removed or renamed.")
+		fmt.Fprintln(os.Stderr, "List recorded sessions with: ggrun claude list")
+		os.Exit(1)
+	}
 	launchArgs := claudeStripResumeArgs(rec.LaunchArgs)
 	if len(launchArgs) == 0 {
 		if rec.ModelPath == "" {
@@ -449,6 +534,14 @@ func cmdClaudeResume(target string, force bool, overrides []string) {
 	launchArgs = append(launchArgs, "--claude-resume", rec.SessionID)
 	if force {
 		launchArgs = append(launchArgs, "--claude-resume-force")
+	}
+	// The recorded launch will die at guardPortFree if its port is already
+	// serving. The session's own backend may have survived, or a fresh launch of
+	// the same model may be running: either way the recorded conversation can be
+	// reopened against the live server without paying for a second load.
+	if rec.Port > 0 && portServesLLM(rec.Port) {
+		code := claudeResumeAgainstLive(cfg.CacheDir, rec)
+		os.Exit(code)
 	}
 	cmdLaunch(launchArgs)
 }

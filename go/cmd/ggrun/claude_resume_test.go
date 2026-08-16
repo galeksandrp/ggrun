@@ -1,7 +1,10 @@
 package main
 
 import (
+	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -232,6 +235,120 @@ func TestHoldInterruptForClaudeAbsorbsSIGINT(t *testing.T) {
 	// Release must stop delivery so the normal shutdown handler can own SIGINT
 	// again once Claude Code has exited.
 	release()
+}
+
+// A live launch with no transcript/workflow must not be offered as a resume
+// target. "latest" skips it to the newest recoverable session; an explicit ID is
+// refused with a message rather than reopening an empty conversation.
+func TestResolveClaudeResumeSkipsAnEmptyLatestSession(t *testing.T) {
+	cacheDir := t.TempDir()
+	workDir := "/home/mik/ggrun-project/ggrun"
+	fresh := claudesession.Record{
+		SessionID: "11111111-2222-4333-8444-555555555555",
+		WorkDir:   workDir, Recorded: time.Now().Add(-time.Hour),
+	}
+	withWF := claudesession.Record{
+		SessionID: "22222222-2222-4222-8222-222222222222",
+		WorkDir:   workDir, Recorded: time.Now().Add(-2 * time.Hour),
+		Workflow: &claudesession.Workflow{RunID: "wf_894b5285-5d3"},
+	}
+	for _, rec := range []claudesession.Record{fresh, withWF} {
+		if err := claudesession.Save(cacheDir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := resolveClaudeResume(cacheDir, workDir, "latest")
+	if err != nil {
+		t.Fatalf("resolveClaudeResume(latest): %v", err)
+	}
+	if got.SessionID != withWF.SessionID {
+		t.Errorf("latest resolved to the empty live session %s, want %s", got.SessionID, withWF.SessionID)
+	}
+	if _, err := resolveClaudeResume(cacheDir, workDir, fresh.SessionID); err == nil {
+		t.Error("an explicit empty session id must be refused")
+	}
+}
+
+// A record whose model has been removed must be refused with the stale path
+// named, not allowed to fail deep inside the loader as a "missing shard".
+func TestClaudeResumeSpecRefusesAMissingRecordedModel(t *testing.T) {
+	rec := claudesession.Record{
+		SessionID:  "072e63a1-819a-4682-a742-559695c3cd76",
+		ModelPath:  "/definitely/not/on/disk/missing.gguf",
+		ServerArgs: []string{"--ctx-size", "1048576", "--parallel", "4"},
+	}
+	_, err := claudeResumeSpec(rec, rec.ServerArgs, false)
+	if err == nil {
+		t.Fatal("resume accepted a session whose recorded model is gone")
+	}
+	if !strings.Contains(err.Error(), "recorded model no longer present") ||
+		!strings.Contains(err.Error(), "missing.gguf") {
+		t.Errorf("error does not name the stale model path: %v", err)
+	}
+}
+
+// portServesLLM must only report true when an HTTP endpoint actually answers.
+// A bare TCP listener is a different process's port and must not read as serving.
+func TestPortServesLLMDistinguishesAnLLMEndpoint(t *testing.T) {
+	if portServesLLM(0) {
+		t.Error("port 0 must never read as serving")
+	}
+	if portServesLLM(-1) {
+		t.Error("a negative port must never read as serving")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	// A TCP listener with no HTTP surface must not read as serving an LLM.
+	if portServesLLM(port) {
+		t.Error("a bare TCP listener reported as an LLM endpoint")
+	}
+	// A real HTTP responder must read as serving.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(ln)
+	defer srv.Close()
+	if !portServesLLM(port) {
+		t.Error("an answering /v1/models endpoint did not read as serving")
+	}
+}
+
+// resolveClaudeResume must load the record from the configured cache directory,
+// so a stale duplicate in the default cache cannot shadow the real one.
+func TestResolveClaudeResumePrefersTheConfiguredCache(t *testing.T) {
+	configured := t.TempDir()
+	stale := t.TempDir()
+	workDir := "/home/mik/ggrun-project/ggrun"
+	good := claudesession.Record{
+		SessionID: "33333333-3333-4333-8333-333333333333",
+		WorkDir:   workDir, Recorded: time.Now(),
+		ModelPath: filepath.Join(t.TempDir(), "model.gguf"),
+		Workflow:  &claudesession.Workflow{RunID: "wf_894b5285-5d3"},
+	}
+	if err := os.WriteFile(good.ModelPath, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bad := good
+	bad.ModelPath = "/definitely/not/on/disk/model.gguf"
+	if err := claudesession.Save(configured, good); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudesession.Save(stale, bad); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveClaudeResume(configured, workDir, good.SessionID)
+	if err != nil {
+		t.Fatalf("resolveClaudeResume: %v", err)
+	}
+	if !got.ModelPathExists() {
+		t.Error("the configured-cache record was not the one resolved")
+	}
 }
 
 // The shape guard fires whenever placement recomputes, which happens routinely

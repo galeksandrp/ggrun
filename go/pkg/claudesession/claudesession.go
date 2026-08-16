@@ -175,6 +175,23 @@ func Latest(cacheDir, workDir string) (Record, error) {
 	return records[0], nil
 }
 
+// LatestRecoverable returns the newest record for workDir that has something to
+// resume: a transcript, a workflow journal, or a recorded workflow pointer. A
+// session that was launched live but never ran a turn records no transcript, so
+// resuming it would reopen an empty conversation. "latest" must skip those.
+func LatestRecoverable(cacheDir, workDir string) (Record, error) {
+	records, err := List(cacheDir, workDir)
+	if err != nil {
+		return Record{}, err
+	}
+	for _, rec := range records {
+		if rec.Recoverable() {
+			return rec, nil
+		}
+	}
+	return Record{}, fmt.Errorf("no recorded Claude Code session for %s has anything to resume", workDir)
+}
+
 // A resume restores a conversation and a workflow journal, both of which are
 // plain recorded data. No backend tensor state survives a restart, so nothing
 // in the launch configuration can reinterpret them.
@@ -338,6 +355,37 @@ func LatestRun(projectsDir, workDir, sessionID string) (*Workflow, int) {
 		}
 	}
 	return wf, bestSize
+}
+
+// Recoverable reports whether resuming this session would reopen anything: the
+// recorded workflow pointer, a recoverable workflow run, or the session
+// transcript. A fresh live launch records none of these until the first turn, so
+// an empty resume must not be offered for it.
+func (r Record) Recoverable() bool {
+	if r.Workflow != nil && r.Workflow.RunID != "" {
+		return true
+	}
+	if wf, _ := LatestRun(defaultProjectsDir(), r.WorkDir, r.SessionID); wf != nil {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(defaultProjectsDir(), ProjectKey(r.WorkDir), r.SessionID+".jsonl")); err == nil {
+		return true
+	}
+	return false
+}
+
+// ModelPathExists reports whether the model a session was recorded under is
+// still on disk. The recorded path is the absolute path the backend loaded, so a
+// reinstall or a renamed model directory makes the record unresumable. The
+// launch path would fail deep inside the loader with an opaque error; naming the
+// stale path up front tells the user the record is stale rather than that their
+// command was wrong.
+func (r Record) ModelPathExists() bool {
+	if r.ModelPath == "" {
+		return true // nothing recorded to check; the launch path reports on its own
+	}
+	_, err := os.Stat(r.ModelPath)
+	return err == nil
 }
 
 // CachedAgents counts completed agent results in a journal. Resuming replays
