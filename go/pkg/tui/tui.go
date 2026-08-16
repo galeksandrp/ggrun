@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/raketenkater/ggrun/pkg/backends"
+	"github.com/raketenkater/ggrun/pkg/chattemplate"
 	"github.com/raketenkater/ggrun/pkg/claudesession"
 	"github.com/raketenkater/ggrun/pkg/config"
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -117,6 +119,10 @@ type Model struct {
 	// claudeProfile is deliberately per-launch: an empty value preserves the
 	// CLI default instead of writing a scheduling policy into user config.
 	claudeProfile string
+	// chatTemplate forces a corrected chat template from the data-driven catalog
+	// (pkg/chattemplate), mirroring the CLI's --chat-template <name>. Empty means
+	// "auto" — the launch auto-matches known-broken templates. Per-launch only.
+	chatTemplate string
 
 	// Tuned config
 	tunedConfigs []tune.ConfigEntry
@@ -279,7 +285,7 @@ func InitialModel() Model {
 		m.screen = ScreenFirstRun
 	}
 
-	m.mainList = newMainList(m.models)
+	m.mainList = newMainList(m.models, m.modelUsage)
 	if configErr != nil {
 		m.message = fmt.Sprintf("Warning: Configuration error: %v. Fix it with ggrun config edit or reset before launching.", configErr)
 		m.messageType = "warning"
@@ -296,28 +302,80 @@ func flattenRecommendationCategories(cats recommend.Categories) []recommend.Reco
 	return rows
 }
 
-func newMainList(models []ModelItem) list.Model {
+// mainModelDesc renders one model's list description. Usage (Launches /
+// LastUsedAt) already drives the sort order, so it is shown here as a badge —
+// otherwise a non-alphabetical list looks random. The same-basename ambiguity
+// case (two model-Q4.gguf in different directories) is disambiguated by always
+// showing a location hint: the parent dir for primary models, "discovered" for
+// external ones.
+func mainModelDesc(m ModelItem, usage *modelusage.Record) string {
+	desc := fmt.Sprintf("%.1fGB · %s", m.SizeGB, m.Arch)
+	if m.AutoBackend != "" {
+		desc += " · backend " + m.AutoBackend
+	} else if m.BackendRecipe != "" {
+		desc += " · backend " + m.BackendRecipe
+	}
+	if m.Tuned > 0 {
+		desc += fmt.Sprintf(" · tuned %d", m.Tuned)
+	}
+	// The fits estimate is the single most useful datapoint for dense models.
+	if m.FitCtx > 0 {
+		desc += fmt.Sprintf(" · fits ~%dk", m.FitCtx/1000)
+	}
+	if usage != nil && usage.Launches > 0 {
+		desc += fmt.Sprintf(" · %dx", usage.Launches)
+		if !usage.LastUsedAt.IsZero() {
+			desc += " " + timeAgo(usage.LastUsedAt)
+		}
+	}
+	if m.External {
+		desc += " · discovered"
+	} else if dir := filepath.Base(filepath.Dir(m.Path)); dir != "." && dir != "" && dir != filepath.Base(m.Path) {
+		desc += " · " + dir
+	}
+	return desc
+}
+
+// timeAgo renders a last-used timestamp compactly ("3d ago"), so the usage
+// badge stays short enough for a 80-column terminal.
+func timeAgo(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Hour:
+		mins := int(d.Minutes())
+		if mins < 1 {
+			mins = 1
+		}
+		return fmt.Sprintf("%dm ago", mins)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return t.Local().Format("2006-01-02")
+	}
+}
+
+func newMainList(models []ModelItem, usageArg ...map[string]modelusage.Record) list.Model {
+	var usage map[string]modelusage.Record
+	if len(usageArg) > 0 {
+		usage = usageArg[0]
+	}
 	items := []list.Item{
 		mainItem{title: "r. Recommended downloads", desc: "Best models and quants that fit this computer", isAction: true, action: "recommend"},
 		mainItem{title: "l. Run latest configuration", desc: "Review and replay the exact previous TUI launch", isAction: true, action: "latest"},
 		mainItem{title: "p. Scan computer for models", desc: "Find GGUFs on all local disks and remember their paths", isAction: true, action: "scan"},
 	}
 	for i, m := range models {
-		desc := fmt.Sprintf("%.1fGB, %s", m.SizeGB, m.Arch)
-		if m.AutoBackend != "" {
-			desc += "  [backend: " + m.AutoBackend + "]"
-		} else if m.BackendRecipe != "" {
-			desc += "  [install backend: " + m.BackendRecipe + "]"
-		}
-		if m.Tuned > 0 {
-			desc += fmt.Sprintf("  [tuned: %d]", m.Tuned)
-		}
-		if m.External {
-			desc += "  [discovered: " + filepath.Dir(m.Path) + "]"
+		var rec *modelusage.Record
+		if usage != nil {
+			if r, ok := usage[modelIdentity(m.Path)]; ok && r.Launches > 0 {
+				rec = &r
+			}
 		}
 		items = append(items, mainItem{
-			title:   fmt.Sprintf("%d. %s", i+1, m.Name),
-			desc:    desc,
+			title:   m.Name,
+			desc:    mainModelDesc(m, rec),
 			index:   i,
 			isModel: true,
 		})
@@ -358,7 +416,7 @@ func (m *Model) rebuildMainList() {
 	prevFilterValue := m.mainList.FilterValue()
 
 	sortModels(m.models, m.modelUsage)
-	m.mainList = newMainList(m.models)
+	m.mainList = newMainList(m.models, m.modelUsage)
 	if m.width > 0 {
 		m.mainList.SetWidth(m.width - 4)
 	}
@@ -427,7 +485,7 @@ func (d mainItemDelegate) Render(w io.Writer, m list.Model, index int, listItem 
 		return
 	}
 	if index == m.Index() {
-		fmt.Fprint(w, selectedStyle.Render("▸ "+i.title)+"\n  "+subtitleStyle.Render(i.desc))
+		fmt.Fprint(w, selectedStyle.Render("> "+i.title)+"\n  "+subtitleStyle.Render(i.desc))
 	} else {
 		fmt.Fprint(w, "  "+i.title+"\n  "+subtitleStyle.Render(i.desc))
 	}
@@ -808,6 +866,7 @@ func (m *Model) applyLaunchRequestFields(req *LaunchRequest) {
 		m.supportOnline = req.SupportOnline
 	}
 	m.noCachedConfig = req.NoCachedConfig
+	m.chatTemplate = req.ChatTemplate
 	m.resumeSession, m.resumeRun, m.resumeCached = req.ResumeSession, "", 0
 	m.refreshTunedCounts()
 }
@@ -826,6 +885,7 @@ func (m Model) cfgRows() []string {
 	if m.claudeCode {
 		rows = append(rows, "claudereviewer", "claudeprofile")
 	}
+	rows = append(rows, "chattemplate")
 	return append(rows, "benchmark", "launch", "dryrun")
 }
 
@@ -938,6 +998,31 @@ func (m *Model) setCtx(val string) {
 }
 
 // cycleCfgRow changes the focused Advanced-config row with ←/→ (dir -1/+1).
+// kvQualityOptions is the canonical KV-quality enum shared by the Settings
+// screen and the Advanced-config cycle, so one vocabulary exists everywhere.
+// "low" is an alias for q4_0 and "high" for f16; presenting both would make
+// cycling visually do nothing, so the aliases are dropped and every option is
+// one distinct type.
+func kvQualityOptions() []string {
+	return []string{"auto", "high", "bf16", "mid", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "f32"}
+}
+
+// kvQualityLabel renders one KV-quality value with a friendly hint on both the
+// Settings screen and the Advanced-config cycle, so the two screens agree on
+// the vocabulary. Legacy aliases (low, f16) are still recognized so a saved
+// config value never renders raw or empty.
+func kvQualityLabel(v string) string {
+	labels := map[string]string{
+		"auto": "auto", "high": "high (f16)", "mid": "mid (q8_0)", "low": "low (q4_0)",
+		"q4_1": "q4_1", "iq4_nl": "iq4_nl", "q5_0": "q5_0", "q5_1": "q5_1",
+		"bf16": "bf16", "f16": "f16", "f32": "f32", "q4_0": "q4_0", "q8_0": "q8_0",
+	}
+	if l, ok := labels[v]; ok {
+		return l
+	}
+	return v
+}
+
 func (m *Model) cycleCfgRow(row string, dir int) {
 	switch row {
 	case "kv":
@@ -950,7 +1035,7 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 	case "kvq":
 		// Same ordering as the Settings screen's "KV quality" enum, so arrow
 		// cycling and the saved setting agree.
-		order := []string{"auto", "high", "bf16", "mid", "q8_0", "q5_1", "q5_0", "q4_1", "low", "q4_0", "iq4_nl", "f32"}
+		order := kvQualityOptions()
 		if dir < 0 {
 			m.kvQuality = prevOption(order, m.kvQuality)
 		} else {
@@ -1002,6 +1087,20 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 		} else {
 			m.claudeProfile = nextOption(profiles, m.claudeProfile)
 		}
+	case "chattemplate":
+		opts := chatTemplateOrdered()
+		cur := m.chatTemplate
+		if cur == "" {
+			cur = "auto"
+		}
+		if dir < 0 {
+			m.chatTemplate = prevOption(opts, cur)
+		} else {
+			m.chatTemplate = nextOption(opts, cur)
+		}
+		if m.chatTemplate == "auto" {
+			m.chatTemplate = ""
+		}
 	case "benchmark":
 		m.benchmark = !m.benchmark
 		if m.benchmark {
@@ -1042,6 +1141,8 @@ func (m Model) activateCfgRow(row string) (tea.Model, tea.Cmd) {
 		m.cycleCfgRow("claudereviewer", 1)
 	case "claudeprofile":
 		m.cycleCfgRow("claudeprofile", 1)
+	case "chattemplate":
+		m.cycleCfgRow("chattemplate", 1)
 	case "benchmark":
 		m.benchmark = !m.benchmark
 		if m.benchmark {
@@ -1167,6 +1268,16 @@ func (m Model) updateModelConfig(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.openSelectedBackendInstall()
 	case "t", "T":
 		m.openTunedPicker()
+	case "e", "E":
+		if m.claudeCode {
+			m.cycleCfgRow("claudereviewer", 1)
+		}
+	case "z", "Z":
+		if m.claudeCode {
+			m.cycleCfgRow("claudeprofile", 1)
+		}
+	case "n", "N":
+		m.cycleCfgRow("chattemplate", 1)
 	case "y", "Y":
 		m.openClearCachesChoice(m.selectedModel)
 	case "g", "G":
@@ -1393,7 +1504,10 @@ func (m Model) viewMain() string {
 	b.WriteString(m.mainList.View())
 
 	b.WriteString("\n")
-	b.WriteString(mutedStyle.Render("  Enter configure · l latest · / search · p scan disks · x delete · r downloads · s settings · u update · q quit"))
+	if m.modelUsage != nil && hasAnyUsage(m.modelUsage) {
+		b.WriteString(mutedStyle.Render("  sorted by usage: most-used and most-recent first") + "\n")
+	}
+	b.WriteString(mutedStyle.Render("  Enter configure · / or type to filter · x delete"))
 
 	if m.message != "" {
 		b.WriteString("\n")
@@ -1431,7 +1545,7 @@ func (m Model) viewFirstRun() string {
 	}
 	for i, a := range actions {
 		if i == m.menuCursor {
-			b.WriteString(selectedStyle.Render("▸ "+labels[a]) + "\n")
+			b.WriteString(selectedStyle.Render("> "+labels[a]) + "\n")
 		} else {
 			b.WriteString("  " + labels[a] + "\n")
 		}
@@ -1468,10 +1582,17 @@ func (m Model) viewModelConfig() string {
 	}
 	line := func(key, label, value string) {
 		if key == focused {
-			b.WriteString(selectedStyle.Render(fmt.Sprintf("  ▸ %-26s %s", label, value)) + "\n")
+			b.WriteString(selectedStyle.Render(fmt.Sprintf("  > %-26s %s", label, value)) + "\n")
 		} else {
 			b.WriteString(fmt.Sprintf("    %-26s ", label) + subtitleStyle.Render(value) + "\n")
 		}
+	}
+	// statline renders a read-only row that is NOT focusable (no arrow key row,
+	// no Enter action): the action is only reachable by its letter hotkey. The
+	// muted render signals "this is state, not a menu row" so a user does not
+	// arrow to it expecting a cursor.
+	statline := func(label, value string) {
+		b.WriteString(mutedStyle.Render(fmt.Sprintf("    %-26s ", label)) + subtitleStyle.Render(value) + "\n")
 	}
 	section := func(title string) {
 		b.WriteString("\n" + recommendStyle.Render("  "+title) + "\n")
@@ -1509,25 +1630,18 @@ func (m Model) viewModelConfig() string {
 		tuneLabel = filepath.Base(m.tunePath)
 	}
 
-	kvQualityLabel := map[string]string{
-		"high": "high (f16)", "mid": "mid (q8_0)", "low": "low (q4_0)",
-		"q4_1": "q4_1", "iq4_nl": "iq4_nl", "q5_0": "q5_0", "q5_1": "q5_1",
-		"bf16": "bf16", "f16": "f16", "f32": "f32",
-	}[m.kvQuality]
-	if kvQualityLabel == "" {
-		kvQualityLabel = m.kvQuality
-	}
+	kvQualityLabel := kvQualityLabel(m.kvQuality)
 
 	section("Backend, context & memory")
 	switch {
 	case model.AutoBackend != "":
-		line("backend", "Backend", model.AutoBackend+" (auto-selected for "+model.Architecture+")")
+		statline("Backend", model.AutoBackend+" (auto-selected for "+model.Architecture+")")
 	case m.selectedBackendRecipe() != nil:
 		line("backend-install", "[i] Backend", "install "+model.BackendRecipe+" for "+model.Architecture)
 	case m.backendRouteBypass && model.BackendRecipe != "":
-		line("backend", "Backend", m.effectiveBackend()+" (unsupported-route check bypassed once)")
+		statline("Backend", m.effectiveBackend()+" (unsupported-route check bypassed once)")
 	default:
-		line("backend", "Backend", m.backend)
+		statline("Backend", m.backend)
 	}
 	line("context", "[c] Context size", ctxLabel)
 	line("parallel", "[p] Parallel slots", parallelLabel)
@@ -1551,20 +1665,21 @@ func (m Model) viewModelConfig() string {
 	}
 	line("claudecode", "[x] Claude Code", ccLabel)
 	if m.claudeCode {
-		line("claudereviewer", "Reviewer/worker", claudeReviewerLabel(m.claudeReviewer))
-		line("claudeprofile", "Claude profile", claudeProfileLabel(m.claudeProfile))
+		line("claudereviewer", "[e] Reviewer/worker", claudeReviewerLabel(m.claudeReviewer))
+		line("claudeprofile", "[z] Claude profile", claudeProfileLabel(m.claudeProfile))
 	}
+	line("chattemplate", "[n] Chat template", m.chatTemplateLabel(model))
 	line("benchmark", "[b] Benchmark mode", boolLabel(m.benchmark))
+
+	section("Cache & launch")
 	nocacheLabel := "off (reuse cached placement/probes)"
 	if m.noCachedConfig {
 		nocacheLabel = "on (derive fresh, ignore cached config)"
 	}
-	line("nocached", "[g] Launch without cached config", nocacheLabel)
-
-	section("Actions")
+	statline("[g] Launch without cached config", nocacheLabel)
+	statline("[y] Clear caches", "drop cached placement/calibration for this model (keep GGUF)")
 	line("launch", "[L] Launch", "▶ start the server")
 	line("dryrun", "[D] Dry run", "print the command, don't run")
-	line("clearcaches", "[y] Clear caches", "drop cached placement/calibration for this model (keep GGUF)")
 
 	b.WriteString("\n" + mutedStyle.Render("  Enter on Launch to start · Esc to go back"))
 
@@ -1583,6 +1698,11 @@ func (m Model) viewModelConfig() string {
 		}
 	}
 
+	// Keep the focused row visible on short terminals: clip the body but add a
+	// hint that more rows exist above/below.
+	if body, clipped := clipToFocused(b.String(), m.viewportLines()); clipped {
+		return body + "\n" + mutedStyle.Render("  (use ↑/↓ — more rows above/below)")
+	}
 	return b.String()
 }
 
@@ -1603,6 +1723,17 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.launchRequest = m.buildLaunchRequest()
 			}
 			return m, tea.Quit
+		case "c", "C":
+			// Apply the suggested context from the KV hint: one keypress turns the
+			// recommendation into the actual launch context.
+			if model := m.currentModel(); model != nil {
+				if hint := m.denseKVHint(*model); hint != nil && hint.suggestCtx > 0 {
+					m.setCtx(strconv.Itoa(hint.suggestCtx))
+					m.message = fmt.Sprintf("Context set to %d — review, then Enter to launch", hint.suggestCtx)
+					m.messageType = "info"
+				}
+			}
+			return m, nil
 		case "r", "R":
 			// Resume only makes sense in Claude Code mode with a recorded
 			// session; otherwise fall through to no-op rather than launching
@@ -1626,6 +1757,59 @@ func (m Model) updatePrelaunch(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// currentModel returns the selected ModelItem, or nil when out of range.
+func (m Model) currentModel() *ModelItem {
+	if m.selectedModel >= 0 && m.selectedModel < len(m.models) {
+		return &m.models[m.selectedModel]
+	}
+	return nil
+}
+
+// verifiedConfigLine reports whether a previously verified serving config
+// exists for this model, so the prelaunch screen can say the launch will start
+// directly from the flags that already proved themselves. The scope key is
+// strategy-free and computed inside placement.Compute, so the TUI uses a
+// lightweight heuristic: any verified-config record whose basename matches this
+// model is surfaced. A miss is silent — this is purely informational.
+func (m Model) verifiedConfigLine(model ModelItem) string {
+	if m.cacheDir == "" {
+		return ""
+	}
+	dir := filepath.Join(m.cacheDir, "verified-configs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	basename := filepath.Base(model.Path)
+	latest := time.Time{}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, ent.Name()))
+		if err != nil {
+			continue
+		}
+		var vc placement.VerifiedConfig
+		if json.Unmarshal(data, &vc) != nil || vc.ModelBasename == "" {
+			continue
+		}
+		// The record's basename is filepath.Base(Path); match it directly and
+		// via the base without the .gguf extension (writeTemplateFile-style
+		// tolerance, mirroring ClearModelCaches' matcher).
+		if vc.ModelBasename != basename && vc.ModelBasename != strings.TrimSuffix(basename, filepath.Ext(basename)) {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, vc.MeasuredAt); err == nil && t.After(latest) {
+			latest = t
+		}
+	}
+	if latest.IsZero() {
+		return ""
+	}
+	return mutedStyle.Render("  verified config from " + latest.Local().Format("2006-01-02 15:04") + " may be reused (clear caches to force re-measure)")
 }
 
 // loadResumableSession looks for a Claude Code session recorded from this
@@ -1673,6 +1857,7 @@ func (m Model) viewPrelaunch() string {
 		return "No model selected"
 	}
 	model := m.models[m.selectedModel]
+	kvHint := m.denseKVHint(model)
 	var b strings.Builder
 	b.WriteString(titleStyle.Render(fmt.Sprintf("═══ Pre-launch: %s ═══", model.Name)) + "\n\n")
 	if m.replayRequest != nil {
@@ -1686,50 +1871,49 @@ func (m Model) viewPrelaunch() string {
 	if m.ctxMode == "fit" {
 		ctx = "fit"
 	}
-	b.WriteString(fmt.Sprintf("  Context:        %s\n", ctx))
-	b.WriteString(fmt.Sprintf("  Model path:     %s\n", model.Path))
+	if model.FitCtx > 0 {
+		ctx += fmt.Sprintf("  (fits ~%d)", model.FitCtx)
+	}
+	if model.MaxCtx > 0 {
+		ctx += fmt.Sprintf("  (train max %d)", model.MaxCtx)
+	}
 	prelaunchBackend := m.effectiveBackend()
 	if m.replayRequest != nil && m.replayRequest.Backend != "" {
 		prelaunchBackend = m.replayRequest.Backend
 	}
+
+	b.WriteString("  Model:          " + model.Path + "\n")
 	b.WriteString(fmt.Sprintf("  Backend:        %s\n", prelaunchBackend))
+	b.WriteString(fmt.Sprintf("  Context:        %s\n", ctx))
 	if m.port > 0 {
 		b.WriteString(fmt.Sprintf("  Port:           %d\n", m.port))
 	}
-	if model.FitCtx > 0 {
-		b.WriteString(fmt.Sprintf("  Fit estimate:   ~%d tokens\n", model.FitCtx))
-	}
-	if model.MaxCtx > 0 {
-		b.WriteString(fmt.Sprintf("  Train max:      %d tokens\n", model.MaxCtx))
-	}
-	if hint := m.denseKVHint(model); hint != "" {
-		for i, hl := range strings.Split(hint, "\n") {
-			if i == 0 {
-				b.WriteString("  KV/ctx:         " + hl + "\n")
-			} else {
-				b.WriteString("                  " + hl + "\n")
-			}
-		}
-	}
 	b.WriteString(fmt.Sprintf("  Parallel:       %s\n", m.prelaunchParallelLabel()))
 	b.WriteString(fmt.Sprintf("  KV placement:   %s\n", m.kvPlacement))
-	b.WriteString(fmt.Sprintf("  KV quality:     %s\n", m.kvQuality))
+	b.WriteString(fmt.Sprintf("  KV quality:     %s\n", kvQualityLabel(m.kvQuality)))
 	b.WriteString(fmt.Sprintf("  Full SWA cache: %s\n", m.swaLabel(model)))
-	b.WriteString(fmt.Sprintf("  AI tune:        %s\n", boolLabel(m.aitune)))
 	if m.aitune {
-		b.WriteString(fmt.Sprintf("  AI tune rounds: %d\n", m.aituneRounds))
+		b.WriteString(fmt.Sprintf("  AI tune:        %s (%d rounds)\n", boolLabel(m.aitune), m.aituneRounds))
+	} else {
+		b.WriteString(fmt.Sprintf("  AI tune:        %s\n", boolLabel(m.aitune)))
 	}
 	b.WriteString(fmt.Sprintf("  Vision:         %s\n", boolLabel(m.vision)))
 	b.WriteString(fmt.Sprintf("  Benchmark:      %s\n", boolLabel(m.benchmark)))
-	b.WriteString(fmt.Sprintf("  Support expert: %s\n", supportExpertLabel(m.supportExpert)))
-	b.WriteString(fmt.Sprintf("  Online research: %s\n", boolLabel(m.supportOnline)))
-	b.WriteString(fmt.Sprintf("  Claude Code:    %s\n", boolLabel(m.claudeCode)))
+	if m.chatTemplate != "" {
+		b.WriteString(fmt.Sprintf("  Chat template:  forced %s\n", m.chatTemplate))
+	} else if entry, ok := m.autoChatTemplate(model); ok {
+		b.WriteString(fmt.Sprintf("  Chat template:  auto (%s corrected)\n", entry.Name))
+	}
 	if m.claudeCode {
+		b.WriteString(fmt.Sprintf("  Claude Code:    %s\n", boolLabel(m.claudeCode)))
 		b.WriteString(fmt.Sprintf("  Reviewer/worker: %s\n", claudeReviewerLabel(m.claudeReviewer)))
 		b.WriteString(fmt.Sprintf("  Claude profile: %s\n", claudeProfileLabel(m.claudeProfile)))
 	}
 	if m.tunePath != "" {
 		b.WriteString(fmt.Sprintf("  Tuned config:   %s\n", filepath.Base(m.tunePath)))
+	}
+	if m.noCachedConfig {
+		b.WriteString("  Cached config:  ignored (fresh derive)\n")
 	}
 	if m.claudeCode && m.resumeSession != "" {
 		b.WriteString(fmt.Sprintf("  Resumable:      session %s\n", shortSessionID(m.resumeSession)))
@@ -1737,11 +1921,31 @@ func (m Model) viewPrelaunch() string {
 			b.WriteString(fmt.Sprintf("                  workflow %s, %d agents cached\n", m.resumeRun, m.resumeCached))
 		}
 	}
+	// Support policy lines are only shown when they deviate from the defaults;
+	// a user cannot change them on this screen and the defaults are noise.
+	if m.supportExpert != "" && m.supportExpert != "auto" {
+		b.WriteString(fmt.Sprintf("  Support expert: %s\n", supportExpertLabel(m.supportExpert)))
+	}
+	if m.supportOnline {
+		b.WriteString("  Online research: on\n")
+	}
+	if vc := m.verifiedConfigLine(model); vc != "" {
+		b.WriteString("  " + vc + "\n")
+	}
+
+	if kvHint != nil {
+		b.WriteString("\n" + warningStyle.Render("  "+strings.Join(kvHint.lines, "\n  ")) + "\n")
+	}
+
 	b.WriteString("\n")
 	b.WriteString(highlightStyle.Render("  [Enter] Confirm and launch"))
 	b.WriteString("\n")
 	if m.claudeCode && m.resumeSession != "" {
 		b.WriteString(highlightStyle.Render("  [r] Resume that session and its workflow"))
+		b.WriteString("\n")
+	}
+	if kvHint != nil && kvHint.suggestCtx > 0 {
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("  [c] Use suggested ctx %d", kvHint.suggestCtx)))
 		b.WriteString("\n")
 	}
 	b.WriteString("  [Esc] Back to config\n")
@@ -1756,6 +1960,11 @@ func (m Model) viewPrelaunch() string {
 			b.WriteString(highlightStyle.Render(m.message))
 		}
 		b.WriteString("\n")
+	}
+	// On short terminals keep the launch actions visible; the tail-first clip
+	// guarantees [Enter]/[r]/[Esc] are never silently cut off.
+	if body, clipped := clipToFocused(b.String(), m.viewportLines()); clipped {
+		return body + "\n" + mutedStyle.Render("  (use ↑/↓ to review the full summary)")
 	}
 	return b.String()
 }
@@ -1800,13 +2009,13 @@ func (m Model) viewTunedPicker() string {
 		b.WriteString("  Run AI tune to create one.\n")
 	} else {
 		if m.tunedIndex == -1 {
-			b.WriteString(selectedStyle.Render("▸ [0] Auto / heuristic cache selection") + "\n")
+			b.WriteString(selectedStyle.Render("> [0] Auto / heuristic cache selection") + "\n")
 		} else {
 			b.WriteString("  [0] Auto / heuristic cache selection\n")
 		}
 		for i, entry := range m.tunedConfigs {
 			if i == m.tunedIndex {
-				b.WriteString(selectedStyle.Render(fmt.Sprintf("▸ [%d] %s", i+1, entry.Label)) + "\n")
+				b.WriteString(selectedStyle.Render(fmt.Sprintf("> [%d] %s", i+1, entry.Label)) + "\n")
 				b.WriteString(subtitleStyle.Render(fmt.Sprintf("     %s", filepath.Base(entry.Path))) + "\n")
 			} else {
 				b.WriteString(fmt.Sprintf("  [%d] %s\n", i+1, entry.Label))
@@ -2029,6 +2238,56 @@ func (m *Model) refreshRecommendations() {
 	}
 }
 
+// clipToFocused clips a rendered screen to maxLines, keeping the focused row
+// (the line whose trimmed text starts with the "> " cursor marker) visible. A
+// config screen can run to ~30 lines while a 24-row terminal only shows ~20;
+// without this the bottom is silently cut off and Launch becomes unreachable.
+// When no focused marker exists (e.g. the prelaunch screen) it keeps the tail,
+// so the launch actions stay visible. It returns (clipped, clippedFlag).
+func clipToFocused(s string, maxLines int) (string, bool) {
+	if maxLines <= 0 {
+		return s, false
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= maxLines {
+		return s, false
+	}
+	focused := -1
+	for i, l := range lines {
+		if strings.HasPrefix(strings.TrimSpace(l), "> ") {
+			focused = i
+			break
+		}
+	}
+	var start int
+	if focused < 0 {
+		start = len(lines) - maxLines
+	} else {
+		start = focused - maxLines/2
+		if start < 0 {
+			start = 0
+		}
+		if start+maxLines > len(lines) {
+			start = len(lines) - maxLines
+		}
+	}
+	return strings.Join(lines[start:start+maxLines], "\n"), true
+}
+
+// viewportLines returns how many rows a full-screen render may use. The TUI
+// runs on an alternate screen where the full terminal height is available, but
+// a 24-row terminal is common; rows below this clip are reachable with ↑/↓.
+func (m Model) viewportLines() int {
+	if m.height <= 0 {
+		return 0 // unknown size: never clip, tests and pre-WindowSizeMsg renders
+	}
+	// Reserve a couple of rows of margin so the clip hint itself fits.
+	if m.height <= 4 {
+		return m.height
+	}
+	return m.height - 2
+}
+
 // wordWrap greedily packs words from s into lines no wider than width,
 // breaking only at spaces. width <= 0 falls back to 78 columns.
 func wordWrap(s string, width int) []string {
@@ -2091,7 +2350,7 @@ func (m Model) viewRecommended() string {
 		for _, rec := range rows {
 			prefix := "  "
 			if idx == m.selectedRecommendation {
-				prefix = selectedStyle.Render("▸ ")
+				prefix = selectedStyle.Render("> ")
 			}
 			quant := rec.QuantName
 			if quant == "" {
@@ -2146,10 +2405,10 @@ func (m Model) recommendedHeadroomControls() string {
 	vram := fmt.Sprintf("[v] VRAM %s", formatHeadroomMB(m.vramHeadroomMB))
 	ram := fmt.Sprintf("[m] RAM %s", formatHeadroomMB(m.ramHeadroomMB))
 	if m.recHeadroomFocus == "vram" {
-		vram = selectedStyle.Render("▸ " + vram + " ◂")
+		vram = selectedStyle.Render("> " + vram + " ◂")
 	}
 	if m.recHeadroomFocus == "ram" {
-		ram = selectedStyle.Render("▸ " + ram + " ◂")
+		ram = selectedStyle.Render("> " + ram + " ◂")
 	}
 	return fmt.Sprintf("Reserve for other apps: %s   %s", vram, ram)
 }
@@ -2334,6 +2593,17 @@ func modelIdentity(path string) string {
 	return path
 }
 
+// hasAnyUsage reports whether any usage record exists, so the footer legend
+// ("sorted by usage") only appears when the sort actually used usage data.
+func hasAnyUsage(usage map[string]modelusage.Record) bool {
+	for _, r := range usage {
+		if r.Launches > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // sortModels orders the list for display. When usage records are available the
 // most-used and most-recently-used models float to the top; everything still
 // falls back to a stable name sort so the list stays deterministic.
@@ -2512,16 +2782,24 @@ func (m Model) swaLabel(model ModelItem) string {
 	return "off (enable cache hits; " + delta + ")"
 }
 
+// kvHint is the result of denseKVHint: the text to render on the prelaunch
+// screen and, when the current context would spill off GPU, a suggested context
+// the user can apply with one keypress ([c] on the prelaunch screen).
+type kvHint struct {
+	lines    []string
+	suggestCtx int // >0: a rung that fits all-GPU; apply it with setCtx
+}
+
 // denseKVHint suggests useful context/KV steps for a DENSE model whose current
 // context would push it into host offload: the 131k/64k/32k rungs with their KV
-// sizes, plus the max-vs-fit tradeoff. It returns "" for MoE models, models with
-// no KV geometry, or when the estimated context already fits entirely on GPU
-// (the pre-launch Fit estimate already covers that case). It mirrors placement's
-// denseMultiGPUFit boundary: model + (CUDA overhead + compute floor) per GPU +
-// KV <= free VRAM.
-func (m Model) denseKVHint(model ModelItem) string {
+// sizes, plus the max-vs-fit tradeoff. It returns nil for MoE models, models
+// with no KV geometry, or when the estimated context already fits entirely on
+// GPU (the pre-launch Fit estimate already covers that case). It mirrors
+// placement's denseMultiGPUFit boundary: model + (CUDA overhead + compute
+// floor) per GPU + KV <= free VRAM.
+func (m Model) denseKVHint(model ModelItem) *kvHint {
 	if model.IsMoE || model.KVProfile == nil || m.caps == nil || len(m.caps.GPUs) == 0 {
-		return ""
+		return nil
 	}
 	kvType, err := placement.NormalizeKVType(m.kvQuality)
 	if err != nil {
@@ -2532,7 +2810,7 @@ func (m Model) denseKVHint(model ModelItem) string {
 		baseMB = int(model.KVProfile.SizeBytes / 1048576)
 	}
 	if baseMB <= 0 {
-		return ""
+		return nil
 	}
 
 	numGPUs := len(m.caps.GPUs)
@@ -2564,7 +2842,7 @@ func (m Model) denseKVHint(model ModelItem) string {
 		cur = model.FitCtx
 	}
 	if cur <= 0 || fits(cur) {
-		return ""
+		return nil
 	}
 
 	rungs := placement.DenseContextRungs(cur + 1)
@@ -2579,17 +2857,25 @@ func (m Model) denseKVHint(model ModelItem) string {
 			bestFit = r
 		}
 	}
-	lines := []string{"KV/ctx steps: " + strings.Join(rungParts, " · ")}
+	hint := &kvHint{}
 	if bestFit > 0 {
 		deficit := baseMB + overheadMB + kvAt(cur) - totalFree
 		if deficit < 0 {
 			deficit = 0
 		}
-		lines = append(lines, fmt.Sprintf("fits all-GPU at ctx %d; at ctx %d needs ~%s host offload", bestFit, cur, gibString(deficit)))
+		hint.lines = []string{
+			fmt.Sprintf("ctx %d would spill ~%s to system RAM", cur, gibString(deficit)),
+			"try " + strings.Join(rungParts, " · "),
+			fmt.Sprintf("[c] use ctx %d (fits all GPU, KV ~%s)", bestFit, gibString(kvAt(bestFit))),
+		}
+		hint.suggestCtx = bestFit
 	} else {
-		lines = append(lines, fmt.Sprintf("does not fit all-GPU even at ctx %d (host offload)", rungs[len(rungs)-1]))
+		hint.lines = []string{
+			fmt.Sprintf("ctx %d would spill to system RAM", cur),
+			"does not fit all-GPU even at " + strings.Join(rungParts, " · "),
+		}
 	}
-	return strings.Join(lines, "\n")
+	return hint
 }
 
 // gibString renders an MiB figure as a compact "N.N GB" string.
@@ -2687,7 +2973,7 @@ func settingRows() []settingRow {
 		{label: "KV placement", kind: "enum", options: []string{"auto", "gpu", "cpu"},
 			get: func(c *config.Config) string { return c.KVPlacement },
 			set: func(c *config.Config, v string) { c.KVPlacement = v }},
-		{label: "KV quality", kind: "enum", options: []string{"auto", "high", "bf16", "mid", "q8_0", "q5_1", "q5_0", "q4_1", "low", "q4_0", "iq4_nl", "f32"},
+		{label: "KV quality", kind: "enum", options: kvQualityOptions(),
 			get: func(c *config.Config) string { return c.KVQuality },
 			set: func(c *config.Config, v string) { c.KVQuality = v }},
 		{label: "Full SWA cache", kind: "bool",
@@ -3190,7 +3476,11 @@ func (m Model) viewSettings() string {
 	b.WriteString(titleStyle.Render("═══ Settings ═══") + "\n\n")
 	rows := settingRows()
 	for i, row := range rows {
-		line := fmt.Sprintf("%-17s %s", row.label+":", row.get(m.settingsCfg))
+		val := row.get(m.settingsCfg)
+		if row.label == "KV quality" {
+			val = kvQualityLabel(val)
+		}
+		line := fmt.Sprintf("%-17s %s", row.label+":", val)
 		if i == m.settingsCursor {
 			b.WriteString("  " + selectedStyle.Render("> "+line) + "\n")
 		} else {
@@ -3285,6 +3575,7 @@ func (m Model) buildLaunchRequest() *LaunchRequest {
 		SupportOnline:          m.supportOnline,
 		SupportSet:             true,
 		NoCachedConfig:         m.noCachedConfig,
+		ChatTemplate:           m.chatTemplate,
 	}
 }
 
@@ -3341,6 +3632,10 @@ type LaunchRequest struct {
 	// measurements without deleting them (the "launch without cached config"
 	// escape hatch for a stale placement or probe).
 	NoCachedConfig bool
+	// ChatTemplate forces a corrected chat template from the data-driven
+	// catalog (pkg/chattemplate), mirroring the CLI's --chat-template <name>.
+	// Empty means auto-match. Per-launch only.
+	ChatTemplate string
 }
 
 func (req *LaunchRequest) LaunchArgs() []string {
@@ -3406,6 +3701,11 @@ func (req *LaunchRequest) LaunchArgs() []string {
 	if req.NoCachedConfig {
 		args = append(args, "--no-cached-config")
 	}
+	// Only emit the chat-template override when the user explicitly forced one;
+	// empty keeps the CLI's automatic catalog matching.
+	if v := strings.TrimSpace(req.ChatTemplate); v != "" {
+		args = append(args, "--chat-template", v)
+	}
 	if req.ClaudeCode {
 		args = append(args, "--claude-code")
 		if req.ClaudeProfile != "" {
@@ -3423,6 +3723,45 @@ func (req *LaunchRequest) LaunchArgs() []string {
 		}
 	}
 	return args
+}
+
+// chatTemplateLabel renders the Chat template row. Empty is "auto" — the
+// launch auto-matches known-broken templates from the data-driven catalog.
+// The resolved override is shown when the model's own template would already
+// be fixed by the catalog, so a user launching that model sees the active fix.
+func (m Model) chatTemplateLabel(model ModelItem) string {
+	if v := strings.TrimSpace(m.chatTemplate); v != "" {
+		return "forced: " + v
+	}
+	if entry, ok := m.autoChatTemplate(model); ok {
+		return "auto (" + entry.Name + ")"
+	}
+	return "auto"
+}
+
+// autoChatTemplate returns the catalog entry the launch would auto-apply to
+// this model: a user override (m.chatTemplate) wins unconditionally; otherwise
+// the first enabled entry whose arch/basename matches and whose embedded
+// template carries the raise_exception guard (mirrors catalogTemplateArgs in
+// the CLI). It reports ok=false when no override applies, so the TUI only
+// surfaces the row when there is something to see or force.
+func (m Model) autoChatTemplate(model ModelItem) (chattemplate.Entry, bool) {
+	if v := strings.TrimSpace(m.chatTemplate); v != "" {
+		return chattemplate.ResolveOverride(v)
+	}
+	arch := model.Architecture
+	if arch == "" {
+		arch = model.Arch
+	}
+	basename := filepath.Base(model.Path)
+	embedded := gguf.ChatTemplate(model.Path)
+	return chattemplate.Resolve(arch, basename, embedded, true)
+}
+
+// chatTemplateOrdered returns the cycle order for the Chat template row. "auto"
+// is the empty value; the forced choices are the catalog entry names.
+func chatTemplateOrdered() []string {
+	return append([]string{"auto"}, chattemplate.Names()...)
 }
 
 func supportExpertLabel(mode string) string {

@@ -295,11 +295,11 @@ Two deliberate restrictions:
   from the printed recipe and drop/replace the `--mcp-config` line.
 - **Auto works locally and remains fail-closed.** Claude Code sends hidden permission
   reviews to the same model ID as coding turns. ggrun detects those exact
-  security-monitor requests and routes them to a pinned Qwen3.5-2B reviewer running
+  security-monitor requests and routes them to a pinned Qwen3.5-4B reviewer running
   locally; all other traffic stays on the selected coding model. The reviewer starts
   before placement, so its measured VRAM use is included when ggrun places the main
   model. This is Auto, not `bypassPermissions`. The first launch downloads and verifies
-  the pinned ~1.3 GiB Q4_K_M GGUF and serves it with one independent 64k slot and Q8
+  the pinned ~2.6 GiB Q4_K_M GGUF and serves it with one independent 64k slot and Q8
   KV cache. GPU visibility
   is isolated to its selected physical device; if it does not fit any selected GPU,
   ggrun falls back to CPU. Override it with `GGRUN_CLAUDE_REVIEWER_MODEL=/path/model.gguf`,

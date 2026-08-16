@@ -334,6 +334,171 @@ Phases:
 
 Sources: current-architecture audit 2026-08-11 (detach/attach design task).
 
+## P0 — thinker/worker: live model switching between a big MoE thinker and a fast dense worker
+
+Goal: ggrun runs TWO models live — a fast dense "worker" (e.g. Muse-Glimmer-30B,
+Qwen3.6-27B) handles routine turns at full speed, and a big MoE "thinker"
+(DeepSeek-V4) is consulted for hard problems — a system where the big MoE does
+the real thinking and gets asked when a difficult question or problem arises.
+Feature requested 2026-08-14.
+
+Rationale: dense models (Muse etc.) are far faster and worth the load time but not
+smart enough to compete with the very big MoE. So: worker does the bulk, escalate
+to the thinker on hard problems. This is the reviewer/advisor tiered-model pattern
+(already shipped for Auto permissions + calibration) applied to the MAIN model
+loop, not just support roles.
+
+- [ ] **Two live backends** — the worker (fast dense) and the thinker (big MoE)
+  both resident, sharing the GPU split by VRAM budget. ggrun manages the placement
+  of both (reviewer/advisor reservation pattern extended to a main-worker + main-
+  thinker pair). The thinker may be cold (unloaded, load-on-escalate) to save VRAM
+  when not needed, or warm if it fits.
+- [ ] **Routing** — the Claude session's requests route to the worker by default.
+  When a request is "hard" (the worker is uncertain / a problem occurs / a complex
+  question), escalate to the thinker. Decision criteria: worker's own confidence
+  signal, request complexity heuristics, explicit escalation on error/failure, or
+  a per-request override.
+- [ ] **Escalation contract** — the thinker receives the context + the hard
+  problem, returns the reasoned answer, and the worker continues. Preserve the
+  conversation state (prompt cache / checkpoints) across the worker→thinker→worker
+  transition. The thinker is consulted (asked) for hard problems, not for every turn.
+- [ ] **Live switching** — switch the active model mid-session without losing the
+  conversation (the detach/attach backend work + the daemon /reload path are the
+  substrate; extend them for a 2-model residency + routing).
+- [ ] **Interaction with existing** — reuse: the reviewer/advisor tiered-model
+  pattern (claudeReviewerReservation, startClaudeAutoReviewer), the detach/attach
+  serve+attach (TODO above), the daemon /reload model-swap path (existing TODO),
+  and the per-router admission (each model gets its own router/admission).
+- [ ] **Loading cost** — a dense worker like Muse loads in ~1-2 min vs the big MoE
+  thinker's ~5-10 min (and its VRAM), so the worker being always-on + the thinker
+  escalating is worth the load time. Document the tradeoff.
+- [ ] **Phases** — (1) two-model residency + worker-default routing + manual
+  escalate (a `/think` or escalation trigger); (2) automatic escalation on
+  uncertainty/failure; (3) hot-swap without conversation loss + shared prompt cache.
+
+## P1 — audit + fix prompt-cache / cache-reuse correctness
+
+Audit whether ggrun provides prompt caching and `--cache-reuse` correctly across
+all launch shapes, and fix the known gaps. Observed 2026-08-14 on the Muse-Glimmer
+dense run: `cached n_tokens` grows 71k-94k (cache-reuse working), `--cache-reuse 256`
++ `--cram 12288` active. But correctness gaps from this session:
+
+- [ ] **swa-full key mismatch (known, live-confirmed)** — ggrun emits `--swa-full`,
+  the backend silently disables it for models that don't support it (DeepSeek-V4,
+  Qwen3.6), yet the probe cache records the key as `swa-full=true`. A future launch
+  reads swa-full=true evidence for a config that actually ran swa-full=off, so
+  prompt-cache sizing is keyed to a config that never ran. (The swa-full reconcile
+  / CALPLAN-4 half.)
+- [ ] **KV-rate multi-seq poisoning (F2)** — a `parallel>1` launch wrote the
+  model-wide KV bytes/token rate from the Nx inflated total with no seq guard,
+  which would poison prompt-cache sizing for later plans. (Fixed in f6d2611; keep
+  a regression guard.)
+- [ ] **cache-reuse x recurrent/SSM correctness** — `--cache-reuse` is gated off for
+  recurrent (deepseek4) and laguna (multi-position RoPE) arches. Verify the gate is
+  right and that no other arch gets a cache-reuse flag the backend silently ignores.
+- [ ] **prompt-cache x no-mmap / host offload** — with `--no-mmap` + CUDA_Host
+  offload, the prompt cache lives partly on host; verify reuse still hits correctly
+  and the `-cram` budget accounts for it (the Muse run had 12 GB cram + 7 GB host).
+- [ ] **per-model/per-shape cache correctness** — verify cache-reuse + prompt cache
+  behave correctly per model/backend/hardware/ctx shape (the scope key), and that a
+  stale cache entry cannot be applied to a different shape.
+
+## P1 — TUI: model ordering, KV/ctx suggestions, reviewer selection
+
+Three TUI features requested 2026-08-14 (test-driving ggrun with dense models):
+
+- [x] **Model ordering by usage** — DONE (commit 9bd6b7c): per-model usage
+  record (pkg/modelusage, launch count + last-used, persisted), TUI list sorts
+  by usage desc then last-used desc then name.
+- [ ] **KV-size / ctx-step suggestions** — when a dense model would offload to
+  system RAM or its KV doesn't fit, suggest useful steps for the KV size /
+  context: show "ctx N gives ~M GB KV" rungs (e.g. the auto-ctx-reduce
+  rungs: 131k/64k/32k with their KV sizes), and for "max" vs "fit" show the
+  tradeoff. Reuse the existing `swaEstimateContext`/`FitCtx` (pkg/tui) and
+  the `lowerContextRungs`/`maybeReduceDenseAutoContext` (pkg/placement) to
+  present the options. Surface on the launch screen: "at ctx 131072 this
+  model fits all-GPU; at 250000 it needs 7 GB host offload."
+- [ ] **Reviewer/worker selection for Claude Code — two named profiles.** The
+  Claude Code option in the TUI should offer TWO profiles by tradeoff, not raw
+  model names:
+  - **Fast + big profile: a WORKER model** (nanbeige4.2) — the reviewer must be
+    a worker-class model in this profile: it can review AND do work (the
+    reviewer/worker companion). Better quality, heavier/resident.
+  - **Small + light profile: the small reviewer** (Qwen3.5-2B) — review-only,
+    lighter, faster to load, less capable.
+  The `--claude-reviewer qwen|nanbeige|auto` + TUI toggle (already added in the
+  TUI rework, commit 9bd6b7c) is the mechanical base. Enhance the TUI to present
+  these as named profiles ("Reviewer/worker: big/fast (nanbeige)" vs
+  "small/light (Qwen2B)") so the user picks by the quality-vs-resource tradeoff.
+  Constraint: the big profile's model must be a WORKER (not just a bigger
+  reviewer). Default stays auto (dense→Qwen, big MoE→nanbeige).
+  (Base `--claude-reviewer qwen|nanbeige|auto` + TUI toggle DONE in 9bd6b7c;
+  the two-named-profile presentation + big-must-be-worker is the open part.)
+- [ ] **Help/usage completeness audit** — the `--help` text (main.go usage block)
+  should reflect ALL current commands + flags generally, not just recent additions.
+  Audit that: every command (launch/daemon/download/tune/recommend/support/models/
+  config/backend/update/claude/gui/... + diagnostics) is listed; every launch flag
+  (port/ctx/kv/kv-quality/gpus/backend/parallel/threads/cache-ram/claude-*/
+  mmap/swa-full/ram-limit/calibrate/worker-benchmark + the newer --claude-reviewer/
+  --chat-template/--cgroup-headroom/--claude-resume) is present + described. The
+  two reviewer profiles ("big/fast worker (nanbeige)" vs "small/light (Qwen2B)")
+  should be named in the --claude-reviewer help. Keep the help current as features
+  land (a "keep --help in sync with new flags" rule).
+
+## P1 — auto-relaunch on ANY unexpected server stop (not just CUDA OOM)
+
+The runtime crash loop (cmd/ggrun/main.go:5349-5367) only relaunches a server
+that crashed with a RECOGNIZED CUDA OOM (runtimeLogCUDAOOM). A non-OOM crash or
+a clean-but-unexpected stop (no OOM message in the log — e.g. the Qwen3.8 q5_1
+run that just "stopped" after 65 min with no error) hits `runtimeLogCUDAOOM` ->
+`!ok` -> `os.Exit(1)` and gives up, leaving a dead server. Requested 2026-08-15:
+"ggrun should relaunch it when it crashes like those without an error."
+
+- [ ] **Auto-relaunch on ANY unexpected stop**: when waitForShutdownOrCrash detects
+  a crash, if it is NOT a recognized CUDA OOM, still auto-relaunch the server
+  (bounded retries, like maxRuntimeOOMRetries), re-using the verified config /
+  placement cache. Only exit after the retry budget is exhausted.
+- [ ] **Distinguish user-stop vs crash**: a clean shutdown (Ctrl+C / signal) should
+  exit; an unexpected stop (process died on its own, no signal) should relaunch.
+  waitForShutdownOrCrash already distinguishes these (returns false on signal,
+  true on self-exit) — use that to gate the relaunch.
+- [ ] **Bounded + safe**: a retry budget (like maxRuntimeOOMRetries) + fall back to
+  normal placement if the verified config fails to relaunch. Never relaunch in a
+  tight loop on a persistent crash.
+- [ ] **Reuse the verified-config-saver**: on relaunch, start directly from the
+  saved verified config (the new c4b76ac feature) so the re-start is fast + known
+  good.
+
+## P0 — generic data-driven rules: chat-template override + KV-quant selection
+
+Hardcoded per-model fixes are not what ggrun is about (the nanbeige template
+override at main.go:2707-2737, the deepseek4/inkling KV rules at
+archconstraints.go:56-63, resolveKVQuality's arch branches) — they only work for
+one model, not everyone's or future ones. Replace them with GENERIC, data-driven,
+user-editable mechanisms that work for any model, exposed in the TUI. Requested
+2026-08-14 (Qwen3.8 raised both: its Jinja raise_exception 500s every request,
+and KV-quant selection is a ggrun-wide choice problem, not a Qwen3.8 one).
+
+- [ ] **Generic chat-template override** — a user-extensible catalog of corrected
+  chat templates keyed by model/arch (a data file, not Go code), so a model with
+  a broken template (nanbeige raise_exception, Qwen3.8 raise_exception, future
+  ones) is fixed by adding an entry — no code change. User can add their own.
+  Format: `<arch>/<model> → corrected .jinja` (+ a flag `--chat-template <name>`
+  and a TUI toggle). ggrun auto-applies when the model's GGUF template has the
+  raise_exception pattern. Replaces the hardcoded nanbeigeTemplateArgs.
+- [ ] **Generic KV-quant selection** — a data-driven KV-quant decision: per-arch
+  correctness rules (the archKVRules table) + a user-chosen default (the TUI
+  KV-quality field) + an auto recommendation (accuracy vs VRAM based on the
+  model + free VRAM). No hardcoded per-model branches — a rule table + user
+  override. Works for any model: "this model has no rule → use the user's choice
+  + the VRAM-aware auto". Replaces the resolveKVQuality arch branches.
+- [ ] **Rule catalog format + UI** — a JSON/TOML file (e.g. `<config>/rules.json`)
+  with template-override + KV-quant entries, editable by the user + shown in the
+  TUI (a "model rules" screen). ggrun ships a default catalog (nanbeige, deepseek4,
+  inkling, qwen3.8) that users extend.
+- [ ] **TUI integration** — the TUI shows the active rule for a model (template
+  override? KV quant?) and lets the user change it per-model or set a default.
+
 ## P1 — finish existing product foundations
 
 - [ ] **TUI extra parameters:** add a free-text field to the model configuration

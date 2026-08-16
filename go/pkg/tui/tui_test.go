@@ -1041,6 +1041,7 @@ func denseTestModel() ModelItem {
 
 func TestPrelaunchShowsKVContextSuggestionForDenseModel(t *testing.T) {
 	m := Model{
+		screen:        ScreenPrelaunch,
 		models:        []ModelItem{denseTestModel()},
 		selectedModel: 0,
 		kvPlacement:   "gpu",
@@ -1057,17 +1058,27 @@ func TestPrelaunchShowsKVContextSuggestionForDenseModel(t *testing.T) {
 	}
 	view := m.viewPrelaunch()
 	for _, want := range []string{
-		"KV/ctx steps:",
+		"would spill",
 		"ctx 131072 → ~",
 		"ctx 65536 → ~",
 		"ctx 32768 → ~",
-		"fits all-GPU at ctx 131072",
-		"needs ~",
-		"host offload",
+		"[c] use ctx 131072",
+		"fits all GPU",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("pre-launch KV/ctx suggestion missing %q in:\n%s", want, view)
 		}
+	}
+	// The suggestion must be actionable: pressing c applies the suggested
+	// context as a manual context size.
+	hint := m.denseKVHint(m.models[0])
+	if hint == nil || hint.suggestCtx != 131072 {
+		t.Fatalf("dense KV hint should suggest ctx 131072, got %#v", hint)
+	}
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	m = nm.(Model)
+	if m.ctxMode != "manual" || m.ctxSize != "131072" {
+		t.Fatalf("applying the suggested context: ctx=%q/%q, want manual/131072", m.ctxMode, m.ctxSize)
 	}
 }
 
@@ -1087,11 +1098,11 @@ func TestPrelaunchHidesKVContextSuggestionWhenDenseFitsAllGPU(t *testing.T) {
 		},
 		cacheDir: "",
 	}
-	if hint := m.denseKVHint(m.models[0]); hint != "" {
-		t.Fatalf("dense model that fits all-GPU must not get a suggestion, got %q", hint)
+	if hint := m.denseKVHint(m.models[0]); hint != nil {
+		t.Fatalf("dense model that fits all-GPU must not get a suggestion, got %#v", hint)
 	}
 	view := m.viewPrelaunch()
-	if strings.Contains(view, "KV/ctx steps:") {
+	if strings.Contains(view, "would spill") {
 		t.Fatalf("pre-launch must not show a suggestion when the model fits all-GPU:\n%s", view)
 	}
 }
@@ -1835,5 +1846,155 @@ func TestSortModelsFallsBackToNameWhenNoUsage(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("sortModels no-usage[%d] = %q, want %q (full order %v)", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestChatTemplateRowCyclesAndEmitsFlag(t *testing.T) {
+	m := Model{
+		models:        []ModelItem{{Name: "nanbeige.gguf", Path: "/models/nanbeige.gguf", Architecture: "nanbeige"}},
+		selectedModel: 0,
+		kvPlacement:   "auto",
+		ctxMode:       "fit",
+	}
+	if indexOf(m.cfgRows(), "chattemplate") < 0 {
+		t.Fatal("Chat template row missing from the Advanced config screen")
+	}
+	// auto -> first catalog entry (nanbeige4.2-3b is first in catalog.json).
+	m.cycleCfgRow("chattemplate", 1)
+	if m.chatTemplate != "nanbeige4.2-3b" {
+		t.Fatalf("cycle chat template: got %q, want nanbeige4.2-3b", m.chatTemplate)
+	}
+	req := m.buildLaunchRequest()
+	if req == nil || req.ChatTemplate != "nanbeige4.2-3b" {
+		t.Fatalf("chat template must reach the launch request: %#v", req)
+	}
+	joined := strings.Join(req.LaunchArgs(), " ")
+	if !strings.Contains(joined, "--chat-template nanbeige4.2-3b") {
+		t.Fatalf("forced chat template must be an explicit launch flag: %q", joined)
+	}
+	// Cycling back returns to auto (empty).
+	m.cycleCfgRow("chattemplate", -1)
+	if m.chatTemplate != "" {
+		t.Fatalf("cycle chat template back: got %q, want empty auto", m.chatTemplate)
+	}
+	req = m.buildLaunchRequest()
+	if req == nil || req.ChatTemplate != "" {
+		t.Fatalf("auto chat template must not emit a flag: %#v", req)
+	}
+	joined = strings.Join(req.LaunchArgs(), " ")
+	if strings.Contains(joined, "--chat-template") {
+		t.Fatalf("auto chat template must stay in catalog matching, not argv: %q", joined)
+	}
+}
+
+func TestChatTemplateSurvivesReplay(t *testing.T) {
+	req := &LaunchRequest{ModelPath: "/models/test.gguf", ChatTemplate: "qwen3.8-27b"}
+	m := Model{}
+	m.applyLaunchRequestFields(req)
+	if m.chatTemplate != "qwen3.8-27b" {
+		t.Fatalf("replayed request must restore the chat template, got %q", m.chatTemplate)
+	}
+}
+
+func TestChatTemplateLabelShowsForcedAndAuto(t *testing.T) {
+	forced := Model{chatTemplate: "nanbeige4.2-3b"}
+	if label := forced.chatTemplateLabel(ModelItem{Architecture: "nanbeige"}); !strings.Contains(label, "forced: nanbeige4.2-3b") {
+		t.Fatalf("forced chat template label = %q", label)
+	}
+	// A model whose arch matches a catalog entry with a broken embedded template
+	// shows the auto fix even before the user touches the row.
+	auto := Model{}
+	if entry, ok := auto.autoChatTemplate(ModelItem{Name: "nanbeige.gguf", Architecture: "nanbeige"}); !ok || entry.Name != "nanbeige4.2-3b" {
+		t.Fatalf("auto chat template not detected for nanbeige arch: entry=%#v ok=%v", entry, ok)
+	}
+	// A model with no catalog match has no auto override and the row says auto.
+	plain := Model{}
+	if label := plain.chatTemplateLabel(ModelItem{Name: "plain.gguf", Architecture: "llama3"}); label != "auto" {
+		t.Fatalf("plain model chat template label = %q, want auto", label)
+	}
+}
+
+func TestKVQualityOptionsDedupeAliases(t *testing.T) {
+	opts := kvQualityOptions()
+	for _, dup := range []string{"low", "f16"} {
+		if indexOf(opts, dup) >= 0 {
+			t.Fatalf("kvQualityOptions still contains the alias %q: %v", dup, opts)
+		}
+	}
+	if opts[0] != "auto" {
+		t.Fatalf("kvQualityOptions must start with auto, got %q", opts[0])
+	}
+	if !strings.Contains(strings.Join(opts, ","), "q4_0") {
+		t.Fatalf("kvQualityOptions must keep the concrete q4_0 type: %v", opts)
+	}
+}
+
+func TestKVQualityLabelFriendlyOnBothScreens(t *testing.T) {
+	if got := kvQualityLabel("high"); got != "high (f16)" {
+		t.Fatalf("kvQualityLabel(high) = %q, want high (f16)", got)
+	}
+	if got := kvQualityLabel("low"); got != "low (q4_0)" {
+		t.Fatalf("kvQualityLabel(low) = %q, want low (q4_0)", got)
+	}
+}
+
+func TestMainModelDescShowsUsageAndLocation(t *testing.T) {
+	rec := &modelusage.Record{Launches: 12, LastUsedAt: time.Now().Add(-3 * 24 * time.Hour)}
+	desc := mainModelDesc(ModelItem{
+		Name: "model-Q4.gguf", Path: "/models/repo-a/model-Q4.gguf",
+		SizeGB: 7.6, Arch: "llama3", FitCtx: 131072,
+	}, rec)
+	for _, want := range []string{"7.6GB", "llama3", "fits ~131k", "12x", "3d ago", "repo-a"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("main model desc missing %q in %q", want, desc)
+		}
+	}
+	// External models get the "discovered" marker instead of a bare dir.
+	ext := mainModelDesc(ModelItem{Name: "found.gguf", Path: "/elsewhere/found.gguf", SizeGB: 1.2, Arch: "qwen", External: true}, nil)
+	if !strings.Contains(ext, "discovered") {
+		t.Fatalf("external model desc must say discovered: %q", ext)
+	}
+	if strings.Contains(ext, "elsewhere") {
+		t.Fatalf("external model desc must not leak the full dir: %q", ext)
+	}
+}
+
+func TestClipToFocusedKeepsCursorRowVisible(t *testing.T) {
+	lines := []string{}
+	for i := 0; i < 12; i++ {
+		lines = append(lines, fmt.Sprintf("  row %02d", i))
+	}
+	lines[6] = "  > row 06"
+	body := strings.Join(lines, "\n")
+	clipped, ok := clipToFocused(body, 5)
+	if !ok {
+		t.Fatal("clip must trigger when body exceeds maxLines")
+	}
+	if !strings.Contains(clipped, "> row 06") {
+		t.Fatalf("clip must keep the focused row, got:\n%s", clipped)
+	}
+	if len(strings.Split(clipped, "\n")) != 5 {
+		t.Fatalf("clip must return exactly maxLines rows, got %d", len(strings.Split(clipped, "\n")))
+	}
+	// Tail-first for screens without a cursor marker: keep the launch actions.
+	plain := []string{}
+	for i := 0; i < 12; i++ {
+		plain = append(plain, fmt.Sprintf("  row %02d", i))
+	}
+	clippedTail, _ := clipToFocused(strings.Join(plain, "\n"), 5)
+	if !strings.Contains(clippedTail, "row 11") {
+		t.Fatalf("tail-first clip must keep the last row, got:\n%s", clippedTail)
+	}
+}
+
+func TestHasAnyUsage(t *testing.T) {
+	if hasAnyUsage(map[string]modelusage.Record{}) {
+		t.Fatal("empty usage must report false")
+	}
+	if hasAnyUsage(map[string]modelusage.Record{"/m": {Launches: 0}}) {
+		t.Fatal("zero-launch records must report false")
+	}
+	if !hasAnyUsage(map[string]modelusage.Record{"/m": {Launches: 1}}) {
+		t.Fatal("a launched record must report true")
 	}
 }
