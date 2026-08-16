@@ -1702,10 +1702,46 @@ func TestBackendFeatureCompatibilityDropsUnsupportedFullSWA(t *testing.T) {
 	}
 
 	supported := &launchRequest{ExtraArgs: []string{"--swa-full"}}
-	applyBackendFeatureCompatibility(supported, &placement.ModelProfile{ModelArch: "laguna"},
+	applyBackendFeatureCompatibility(supported, &placement.ModelProfile{ModelArch: "laguna", SlidingWindow: 512},
 		&backendInfo{Path: "/laguna/llama-server", Help: "--swa-full"})
 	if !hasArg(supported.ExtraArgs, "--swa-full") {
 		t.Fatal("supported Full SWA flag was removed")
+	}
+}
+
+// A model with no sliding-window layer cannot use a full SWA cache even when the
+// backend advertises --swa-full in its --help (mainline llama-server does this
+// and silently disables swa_full at load for n_swa==0 models). The deterministic
+// GGUF gate must remove the flag before placement and the probe-key computation.
+func TestBackendFeatureCompatibilityDropsFullSWAWhenModelHasNoSWAWindow(t *testing.T) {
+	// Mainline advertises --swa-full in help, so the old help-surface gate never
+	// fired; only the new SlidingWindow<=0 gate catches this.
+	req := &launchRequest{ExtraArgs: []string{"--swa-full", "--metrics"}}
+	be := &backendInfo{Path: "/llama/llama-server", Help: "--swa-full --ctx-checkpoints-interval N"}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "qwen3moe", SlidingWindow: 0}, be)
+	if hasArg(req.ExtraArgs, "--swa-full") || !hasArg(req.ExtraArgs, "--metrics") {
+		t.Fatalf("model with SlidingWindow<=0 kept --swa-full after backend feature normalization: %#v", req.ExtraArgs)
+	}
+}
+
+// A model WITH a sliding window must keep the flag even when the backend help is
+// empty (unknown help surface is not evidence of unsupported).
+func TestBackendFeatureCompatibilityKeepsFullSWAWhenModelHasSWAWindow(t *testing.T) {
+	req := &launchRequest{ExtraArgs: []string{"--swa-full"}}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "qwen3moe", SlidingWindow: 512}, &backendInfo{Path: "/llama/llama-server"})
+	if !hasArg(req.ExtraArgs, "--swa-full") {
+		t.Fatal("model with a sliding-window layer lost --swa-full")
+	}
+}
+
+// An explicit user-supplied --swa-full on a no-SWA model must be preserved and
+// fail closed, matching the -khad explicit-passthrough behavior. Explicit intent
+// is carried in req.OriginalArgs (see userExplicitBackendFlag).
+func TestBackendFeatureCompatibilityPreservesExplicitFullSWAonNoSWAModel(t *testing.T) {
+	req := &launchRequest{ExtraArgs: []string{"--swa-full"}, OriginalArgs: []string{"--swa-full"}}
+	applyBackendFeatureCompatibility(req, &placement.ModelProfile{ModelArch: "qwen3moe", SlidingWindow: 0}, &backendInfo{Path: "/ik/llama-server", Help: "--swa-full"})
+	if !hasArg(req.ExtraArgs, "--swa-full") {
+		t.Fatal("explicit user-supplied --swa-full was silently disabled on a no-SWA model")
 	}
 }
 

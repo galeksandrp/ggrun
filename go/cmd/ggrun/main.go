@@ -4499,6 +4499,22 @@ func applyBackendFeatureCompatibility(req *launchRequest, model *placement.Model
 	if !hasArg(req.ExtraArgs, "--swa-full") {
 		return
 	}
+	// A model with no sliding-window layer (SlidingWindow <= 0) cannot use a full
+	// SWA cache at all, regardless of whether the backend lists --swa-full in its
+	// --help. Mainline llama-server DOES advertise --swa-full but still silently
+	// disables it at load for n_swa==0 models, so this deterministic GGUF gate must
+	// run before the help-surface gate below (which would otherwise early-return).
+	// It mirrors the -khad DeepSeek4 disable: an explicit user passthrough stays
+	// authoritative and fails closed rather than being silently changed.
+	if model != nil && model.SlidingWindow <= 0 && !userExplicitBackendFlag(req, "--swa-full") {
+		req.ExtraArgs = setPassthroughBoolFlag(req.ExtraArgs, "--swa-full", false)
+		archLabel := "this model"
+		if arch != "" {
+			archLabel = arch
+		}
+		fmt.Printf("[launch] Full SWA cache is unavailable for %s (no sliding-window layer); disabling it for this launch.\n", archLabel)
+		return
+	}
 	// An empty help surface is unknown, not unsupported. With a real help probe,
 	// however, passing an absent option is guaranteed to abort argument parsing.
 	if strings.TrimSpace(be.Help) == "" || strings.Contains(be.Help, "--swa-full") {
