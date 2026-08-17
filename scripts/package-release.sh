@@ -86,6 +86,15 @@ if command -v ldd >/dev/null 2>&1; then
     )
 fi
 
+# Versioned files (libfoo.so.0.0.1) also need the SONAME the binary loads.
+for f in "$PAYLOAD/bin"/lib*.so.*; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    soname="$(printf '%s\n' "$base" | sed -E 's/(\.so\.[0-9]+)\.[0-9].*/\1/')"
+    [[ -n "$soname" && "$soname" != "$base" && ! -e "$PAYLOAD/bin/$soname" ]] || continue
+    ln -sfn "$base" "$PAYLOAD/bin/$soname"
+done
+
 (
     cd "$WORK_DIR"
 

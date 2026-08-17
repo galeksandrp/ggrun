@@ -111,7 +111,33 @@ func Setup(binaryPath string) (string, bool, error) {
 		os.RemoveAll(hubDir)
 		return "", false, nil
 	}
+	// Release tarballs often ship libfoo.so.0.0.1 without the SONAME
+	// libfoo.so.0 that the binary actually loads.
+	for name := range seen {
+		alias := sonameAlias(name)
+		if alias == "" || seen[alias] {
+			continue
+		}
+		if err := os.Symlink(name, filepath.Join(hubDir, alias)); err == nil {
+			seen[alias] = true
+		}
+	}
 	return hubDir, true, nil
+}
+
+// sonameAlias maps libfoo.so.0.14.0 to libfoo.so.0, the name the dynamic
+// linker asks for. Already-short names such as libfoo.so.0 return "".
+func sonameAlias(name string) string {
+	i := strings.Index(name, ".so.")
+	if i < 0 {
+		return ""
+	}
+	rest := name[i+4:]
+	major, _, _ := strings.Cut(rest, ".")
+	if major == "" || major == rest {
+		return ""
+	}
+	return name[:i] + ".so." + major
 }
 
 // StableLibraryPath returns persistent directories containing the backend's

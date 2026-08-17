@@ -1085,15 +1085,36 @@ place_isolated_backend() {
     mkdir -p "$box"
     install -m 0755 "$src" "$box/llama-server"
     while IFS= read -r lib; do
-        install -m 0644 "$lib" "$box/$(basename "$lib")"
-    done < <(find "$(dirname "$src")" -maxdepth 1 -type f \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
+        if [[ -L "$lib" ]]; then
+            cp -a "$lib" "$box/$(basename "$lib")"
+        else
+            install -m 0644 "$lib" "$box/$(basename "$lib")"
+        fi
+    done < <(find "$(dirname "$src")" -maxdepth 1 \( -type f -o -type l \) \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
+    # Bundles often ship libfoo.so.0.0.1 without the SONAME libfoo.so.0.
+    local f base soname
+    for f in "$box"/lib*.so.*; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        soname="$(printf '%s\n' "$base" | sed -E 's/(\.so\.[0-9]+)\.[0-9].*/\1/')"
+        [[ -n "$soname" && "$soname" != "$base" && ! -e "$box/$soname" ]] || continue
+        ln -sfn "$base" "$box/$soname"
+    done
     ln -sfn "backends/$dest_name/llama-server" "$INSTALL_DIR/$dest_name"
     # --version can fail if a Vulkan ICD or CUDA driver is missing. The
     # binary is still the install we wanted; ggrun will use it when the
-    # runtime is present. Only fail if the file did not land.
+    # runtime is present. Missing libllama/libggml from the bundle is not
+    # that case — treat it as a failed place so a complete prebuilt can run.
     [[ -x "$box/llama-server" && -e "$INSTALL_DIR/$dest_name" ]] || return 1
     local ver_out=""
     if ! ver_out="$(env LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$box/llama-server" --version 2>&1)"; then
+        if [[ "$ver_out" == *"cannot open shared object file"* ]] && \
+           [[ "$ver_out" == *libllama* || "$ver_out" == *libggml* || "$ver_out" == *libmtmd* ]]; then
+            warn "$dest_name is missing its own libraries: ${ver_out%%$'\n'*}"
+            rm -f "$INSTALL_DIR/$dest_name"
+            rm -rf "$box"
+            return 1
+        fi
         warn "$dest_name installed but --version failed (missing GPU runtime is OK; will still use this binary)"
         [[ -n "$ver_out" ]] && warn "${ver_out%%$'\n'*}"
     fi

@@ -82,6 +82,45 @@ func TestSetupFindsScatteredLibrariesInNamedBuildDir(t *testing.T) {
 }
 
 // A static binary (no libraries anywhere) needs no hub.
+func TestSetupAddsSonameAliasForVersionedLibs(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "llama-server")
+	touch(t, bin)
+	touch(t, filepath.Join(dir, "libllama-common.so.0.0.1"))
+	touch(t, filepath.Join(dir, "libggml-cpu.so.0.14.0"))
+
+	hub, ok, err := Setup(bin)
+	if err != nil || !ok {
+		t.Fatalf("versioned libs: ok=%v err=%v", ok, err)
+	}
+	defer Cleanup(hub)
+	for _, want := range []string{
+		"libllama-common.so.0.0.1",
+		"libllama-common.so.0",
+		"libggml-cpu.so.0.14.0",
+		"libggml-cpu.so.0",
+	} {
+		if _, err := os.Stat(filepath.Join(hub, want)); err != nil {
+			t.Fatalf("hub missing %s: %v", want, err)
+		}
+	}
+}
+
+func TestSonameAlias(t *testing.T) {
+	if got := sonameAlias("libllama-common.so.0.0.1"); got != "libllama-common.so.0" {
+		t.Fatalf("got %q", got)
+	}
+	if got := sonameAlias("libggml-cpu.so.0.14.0"); got != "libggml-cpu.so.0" {
+		t.Fatalf("got %q", got)
+	}
+	if got := sonameAlias("libllama-common.so.0"); got != "" {
+		t.Fatalf("short name should not alias, got %q", got)
+	}
+	if got := sonameAlias("libllama-server-impl.so"); got != "" {
+		t.Fatalf("unversioned should not alias, got %q", got)
+	}
+}
+
 func TestSetupStaticBinaryNoHub(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "llama-server")
