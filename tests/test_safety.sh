@@ -69,7 +69,7 @@ export LLM_MODEL_DIR="$TMP/models"
 export LLM_ASSUME_YES=1
 export LLM_SERVER_TEST_STOP_AFTER_AI_TUNE_PRECLEANUP=1
 
-out=$("$GO_BIN" --cpu --ai-tune --port "$PORT" "$TMP/model.gguf" 2>&1 || true)
+out=$("$GO_BIN" --cpu --ai-tune --server-bin "$TMP/llama-server" --port "$PORT" "$TMP/model.gguf" 2>&1 || true)
 
 if ! kill -0 "$LISTENER_PID" 2>/dev/null; then
     echo "foreign listener was killed unexpectedly"
