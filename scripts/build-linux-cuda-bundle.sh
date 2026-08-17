@@ -52,23 +52,38 @@ else
     git -C "$IK_DIR" checkout --detach FETCH_HEAD
 fi
 echo "==> Configuring + building llama-server (CUDA)"
-# Devel images have nvcc but no driver. The stub satisfies link-time
-# libcuda.so.1; the real driver is loaded on the user's machine.
-stub_dir=""
-for d in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/x86_64-linux/lib/stubs; do
-    [[ -e "$d/libcuda.so" ]] && stub_dir="$d" && break
+# CI has nvcc, not the driver. -L stubs is not enough: ld then looks up
+# libcuda.so.1 as a DT_NEEDED of libggml.so and still misses it unless the
+# stub is on a default search path or rpath-link is set.
+stub=""
+for d in /usr/local/cuda/lib64/stubs \
+         /usr/local/cuda/targets/x86_64-linux/lib/stubs \
+         /usr/local/cuda-12.8/lib64/stubs; do
+    if [[ -e "$d/libcuda.so" ]]; then
+        stub="$d/libcuda.so"
+        break
+    fi
 done
-cmake_link=()
-if [[ -n "$stub_dir" ]]; then
-    [[ -e "$stub_dir/libcuda.so.1" ]] || ln -sfn libcuda.so "$stub_dir/libcuda.so.1"
-    export LIBRARY_PATH="$stub_dir${LIBRARY_PATH:+:$LIBRARY_PATH}"
-    cmake_link=(-DCMAKE_EXE_LINKER_FLAGS="-L${stub_dir}" -DCMAKE_SHARED_LINKER_FLAGS="-L${stub_dir}")
-    echo "==> Linking against CUDA driver stub in $stub_dir"
-fi
+[[ -n "$stub" ]] || { echo "Error: CUDA driver stub libcuda.so not found" >&2; exit 1; }
+for dest in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/local/lib; do
+    [[ -d "$dest" ]] || continue
+    ln -sfn "$stub" "$dest/libcuda.so"
+    ln -sfn "$stub" "$dest/libcuda.so.1"
+    echo "==> Installed driver stub at $dest/libcuda.so.1 -> $stub"
+    break
+done
+export LIBRARY_PATH="$(dirname "$stub")${LIBRARY_PATH:+:$LIBRARY_PATH}"
+# Fail in seconds, not after a two-hour compile, if the stub is unusable.
+echo 'int main(void){return 0;}' | cc -xc - -o /tmp/cuda-stub-probe -lcuda \
+    || { echo "Error: cc -lcuda cannot link the driver stub" >&2; exit 1; }
+rm -f /tmp/cuda-stub-probe
+stub_dir="$(dirname "$stub")"
+# Default FA kernels only. ALL_QUANTS made CI take ~2h per attempt.
 cmake -S "$IK_DIR" -B "$IK_DIR/build" \
     -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON \
-    -DGGML_CUDA_FA_ALL_QUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89" \
-    "${cmake_link[@]}"
+    "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89" \
+    -DCMAKE_EXE_LINKER_FLAGS="-L${stub_dir} -Wl,-rpath-link,${stub_dir}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-L${stub_dir} -Wl,-rpath-link,${stub_dir}"
 cmake --build "$IK_DIR/build" --config Release -j"$(nproc 2>/dev/null || echo 4)" -t llama-server
 
 SERVER="$IK_DIR/build/bin/llama-server"
