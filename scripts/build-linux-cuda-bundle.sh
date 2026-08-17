@@ -20,6 +20,14 @@ ASSET="ggrun-linux-x86_64-cuda.tar.gz"
 for tool in nvcc cmake go git; do
     command -v "$tool" >/dev/null 2>&1 || { echo "Error: '$tool' not found on PATH" >&2; exit 1; }
 done
+# ik_llama's ggml target asks for CUDA20. Ubuntu 22.04's CMake 3.22 cannot.
+cmake_ver="$(cmake --version | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)"
+cmake_maj="${cmake_ver%%.*}"
+cmake_min="${cmake_ver#*.}"
+if [ "${cmake_maj:-0}" -lt 3 ] || { [ "${cmake_maj}" -eq 3 ] && [ "${cmake_min%%.*}" -lt 25 ]; }; then
+    echo "Error: CMake >= 3.25 is required (have ${cmake_ver:-unknown})" >&2
+    exit 1
+fi
 
 # 1. Go launcher — package-release.sh bundles $ROOT_DIR/go/ggrun when present.
 echo "==> Building ggrun (Go launcher)"

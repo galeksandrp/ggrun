@@ -253,7 +253,7 @@ jobs:
     name: package ggrun-linux-x86_64-cuda.tar.gz
     needs: preflight
     runs-on: ubuntu-latest
-    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
     env:
       IK_LLAMA_REF: 1fddd12ba861c4815a8633f14d9c5670692099cc
       ASSET: ggrun-linux-x86_64-cuda.tar.gz
