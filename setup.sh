@@ -9,6 +9,12 @@
 
 set -euo pipefail
 
+# curl | bash should not stop for questions.
+if [[ ! -t 0 && -z "${LLM_SETUP_NONINTERACTIVE:-}" ]]; then
+    export LLM_SETUP_NONINTERACTIVE=1
+    export LLM_INSTALL_NONINTERACTIVE=1
+fi
+
 REPO="raketenkater/ggrun"
 REF="${LLM_SETUP_REF:-main}"
 TMP_DIR=""

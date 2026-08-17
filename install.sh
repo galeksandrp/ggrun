@@ -692,7 +692,77 @@ install_release_bundle() {
     (( found_backend ))
 }
 
-# Try CUDA, then Vulkan, then CPU release bundles. Auto never compiles.
+# ggml-org ships Linux CPU and Vulkan prebuilts, not Linux CUDA.
+# Used when a ggrun release has no matching bundle so the one-liner still
+# leaves a working llama-server.
+install_upstream_linux_prebuilt() {
+    local want="$1" api tmp archive url name server
+    [[ "$OS" == "Linux" ]] || return 1
+    [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v tar >/dev/null 2>&1 || return 1
+    case "$want" in
+        vulkan) name="ubuntu-vulkan-x64" ;;
+        cpu)    name="ubuntu-x64" ;;
+        *) return 1 ;;
+    esac
+    say "Trying ggml-org llama.cpp $want prebuilt..."
+    api="$(mktemp)"
+    if ! curl -fsSL -A ggrun-installer "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" -o "$api"; then
+        rm -f "$api"
+        return 1
+    fi
+    url="$(python3 - "$api" "$name" <<'PY' 2>/dev/null || true
+import json, sys
+want = sys.argv[2]
+data = json.load(open(sys.argv[1]))
+for a in data.get("assets") or []:
+    n = a.get("name") or ""
+    if n.endswith("bin-" + want + ".tar.gz") or ("bin-" + want + ".tar.gz" in n):
+        print(a.get("browser_download_url") or "")
+        break
+PY
+)"
+    rm -f "$api"
+    # grep fallback if python is missing
+    if [[ -z "$url" ]]; then
+        url="$(curl -fsSL -A ggrun-installer "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest" \
+            | grep -Eo 'https://github.com/ggml-org/llama.cpp/releases/download/[^"]+bin-ubuntu[^"]+\.tar\.gz' \
+            | grep -F "$name" | head -n 1 || true)"
+    fi
+    [[ -n "$url" ]] || return 1
+    tmp="$(mktemp -d -t ggrun-llama-prebuilt.XXXXXX)"
+    archive="$tmp/llama.tgz"
+    if ! curl -fL --retry 3 -A ggrun-installer "$url" -o "$archive"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    mkdir -p "$tmp/out"
+    if ! tar -xzf "$archive" -C "$tmp/out"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    server="$(find "$tmp/out" -type f -name llama-server -print -quit)"
+    if [[ -z "$server" || ! -f "$server" ]]; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    install -m 0755 "$server" "$INSTALL_DIR/llama-server"
+    while IFS= read -r lib; do
+        install -m 0644 "$lib" "$INSTALL_DIR/$(basename "$lib")"
+    done < <(find "$(dirname "$server")" -maxdepth 1 -type f \( -name 'lib*.so*' -o -name '*.so' \) 2>/dev/null | sort)
+    rm -rf "$tmp"
+    if ! "$INSTALL_DIR/llama-server" --version >/dev/null 2>&1; then
+        rm -f "$INSTALL_DIR/llama-server"
+        return 1
+    fi
+    BACKEND_CHOICE="$want"
+    ok "Installed ggml-org llama.cpp $want prebuilt"
+    return 0
+}
+
+# Try CUDA, then Vulkan, then CPU. Prefer ggrun releases, then ggml-org
+# Linux prebuilts. Auto does not compile.
 install_auto_release_backends() {
     local b
     while read -r b; do
@@ -700,11 +770,20 @@ install_auto_release_backends() {
         BACKEND_CHOICE="$b"
         say "Trying $b release bundle..."
         if install_release_bundle; then
+            if [[ -x "$INSTALL_DIR/llama-server" ]] && ! "$INSTALL_DIR/llama-server" --version >/dev/null 2>&1; then
+                warn "$b bundle installed but llama-server would not start; trying the next backend."
+                continue
+            fi
             ok "Installed $b backend from release"
             return 0
         fi
         warn "No $b release bundle; trying the next backend."
     done < <(auto_backend_candidates)
+    for b in vulkan cpu; do
+        if install_upstream_linux_prebuilt "$b"; then
+            return 0
+        fi
+    done
     return 1
 }
 
@@ -862,8 +941,7 @@ if [[ "$INSTALL_MODE" == "auto" || "$INSTALL_MODE" == "release" ]]; then
         if install_auto_release_backends; then
             RELEASE_INSTALLED=1
         else
-            warn "No CUDA, Vulkan, or CPU release bundle found. Installing the launcher only."
-            warn "A later release with ggrun-linux-x86_64-cuda.tar.gz is needed for one-command CUDA."
+            warn "No prebuilt CUDA/Vulkan/CPU backend could be downloaded."
         fi
     elif install_release_bundle; then
         RELEASE_INSTALLED=1
