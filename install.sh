@@ -13,7 +13,8 @@
 #
 # Flags (env vars):
 #   LLM_INSTALL_BACKEND=auto|cuda|vulkan|metal|cpu|skip   default: auto
-#     auto on Linux: CUDA release bundle, then Vulkan, then CPU. No compile.
+#     auto: install both ik_llama.cpp (CUDA) and llama.cpp (Vulkan/CPU)
+#           when the files exist. No compile.
 #   LLM_INSTALL_MODE=auto|release|build|scripts           default: auto
 #   LLM_INSTALL_RELEASE=latest|vX.Y.Z                      default: latest
 #   LLM_INSTALL_RELEASE_DIR=<dir>                          local bundle dir (tests/offline)
@@ -611,7 +612,7 @@ install_legacy_bash_shim() {
 }
 
 install_release_bundle() {
-    local platform asset url sums_url tmp archive payload_root found_backend=0
+    local platform asset url sums_url tmp archive payload_root found_backend=0 dest_name="${1:-}"
     [[ "$BACKEND_CHOICE" == "skip" ]] && return 1
     # CUDA release bundles are published for supported Linux x86_64 hosts. If a
     # matching bundle is unavailable, auto mode can still fall back to Vulkan or
@@ -675,28 +676,65 @@ install_release_bundle() {
         install_go_as_main "$INSTALL_DIR/llm-server-go" || true
     fi
 
+    if [[ -z "$dest_name" ]]; then
+        case "$BACKEND_CHOICE" in
+            cuda) dest_name="ik_llama-server-cuda" ;;
+            vulkan) dest_name="llama-server-vulkan" ;;
+            *) dest_name="llama-server" ;;
+        esac
+    fi
     for candidate in "$payload_root/llama-server" "$payload_root/bin/llama-server"; do
         if [[ -f "$candidate" ]]; then
-            install -m 0755 "$candidate" "$INSTALL_DIR/llama-server"
-            found_backend=1
-            ok "Installed bundled llama-server"
+            if place_isolated_backend "$candidate" "$dest_name"; then
+                found_backend=1
+                ok "Installed $dest_name from $asset"
+            fi
             break
         fi
     done
-    while IFS= read -r lib; do
-        install -m 0644 "$lib" "$INSTALL_DIR/$(basename "$lib")"
-        ok "Installed $(basename "$lib")"
-    done < <(find "$payload_root" -maxdepth 2 -type f \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
 
     rm -rf "$tmp"
     (( found_backend ))
+}
+
+# Keep each backend's shared libraries next to its binary so ik_llama.cpp
+# and llama.cpp can both live in .bin without overwriting each other.
+place_isolated_backend() {
+    local src="$1" dest_name="$2" box
+    [[ -f "$src" && -n "$dest_name" ]] || return 1
+    box="$INSTALL_DIR/backends/$dest_name"
+    mkdir -p "$box"
+    install -m 0755 "$src" "$box/llama-server"
+    while IFS= read -r lib; do
+        install -m 0644 "$lib" "$box/$(basename "$lib")"
+    done < <(find "$(dirname "$src")" -maxdepth 1 -type f \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
+    ln -sfn "backends/$dest_name/llama-server" "$INSTALL_DIR/$dest_name"
+    if ! env LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$box/llama-server" --version >/dev/null 2>&1; then
+        rm -f "$INSTALL_DIR/$dest_name"
+        return 1
+    fi
+    return 0
+}
+
+link_default_llama_server() {
+    local src=""
+    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+        src="ik_llama-server-cuda"
+    elif [[ -e "$INSTALL_DIR/llama-server-vulkan" ]]; then
+        src="llama-server-vulkan"
+    elif [[ -e "$INSTALL_DIR/llama-server-cuda" ]]; then
+        src="llama-server-cuda"
+    fi
+    [[ -n "$src" ]] || return 0
+    [[ -e "$INSTALL_DIR/llama-server" ]] && return 0
+    ln -sfn "$src" "$INSTALL_DIR/llama-server"
 }
 
 # ggml-org ships Linux CPU and Vulkan prebuilts, not Linux CUDA.
 # Used when a ggrun release has no matching bundle so the one-liner still
 # leaves a working llama-server.
 install_upstream_linux_prebuilt() {
-    local want="$1" api tmp archive url name server
+    local want="$1" dest="${2:-}" api tmp archive url name server
     [[ "$OS" == "Linux" ]] || return 1
     [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]] || return 1
     command -v curl >/dev/null 2>&1 || return 1
@@ -747,44 +785,47 @@ PY
         rm -rf "$tmp"
         return 1
     fi
-    install -m 0755 "$server" "$INSTALL_DIR/llama-server"
-    while IFS= read -r lib; do
-        install -m 0644 "$lib" "$INSTALL_DIR/$(basename "$lib")"
-    done < <(find "$(dirname "$server")" -maxdepth 1 -type f \( -name 'lib*.so*' -o -name '*.so' \) 2>/dev/null | sort)
-    rm -rf "$tmp"
-    if ! "$INSTALL_DIR/llama-server" --version >/dev/null 2>&1; then
-        rm -f "$INSTALL_DIR/llama-server"
+    if [[ -z "$dest" ]]; then
+        case "$want" in
+            vulkan) dest="llama-server-vulkan" ;;
+            *) dest="llama-server" ;;
+        esac
+    fi
+    if ! place_isolated_backend "$server" "$dest"; then
+        rm -rf "$tmp"
         return 1
     fi
+    rm -rf "$tmp"
     BACKEND_CHOICE="$want"
-    ok "Installed ggml-org llama.cpp $want prebuilt"
+    ok "Installed ggml-org llama.cpp $want as $dest"
     return 0
 }
 
-# Try CUDA, then Vulkan, then CPU. Prefer ggrun releases, then ggml-org
-# Linux prebuilts. Auto does not compile.
+# Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan or CPU).
 install_auto_release_backends() {
-    local b
-    while read -r b; do
-        [[ -n "$b" ]] || continue
-        BACKEND_CHOICE="$b"
-        say "Trying $b release bundle..."
-        if install_release_bundle; then
-            if [[ -x "$INSTALL_DIR/llama-server" ]] && ! "$INSTALL_DIR/llama-server" --version >/dev/null 2>&1; then
-                warn "$b bundle installed but llama-server would not start; trying the next backend."
-                continue
-            fi
-            ok "Installed $b backend from release"
-            return 0
+    local got=0
+    if has_nvidia_gpu; then
+        BACKEND_CHOICE="cuda"
+        say "Installing ik_llama.cpp (CUDA)..."
+        if install_release_bundle ik_llama-server-cuda; then
+            got=1
+        else
+            warn "No ggrun CUDA bundle. Publish ggrun-linux-x86_64-cuda.tar.gz for ik_llama.cpp."
         fi
-        warn "No $b release bundle; trying the next backend."
-    done < <(auto_backend_candidates)
-    for b in vulkan cpu; do
-        if install_upstream_linux_prebuilt "$b"; then
-            return 0
+    fi
+    BACKEND_CHOICE="vulkan"
+    say "Installing llama.cpp (Vulkan)..."
+    if install_release_bundle llama-server-vulkan || install_upstream_linux_prebuilt vulkan llama-server-vulkan; then
+        got=1
+    else
+        BACKEND_CHOICE="cpu"
+        say "Installing llama.cpp (CPU)..."
+        if install_release_bundle llama-server || install_upstream_linux_prebuilt cpu llama-server; then
+            got=1
         fi
-    done
-    return 1
+    fi
+    link_default_llama_server
+    (( got ))
 }
 
 run_privileged() {

@@ -100,8 +100,8 @@ if [[ "$NONINTERACTIVE" != "1" && -r /dev/tty ]]; then
     APP_ENV="$APP_HOME/.env.sh"
 
     say ""
-    say "Backend (auto = CUDA if you have an NVIDIA GPU, else Vulkan, else CPU)."
-    say "auto downloads a prebuilt server. It does not compile."
+    say "Backend: auto installs both ik_llama.cpp (CUDA) and llama.cpp (Vulkan/CPU)"
+    say "when those prebuilts exist. ggrun picks the right one per model."
     if [[ "$PLATFORM" == "linux" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
         say "No nvidia-smi in PATH. CUDA needs an NVIDIA driver. auto will use Vulkan or CPU."
     fi
@@ -181,9 +181,12 @@ fi
 
 backend_config="$BACKEND"
 if [[ "$backend_config" == "auto" ]]; then
-    if [[ "$backend_real" == *ik_llama.cpp* ]]; then
+    # Both servers may be present. Leave auto so ggrun can pick per model.
+    if [[ -e "$APP_BIN/ik_llama-server-cuda" && -e "$APP_BIN/llama-server-vulkan" ]]; then
+        backend_config="auto"
+    elif [[ "$backend_real" == *ik_llama.cpp* || -e "$APP_BIN/ik_llama-server-cuda" ]]; then
         backend_config="ik_llama"
-    elif [[ "$backend_real" == *vulkan* || "$backend_real" == *build-vulkan* ]]; then
+    elif [[ "$backend_real" == *vulkan* || -e "$APP_BIN/llama-server-vulkan" ]]; then
         backend_config="vulkan"
     elif [[ "$PLATFORM" == "mac" ]]; then
         backend_config="llama"
@@ -242,10 +245,13 @@ if ! LLM_APP_HOME="$APP_HOME" "$APP_BIN/ggrun" detect >/dev/null 2>&1; then
     err "Installed ggrun failed hardware detection. See log: $LOG_FILE"
     exit 1
 fi
-if [[ -n "$backend_bin" ]] && ! "$backend_bin" --version >/dev/null 2>&1; then
-    err "Installed backend could not start: $backend_bin"
-    err "This usually means the bundle is incompatible or a required runtime library is missing. See log: $LOG_FILE"
-    exit 1
+if [[ -n "$backend_bin" ]]; then
+    backend_dir="$(dirname "$(readlink -f "$backend_bin" 2>/dev/null || printf '%s' "$backend_bin")")"
+    if ! env LD_LIBRARY_PATH="$backend_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$backend_bin" --version >/dev/null 2>&1; then
+        err "Installed backend could not start: $backend_bin"
+        err "This usually means the bundle is incompatible or a required runtime library is missing. See log: $LOG_FILE"
+        exit 1
+    fi
 fi
 ok_msg="CLI, hardware detection, and backend startup checks passed"
 say "  ✓ $ok_msg"

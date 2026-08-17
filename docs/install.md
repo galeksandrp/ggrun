@@ -67,9 +67,11 @@ ships these archives, checksummed in `SHA256SUMS`:
 | macOS arm64 | Metal |
 | Windows x86_64 | CPU |
 
-Linux NVIDIA builds the CUDA backend from source when the release has no
-`ggrun-linux-x86_64-cuda.tar.gz`. Windows CUDA: `install.ps1 -Backend cuda`
-(prebuilt llama.cpp CUDA if present, otherwise a local build).
+Linux `auto` installs both when the files exist: ik_llama.cpp (CUDA) as
+`ik_llama-server-cuda` and llama.cpp (Vulkan or CPU) as `llama-server-vulkan`.
+ggrun picks the matching server per model. Linux CUDA comes from
+`ggrun-linux-x86_64-cuda.tar.gz` on the release. Windows CUDA:
+`install.ps1 -Backend cuda`.
 
 ## Classic install to `~/.local/bin`
 
