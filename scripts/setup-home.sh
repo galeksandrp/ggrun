@@ -285,7 +285,7 @@ fi
 if [[ -n "$backend_bin" ]]; then
     backend_dir="$(dirname "$(readlink -f "$backend_bin" 2>/dev/null || printf '%s' "$backend_bin")")"
     if ! env LD_LIBRARY_PATH="$backend_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$backend_bin" --version >/dev/null 2>&1; then
-        say "  ⚠ Backend installed at $backend_bin but --version failed (missing GPU runtime is OK)"
+        say "  ⚠ Backend at $backend_bin did not start (--version). GPU driver/ICD may be missing; ggrun still runs if a CPU backend is installed."
     fi
 fi
 ok_msg="CLI, hardware detection, and backend startup checks passed"

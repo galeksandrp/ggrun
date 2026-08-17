@@ -85,6 +85,7 @@ eval "$(
         /^FOUND_NVIDIA_SMI=/ {keep=1}
         /^_path_score\(\)|^_better_server\(\)|^classify_llama_bin\(\)|^_collect_llama_bins\(\)/ {keep=1}
         /^scan_system_installs\(\)|^link_existing_backend\(\)|^adopt_system_backends\(\)|^link_default_llama_server\(\)/ {keep=1}
+        /^classify_probe_output\(\)|^probe_llama_server\(\)|^backend_probe_kind\(\)|^copy_backend_libs\(\)/ {keep=1}
         keep {print}
         keep && /^}/ {keep=0}
     ' "$ROOT/install.sh"

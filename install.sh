@@ -13,8 +13,9 @@
 #
 # Flags (env vars):
 #   LLM_INSTALL_BACKEND=auto|cuda|vulkan|metal|cpu|skip   default: auto
-#     auto: install both ik_llama.cpp (CUDA) and llama.cpp (Vulkan/CPU)
-#           when the files exist. No compile.
+#     auto: reuse local llama.cpp/ik_llama, then install CUDA/Vulkan/CPU
+#           prebuilts. A backend counts only if it starts on this machine,
+#           or only needs a GPU driver. CPU is installed when nothing runs.
 #   LLM_INSTALL_MODE=auto|release|build|scripts           default: auto
 #   LLM_INSTALL_RELEASE=latest|vX.Y.Z                      default: latest
 #   LLM_INSTALL_RELEASE_DIR=<dir>                          local bundle dir (tests/offline)
@@ -1076,22 +1077,88 @@ install_release_bundle() {
     (( found_backend ))
 }
 
-# Keep each backend's shared libraries next to its binary so ik_llama.cpp
-# and llama.cpp can both live in .bin without overwriting each other.
-place_isolated_backend() {
-    local src="$1" dest_name="$2" box
-    [[ -f "$src" && -n "$dest_name" ]] || return 1
-    box="$INSTALL_DIR/backends/$dest_name"
-    mkdir -p "$box"
-    install -m 0755 "$src" "$box/llama-server"
-    while IFS= read -r lib; do
-        if [[ -L "$lib" ]]; then
-            cp -a "$lib" "$box/$(basename "$lib")"
-        else
-            install -m 0644 "$lib" "$box/$(basename "$lib")"
+host_libc() {
+    if [[ -e /lib/ld-musl-x86_64.so.1 || -e /lib/ld-musl-aarch64.so.1 || -e /lib64/ld-musl-x86_64.so.1 ]]; then
+        printf 'musl\n'
+        return 0
+    fi
+    printf 'glibc\n'
+}
+
+# ggml-org and ggrun Linux prebuilts are glibc x86_64. Other hosts reuse a
+# local llama-server or compile.
+host_can_run_ubuntu_prebuilt() {
+    [[ "${OS:-}" == "Linux" ]] || return 1
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) return 1 ;;
+    esac
+    [[ "$(host_libc)" == "glibc" ]]
+}
+
+# runs: binary starts on this machine.
+# needs_gpu: binary is valid but Vulkan/CUDA runtime is missing.
+# broken: wrong arch, musl vs glibc, or missing the bundle's own libraries.
+classify_probe_output() {
+    local out="$1"
+    if [[ "$out" == *"Exec format error"* || "$out" == *"cannot execute binary file"* ]]; then
+        printf 'broken\n'
+        return 0
+    fi
+    if [[ "$out" == *GLIBC_* || "$out" == *"ld-linux"* && "$out" == *"not found"* ]]; then
+        printf 'broken\n'
+        return 0
+    fi
+    if [[ "$out" == *"cannot open shared object file"* || "$out" == *"error while loading shared libraries"* ]]; then
+        if [[ "$out" == *libvulkan* || "$out" == *libcuda* || "$out" == *libcudart* \
+            || "$out" == *libnvidia* || "$out" == *vulkan* || "$out" == *ICD* \
+            || "$out" == *icd* || "$out" == *cuInit* ]]; then
+            printf 'needs_gpu\n'
+            return 0
         fi
-    done < <(find "$(dirname "$src")" -maxdepth 1 \( -type f -o -type l \) \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
-    # Bundles often ship libfoo.so.0.0.1 without the SONAME libfoo.so.0.
+        printf 'broken\n'
+        return 0
+    fi
+    if [[ "$out" == *libvulkan* || "$out" == *libcuda* || "$out" == *libcudart* \
+        || "$out" == *libnvidia* || "$out" == *vulkan* || "$out" == *ICD* \
+        || "$out" == *icd* || "$out" == *cuInit* ]]; then
+        printf 'needs_gpu\n'
+        return 0
+    fi
+    if [[ "$out" == *[Vv]ersion* && "$out" != *"not found"* ]]; then
+        printf 'runs\n'
+        return 0
+    fi
+    printf 'needs_gpu\n'
+}
+
+probe_llama_server() {
+    local bin="$1" libdir="${2:-}" out=""
+    [[ -z "$libdir" ]] && libdir="$(dirname "$bin")"
+    [[ -x "$bin" ]] || { printf 'broken\n'; return 1; }
+    if command -v timeout >/dev/null 2>&1; then
+        out="$(timeout 8 env LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$bin" --version 2>&1)" || true
+    else
+        out="$(env LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$bin" --version 2>&1)" || true
+    fi
+    local kind
+    kind="$(classify_probe_output "$out")"
+    printf '%s\n' "$kind"
+    [[ "$kind" != "broken" ]]
+}
+
+copy_backend_libs() {
+    local src_dir="$1" box="$2" extra lib
+    for extra in "$src_dir" "$src_dir/lib" "$(dirname "$src_dir")/lib"; do
+        [[ -d "$extra" ]] || continue
+        while IFS= read -r lib; do
+            if [[ -L "$lib" ]]; then
+                cp -a "$lib" "$box/$(basename "$lib")"
+            else
+                install -m 0644 "$lib" "$box/$(basename "$lib")"
+            fi
+        done < <(find "$extra" -maxdepth 1 \( -type f -o -type l \) \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
+    done
     local f base soname
     for f in "$box"/lib*.so.*; do
         [[ -e "$f" ]] || continue
@@ -1100,39 +1167,62 @@ place_isolated_backend() {
         [[ -n "$soname" && "$soname" != "$base" && ! -e "$box/$soname" ]] || continue
         ln -sfn "$base" "$box/$soname"
     done
+}
+
+backend_probe_kind() {
+    local name="$1" p t
+    p="$INSTALL_DIR/$name"
+    [[ -e "$p" || -L "$p" ]] || { printf 'missing\n'; return 1; }
+    t="$(_discover_abspath "$p")"
+    probe_llama_server "$t" "$(dirname "$t")"
+}
+
+# Keep each backend's shared libraries next to its binary so ik_llama.cpp
+# and llama.cpp can both live in .bin without overwriting each other.
+place_isolated_backend() {
+    local src="$1" dest_name="$2" box kind
+    [[ -f "$src" && -n "$dest_name" ]] || return 1
+    box="$INSTALL_DIR/backends/$dest_name"
+    mkdir -p "$box"
+    install -m 0755 "$src" "$box/llama-server"
+    copy_backend_libs "$(dirname "$src")" "$box"
     ln -sfn "backends/$dest_name/llama-server" "$INSTALL_DIR/$dest_name"
-    # --version can fail if a Vulkan ICD or CUDA driver is missing. The
-    # binary is still the install we wanted; ggrun will use it when the
-    # runtime is present. Missing libllama/libggml from the bundle is not
-    # that case — treat it as a failed place so a complete prebuilt can run.
     [[ -x "$box/llama-server" && -e "$INSTALL_DIR/$dest_name" ]] || return 1
-    local ver_out=""
-    if ! ver_out="$(env LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$box/llama-server" --version 2>&1)"; then
-        if [[ "$ver_out" == *"cannot open shared object file"* ]] && \
-           [[ "$ver_out" == *libllama* || "$ver_out" == *libggml* || "$ver_out" == *libmtmd* ]]; then
-            warn "$dest_name is missing its own libraries: ${ver_out%%$'\n'*}"
+    kind="$(probe_llama_server "$box/llama-server" "$box" || true)"
+    case "$kind" in
+        runs) return 0 ;;
+        needs_gpu)
+            warn "$dest_name installed but needs a GPU runtime on this machine (kept; CPU backend will still be installed if nothing runs)"
+            return 0
+            ;;
+        *)
+            warn "$dest_name cannot start on this machine (wrong libc/arch or incomplete bundle)"
             rm -f "$INSTALL_DIR/$dest_name"
             rm -rf "$box"
             return 1
-        fi
-        warn "$dest_name installed but --version failed (missing GPU runtime is OK; will still use this binary)"
-        [[ -n "$ver_out" ]] && warn "${ver_out%%$'\n'*}"
-    fi
-    return 0
+            ;;
+    esac
 }
 
 link_default_llama_server() {
-    local src=""
-    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
-        src="ik_llama-server-cuda"
-    elif [[ -e "$INSTALL_DIR/llama-server-vulkan" ]]; then
-        src="llama-server-vulkan"
-    elif [[ -e "$INSTALL_DIR/llama-server-cuda" ]]; then
-        src="llama-server-cuda"
+    local name t kind best=""
+    for name in ik_llama-server-cuda llama-server-vulkan llama-server-cuda llama-server; do
+        [[ -e "$INSTALL_DIR/$name" || -L "$INSTALL_DIR/$name" ]] || continue
+        kind="$(backend_probe_kind "$name" || true)"
+        if [[ "$kind" == "runs" ]]; then
+            best="$name"
+            break
+        fi
+    done
+    if [[ -z "$best" ]]; then
+        for name in ik_llama-server-cuda llama-server-vulkan llama-server-cuda llama-server; do
+            [[ -e "$INSTALL_DIR/$name" || -L "$INSTALL_DIR/$name" ]] || continue
+            best="$name"
+            break
+        done
     fi
-    [[ -n "$src" ]] || return 0
-    [[ -e "$INSTALL_DIR/llama-server" ]] && return 0
-    ln -sfn "$src" "$INSTALL_DIR/llama-server"
+    [[ -n "$best" && "$best" != "llama-server" ]] || return 0
+    ln -sfn "$best" "$INSTALL_DIR/llama-server"
 }
 
 # ggml-org ships Linux CPU and Vulkan prebuilts, not Linux CUDA.
@@ -1140,8 +1230,7 @@ link_default_llama_server() {
 # leaves a working llama-server.
 install_upstream_linux_prebuilt() {
     local want="$1" dest="${2:-}" api tmp archive url name server
-    [[ "$OS" == "Linux" ]] || return 1
-    [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "amd64" ]] || return 1
+    host_can_run_ubuntu_prebuilt || return 1
     command -v curl >/dev/null 2>&1 || return 1
     command -v tar >/dev/null 2>&1 || return 1
     case "$want" in
@@ -1206,9 +1295,20 @@ PY
     return 0
 }
 
-# Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan or CPU).
+backend_kind_runs() {
+    local name="$1" kind
+    kind="$(backend_probe_kind "$name" || true)"
+    [[ "$kind" == "runs" ]]
+}
+
+# Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan and/or CPU).
+# GPU prebuilts that only need a driver are kept. Something that actually
+# starts on this machine (usually CPU) is installed when nothing else runs.
 install_auto_release_backends() {
     local got=0
+    if ! host_can_run_ubuntu_prebuilt && [[ "$OS" == "Linux" ]]; then
+        warn "Linux prebuilts are glibc x86_64. This host is $(uname -m) $(host_libc); using a local llama-server or a source build."
+    fi
     if installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan \
         || installed_real_server llama-server || installed_real_server llama-server-cuda; then
         got=1
@@ -1219,26 +1319,36 @@ install_auto_release_backends() {
         if install_release_bundle ik_llama-server-cuda; then
             got=1
         else
-            warn "No ggrun CUDA bundle. Publish ggrun-linux-x86_64-cuda.tar.gz for ik_llama.cpp."
+            warn "No ggrun CUDA bundle for this host. NVIDIA is still usable once a CUDA llama-server is present."
         fi
     elif installed_real_server ik_llama-server-cuda; then
         say "Keeping existing ik_llama.cpp (CUDA)."
     fi
-    if ! installed_real_server llama-server-vulkan && ! installed_real_server llama-server; then
+    if ! installed_real_server llama-server-vulkan; then
         BACKEND_CHOICE="vulkan"
         say "Installing llama.cpp (Vulkan)..."
         if install_release_bundle llama-server-vulkan || install_upstream_linux_prebuilt vulkan llama-server-vulkan; then
             got=1
         else
-            BACKEND_CHOICE="cpu"
-            say "Installing llama.cpp (CPU)..."
-            if install_release_bundle llama-server || install_upstream_linux_prebuilt cpu llama-server; then
-                got=1
-            fi
+            warn "No Vulkan llama.cpp prebuilt for this host."
         fi
     else
-        say "Keeping existing llama.cpp backend."
-        installed_real_server llama-server-vulkan && BACKEND_CHOICE="vulkan"
+        say "Keeping existing llama.cpp Vulkan backend."
+    fi
+    if ! backend_kind_runs ik_llama-server-cuda && ! backend_kind_runs llama-server-vulkan \
+        && ! backend_kind_runs llama-server-cuda && ! backend_kind_runs llama-server; then
+        BACKEND_CHOICE="cpu"
+        say "Installing llama.cpp (CPU) so ggrun can start without a GPU runtime..."
+        if install_release_bundle llama-server || install_upstream_linux_prebuilt cpu llama-server; then
+            got=1
+        fi
+    fi
+    if backend_kind_runs llama-server-vulkan; then
+        BACKEND_CHOICE="vulkan"
+    elif backend_kind_runs ik_llama-server-cuda; then
+        BACKEND_CHOICE="cuda"
+    elif backend_kind_runs llama-server; then
+        BACKEND_CHOICE="cpu"
     fi
     link_default_llama_server
     if installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan || installed_real_server llama-server; then
