@@ -101,7 +101,8 @@ if [[ "$NONINTERACTIVE" != "1" && -r /dev/tty ]]; then
 
     say ""
     say "Backend: auto uses llama.cpp / ik_llama.cpp / forks / CUDA already on"
-    say "this machine, then downloads the rest. ggrun picks the right one per model."
+    say "this machine, then installs what is missing (Vulkan loader, CUDA toolkit,"
+    say "prebuilts, or a CUDA source build if nvcc is here)."
     if [[ -x "$ROOT/install.sh" ]]; then
         disc="$(mktemp)"
         if LLM_INSTALL_NONINTERACTIVE=1 "$ROOT/install.sh" --discover >"$disc" 2>/dev/null; then

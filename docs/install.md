@@ -69,12 +69,11 @@ ships these archives, checksummed in `SHA256SUMS`:
 
 Linux `auto` first searches the machine for an existing `llama-server`
 (ik_llama.cpp, llama.cpp, and forks) plus the NVIDIA driver and CUDA toolkit.
-It reuses those, then downloads what is missing. A prebuilt only counts if it
-starts on this host, or if it only needs a GPU driver. When Vulkan/CUDA cannot
-run (no ICD, Alpine/musl, aarch64, incomplete libs), CPU is installed so
-`ggrun` still works. Linux CUDA bundles come from
-`ggrun-linux-x86_64-cuda.tar.gz` on the release. Windows CUDA:
-`install.ps1 -Backend cuda`.
+It reuses those, then installs what is missing: Vulkan loader/ICD via the
+distro package manager, a CUDA/Vulkan/CPU prebuilt, and ik_llama.cpp from
+source when `nvcc` is already there. A prebuilt only counts if it starts on
+this host. CPU is last if nothing else runs. The NVIDIA proprietary driver is
+never auto-installed. Windows CUDA: `install.ps1 -Backend cuda`.
 
 ## Classic install to `~/.local/bin`
 

@@ -430,17 +430,34 @@ has_cuda_toolkit() {
     "$nvcc" --version >/dev/null 2>&1
 }
 
+vulkan_loader_present() {
+    local lib
+    for lib in /usr/lib64/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
+               /usr/lib/aarch64-linux-gnu/libvulkan.so.1 /usr/lib/libvulkan.so.1 \
+               /usr/local/lib/libvulkan.so.1 /usr/local/lib64/libvulkan.so.1; do
+        [[ -e "$lib" ]] && return 0
+    done
+    ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1' && return 0
+    return 1
+}
+
+vulkan_icd_present() {
+    local f
+    for f in /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json \
+             /usr/lib64/nvidia/icd.d/*.json /usr/share/nvidia/nv_vulkan_wrapper.json; do
+        [[ -e "$f" ]] && return 0
+    done
+    return 1
+}
+
 vulkan_available() {
-    local info lib
+    local info
     info="$(command -v vulkaninfo 2>/dev/null || true)"
     [[ -z "$info" && -x /usr/bin/vulkaninfo ]] && info=/usr/bin/vulkaninfo
     if [[ -n "$info" ]]; then
         "$info" --summary 2>/dev/null | grep -qi "GPU\|deviceName" && return 0
     fi
-    for lib in /usr/lib64/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /usr/lib/libvulkan.so.1; do
-        [[ -e "$lib" ]] && return 0
-    done
-    return 1
+    vulkan_loader_present && vulkan_icd_present
 }
 
 has_nvidia_gpu() {
@@ -1301,9 +1318,121 @@ backend_kind_runs() {
     [[ "$kind" == "runs" ]]
 }
 
+install_distro_packages() {
+    local pkgs=("$@")
+    [[ ${#pkgs[@]} -gt 0 ]] || return 1
+    if command -v apt-get >/dev/null 2>&1; then
+        run_privileged apt-get update && run_privileged apt-get install -y "${pkgs[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        run_privileged dnf install -y "${pkgs[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        run_privileged yum install -y "${pkgs[@]}"
+    elif command -v pacman >/dev/null 2>&1; then
+        run_privileged pacman -Sy --needed --noconfirm "${pkgs[@]}"
+    elif command -v zypper >/dev/null 2>&1; then
+        run_privileged zypper install -y "${pkgs[@]}"
+    else
+        return 1
+    fi
+}
+
+vulkan_runtime_packages() {
+    if command -v apt-get >/dev/null 2>&1; then
+        printf '%s\n' libvulkan1 vulkan-tools
+        has_nvidia_gpu || printf '%s\n' mesa-vulkan-drivers
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        printf '%s\n' vulkan-loader vulkan-tools
+        has_nvidia_gpu || printf '%s\n' mesa-vulkan-drivers
+    elif command -v pacman >/dev/null 2>&1; then
+        printf '%s\n' vulkan-icd-loader vulkan-tools
+        has_nvidia_gpu || printf '%s\n' vulkan-intel vulkan-radeon
+    elif command -v zypper >/dev/null 2>&1; then
+        printf '%s\n' libvulkan1 vulkan-tools
+        has_nvidia_gpu || printf '%s\n' Mesa-vulkan-device-select
+    fi
+}
+
+cuda_toolkit_packages() {
+    if command -v apt-get >/dev/null 2>&1; then
+        printf '%s\n' nvidia-cuda-toolkit
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        printf '%s\n' cuda-toolkit
+    elif command -v pacman >/dev/null 2>&1; then
+        printf '%s\n' cuda
+    elif command -v zypper >/dev/null 2>&1; then
+        printf '%s\n' cuda
+    fi
+}
+
+# Install Vulkan loader + ICD when the GPU binary cannot start without them.
+# Never installs the NVIDIA proprietary driver.
+ensure_vulkan_runtime() {
+    vulkan_available && return 0
+    [[ "$OS" == "Linux" ]] || return 1
+    [[ "$DEPS_MODE" == "skip" ]] && return 1
+    local pkgs=()
+    mapfile -t pkgs < <(vulkan_runtime_packages)
+    [[ ${#pkgs[@]} -gt 0 ]] || return 1
+    say "Vulkan loader/ICD is not installed. llama.cpp Vulkan needs it on this distro."
+    if (( NONINTERACTIVE )) && [[ "$DEPS_MODE" != "install" ]]; then
+        warn "Install: ${pkgs[*]}"
+        return 1
+    fi
+    if [[ "$DEPS_MODE" == "install" ]] || ask "Install ${pkgs[*]} with the system package manager? [Y/n]" y; then
+        say "Installing Vulkan runtime: ${pkgs[*]}"
+        install_distro_packages "${pkgs[@]}" || return 1
+    else
+        return 1
+    fi
+    vulkan_available
+}
+
+# Install nvcc only when this machine already has an NVIDIA driver.
+ensure_cuda_toolkit() {
+    has_cuda_toolkit && return 0
+    has_nvidia_gpu || return 1
+    [[ "$OS" == "Linux" ]] || return 1
+    [[ "$DEPS_MODE" == "skip" ]] && return 1
+    local pkgs=()
+    mapfile -t pkgs < <(cuda_toolkit_packages)
+    [[ ${#pkgs[@]} -gt 0 ]] || return 1
+    say "CUDA toolkit (nvcc) is not installed. Needed to build ik_llama.cpp."
+    if (( NONINTERACTIVE )) && [[ "$DEPS_MODE" != "install" ]]; then
+        warn "Install: ${pkgs[*]}"
+        return 1
+    fi
+    local default=n
+    [[ "$BACKEND_REQUEST" == "cuda" ]] && default=y
+    if [[ "$DEPS_MODE" == "install" ]] || ask "Install ${pkgs[*]}? This is a large download. [Y/n]" "$default"; then
+        say "Installing CUDA toolkit: ${pkgs[*]}"
+        install_distro_packages "${pkgs[@]}" || return 1
+    else
+        return 1
+    fi
+    has_cuda_toolkit
+}
+
+# No published Linux CUDA tarball yet: build ik_llama.cpp when nvcc is here.
+install_cuda_backend_from_source() {
+    has_cuda_toolkit || return 1
+    BACKEND_CHOICE="cuda"
+    BACKEND_REPO="https://github.com/ikawrakow/ik_llama.cpp.git"
+    BACKEND_DIR="$BACKEND_ROOT/ik_llama.cpp"
+    BACKEND_BUILD="$BACKEND_DIR/build"
+    BACKEND_CMAKE=(-DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON)
+    say "Building ik_llama.cpp from source (CUDA toolkit is on this machine)..."
+    build_backend || return 1
+    local built
+    built="$(backend_server_path)"
+    [[ -x "$built" ]] || return 1
+    built="$(_discover_abspath "$built")"
+    ln -sfn "$built" "$INSTALL_DIR/ik_llama-server-cuda"
+    ok "Installed ik_llama.cpp CUDA at $built"
+}
+
 # Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan and/or CPU).
-# GPU prebuilts that only need a driver are kept. Something that actually
-# starts on this machine (usually CPU) is installed when nothing else runs.
+# Missing Vulkan loader/ICD and (when asked) CUDA toolkit are installed via
+# the distro. Missing ik_llama is built when nvcc is present. CPU is last.
 install_auto_release_backends() {
     local got=0
     if ! host_can_run_ubuntu_prebuilt && [[ "$OS" == "Linux" ]]; then
@@ -1313,17 +1442,31 @@ install_auto_release_backends() {
         || installed_real_server llama-server || installed_real_server llama-server-cuda; then
         got=1
     fi
+
+    if ! vulkan_available; then
+        ensure_vulkan_runtime && ok "Vulkan runtime is installed" || true
+    fi
+
     if has_nvidia_gpu && ! installed_real_server ik_llama-server-cuda; then
         BACKEND_CHOICE="cuda"
         say "Installing ik_llama.cpp (CUDA)..."
         if install_release_bundle ik_llama-server-cuda; then
             got=1
         else
-            warn "No ggrun CUDA bundle for this host. NVIDIA is still usable once a CUDA llama-server is present."
+            warn "No published ggrun CUDA bundle for this host."
+            if ! has_cuda_toolkit; then
+                ensure_cuda_toolkit || true
+            fi
+            if has_cuda_toolkit && install_cuda_backend_from_source; then
+                got=1
+            else
+                warn "CUDA llama-server is still missing. Install the NVIDIA driver + CUDA toolkit, or wait for ggrun-linux-x86_64-cuda.tar.gz."
+            fi
         fi
     elif installed_real_server ik_llama-server-cuda; then
         say "Keeping existing ik_llama.cpp (CUDA)."
     fi
+
     if ! installed_real_server llama-server-vulkan; then
         BACKEND_CHOICE="vulkan"
         say "Installing llama.cpp (Vulkan)..."
@@ -1335,6 +1478,7 @@ install_auto_release_backends() {
     else
         say "Keeping existing llama.cpp Vulkan backend."
     fi
+
     if ! backend_kind_runs ik_llama-server-cuda && ! backend_kind_runs llama-server-vulkan \
         && ! backend_kind_runs llama-server-cuda && ! backend_kind_runs llama-server; then
         BACKEND_CHOICE="cpu"
