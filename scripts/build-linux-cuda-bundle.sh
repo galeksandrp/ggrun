@@ -29,7 +29,7 @@ case "$version" in
     v*) ldflags="$ldflags -X github.com/raketenkater/ggrun/pkg/update.currentVersion=$version" ;;
     *) ;;
 esac
-( cd "$ROOT_DIR/go" && go build -trimpath -ldflags="$ldflags" -o ggrun ./cmd/ggrun )
+( cd "$ROOT_DIR/go" && go build -buildvcs=false -trimpath -ldflags="$ldflags" -o ggrun ./cmd/ggrun )
 
 # 2. ik_llama.cpp CUDA llama-server.
 if [[ -d "$IK_DIR/.git" ]]; then
