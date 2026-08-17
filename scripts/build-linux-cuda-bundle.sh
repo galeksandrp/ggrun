@@ -52,9 +52,23 @@ else
     git -C "$IK_DIR" checkout --detach FETCH_HEAD
 fi
 echo "==> Configuring + building llama-server (CUDA)"
+# Devel images have nvcc but no driver. The stub satisfies link-time
+# libcuda.so.1; the real driver is loaded on the user's machine.
+stub_dir=""
+for d in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/x86_64-linux/lib/stubs; do
+    [[ -e "$d/libcuda.so" ]] && stub_dir="$d" && break
+done
+cmake_link=()
+if [[ -n "$stub_dir" ]]; then
+    [[ -e "$stub_dir/libcuda.so.1" ]] || ln -sfn libcuda.so "$stub_dir/libcuda.so.1"
+    export LIBRARY_PATH="$stub_dir${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    cmake_link=(-DCMAKE_EXE_LINKER_FLAGS="-L${stub_dir}" -DCMAKE_SHARED_LINKER_FLAGS="-L${stub_dir}")
+    echo "==> Linking against CUDA driver stub in $stub_dir"
+fi
 cmake -S "$IK_DIR" -B "$IK_DIR/build" \
     -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON \
-    -DGGML_CUDA_FA_ALL_QUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89"
+    -DGGML_CUDA_FA_ALL_QUANTS=ON "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89" \
+    "${cmake_link[@]}"
 cmake --build "$IK_DIR/build" --config Release -j"$(nproc 2>/dev/null || echo 4)" -t llama-server
 
 SERVER="$IK_DIR/build/bin/llama-server"
