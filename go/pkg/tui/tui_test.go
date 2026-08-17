@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -278,7 +279,7 @@ func TestLoadRecognizedModelsDeduplicatesPrimaryAndCachedPaths(t *testing.T) {
 	}
 }
 
-func TestExternalDiscoveredModelCannotBeDeletedThroughTUI(t *testing.T) {
+func TestExternalDiscoveredModelCannotBeDeletedWithoutTypedConfirmation(t *testing.T) {
 	externalDir := t.TempDir()
 	path := filepath.Join(externalDir, "external.gguf")
 	if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
@@ -292,15 +293,156 @@ func TestExternalDiscoveredModelCannotBeDeletedThroughTUI(t *testing.T) {
 	if !ok {
 		t.Fatal("test external GGUF was not recognized")
 	}
-	m := Model{screen: ScreenMain, modelDir: t.TempDir(), models: []ModelItem{item}}
+	dir := t.TempDir()
+	m := Model{screen: ScreenMain, modelDir: dir, models: []ModelItem{item}, mainList: newMainList([]ModelItem{item})}
+	m.input = textinput.New()
 
-	m.openRemoveModelChoice(0)
-	if m.screen != ScreenMain || m.messageType != "warning" {
-		t.Fatalf("external delete should stay on Main with a warning, screen=%v type=%q", m.screen, m.messageType)
+	// x on an external row must open the arrow-select offer (not a dead-end
+	// warning), defaulting to Cancel.
+	m.mainList.Select(3) // rows 0-2 are Recommended, Latest, and Scan computer
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	m = nm.(Model)
+	if m.screen != ScreenChoice {
+		t.Fatalf("x on an external model should open the remove offer, screen=%v", m.screen)
 	}
-	m.removeModelAt(0) // the lower-level path is guarded too
+	if m.choiceOptions[m.choiceCursor] != "Cancel" {
+		t.Fatalf("external remove offer must default to Cancel, got %q", m.choiceOptions[m.choiceCursor])
+	}
+	if !strings.Contains(m.choiceTitle, "outside the primary directory") {
+		t.Fatalf("external remove offer must warn about the primary directory, got %q", m.choiceTitle)
+	}
+
+	// Advancing to "Remove file <name>" and confirming opens the typed prompt.
+	for i, opt := range m.choiceOptions {
+		if strings.HasPrefix(opt, "Remove file ") {
+			m.choiceCursor = i
+			break
+		}
+	}
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if m.screen != ScreenDownload || m.inputMode != "external-remove-confirm" {
+		t.Fatalf("confirming the offer must open the typed yes screen, screen=%v inputMode=%q", m.screen, m.inputMode)
+	}
+	if m.pendingExternalRemoveIdx != 0 {
+		t.Fatalf("pending external remove index not recorded, got %d", m.pendingExternalRemoveIdx)
+	}
 	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("external model was touched: %v", err)
+		t.Fatalf("the typed screen alone must not touch the file: %v", err)
+	}
+
+	// Entering anything other than "yes" on the typed screen cancels safely.
+	m.input.SetValue("n")
+	nm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if m.screen != ScreenMain || m.inputMode != "" {
+		t.Fatalf("non-yes answer must return to Main with no pending removal, screen=%v inputMode=%q", m.screen, m.inputMode)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("non-yes answer must not remove the file: %v", err)
+	}
+
+	// The lower-level path is guarded too: removeModelAt refuses any external
+	// row whose index was not handed down by the typed screen.
+	m = Model{screen: ScreenMain, modelDir: dir, models: []ModelItem{item}}
+	m.pendingExternalRemoveIdx = -1
+	m.removeModelAt(0)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("ungated removeModelAt must not touch the file: %v", err)
+	}
+	if m.messageType != "warning" {
+		t.Fatalf("ungated removeModelAt must warn, got type=%q msg=%q", m.messageType, m.message)
+	}
+}
+
+func TestExternalDiscoveredModelDeletedAfterTypedConfirmation(t *testing.T) {
+	externalDir := t.TempDir()
+	path := filepath.Join(externalDir, "external.gguf")
+	if err := os.WriteFile(path, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _, ok := modelItemFromPath(path, info, true)
+	if !ok {
+		t.Fatal("test external GGUF was not recognized")
+	}
+	dir := t.TempDir()
+	m := Model{screen: ScreenMain, modelDir: dir, models: []ModelItem{item}}
+	m.input = textinput.New()
+
+	m.openExternalRemoveConfirm(0)
+	m.input.SetValue("yes")
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("typed yes must remove the external file, stat err=%v", err)
+	}
+	if m.screen != ScreenMain || m.inputMode != "" {
+		t.Fatalf("after external removal the TUI must be back on Main, screen=%v inputMode=%q", m.screen, m.inputMode)
+	}
+	if m.messageType != "info" || !strings.Contains(m.message, "Removed") {
+		t.Fatalf("expected an info removal message, got type=%q msg=%q", m.messageType, m.message)
+	}
+	if m.pendingExternalRemoveIdx != -1 {
+		t.Fatalf("pending external remove index must be cleared after removal, got %d", m.pendingExternalRemoveIdx)
+	}
+}
+
+func TestExternalRemoveConfirmEscapedSymlinkDeletesRealTargetOnlyAfterConfirmation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink permissions are not portable on Windows CI")
+	}
+	outsideDir := t.TempDir()
+	realTarget := filepath.Join(outsideDir, "real-target.gguf")
+	if err := os.WriteFile(realTarget, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.gguf")
+	if err := os.Symlink(realTarget, link); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _, ok := modelItemFromPath(link, info, true)
+	if !ok {
+		t.Fatal("test symlinked GGUF was not recognized")
+	}
+	dir := t.TempDir()
+	m := Model{screen: ScreenMain, modelDir: dir, models: []ModelItem{item}}
+	m.input = textinput.New()
+	m.pendingExternalRemoveIdx = -1
+
+	// Without confirmation the symlink and its target must be untouched.
+	m.removeModelAt(0)
+	if _, err := os.Stat(realTarget); err != nil {
+		t.Fatalf("ungated remove must not touch the symlink target: %v", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("ungated remove must not touch the symlink: %v", err)
+	}
+
+	// With typed confirmation the real target is deleted even though the row's
+	// path is a symlink pointing outside the primary directory.
+	m.pendingExternalRemoveIdx = 0
+	m.openExternalRemoveConfirm(0)
+	m.input.SetValue("yes")
+	nm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = nm.(Model)
+	if _, err := os.Stat(realTarget); !os.IsNotExist(err) {
+		t.Fatalf("typed yes must delete the symlink's real target, stat err=%v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("typed yes must also remove the symlink itself, err=%v", err)
+	}
+	if m.messageType != "info" {
+		t.Fatalf("expected an info removal message, got type=%q msg=%q", m.messageType, m.message)
 	}
 }
 

@@ -3080,6 +3080,78 @@ func tryResidentWithoutClaudeReviewer(
 	return candidate, nil
 }
 
+// proactiveReviewerDropMinHeadroomMB is the minimum spare VRAM a fully-resident
+// dense main-model plan must have, after the reviewer's reservation is reclaimed,
+// for the proactive gate to drop the separate Auto reviewer. Review traffic then
+// routes through the main model (the router already supports that), which must be
+// able to absorb the extra load without threatening the launch — a barely-fitting
+// plan keeps its dedicated reviewer instead.
+const proactiveReviewerDropMinHeadroomMB = 3072 // 3 GiB conservative spare
+
+// proactivelyDropReviewerForVRAMModel is the proactive counterpart to
+// tryResidentWithoutClaudeReviewer. Where the fallback reacts to a placement that
+// FAILS with the reviewer seated, this gate acts up front: for a dense model that
+// fits fully on GPU, the reviewer's separate VRAM seat is pure overhead while the
+// main model has plenty of spare capacity to serve Auto review itself. It re-runs
+// the exact placement engine WITHOUT the reviewer reservation (the same compute
+// replay pattern the reactive fallback uses) and, only when the recomputed plan
+// still fits comfortably, drops the reviewer and adopts the recomputed plan. The
+// conservative spare-capacity requirement guarantees the gate never silently
+// drops the reviewer when doing so could risk an OOM. Returns the strategy to
+// launch with: the recomputed main-model-only plan when the reviewer was dropped,
+// or the original strategy otherwise.
+func proactivelyDropReviewerForVRAMModel(
+	req *launchRequest,
+	caps *detect.Capabilities,
+	model *placement.ModelProfile,
+	strategy *placement.Strategy,
+	compute func(*launchRequest) (*placement.Strategy, error),
+	output io.Writer,
+	cacheDir string,
+) *placement.Strategy {
+	if req == nil || strategy == nil || compute == nil {
+		return strategy
+	}
+	// The request must actually have a GPU reviewer seat to reclaim.
+	if !req.ClaudeCode || req.ClaudeReviewerDisabled || req.ReviewerReservation == nil {
+		return strategy
+	}
+	// The gate only ever considers a fully-resident dense plan; MoE/offload
+	// strategies keep their separate reviewer and their own reactive fallback.
+	if strategy.MMapRequired || strategy.IsMoE {
+		return strategy
+	}
+	if strategy.Type != placement.SingleGPU && strategy.Type != placement.MultiGPUDense {
+		return strategy
+	}
+	candidateReq := *req
+	candidateReq.ReviewerReservation = nil
+	candidateReq.ClaudeReviewerDisabled = true
+	candidate, err := compute(&candidateReq)
+	if err != nil || candidate == nil || candidate.MMapRequired {
+		return strategy
+	}
+	// The recomputed plan must still be a fully-resident dense plan; a recompute
+	// that degraded to offload means dropping the reviewer costs the model its
+	// residency, which is exactly the OOM risk the gate must not take.
+	if candidate.IsMoE ||
+		(candidate.Type != placement.SingleGPU && candidate.Type != placement.MultiGPUDense) {
+		return strategy
+	}
+	// Conservative spare-capacity requirement: never drop the reviewer unless the
+	// main model fits with comfortable VRAM to spare once the reviewer's seat is
+	// reclaimed. A barely-fitting plan keeps the separate reviewer so review
+	// traffic cannot push the main model into an OOM.
+	headroom := placement.StrategyVRAMHeadroomMB(caps, model, candidate, cacheDir)
+	if headroom < proactiveReviewerDropMinHeadroomMB {
+		return strategy
+	}
+	req.ReviewerReservation = nil
+	req.ClaudeReviewerDisabled = true
+	fmt.Fprintf(output, "[launch] main model fits with spare VRAM (%d MiB); separate Auto reviewer disabled, Auto reviews will use the main model\n", headroom)
+	return candidate
+}
+
 func confirmLiveMemoryProbe(req *launchRequest, reason string, input io.Reader, output io.Writer, interactive bool) error {
 	if req == nil {
 		return fmt.Errorf("live memory probe approval requires a launch request")
@@ -4986,6 +5058,12 @@ func cmdLaunch(args []string) {
 			}
 		}
 	}
+	// Proactive reviewer-drop gate: a dense model that fits fully on GPU with
+	// comfortable spare VRAM does not need a separate Auto reviewer — review
+	// traffic routes through the main model. This runs only on the FIRST
+	// successful plan; happened-before any reactive retry path, and never on a
+	// plan that only fits because the reviewer was already dropped.
+	strategy = proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, computeStrategy, os.Stderr, cfg.CacheDir)
 	if err := confirmRequiredMMap(req, strategy, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
 		if !errors.Is(err, errMMapDeclined) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

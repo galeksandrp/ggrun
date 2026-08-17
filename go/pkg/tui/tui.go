@@ -156,6 +156,11 @@ type Model struct {
 	choiceApply   func(*Model, string)
 	choiceReturn  Screen
 
+	// Strong typed confirmation for deleting a model discovered outside the
+	// primary directory. The user must type "yes" into the input screen before
+	// removeModelAt may call modelstore.RemoveExternal on that row.
+	pendingExternalRemoveIdx int
+
 	// Resumable Claude Code session for the working directory, discovered when
 	// the pre-launch screen is opened.
 	resumeSession string
@@ -258,6 +263,7 @@ func InitialModel() Model {
 	if m.port <= 0 {
 		m.port = 8081
 	}
+	m.pendingExternalRemoveIdx = -1
 	if m.ctxSize == "" {
 		m.ctxSize = "fit"
 	}
@@ -597,6 +603,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputMode = ""
 				m.input.Blur()
 				if m.screen == ScreenDownload || m.screen == ScreenBackend {
+					if m.screen == ScreenDownload {
+						m.pendingExternalRemoveIdx = -1
+					}
 					m.screen = ScreenMain
 					m.message = ""
 				}
@@ -1384,6 +1393,18 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if keyMsg, ok := msg.(tea.KeyMsg); ok && keyMsg.String() == "enter" {
 		val := m.input.Value()
 		switch m.inputMode {
+		case "external-remove-confirm":
+			idx := m.pendingExternalRemoveIdx
+			m.inputMode = ""
+			m.input.Blur()
+			m.screen = ScreenMain
+			if strings.TrimSpace(val) != "yes" {
+				m.message = "External model removal cancelled."
+				m.messageType = ""
+				return m, cmd
+			}
+			m.removeModelAt(idx)
+			return m, cmd
 		case "download":
 			val = strings.TrimSpace(val)
 			if val != "" {
@@ -2427,12 +2448,18 @@ func (m Model) viewInputScreen() string {
 		title = "Add llama.cpp Fork"
 	case "backend-register":
 		title = "Register Built Backend"
+	case "external-remove-confirm":
+		title = "Delete Outside the Primary Directory"
 	default:
 		title = "Input"
 	}
 	b.WriteString(titleStyle.Render(fmt.Sprintf("═══ %s ═══", title)) + "\n\n")
 	b.WriteString(m.input.View())
-	b.WriteString("\n\n  Press Enter to confirm, Esc to cancel")
+	if m.inputMode == "external-remove-confirm" {
+		b.WriteString("\n\n  Type exactly 'yes' to permanently delete this file, Esc to cancel")
+	} else {
+		b.WriteString("\n\n  Press Enter to confirm, Esc to cancel")
+	}
 	if m.message != "" {
 		b.WriteString("\n\n  ")
 		switch m.messageType {
@@ -2786,7 +2813,7 @@ func (m Model) swaLabel(model ModelItem) string {
 // screen and, when the current context would spill off GPU, a suggested context
 // the user can apply with one keypress ([c] on the prelaunch screen).
 type kvHint struct {
-	lines    []string
+	lines      []string
 	suggestCtx int // >0: a rung that fits all-GPU; apply it with setCtx
 }
 
@@ -3205,23 +3232,49 @@ func (m *Model) openBackendManager(ret Screen) {
 
 // openRemoveModelChoice confirms before deleting the selected model's GGUF
 // file(s) from disk, reusing the same confirm-first choice screen as backend
-// fork removal (default cursor on Cancel).
+// fork removal (default cursor on Cancel). A model discovered outside the
+// primary directory needs a second, stronger type-to-confirm step afterwards
+// (see openExternalRemoveConfirm).
 func (m *Model) openRemoveModelChoice(idx int) {
 	if idx < 0 || idx >= len(m.models) {
 		return
 	}
+	name := m.models[idx].Name
 	if m.models[idx].External {
-		m.message = "Discovered models outside the primary directory are launch-only; remove the file at its source or make that directory primary first."
-		m.messageType = "warning"
+		m.openChoice("Delete "+name+" outside the primary directory?", []string{"Cancel", "Remove file " + name}, "Cancel", ScreenMain, func(cm *Model, confirm string) {
+			if confirm == "Cancel" {
+				return
+			}
+			cm.openExternalRemoveConfirm(idx)
+		})
 		return
 	}
-	name := m.models[idx].Name
 	m.openChoice("Delete "+name+"?", []string{"Cancel", "Confirm: delete " + name}, "Cancel", ScreenMain, func(cm *Model, confirm string) {
 		if confirm == "Cancel" {
 			return
 		}
 		cm.removeModelAt(idx)
 	})
+}
+
+// openExternalRemoveConfirm opens the strong typed confirmation screen for a
+// model outside the primary directory. Unlike the in-dir path, which deletes
+// after one arrow-select confirm, this needs an explicit typed "yes": the file
+// lives elsewhere on disk, and a single stray Enter must not destroy it. The
+// hidden prompt is filled in by the user (the same input harness used by every
+// other text screen); updateInputScreen validates it in the
+// "external-remove-confirm" mode below. Esc on this screen falls through the
+// generic input-screen path and discards the pending removal.
+func (m *Model) openExternalRemoveConfirm(idx int) {
+	m.pendingExternalRemoveIdx = idx
+	m.screen = ScreenDownload
+	m.inputMode = "external-remove-confirm"
+	m.input.SetValue("")
+	m.input.Placeholder = "type yes to permanently delete"
+	m.input.Focus()
+	m.message = fmt.Sprintf("This file is OUTSIDE the primary model directory (%s) and will be permanently deleted:\n%s\nType yes to confirm, or back out and make this its directory primary ('m' on the Main screen) instead.",
+		m.modelDir, m.models[idx].Path)
+	m.messageType = "warning"
 }
 
 // removeModelAt deletes a model's GGUF file(s) from disk — the same removal
@@ -3235,9 +3288,30 @@ func (m *Model) removeModelAt(idx int) {
 		return
 	}
 	item := m.models[idx]
+	// A model outside the primary directory leaves the in-dir removal path: it
+	// is not listed by modelstore.List(m.modelDir), so the match-by-relative-path
+	// logic below could never find it. Removal is gated on the strong typed
+	// "yes" confirmation (openExternalRemoveConfirm): updateInputScreen sets
+	// pendingExternalRemoveIdx to this exact index only after the user typed
+	// "yes", and removes it again afterwards. Anything else reaching this branch
+	// (a stray call, a stale index) is refused.
 	if item.External {
-		m.message = "Discovered models outside the primary directory are launch-only; remove the file at its source or make that directory primary first."
-		m.messageType = "warning"
+		if m.pendingExternalRemoveIdx != idx {
+			m.message = "External model removal requires the typed confirmation."
+			m.messageType = "warning"
+			return
+		}
+		m.pendingExternalRemoveIdx = -1
+		removed, err := modelstore.RemoveExternal(m.modelDir, item.Path)
+		if err != nil {
+			m.message = fmt.Sprintf("Error removing %s: %v", item.Name, err)
+			m.messageType = "error"
+			return
+		}
+		m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, m.caps)
+		m.rebuildMainList()
+		m.message = fmt.Sprintf("Removed %s (%.1fGB freed).", removed.Name, float64(removed.Bytes)/(1024*1024*1024))
+		m.messageType = "info"
 		return
 	}
 	rel, err := filepath.Rel(m.modelDir, item.Path)

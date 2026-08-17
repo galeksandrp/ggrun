@@ -5132,3 +5132,41 @@ func TestComputeDenseAutoReduceSingleGPUUnchanged(t *testing.T) {
 		t.Fatalf("expected single_gpu, got %s", strat.Type)
 	}
 }
+
+// TestStrategyVRAMHeadroomMB verifies the conservative spare-VRAM estimator the
+// proactive reviewer-drop gate relies on: dense plans report positive headroom
+// when they fit comfortably, and return 0 for offload/CPU-only plans that are
+// not fully GPU-resident (or for a plan that does not fit).
+func TestStrategyVRAMHeadroomMB(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 0, VRAMTotalMB: 24564, VRAMUsedMB: 500, BandwidthMBps: 15754},
+	}}
+	model := &ModelProfile{Path: "/models/small.gguf", TotalSizeMB: 2741, SizeBytes: 2741 << 20, NumLayers: 36}
+
+	// A small dense model on a 24 GB card: used = 2741 + compute floor (1024) +
+	// KV estimate + CUDA overhead (0 when unchached) = ~4 GB, while the card has
+	// ~24 GB free — the headroom must be large and comfortably positive.
+	single := &Strategy{Type: SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q8_0", KVPlacement: "gpu"}
+	if h := StrategyVRAMHeadroomMB(caps, model, single, ""); h < 3*1024 {
+		t.Fatalf("single-GPU headroom = %d, want >= 3 GiB for a comfortably fitting small model", h)
+	}
+
+	// A model that cannot fit at all (weights alone exceed the GPU) reports 0.
+	big := &ModelProfile{Path: "/models/big.gguf", TotalSizeMB: 30000, SizeBytes: 30000 << 20, NumLayers: 64}
+	if h := StrategyVRAMHeadroomMB(caps, big, &Strategy{Type: SingleGPU, MainGPU: 0, ContextSize: 8192, KVType: "q8_0", KVPlacement: "gpu"}, ""); h != 0 {
+		t.Fatalf("over-capacity single-GPU headroom = %d, want 0", h)
+	}
+
+	// Offload/CPU-only plans are never priced: the proactive gate must treat them
+	// as having no spare VRAM so it never drops a companion from one.
+	offload := &Strategy{Type: MoEOffload, IsMoE: true, ContextSize: 65536, KVType: "q8_0"}
+	if h := StrategyVRAMHeadroomMB(caps, model, offload, ""); h != 0 {
+		t.Fatalf("MoE offload headroom = %d, want 0", h)
+	}
+	if h := StrategyVRAMHeadroomMB(caps, model, &Strategy{Type: CPUOnly}, ""); h != 0 {
+		t.Fatalf("CPUOnly headroom = %d, want 0", h)
+	}
+	if h := StrategyVRAMHeadroomMB(caps, model, &Strategy{Type: DenseCPUOffload}, ""); h != 0 {
+		t.Fatalf("DenseCPUOffload headroom = %d, want 0", h)
+	}
+}

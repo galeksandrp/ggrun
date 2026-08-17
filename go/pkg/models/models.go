@@ -164,6 +164,88 @@ func Remove(root, name string) (Model, error) {
 	return *target, nil
 }
 
+// RemoveExternal deletes a model file that lives outside the configured model
+// directory. Unlike Remove it takes an explicit path, not a model name: the
+// caller is the TUI, which has already shown a strong typed confirmation that
+// the file sits outside the primary model directory and will be permanently
+// deleted. Safety boundary: the path must be the model's own resolved identity
+// (never arbitrary user input), directories are refused, and a path that
+// resolves back inside the primary directory is refused so this API can never
+// bypass Remove's in-dir checks. Symlinks are followed to their real target,
+// which is what gets deleted — the strong confirmation is the guard for that.
+func RemoveExternal(root, path string) (Model, error) {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return Model{}, errors.New("model directory is empty")
+	}
+	if path == "" {
+		return Model{}, errors.New("remove external model: empty path")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return Model{}, fmt.Errorf("remove external model %s: %w", path, err)
+	}
+	abs = filepath.Clean(abs)
+
+	// A sharded GGUF is one model; delete the whole set. An incomplete set (or
+	// a missing shard) falls back to the single entrypoint the caller knows
+	// about rather than failing silently.
+	files, _, shardErr := ResolveGGUFShardFiles(abs)
+	if shardErr != nil {
+		files = []string{abs}
+	}
+
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return Model{}, fmt.Errorf("resolve model directory: %w", err)
+	}
+
+	var removed Model
+	removed.Files = make([]string, 0, len(files))
+	for _, f := range files {
+		realPath, err := filepath.EvalSymlinks(f)
+		if err != nil {
+			return Model{}, fmt.Errorf("resolve external model %s: %w", f, err)
+		}
+		realPath = filepath.Clean(realPath)
+		// A file that resolves inside the primary directory is protected: the
+		// normal Remove path manages those and this API must not bypass its
+		// cleanName/symlinked-directory checks. External rows only exist for
+		// paths outside the primary dir, so reaching here means the file's
+		// identity changed underneath us — refuse rather than guess.
+		rel, relErr := filepath.Rel(resolvedRoot, realPath)
+		if relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return Model{}, fmt.Errorf("refusing to remove %s through the external path: it resolves inside the model directory", f)
+		}
+		info, err := os.Lstat(realPath)
+		if err != nil {
+			return Model{}, fmt.Errorf("remove external model %s: %w", realPath, err)
+		}
+		if info.IsDir() {
+			return Model{}, fmt.Errorf("refusing to remove a directory: %s", realPath)
+		}
+		if err := os.Remove(realPath); err != nil {
+			return Model{}, fmt.Errorf("remove external model %s: %w", realPath, err)
+		}
+		removed.Bytes += info.Size()
+		removed.Files = append(removed.Files, realPath)
+		// The confirmed path may itself have been a symlink to that real target.
+		// Remove the entry too so the row cannot linger as a broken link.
+		if f != realPath {
+			if _, lerr := os.Lstat(f); lerr == nil {
+				if err := os.Remove(f); err != nil {
+					return Model{}, fmt.Errorf("remove external model symlink %s: %w", f, err)
+				}
+			}
+		}
+	}
+	if len(removed.Files) == 0 {
+		return Model{}, errors.New("remove external model: no files removed")
+	}
+	removed.Name = filepath.Base(removed.Files[0])
+	return removed, nil
+}
+
 func logicalName(rel string) string {
 	base := filepath.Base(rel)
 	match := shardName.FindStringSubmatch(base)

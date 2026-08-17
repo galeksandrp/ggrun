@@ -122,3 +122,91 @@ func TestRemoveRejectsFilesThroughSymlinkedDirectory(t *testing.T) {
 		t.Fatalf("outside model was removed: %v", err)
 	}
 }
+
+func TestRemoveExternalDeletesExplicitOutsideFile(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	writeModel(t, outside, "external.gguf", 9)
+	keep := filepath.Join(outside, "keep.gguf")
+	writeModel(t, outside, "keep.gguf", 4)
+
+	removed, err := RemoveExternal(root, filepath.Join(outside, "external.gguf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed.Bytes != 9 || len(removed.Files) != 1 || removed.Files[0] != filepath.Join(outside, "external.gguf") {
+		t.Fatalf("removed = %#v", removed)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "external.gguf")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("external model still exists: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("unrelated external file was removed: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("primary directory must be untouched: %v", err)
+	}
+}
+
+func TestRemoveExternalRejectsPathResolvingInsidePrimaryDir(t *testing.T) {
+	root := t.TempDir()
+	writeModel(t, root, "inside.gguf", 5)
+	outsideroot := t.TempDir()
+	// A symlink inside the primary dir pointing at another file inside the
+	// primary dir must not be removable as "external": the resolved target is
+	// inside, so this API refuses to bypass the normal in-dir Remove path.
+	link := filepath.Join(outsideroot, "link.gguf")
+	if err := os.Symlink(filepath.Join(root, "inside.gguf"), link); err != nil {
+		t.Skip("symlink permissions are not portable on this platform")
+	}
+
+	if _, err := RemoveExternal(root, link); err == nil {
+		t.Fatal("RemoveExternal must refuse a path whose target resolves inside the primary directory")
+	}
+	if _, err := os.Stat(filepath.Join(root, "inside.gguf")); err != nil {
+		t.Fatalf("in-dir model was removed through the external path: %v", err)
+	}
+}
+
+func TestRemoveExternalFollowsSymlinkToRealTargetOnConfirmation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink permissions are not portable on Windows CI")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	realTarget := filepath.Join(outside, "real-target.gguf")
+	writeModel(t, outside, "real-target.gguf", 7)
+	linkDir := t.TempDir()
+	link := filepath.Join(linkDir, "link.gguf")
+	if err := os.Symlink(realTarget, link); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := RemoveExternal(root, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(realTarget); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed external removal must delete the symlink's real target, stat err=%v", err)
+	}
+	if _, err := os.Lstat(link); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the symlink itself must be removed too, err=%v", err)
+	}
+	if removed.Bytes != 7 || removed.Name != "real-target.gguf" {
+		t.Fatalf("removed = %#v", removed)
+	}
+}
+
+func TestRemoveExternalRejectsMissingAndDirectoryPaths(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	dirPath := filepath.Join(outside, "adir")
+	if err := os.MkdirAll(dirPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(outside, "missing.gguf"), dirPath} {
+		if _, err := RemoveExternal(root, path); err == nil {
+			t.Fatalf("RemoveExternal(%q) succeeded", path)
+		}
+	}
+}

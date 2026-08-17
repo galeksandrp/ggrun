@@ -156,6 +156,163 @@ func TestResidentReviewerFallbackIsClaudeOnlyAndExplicitWhenNonInteractive(t *te
 	}
 }
 
+// TestProactivelyDropReviewerForVRAMModelFires confirms the proactive gate drops
+// the separate Auto reviewer for a dense model that fits fully on GPU with
+// comfortable spare VRAM: the request loses its reservation, review is routed to
+// the main model, and the recomputed (reviewer-free) plan is adopted.
+func TestProactivelyDropReviewerForVRAMModelFires(t *testing.T) {
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 4600}
+	req := &launchRequest{ClaudeCode: true, ReviewerReservation: reservation}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 0, VRAMTotalMB: 24564, VRAMUsedMB: 0, BandwidthMBps: 15754},
+	}}
+	// A small dense model on a 24 GB card: model + KV + overhead + compute floor
+	// leaves thousands of MiB of spare VRAM, so the reviewer's seat is pure waste.
+	model := &placement.ModelProfile{
+		Path:        "/models/qwen3.5-4b-q4.gguf",
+		Basename:    "qwen3.5-4b-q4.gguf",
+		TotalSizeMB: 2741,
+		SizeBytes:   2741 * 1024 * 1024,
+		NumLayers:   36,
+	}
+	strategy := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q8_0", KVPlacement: "gpu", IsMoE: false}
+	want := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q8_0", KVPlacement: "gpu", IsMoE: false}
+	called := 0
+	compute := func(candidateReq *launchRequest) (*placement.Strategy, error) {
+		called++
+		if candidateReq.ReviewerReservation != nil || !candidateReq.ClaudeReviewerDisabled {
+			t.Fatalf("gate candidate did not isolate only the reviewer: %#v", candidateReq)
+		}
+		return want, nil
+	}
+	var output bytes.Buffer
+	got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, compute, &output, "")
+	if got != want || called != 1 {
+		t.Fatalf("gate result=%#v calls=%d, want recomputed plan and one recompute", got, called)
+	}
+	if req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
+		t.Fatalf("gate accepted without retaining the drop on request: %#v", req)
+	}
+	if !strings.Contains(output.String(), "separate Auto reviewer disabled") {
+		t.Fatalf("gate notice did not explain routing: %q", output.String())
+	}
+}
+
+// TestProactivelyDropReviewerSkipsWhenRecomputeOOMs confirms the gate does NOT
+// drop the reviewer when recomputing without it would OOM (recompute fails or
+// degrades to an offload/mmap plan).
+func TestProactivelyDropReviewerSkipsWhenRecomputeOOMs(t *testing.T) {
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 4600}
+	req := &launchRequest{ClaudeCode: true, ReviewerReservation: reservation}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}}
+	model := &placement.ModelProfile{Path: "/models/big.gguf", TotalSizeMB: 20000, SizeBytes: 20000 * 1024 * 1024}
+	strategy := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 8192, KVType: "q8_0", KVPlacement: "gpu", IsMoE: false}
+
+	// Recompute without reviewer fails outright: keep the reviewer.
+	recomputeFails := func(*launchRequest) (*placement.Strategy, error) {
+		return nil, fmt.Errorf("does not fit without reviewer either")
+	}
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, recomputeFails, io.Discard, ""); got != strategy {
+		t.Fatalf("gate dropped reviewer on a failed recompute; result=%#v", got)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("failed recompute mutated request: %#v", req)
+	}
+
+	// Recompute succeeds but is not a fully-resident dense plan (mmap required):
+	// dropping the reviewer would jeopardize residency, so the reviewer stays.
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	mmapPlan := &placement.Strategy{Type: placement.MoEOffload, MMapRequired: true, IsMoE: true}
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, func(*launchRequest) (*placement.Strategy, error) {
+		return mmapPlan, nil
+	}, io.Discard, ""); got != strategy {
+		t.Fatalf("gate dropped reviewer into an mmap/offload plan; result=%#v", got)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("mmap-plan recompute mutated request: %#v", req)
+	}
+
+	// Recompute succeeds, dense, but WITHOUT comfortable spare VRAM: the model
+	// barely fits, so a separate reviewer must stay to absorb review traffic.
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	// 22 GB weights on a 24 GB card: free 24564 - (22000 + 1024 floor + 0 kv) =
+	// 1540 MiB headroom, comfortably below the 3072 MiB conservative gate
+	// threshold, so the reviewer stays.
+	tightModel := &placement.ModelProfile{Path: "/models/tight.gguf", TotalSizeMB: 22000, SizeBytes: 22000 * 1024 * 1024}
+	tightPlan := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q4_0", KVPlacement: "gpu", IsMoE: false}
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, strategy, func(*launchRequest) (*placement.Strategy, error) {
+		return tightPlan, nil
+	}, io.Discard, ""); got != strategy {
+		t.Fatalf("gate dropped reviewer on a barely-fitting plan; result=%#v", got)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("tight-plan recompute mutated request: %#v", req)
+	}
+}
+
+// TestProactivelyDropReviewerSkipsMoEAndOffload confirms the gate never fires for
+// MoE or offload strategies — reserved for dense models that fit fully on GPU.
+func TestProactivelyDropReviewerSkipsMoEAndOffload(t *testing.T) {
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 4600}
+	model := &placement.ModelProfile{Path: "/models/moe.gguf", TotalSizeMB: 40000, SizeBytes: 40000 * 1024 * 1024, IsMoE: true}
+	for name, strategy := range map[string]*placement.Strategy{
+		"moeOffload": {Type: placement.MoEOffload, IsMoE: true},
+		"denseCPU":   {Type: placement.DenseCPUOffload, IsMoE: false},
+		"mmapDense":  {Type: placement.SingleGPU, MainGPU: 0, MMapRequired: true, IsMoE: false},
+	} {
+		req := &launchRequest{ClaudeCode: true, ReviewerReservation: reservation}
+		compute := func(*launchRequest) (*placement.Strategy, error) {
+			t.Fatalf("%s: gate must not recompute for an ineligible strategy", name)
+			return nil, nil
+		}
+		if got := proactivelyDropReviewerForVRAMModel(req, &detect.Capabilities{}, model, strategy, compute, io.Discard, ""); got != strategy {
+			t.Fatalf("%s: gate dropped reviewer for an ineligible strategy; result=%#v", name, got)
+		}
+		if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+			t.Fatalf("%s: gate mutated request: %#v", name, req)
+		}
+	}
+}
+
+// TestProactiveGateKeepsReactiveFallbackIntact confirms that the reactive
+// fallback path (placement WITH reviewer fails) still works independently of the
+// proactive gate, and that the gate itself is a no-op when there is no reviewer
+// reservation to reclaim.
+func TestProactiveGateKeepsReactiveFallbackIntact(t *testing.T) {
+	// Reactive fallback (existing behavior) still fires when placement with the
+	// reviewer fails: no proactive gate involved, consent still required.
+	originalErr := fmt.Errorf("resident placement with reviewer does not fit")
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 2600}
+	req := &launchRequest{ClaudeCode: true, NoMMap: true, ReviewerReservation: reservation}
+	want := &placement.Strategy{Type: placement.MoEOffload, MMap: false}
+	compute := func(candidateReq *launchRequest) (*placement.Strategy, error) {
+		if candidateReq.ReviewerReservation != nil || !candidateReq.ClaudeReviewerDisabled || !candidateReq.NoMMap {
+			t.Fatalf("fallback candidate did not isolate only the reviewer: %#v", candidateReq)
+		}
+		return want, nil
+	}
+	var output bytes.Buffer
+	got, err := tryResidentWithoutClaudeReviewer(req, originalErr, strings.NewReader("yes\n"), &output, true, compute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want || req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
+		t.Fatalf("reactive fallback result=%#v req=%#v, want plan and disabled reviewer", got, req)
+	}
+
+	// Proactive gate with no reservation is a no-op: nothing to reclaim.
+	noReservation := &launchRequest{ClaudeCode: true}
+	strategy := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0}
+	if got := proactivelyDropReviewerForVRAMModel(noReservation, nil, nil, strategy, func(*launchRequest) (*placement.Strategy, error) {
+		t.Fatal("gate must not recompute when there is no reviewer reservation")
+		return nil, nil
+	}, io.Discard, ""); got != strategy {
+		t.Fatalf("gate fired without a reviewer reservation; result=%#v", got)
+	}
+}
+
 func TestConfirmLiveMemoryProbeRequiresExplicitNonInteractiveConsent(t *testing.T) {
 	var output bytes.Buffer
 	req := &launchRequest{}

@@ -186,6 +186,61 @@ func TestCheckpointSpacingTilesTheContext(t *testing.T) {
 	}
 }
 
+// A recurrent/hybrid model (n_swa <= 0) must still emit a checkpoint step so
+// checkpoints tile the context and the startup anchor (pos_min == 0) survives
+// capacity eviction. Verified against the live 60k failure: DeepSeek-V4 and
+// Qwen3.8-27B both force a full prompt re-process because no checkpoint with
+// pos_min == 0 or pos_min < thold survives at 60k tokens. DeepSeek-V4 got
+// --checkpoint-min-step from the SWA path but the startup anchors were FIFO-
+// evicted; Qwen3.8 (n_swa=0) got no interval flag at all because
+// checkpointMinStep returned 0 for SlidingWindow <= 0.
+func TestCheckpointSpacingForRecurrentHybrid(t *testing.T) {
+	// DeepSeek4: architecture-name signal, no sliding window.
+	ds4 := &ModelProfile{ModelArch: "deepseek4", ContextSize: 131072}
+	if got, want := checkpointMinStep(ds4, 512), checkpointMinStepFloor; got != want {
+		t.Errorf("deepseek4 step = %d, want the conservative floor %d", got, want)
+	}
+	// SSM hybrid with the metadata bit set.
+	ssm := &ModelProfile{SlidingWindow: 0, HasSSM: 1}
+	if got, want := checkpointMinStep(ssm, 512), checkpointMinStepFloor; got != want {
+		t.Errorf("ssm step = %d, want the conservative floor %d", got, want)
+	}
+	// Case-insensitive arch match.
+	if got := checkpointMinStep(&ModelProfile{ModelArch: "DeepSeek4"}, 0); got != checkpointMinStepFloor {
+		t.Errorf("case-insensitive deepseek4 step = %d, want %d", got, checkpointMinStepFloor)
+	}
+	// The SWA path stays unchanged for windowed models, even when they are
+	// also arch-deepseek4.
+	ds4swa := &ModelProfile{ModelArch: "deepseek4", SlidingWindow: 512}
+	if got, want := checkpointMinStep(ds4swa, 256), 768; got != want {
+		t.Errorf("SWA path for deepseek4 = %d, want n_swa+n_ubatch %d", got, want)
+	}
+
+	// The step must actually be emitted by the strategy's placeholder gate:
+	// a recurrent/hybrid strategy carries a positive CheckpointMinStep and its
+	// argv gets the backend spelling.
+	s := &Strategy{
+		Type:                         SingleGPU,
+		ContextSize:                  131072,
+		KVQuality:                    "mid",
+		KVType:                       "q8_0",
+		Threads:                      8,
+		ThreadsBatch:                 8,
+		BatchSize:                    128,
+		UBatchSize:                   512,
+		CRAM:                         4096,
+		MaxCheckpoints:               16,
+		CheckpointMinStep:            checkpointMinStep(ds4, 512),
+		HasSSM:                       true,
+		BackendTag:                   "ik_llama",
+		BackendCheckpointMinStepFlag: "--ctx-checkpoints-interval",
+	}
+	args := s.Args("model.gguf", 8081)
+	if !hasAdjacentArgPlacement(args, "--ctx-checkpoints-interval", "512") {
+		t.Fatalf("recurrent/hybrid model did not emit its checkpoint interval: %v", args)
+	}
+}
+
 // The system CUDA overhead probe measured a whole device's usage minus the
 // server's own logged buffers, so anything else resident on that card became
 // permanent "overhead". ggrun seats the Auto reviewer on the least valuable

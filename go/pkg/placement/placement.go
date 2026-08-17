@@ -308,26 +308,49 @@ type GPULedgerEntry struct {
 // Note this is not 2*n_swa: that matched only because this project runs
 // -ub 512 with a 512 window, and would be a third too coarse at -ub 256.
 //
-// Returns 0 when the model has no sliding window, leaving llama.cpp's default
-// in place -- without SWA the checkpoint depth is not derived this way.
+// Returns 0 when the model has neither a sliding window nor recurrent state,
+// leaving llama.cpp's default in place -- without a derived depth the backend
+// default (8192) applies.
+//
+// Recurrent/hybrid models (n_swa <= 0, e.g. DeepSeek4 or an SSM arch) have no
+// sliding-window cache to derive the depth from, but still need a spacing so
+// checkpoints tile the context: a checkpoint covers the recurrent state, and
+// without an interval llama.cpp's 8192 default leaves gaps a resume point can
+// fall into, forcing a full prompt re-process. The GGUF does not expose the
+// recurrent span, so fall back to the conservative checkpoint floor.
 func checkpointMinStep(model *ModelProfile, ubatch int) int {
-	if model == nil || model.SlidingWindow <= 0 {
+	if model == nil {
 		return 0
 	}
-	if ubatch <= 0 {
-		// llama.cpp's own default physical batch.
-		ubatch = 512
+	if model.SlidingWindow > 0 {
+		if ubatch <= 0 {
+			// llama.cpp's own default physical batch.
+			ubatch = 512
+		}
+		step := model.SlidingWindow + ubatch
+		// The backend pads the cache to a 256-cell boundary; match it so the
+		// spacing cannot be marginally wider than the depth it is tiling.
+		if rem := step % 256; rem != 0 {
+			step -= rem
+		}
+		if step < checkpointMinStepFloor {
+			step = checkpointMinStepFloor
+		}
+		return step
 	}
-	step := model.SlidingWindow + ubatch
-	// The backend pads the cache to a 256-cell boundary; match it so the
-	// spacing cannot be marginally wider than the depth it is tiling.
-	if rem := step % 256; rem != 0 {
-		step -= rem
+	if isRecurrentOrHybrid(model) {
+		return checkpointMinStepFloor
 	}
-	if step < checkpointMinStepFloor {
-		step = checkpointMinStepFloor
-	}
-	return step
+	return 0
+}
+
+// isRecurrentOrHybrid reports whether the model carries recurrent state that a
+// context checkpoint must preserve and restore. This is the same set that
+// requiresScopedContextEvidence prices separately: DeepSeek4's GGUFs do not
+// expose the generic SSM metadata bit, so its architecture name is the signal
+// there.
+func isRecurrentOrHybrid(model *ModelProfile) bool {
+	return model != nil && (model.HasSSM != 0 || strings.EqualFold(model.ModelArch, "deepseek4"))
 }
 
 // checkpointMinStepFloor keeps a tiny sliding window from producing a
@@ -449,9 +472,9 @@ type Options struct {
 	// config cache under this key before estimating. Empty disables verified
 	// config reuse.
 	VerifiedConfigScopeKey string
-	NoMMap          bool
-	ForceMMap       bool
-	Parallel        int
+	NoMMap                 bool
+	ForceMMap              bool
+	Parallel               int
 	// Threads overrides the CPU thread count, which otherwise follows physical
 	// cores. Physical cores is the right default -- MoE experts on CPU are
 	// bandwidth-bound, and SMT siblings share the ports that bound them -- but
@@ -3636,10 +3659,7 @@ func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string, swaFull b
 // valuable for the exact launch but is not a model-wide rate or a uniformly
 // quantized geometry that can be extrapolated safely.
 func requiresScopedContextEvidence(model *ModelProfile) bool {
-	if model == nil {
-		return false
-	}
-	return model.HasSSM != 0 || strings.EqualFold(model.ModelArch, "deepseek4")
+	return isRecurrentOrHybrid(model)
 }
 
 // EstimateKVCacheMB exposes the same KV arithmetic used by placement to
@@ -4258,6 +4278,57 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 		return fmt.Errorf("%s", msg)
 	}
 	return nil
+}
+
+// StrategyVRAMHeadroomMB returns the plan's estimated unused VRAM after a
+// fully-resident model is placed, aggregated across the GPUs the plan uses: the
+// selected GPU for SingleGPU, the whole GPU set for MultiGPUDense. The estimate
+// is deliberately conservative — the llama.cpp compute-buffer floor is charged
+// per GPU even when the plan was derived under measured buffers that charged
+// zero, and a negative headroom is clamped to 0 — so callers can decide whether
+// a fully-resident plan has enough spare capacity to shed a companion (the
+// proactive reviewer-drop gate) without risking an OOM. Plans that are not fully
+// GPU-resident (CPUOnly, DenseCPUOffload, MoEOffload) return 0.
+func StrategyVRAMHeadroomMB(caps *detect.Capabilities, model *ModelProfile, s *Strategy, cacheDir string) int {
+	if caps == nil || model == nil || s == nil {
+		return 0
+	}
+	totalSizeMB := model.TotalSizeMB + s.MMProjSizeMB
+	if totalSizeMB <= 0 {
+		totalSizeMB = int(model.SizeBytes / 1024 / 1024)
+	}
+	kvMB := s.ContextAllocationMB
+	if kvMB <= 0 {
+		kvMB = computeKVTotalMB(model, s.ContextSize, s.KVType, s.SWAFull)
+	}
+	cudaOverheadMB := measuredCUDAOverheadMB(loadSystemProbe(cacheDir, caps.GPUs))
+	switch s.Type {
+	case SingleGPU:
+		// Only the selected GPU carries the model weights, KV, and compute graph.
+		usedMB := totalSizeMB + cudaOverheadMB + computeFloorMB + kvMB
+		for _, g := range caps.GPUs {
+			if g.Index == s.MainGPU {
+				if h := g.VRAMFreeMB() - usedMB; h > 0 {
+					return h
+				}
+				return 0
+			}
+		}
+		return 0
+	case MultiGPUDense:
+		// Every contributing GPU pays its own CUDA overhead and compute floor.
+		usedMB := totalSizeMB + (cudaOverheadMB+computeFloorMB)*len(caps.GPUs) + kvMB
+		availableMB := 0
+		for _, g := range caps.GPUs {
+			availableMB += g.VRAMFreeMB()
+		}
+		if h := availableMB - usedMB; h > 0 {
+			return h
+		}
+		return 0
+	default:
+		return 0
+	}
 }
 
 // computeCRAM calculates prompt cache size from remaining memory after load.
