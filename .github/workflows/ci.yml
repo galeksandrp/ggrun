@@ -121,6 +121,8 @@ jobs:
           cache: false
       - name: Run setup home regression tests
         run: bash tests/test_setup_home.sh
+      - name: Keep prebuilt backend when --version fails
+        run: bash tests/test_place_isolated_backend.sh
 
   model-index-tests:
     runs-on: ubuntu-latest

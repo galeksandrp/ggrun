@@ -709,9 +709,14 @@ place_isolated_backend() {
         install -m 0644 "$lib" "$box/$(basename "$lib")"
     done < <(find "$(dirname "$src")" -maxdepth 1 -type f \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
     ln -sfn "backends/$dest_name/llama-server" "$INSTALL_DIR/$dest_name"
-    if ! env LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$box/llama-server" --version >/dev/null 2>&1; then
-        rm -f "$INSTALL_DIR/$dest_name"
-        return 1
+    # --version can fail if a Vulkan ICD or CUDA driver is missing. The
+    # binary is still the install we wanted; ggrun will use it when the
+    # runtime is present. Only fail if the file did not land.
+    [[ -x "$box/llama-server" && -e "$INSTALL_DIR/$dest_name" ]] || return 1
+    local ver_out=""
+    if ! ver_out="$(env LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$box/llama-server" --version 2>&1)"; then
+        warn "$dest_name installed but --version failed (missing GPU runtime is OK; will still use this binary)"
+        [[ -n "$ver_out" ]] && warn "${ver_out%%$'\n'*}"
     fi
     return 0
 }
@@ -825,6 +830,9 @@ install_auto_release_backends() {
         fi
     fi
     link_default_llama_server
+    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -e "$INSTALL_DIR/llama-server" ]]; then
+        got=1
+    fi
     (( got ))
 }
 
@@ -1119,6 +1127,10 @@ if [[ -n "$BACKEND_REPO" ]]; then
     say ""
     say "── Backend: $BACKEND_CHOICE ──"
     backend_binary="$(backend_server_path)"
+    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -x "$INSTALL_DIR/llama-server" ]]; then
+        link_default_llama_server
+        RELEASE_INSTALLED=1
+    fi
     if (( RELEASE_INSTALLED )); then
         ok "Using bundled backend at $INSTALL_DIR/llama-server"
     elif [[ -x "$backend_binary" ]]; then
