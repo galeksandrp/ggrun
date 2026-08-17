@@ -13,6 +13,7 @@
 #
 # Flags (env vars):
 #   LLM_INSTALL_BACKEND=auto|cuda|vulkan|metal|cpu|skip   default: auto
+#     auto on Linux: CUDA release bundle, then Vulkan, then CPU. No compile.
 #   LLM_INSTALL_MODE=auto|release|build|scripts           default: auto
 #   LLM_INSTALL_RELEASE=latest|vX.Y.Z                      default: latest
 #   LLM_INSTALL_RELEASE_DIR=<dir>                          local bundle dir (tests/offline)
@@ -50,7 +51,8 @@ GO_BOOTSTRAP_ROOT="${LLM_INSTALL_GO_ROOT:-$BACKEND_ROOT/.llm-server-go}"
 GO_CMD=""
 NONINTERACTIVE="${LLM_INSTALL_NONINTERACTIVE:-0}"
 MAIN_IMPL="${LLM_INSTALL_MAIN:-go}"
-[[ ! -t 0 && ! -r /dev/tty ]] && NONINTERACTIVE=1   # piped installs can still ask through /dev/tty
+# curl | bash has no stdin tty. Do not block on /dev/tty questions.
+[[ ! -t 0 && -z "${LLM_INSTALL_NONINTERACTIVE:-}" ]] && NONINTERACTIVE=1
 
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
@@ -295,19 +297,30 @@ vulkan_available() {
     vulkaninfo --summary 2>/dev/null | grep -qi "GPU\|deviceName"
 }
 
-detect_backend() {
-    if [[ "$OS" == "Darwin" ]]; then echo metal; return; fi
+has_nvidia_gpu() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q GPU
+}
+
+# Linux auto: CUDA first when an NVIDIA GPU is present, then Vulkan, then CPU.
+# macOS: Metal. Never pick CUDA on a machine with no NVIDIA device.
+auto_backend_candidates() {
+    if [[ "$OS" == "Darwin" ]]; then
+        echo metal
+        return
+    fi
     if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
         err "Use install.ps1 for native Windows installs, or run this Bash installer on Linux/macOS."
         exit 1
     fi
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q GPU; then
-        echo cuda; return
+    if has_nvidia_gpu; then
+        echo cuda
     fi
-    if vulkan_available; then
-        echo vulkan; return
-    fi
+    echo vulkan
     echo cpu
+}
+
+detect_backend() {
+    auto_backend_candidates | head -n 1
 }
 [[ "$BACKEND_CHOICE" == "auto" ]] && BACKEND_CHOICE="$(detect_backend)"
 DETECTED_BACKEND="$BACKEND_CHOICE"
@@ -679,19 +692,20 @@ install_release_bundle() {
     (( found_backend ))
 }
 
-choose_cuda_auto_fallback_backend() {
-    [[ "$BACKEND_REQUEST" == "auto" && "$BACKEND_CHOICE" == "cuda" ]] || return 1
-    has_cuda_toolkit && return 1
-    if vulkan_available; then
-        BACKEND_CHOICE="vulkan"
-        say "No CUDA toolkit found — installing the prebuilt Vulkan GPU backend (runs on your"
-        say "GPU, no build needed). For maximum CUDA speed, install the CUDA toolkit and re-run,"
-        say "or attach a ggrun CUDA release bundle."
-    else
-        BACKEND_CHOICE="cpu"
-        warn "No CUDA toolkit and no usable Vulkan device found; installing the CPU backend."
-    fi
-    ok "Selected fallback backend: $BACKEND_CHOICE"
+# Try CUDA, then Vulkan, then CPU release bundles. Auto never compiles.
+install_auto_release_backends() {
+    local b
+    while read -r b; do
+        [[ -n "$b" ]] || continue
+        BACKEND_CHOICE="$b"
+        say "Trying $b release bundle..."
+        if install_release_bundle; then
+            ok "Installed $b backend from release"
+            return 0
+        fi
+        warn "No $b release bundle; trying the next backend."
+    done < <(auto_backend_candidates)
+    return 1
 }
 
 run_privileged() {
@@ -844,20 +858,23 @@ mkdir -p "$INSTALL_DIR" "$MODEL_DIR"
 RELEASE_INSTALLED=0
 
 if [[ "$INSTALL_MODE" == "auto" || "$INSTALL_MODE" == "release" ]]; then
-    if install_release_bundle; then
+    if [[ "$BACKEND_REQUEST" == "auto" && "$INSTALL_MODE" == "auto" ]]; then
+        if install_auto_release_backends; then
+            RELEASE_INSTALLED=1
+        else
+            warn "No CUDA, Vulkan, or CPU release bundle found. Installing the launcher only."
+            warn "A later release with ggrun-linux-x86_64-cuda.tar.gz is needed for one-command CUDA."
+        fi
+    elif install_release_bundle; then
         RELEASE_INSTALLED=1
     elif [[ "$INSTALL_MODE" == "release" ]]; then
         err "No compatible release bundle found for $(platform_slug 2>/dev/null || echo unknown)-$BACKEND_CHOICE"
         [[ "$BACKEND_CHOICE" == "cuda" ]] && err "CUDA release mode requires a matching CUDA bundle for this platform."
         exit 1
+    elif [[ "$BACKEND_CHOICE" == "cuda" ]]; then
+        warn "No compatible CUDA release bundle found; falling back to ik_llama.cpp source build."
     else
-        if choose_cuda_auto_fallback_backend && install_release_bundle; then
-            RELEASE_INSTALLED=1
-        elif [[ "$BACKEND_CHOICE" == "cuda" ]]; then
-            warn "No compatible CUDA release bundle found; falling back to ik_llama.cpp source build."
-        else
-            warn "No compatible release bundle found; falling back to local script install + source build."
-        fi
+        warn "No compatible release bundle found; falling back to local script install + source build."
     fi
 fi
 
