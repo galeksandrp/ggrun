@@ -178,24 +178,38 @@ if [[ ! -x "$APP_BIN/ggrun" ]]; then
 fi
 
 
+usable_llama_server() {
+    local p="$1" t hdr
+    [[ -n "$p" && -e "$p" ]] || return 1
+    t="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+    [[ -f "$t" && -x "$t" ]] || return 1
+    case "$(basename "$t")" in
+        llama-server|llama-server.exe|ik_llama-server|ik_llama-server-cuda|ik_llama-server-vulkan) ;;
+        *) return 1 ;;
+    esac
+    case "$t" in
+        *simulator*|*llama-eval*|*/examples/*) return 1 ;;
+    esac
+    hdr="$(head -c 4 "$t" 2>/dev/null || true)"
+    [[ "$hdr" == $'\x7fELF' || "${hdr:0:2}" == "MZ" ]]
+}
+
 backend_bin=""
-if [[ -x "$APP_BIN/llama-server-cuda" ]]; then
-    backend_bin="$APP_BIN/llama-server-cuda"
-elif [[ -x "$APP_BIN/ik_llama-server-cuda" ]]; then
-    backend_bin="$APP_BIN/ik_llama-server-cuda"
-elif [[ -x "$APP_BIN/llama-server-vulkan" ]]; then
-    backend_bin="$APP_BIN/llama-server-vulkan"
-elif [[ -x "$APP_BIN/llama-server" ]]; then
-    backend_bin="$APP_BIN/llama-server"
-elif [[ -x "$APP_SRC/llama.cpp/build-cuda/bin/llama-server" ]]; then
-    backend_bin="$APP_SRC/llama.cpp/build-cuda/bin/llama-server"
-elif [[ -x "$APP_SRC/ik_llama.cpp/build/bin/llama-server" ]]; then
-    backend_bin="$APP_SRC/ik_llama.cpp/build/bin/llama-server"
-elif [[ -x "$APP_SRC/llama.cpp/build-vulkan/bin/llama-server" ]]; then
-    backend_bin="$APP_SRC/llama.cpp/build-vulkan/bin/llama-server"
-elif [[ -x "$APP_SRC/llama.cpp/build/bin/llama-server" ]]; then
-    backend_bin="$APP_SRC/llama.cpp/build/bin/llama-server"
-fi
+for cand in \
+    "$APP_BIN/llama-server-cuda" \
+    "$APP_BIN/ik_llama-server-cuda" \
+    "$APP_BIN/llama-server-vulkan" \
+    "$APP_BIN/llama-server" \
+    "$APP_SRC/llama.cpp/build-cuda/bin/llama-server" \
+    "$APP_SRC/ik_llama.cpp/build/bin/llama-server" \
+    "$APP_SRC/llama.cpp/build-vulkan/bin/llama-server" \
+    "$APP_SRC/llama.cpp/build/bin/llama-server"
+do
+    if usable_llama_server "$cand"; then
+        backend_bin="$cand"
+        break
+    fi
+done
 
 backend_real="$backend_bin"
 if [[ -n "$backend_bin" ]]; then
@@ -298,11 +312,16 @@ if (( GUIDE_PATH )); then
     [[ "$(uname -s)" == "Darwin" ]] && SHELL_RC="$HOME/.zshrc"
     line="source \"$APP_ENV\""
     if [[ -f "$SHELL_RC" ]] && grep -Fqs "$APP_ENV" "$SHELL_RC"; then
-        say "PATH already set in $SHELL_RC"
+        say "bashrc already sources $APP_ENV (new terminals get ggrun)"
     else
         printf '\n# ggrun\n%s\n' "$line" >>"$SHELL_RC"
         say "Added $line to $SHELL_RC"
     fi
+    mkdir -p "$HOME/.local/bin"
+    ln -sfn "$APP_HOME/ggrun" "$HOME/.local/bin/ggrun"
+    ln -sfn "$APP_HOME/ggrun" "$HOME/.local/bin/llm-server" 2>/dev/null || true
+    hash -r 2>/dev/null || true
+    say "Linked $HOME/.local/bin/ggrun -> $APP_HOME/ggrun"
 fi
 
 say ""
@@ -317,7 +336,15 @@ say "Config:    $APP_CONFIG/config"
 say "Logs:      $APP_LOGS"
 say ""
 say "Try now:"
-say "  \"$APP_HOME/ggrun\"            # interactive GUI"
+if command -v ggrun >/dev/null 2>&1; then
+    say "  ggrun            # interactive GUI"
+    say "  ggrun detect"
+else
+    say "  This shell does not have ggrun on PATH yet. Run:"
+    say "    source \"$APP_ENV\""
+    say "  or:"
+    say "    \"$APP_HOME/ggrun\""
+fi
 say "  \"$APP_HOME/ggrun\" detect"
 say "  \"$APP_HOME/ggrun\" <repo/name> --download"
 say "  \"$APP_HOME/ggrun\" \"$APP_MODELS/your-model.gguf\""

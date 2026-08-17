@@ -311,11 +311,61 @@ _discover_skip_path() {
 _discover_locate() {
     local name="$1"
     if command -v plocate >/dev/null 2>&1; then
-        _discover_timeout 8 plocate -b "$name" 2>/dev/null || true
+        # -b without a regex is a substring; llama-server-simulator.py must not match.
+        _discover_timeout 8 plocate -b -r "^${name}$" 2>/dev/null \
+            || _discover_timeout 8 plocate -b "$name" 2>/dev/null || true
     elif command -v locate >/dev/null 2>&1; then
         _discover_timeout 8 locate -b "\\$name" 2>/dev/null || true
     fi
     return 0
+}
+
+# A real backend is a native llama-server / ik_llama-server binary, not a
+# Python simulator, shell stub, or examples/ helper with a similar name.
+is_native_binary() {
+    local hdr
+    [[ -f "$1" && -r "$1" ]] || return 1
+    hdr="$(head -c 4 "$1" 2>/dev/null || true)"
+    [[ "$hdr" == $'\x7fELF' ]] && return 0
+    [[ "${hdr:0:2}" == "MZ" ]] && return 0
+    case "$hdr" in
+        $'\xfe\xed\xfa\xcf'|$'\xcf\xfa\xed\xfe'|$'\xfe\xed\xfa\xce'|$'\xce\xfa\xed\xfe') return 0 ;;
+    esac
+    return 1
+}
+
+is_real_llama_server() {
+    local p="$1" base
+    [[ -n "$p" && -f "$p" && -x "$p" ]] || return 1
+    base="$(basename "$p")"
+    case "$base" in
+        llama-server|llama-server.exe|ik_llama-server|ik_llama-server-cuda|ik_llama-server-vulkan) ;;
+        *) return 1 ;;
+    esac
+    case "$p" in
+        *simulator*|*llama-eval*|*/examples/*) return 1 ;;
+    esac
+    is_native_binary "$p"
+}
+
+installed_real_server() {
+    local p="$INSTALL_DIR/$1" t
+    [[ -e "$p" || -L "$p" ]] || return 1
+    t="$(_discover_abspath "$p")"
+    is_real_llama_server "$t"
+}
+
+drop_fake_installed_backends() {
+    local name p t
+    for name in llama-server llama-server-vulkan llama-server-cuda ik_llama-server-cuda; do
+        p="$INSTALL_DIR/$name"
+        [[ -e "$p" || -L "$p" ]] || continue
+        t="$(_discover_abspath "$p")"
+        if ! is_real_llama_server "$t"; then
+            warn "Ignoring $p (not a llama-server binary${t:+: $t})"
+            rm -f "$p"
+        fi
+    done
 }
 
 find_nvidia_smi() {
@@ -517,6 +567,7 @@ scan_system_installs() {
         [[ -n "$p" && -x "$p" ]] || continue
         p="$(_discover_abspath "$p")"
         _discover_skip_path "$p" && continue
+        is_real_llama_server "$p" || continue
         case " $seen " in
             *" $p "*) continue ;;
         esac
@@ -587,6 +638,7 @@ print_discover_kv() {
 link_existing_backend() {
     local src="$1" dest="$2"
     [[ -x "$src" && -n "$dest" ]] || return 1
+    is_real_llama_server "$src" || return 1
     mkdir -p "$INSTALL_DIR"
     if [[ -e "$INSTALL_DIR/$dest" || -L "$INSTALL_DIR/$dest" ]]; then
         return 0
@@ -1136,10 +1188,11 @@ PY
 # Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan or CPU).
 install_auto_release_backends() {
     local got=0
-    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -e "$INSTALL_DIR/llama-server" || -e "$INSTALL_DIR/llama-server-cuda" ]]; then
+    if installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan \
+        || installed_real_server llama-server || installed_real_server llama-server-cuda; then
         got=1
     fi
-    if has_nvidia_gpu && [[ ! -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+    if has_nvidia_gpu && ! installed_real_server ik_llama-server-cuda; then
         BACKEND_CHOICE="cuda"
         say "Installing ik_llama.cpp (CUDA)..."
         if install_release_bundle ik_llama-server-cuda; then
@@ -1147,10 +1200,10 @@ install_auto_release_backends() {
         else
             warn "No ggrun CUDA bundle. Publish ggrun-linux-x86_64-cuda.tar.gz for ik_llama.cpp."
         fi
-    elif [[ -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+    elif installed_real_server ik_llama-server-cuda; then
         say "Keeping existing ik_llama.cpp (CUDA)."
     fi
-    if [[ ! -e "$INSTALL_DIR/llama-server-vulkan" && ! -e "$INSTALL_DIR/llama-server" ]]; then
+    if ! installed_real_server llama-server-vulkan && ! installed_real_server llama-server; then
         BACKEND_CHOICE="vulkan"
         say "Installing llama.cpp (Vulkan)..."
         if install_release_bundle llama-server-vulkan || install_upstream_linux_prebuilt vulkan llama-server-vulkan; then
@@ -1164,10 +1217,10 @@ install_auto_release_backends() {
         fi
     else
         say "Keeping existing llama.cpp backend."
-        [[ -e "$INSTALL_DIR/llama-server-vulkan" ]] && BACKEND_CHOICE="vulkan"
+        installed_real_server llama-server-vulkan && BACKEND_CHOICE="vulkan"
     fi
     link_default_llama_server
-    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -e "$INSTALL_DIR/llama-server" ]]; then
+    if installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan || installed_real_server llama-server; then
         got=1
     fi
     (( got ))
@@ -1321,6 +1374,7 @@ build_backend() {
 # ── Stage 3: install scripts ────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR" "$MODEL_DIR"
 RELEASE_INSTALLED=0
+drop_fake_installed_backends
 
 if [[ "$INSTALL_MODE" == "auto" || "$INSTALL_MODE" == "release" ]]; then
     if [[ "${LLM_INSTALL_SCAN_SYSTEM:-1}" != "0" ]]; then
@@ -1337,7 +1391,8 @@ if [[ "$INSTALL_MODE" == "auto" || "$INSTALL_MODE" == "release" ]]; then
         else
             warn "No prebuilt CUDA/Vulkan/CPU backend could be downloaded."
         fi
-    elif [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -x "$INSTALL_DIR/llama-server" || -e "$INSTALL_DIR/llama-server-cuda" ]]; then
+    elif installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan \
+        || installed_real_server llama-server || installed_real_server llama-server-cuda; then
         RELEASE_INSTALLED=1
     elif install_release_bundle; then
         RELEASE_INSTALLED=1
@@ -1474,7 +1529,7 @@ if [[ -n "$BACKEND_REPO" ]]; then
     say ""
     say "── Backend: $BACKEND_CHOICE ──"
     backend_binary="$(backend_server_path)"
-    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -x "$INSTALL_DIR/llama-server" ]]; then
+    if installed_real_server ik_llama-server-cuda || installed_real_server llama-server-vulkan || installed_real_server llama-server; then
         link_default_llama_server
         RELEASE_INSTALLED=1
     fi
