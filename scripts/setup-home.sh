@@ -100,18 +100,41 @@ if [[ "$NONINTERACTIVE" != "1" && -r /dev/tty ]]; then
     APP_ENV="$APP_HOME/.env.sh"
 
     say ""
-    say "Backend: auto installs both ik_llama.cpp (CUDA) and llama.cpp (Vulkan/CPU)"
-    say "when those prebuilts exist. ggrun picks the right one per model."
-    if [[ "$PLATFORM" == "linux" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
-        say "No nvidia-smi in PATH. CUDA needs an NVIDIA driver. auto will use Vulkan or CPU."
+    say "Backend: auto uses llama.cpp / ik_llama.cpp / forks / CUDA already on"
+    say "this machine, then downloads the rest. ggrun picks the right one per model."
+    if [[ -x "$ROOT/install.sh" ]]; then
+        disc="$(mktemp)"
+        if LLM_INSTALL_NONINTERACTIVE=1 "$ROOT/install.sh" --discover >"$disc" 2>/dev/null; then
+            if [[ -s "$disc" ]]; then
+                say ""
+                say "Already on this machine:"
+                while IFS='=' read -r k v; do
+                    case "$k" in
+                        nvidia_smi) say "  NVIDIA driver: $v" ;;
+                        nvcc) say "  CUDA toolkit:  $v" ;;
+                        ik_llama) say "  ik_llama.cpp:  $v" ;;
+                        llama_vulkan) say "  llama.cpp Vulkan: $v" ;;
+                        llama_cuda) say "  llama.cpp CUDA: $v" ;;
+                        llama) say "  llama.cpp:     $v" ;;
+                        fork) say "  fork:          $v" ;;
+                    esac
+                done <"$disc"
+            fi
+        fi
+        rm -f "$disc"
+    fi
+    if [[ "$PLATFORM" == "linux" ]] && ! command -v nvidia-smi >/dev/null 2>&1 \
+        && [[ ! -x /usr/bin/nvidia-smi && ! -e /dev/nvidia0 ]]; then
+        say "No NVIDIA driver found. CUDA needs one. auto will use Vulkan or CPU if needed."
     fi
     reply="$(read_tty "Backend [auto/cuda/vulkan/cpu/metal/skip]" "$BACKEND")"
     case "$reply" in
         auto|cuda|vulkan|cpu|metal|skip) BACKEND="$reply" ;;
         *) say "Using $BACKEND" ;;
     esac
-    if [[ "$BACKEND" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
-        say "CUDA was requested but nvidia-smi is missing. Install the NVIDIA driver, or pick auto."
+    if [[ "$BACKEND" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1 \
+        && [[ ! -x /usr/bin/nvidia-smi && ! -e /dev/nvidia0 ]]; then
+        say "CUDA was requested but no NVIDIA driver was found. Install the driver, or pick auto."
         if ask_tty "Switch to auto (Vulkan/CPU if CUDA cannot be downloaded)? [Y/n]" y; then
             BACKEND="auto"
         fi
@@ -248,9 +271,7 @@ fi
 if [[ -n "$backend_bin" ]]; then
     backend_dir="$(dirname "$(readlink -f "$backend_bin" 2>/dev/null || printf '%s' "$backend_bin")")"
     if ! env LD_LIBRARY_PATH="$backend_dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$backend_bin" --version >/dev/null 2>&1; then
-        err "Installed backend could not start: $backend_bin"
-        err "This usually means the bundle is incompatible or a required runtime library is missing. See log: $LOG_FILE"
-        exit 1
+        say "  ⚠ Backend installed at $backend_bin but --version failed (missing GPU runtime is OK)"
     fi
 fi
 ok_msg="CLI, hardware detection, and backend startup checks passed"

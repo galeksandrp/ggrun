@@ -67,9 +67,11 @@ ships these archives, checksummed in `SHA256SUMS`:
 | macOS arm64 | Metal |
 | Windows x86_64 | CPU |
 
-Linux `auto` installs both when the files exist: ik_llama.cpp (CUDA) as
-`ik_llama-server-cuda` and llama.cpp (Vulkan or CPU) as `llama-server-vulkan`.
-ggrun picks the matching server per model. Linux CUDA comes from
+Linux `auto` first searches the machine for an existing `llama-server`
+(ik_llama.cpp, llama.cpp, and forks) plus the NVIDIA driver and CUDA toolkit.
+It reuses those, then downloads whatever is still missing: ik_llama.cpp (CUDA)
+as `ik_llama-server-cuda` and llama.cpp (Vulkan or CPU) as `llama-server-vulkan`.
+ggrun picks the matching server per model. Linux CUDA bundles come from
 `ggrun-linux-x86_64-cuda.tar.gz` on the release. Windows CUDA:
 `install.ps1 -Backend cuda`.
 

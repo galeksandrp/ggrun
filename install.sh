@@ -29,6 +29,9 @@
 #   LLM_INSTALL_MAIN=go|bash                               default: go
 #   LLM_INSTALL_NONINTERACTIVE=1                          skip prompts
 #   LLM_INSTALL_PROMPT=0                                  never ask guided setup questions
+#   LLM_INSTALL_SCAN_SYSTEM=0                             do not search the machine for
+#                                                         existing llama.cpp / CUDA
+#   ./install.sh --discover                               print what is already installed
 
 set -Eeuo pipefail
 
@@ -76,10 +79,15 @@ show_help() {
     sed -n '2,/^set -Eeuo pipefail$/p' "${BASH_SOURCE[0]}" | sed '$d'
 }
 
+DISCOVER_ONLY=0
+[[ "${LLM_INSTALL_DISCOVER_ONLY:-0}" == "1" ]] && DISCOVER_ONLY=1
 case "${1:-}" in
     -h|--help)
         show_help
         exit 0
+        ;;
+    --discover)
+        DISCOVER_ONLY=1
         ;;
     "") ;;
     *)
@@ -206,20 +214,24 @@ case "$MAIN_IMPL" in
     *) err "unknown main implementation: $MAIN_IMPL"; exit 1 ;;
 esac
 
-say "═══ ggrun installer ═══"
-INSTALL_STARTED=1
+if (( ! DISCOVER_ONLY )); then
+    say "═══ ggrun installer ═══"
+    INSTALL_STARTED=1
+fi
 
 # ── Stage 1: use local repo if present; clone only if source fallback needs it ──
 SRC_DIR=""
 SRC_DIR_EXTERNAL=0
-if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/go/go.mod" && -f "$SCRIPT_DIR/scripts/setup-home.sh" ]]; then
-    SRC_DIR="$SCRIPT_DIR"
-    SRC_DIR_EXTERNAL=1
-    ok "Using local repo at $SRC_DIR"
-elif [[ -f "./go/go.mod" && -f "./scripts/setup-home.sh" ]]; then
-    SRC_DIR="$(pwd)"
-    SRC_DIR_EXTERNAL=1
-    ok "Using local repo at $SRC_DIR"
+if (( ! DISCOVER_ONLY )); then
+    if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/go/go.mod" && -f "$SCRIPT_DIR/scripts/setup-home.sh" ]]; then
+        SRC_DIR="$SCRIPT_DIR"
+        SRC_DIR_EXTERNAL=1
+        ok "Using local repo at $SRC_DIR"
+    elif [[ -f "./go/go.mod" && -f "./scripts/setup-home.sh" ]]; then
+        SRC_DIR="$(pwd)"
+        SRC_DIR_EXTERNAL=1
+        ok "Using local repo at $SRC_DIR"
+    fi
 fi
 
 prepare_persistent_source_repo() {
@@ -263,26 +275,100 @@ ensure_source_repo() {
     fi
 }
 
-if [[ -n "$SOURCE_REPO_DIR" ]]; then
+if (( ! DISCOVER_ONLY )) && [[ -n "$SOURCE_REPO_DIR" ]]; then
     prepare_persistent_source_repo || true
 fi
 
 # ── Stage 2: detect platform + backend ──────────────────────────────────────
 OS="$(uname -s)"
 
+_discover_timeout() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$@"
+    else
+        shift
+        "$@"
+    fi
+}
+
+_discover_abspath() {
+    readlink -f "$1" 2>/dev/null || printf '%s\n' "$1"
+}
+
+_discover_skip_path() {
+    local p="$1"
+    case "$p" in
+        /proc/*|/sys/*|/dev/*|/run/*) return 0 ;;
+    esac
+    if [[ -n "${INSTALL_DIR:-}" ]]; then
+        local dest
+        dest="$(_discover_abspath "$INSTALL_DIR")"
+        [[ "$p" == "$dest" || "$p" == "$dest"/* ]] && return 0
+    fi
+    return 1
+}
+
+_discover_locate() {
+    local name="$1"
+    if command -v plocate >/dev/null 2>&1; then
+        _discover_timeout 8 plocate -b "$name" 2>/dev/null || true
+    elif command -v locate >/dev/null 2>&1; then
+        _discover_timeout 8 locate -b "\\$name" 2>/dev/null || true
+    fi
+    return 0
+}
+
+find_nvidia_smi() {
+    local c
+    for c in \
+        "$(command -v nvidia-smi 2>/dev/null || true)" \
+        /usr/bin/nvidia-smi \
+        /usr/local/bin/nvidia-smi \
+        /usr/lib/nvidia/bin/nvidia-smi \
+        /opt/nvidia/bin/nvidia-smi \
+        /usr/lib64/nvidia/bin/nvidia-smi
+    do
+        [[ -n "$c" && -x "$c" ]] || continue
+        printf '%s\n' "$(_discover_abspath "$c")"
+        return 0
+    done
+    while IFS= read -r c; do
+        [[ -n "$c" && -x "$c" ]] || continue
+        _discover_skip_path "$c" && continue
+        printf '%s\n' "$(_discover_abspath "$c")"
+        return 0
+    done < <(_discover_locate nvidia-smi | head -n 20)
+    return 1
+}
+
 cuda_nvcc_path() {
-    if command -v nvcc >/dev/null 2>&1; then
-        command -v nvcc
+    local c dir
+    for c in \
+        "$(command -v nvcc 2>/dev/null || true)" \
+        "${CUDACXX:-}" \
+        "${CUDA_HOME:+$CUDA_HOME/bin/nvcc}" \
+        "${CUDA_PATH:+$CUDA_PATH/bin/nvcc}" \
+        /usr/local/cuda/bin/nvcc \
+        /usr/bin/nvcc \
+        /opt/cuda/bin/nvcc \
+        "$HOME/cuda/bin/nvcc" \
+        "$HOME/.local/cuda/bin/nvcc"
+    do
+        [[ -n "$c" && -x "$c" ]] || continue
+        printf '%s\n' "$(_discover_abspath "$c")"
         return 0
-    fi
-    if [[ -n "${CUDA_PATH:-}" && -x "${CUDA_PATH}/bin/nvcc" ]]; then
-        printf '%s\n' "${CUDA_PATH}/bin/nvcc"
+    done
+    for dir in /usr/local/cuda-* /opt/cuda-*; do
+        [[ -x "$dir/bin/nvcc" ]] || continue
+        printf '%s\n' "$(_discover_abspath "$dir/bin/nvcc")"
         return 0
-    fi
-    if [[ -x /usr/local/cuda/bin/nvcc ]]; then
-        printf '%s\n' /usr/local/cuda/bin/nvcc
+    done
+    while IFS= read -r c; do
+        [[ -n "$c" && -x "$c" && "$(basename "$c")" == nvcc ]] || continue
+        _discover_skip_path "$c" && continue
+        printf '%s\n' "$(_discover_abspath "$c")"
         return 0
-    fi
+    done < <(_discover_locate nvcc | head -n 20)
     return 1
 }
 
@@ -294,13 +380,254 @@ has_cuda_toolkit() {
 }
 
 vulkan_available() {
-    command -v vulkaninfo >/dev/null 2>&1 || return 1
-    vulkaninfo --summary 2>/dev/null | grep -qi "GPU\|deviceName"
+    local info lib
+    info="$(command -v vulkaninfo 2>/dev/null || true)"
+    [[ -z "$info" && -x /usr/bin/vulkaninfo ]] && info=/usr/bin/vulkaninfo
+    if [[ -n "$info" ]]; then
+        "$info" --summary 2>/dev/null | grep -qi "GPU\|deviceName" && return 0
+    fi
+    for lib in /usr/lib64/libvulkan.so.1 /usr/lib/x86_64-linux-gnu/libvulkan.so.1 /usr/lib/libvulkan.so.1; do
+        [[ -e "$lib" ]] && return 0
+    done
+    return 1
 }
 
 has_nvidia_gpu() {
-    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q GPU
+    local smi
+    smi="$(find_nvidia_smi 2>/dev/null || true)"
+    if [[ -n "$smi" ]] && "$smi" -L 2>/dev/null | grep -q GPU; then
+        return 0
+    fi
+    [[ -e /dev/nvidia0 || -r /proc/driver/nvidia/version ]] && return 0
+    [[ -e /usr/lib64/libcuda.so.1 || -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 || -e /usr/lib/libcuda.so.1 ]] && return 0
+    if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qiE 'VGA.*NVIDIA|3D.*NVIDIA|NVIDIA.*Controller'; then
+        return 0
+    fi
+    return 1
 }
+
+FOUND_NVIDIA_SMI=""
+FOUND_NVCC=""
+FOUND_IK_SERVER=""
+FOUND_VULKAN_SERVER=""
+FOUND_CUDA_SERVER=""
+FOUND_LLAMA_SERVER=""
+FOUND_FORK_SERVERS=""
+
+_path_score() {
+    local p="$1" n=50
+    case "$p" in
+        *pre-rebrand*|*legacy*|*-prev-*|*/.cache/*) n=5 ;;
+        "$HOME/ik_llama.cpp"/*) n=200 ;;
+        "$HOME/llama.cpp"/*) n=180 ;;
+        "$HOME/.local/bin"/*) n=160 ;;
+        /usr/local/bin/*) n=150 ;;
+        /usr/bin/*) n=140 ;;
+        *fork-*|*fork_*) n=40 ;;
+    esac
+    [[ "$p" == *"/build-cuda/"* ]] && n=$((n + 8))
+    [[ "$p" == *"/build-vulkan/"* ]] && n=$((n + 6))
+    printf '%s\n' "$n"
+}
+
+_better_server() {
+    local cur="$1" cand="$2"
+    [[ -z "$cand" ]] && { printf '%s\n' "$cur"; return; }
+    [[ -z "$cur" ]] && { printf '%s\n' "$cand"; return; }
+    local sc cc
+    sc="$(_path_score "$cur")"
+    cc="$(_path_score "$cand")"
+    if (( cc > sc )); then
+        printf '%s\n' "$cand"
+    else
+        printf '%s\n' "$cur"
+    fi
+}
+
+classify_llama_bin() {
+    local path="$1" low
+    low="$(printf '%s' "$path" | tr '[:upper:]' '[:lower:]')"
+    case "$low" in
+        *ik_llama*|*ik-llama*) printf 'ik\n' ;;
+        *vulkan*) printf 'vulkan\n' ;;
+        *fork-*|*fork_*) printf 'fork\n' ;;
+        *cuda*) printf 'cuda\n' ;;
+        *) printf 'llama\n' ;;
+    esac
+}
+
+_collect_llama_bins() {
+    local hit name root p
+    for name in llama-server llama-server-cuda llama-server-vulkan \
+                ik_llama-server ik_llama-server-cuda; do
+        hit="$(command -v "$name" 2>/dev/null || true)"
+        [[ -n "$hit" && -x "$hit" ]] && printf '%s\n' "$(_discover_abspath "$hit")"
+    done
+    for p in \
+        "$HOME/ik_llama.cpp/build/bin/llama-server" \
+        "$HOME/ik_llama.cpp/build-cuda/bin/llama-server" \
+        "$HOME/llama.cpp/build/bin/llama-server" \
+        "$HOME/llama.cpp/build-cuda/bin/llama-server" \
+        "$HOME/llama.cpp/build-vulkan/bin/llama-server" \
+        "$HOME/.local/bin/llama-server" \
+        "$HOME/.local/bin/ik_llama-server-cuda" \
+        "$HOME/ggrun/.bin/ik_llama-server-cuda" \
+        "$HOME/ggrun/.bin/llama-server-vulkan" \
+        "$HOME/ggrun/.bin/llama-server" \
+        /usr/local/bin/llama-server \
+        /usr/bin/llama-server \
+        /opt/llama.cpp/build/bin/llama-server \
+        /opt/ik_llama.cpp/build/bin/llama-server
+    do
+        [[ -x "$p" ]] && printf '%s\n' "$(_discover_abspath "$p")"
+    done
+    # Stay off /mnt and /media: those often hang on network mounts.
+    # LLM_INSTALL_SCAN_ROOTS is a colon-separated override for tests and offline use.
+    local roots="${LLM_INSTALL_SCAN_ROOTS:-}"
+    if [[ -z "$roots" ]]; then
+        roots="$HOME:$HOME/.local:/usr/local:/opt:/usr"
+    fi
+    local IFS=':'
+    for root in $roots; do
+        unset IFS
+        [[ -d "$root" ]] || continue
+        _discover_timeout 20 find "$root" -maxdepth 6 \
+            \( -name .git -o -name .cache -o -name node_modules -o -name .Trash \
+               -o -name Trash -o -name steamapps -o -name Proton -o -name proc \) -prune -o \
+            -type f \( -name llama-server -o -name llama-server.exe -o -name 'ik_llama-server*' \) \
+            -print 2>/dev/null || true
+    done
+    _discover_locate llama-server
+    _discover_locate ik_llama-server
+    return 0
+}
+
+scan_system_installs() {
+    FOUND_NVIDIA_SMI="$(find_nvidia_smi 2>/dev/null || true)"
+    FOUND_NVCC="$(cuda_nvcc_path 2>/dev/null || true)"
+    FOUND_IK_SERVER=""
+    FOUND_VULKAN_SERVER=""
+    FOUND_CUDA_SERVER=""
+    FOUND_LLAMA_SERVER=""
+    FOUND_FORK_SERVERS=""
+    [[ "${LLM_INSTALL_SCAN_SYSTEM:-1}" == "0" ]] && return 0
+
+    local p kind seen=""
+    while IFS= read -r p; do
+        [[ -n "$p" && -x "$p" ]] || continue
+        p="$(_discover_abspath "$p")"
+        _discover_skip_path "$p" && continue
+        case " $seen " in
+            *" $p "*) continue ;;
+        esac
+        seen+=" $p"
+        kind="$(classify_llama_bin "$p")"
+        case "$kind" in
+            ik) FOUND_IK_SERVER="$(_better_server "$FOUND_IK_SERVER" "$p")" ;;
+            vulkan) FOUND_VULKAN_SERVER="$(_better_server "$FOUND_VULKAN_SERVER" "$p")" ;;
+            cuda) FOUND_CUDA_SERVER="$(_better_server "$FOUND_CUDA_SERVER" "$p")" ;;
+            fork) FOUND_FORK_SERVERS+="$p"$'\n' ;;
+            *) FOUND_LLAMA_SERVER="$(_better_server "$FOUND_LLAMA_SERVER" "$p")" ;;
+        esac
+    done < <(_collect_llama_bins | sed '/^$/d' | sort -u)
+    return 0
+}
+
+report_system_installs() {
+    say "── Already on this machine ──"
+    if [[ -n "$FOUND_NVIDIA_SMI" ]]; then
+        ok "NVIDIA driver: $FOUND_NVIDIA_SMI"
+    else
+        say "  NVIDIA driver: not found"
+    fi
+    if [[ -n "$FOUND_NVCC" ]]; then
+        ok "CUDA toolkit:  $FOUND_NVCC"
+    else
+        say "  CUDA toolkit:  not found"
+    fi
+    if [[ -n "$FOUND_IK_SERVER" ]]; then
+        ok "ik_llama.cpp:  $FOUND_IK_SERVER"
+    else
+        say "  ik_llama.cpp:  not found"
+    fi
+    if [[ -n "$FOUND_VULKAN_SERVER" ]]; then
+        ok "llama.cpp Vulkan: $FOUND_VULKAN_SERVER"
+    fi
+    if [[ -n "$FOUND_CUDA_SERVER" ]]; then
+        ok "llama.cpp CUDA: $FOUND_CUDA_SERVER"
+    fi
+    if [[ -n "$FOUND_LLAMA_SERVER" ]]; then
+        ok "llama.cpp:     $FOUND_LLAMA_SERVER"
+    fi
+    if [[ -z "$FOUND_VULKAN_SERVER$FOUND_CUDA_SERVER$FOUND_LLAMA_SERVER" ]]; then
+        say "  llama.cpp:     not found"
+    fi
+    if [[ -n "$FOUND_FORK_SERVERS" ]]; then
+        local f
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && ok "fork:          $f"
+        done <<<"$FOUND_FORK_SERVERS"
+    fi
+}
+
+print_discover_kv() {
+    [[ -n "$FOUND_NVIDIA_SMI" ]] && printf 'nvidia_smi=%s\n' "$FOUND_NVIDIA_SMI"
+    [[ -n "$FOUND_NVCC" ]] && printf 'nvcc=%s\n' "$FOUND_NVCC"
+    [[ -n "$FOUND_IK_SERVER" ]] && printf 'ik_llama=%s\n' "$FOUND_IK_SERVER"
+    [[ -n "$FOUND_VULKAN_SERVER" ]] && printf 'llama_vulkan=%s\n' "$FOUND_VULKAN_SERVER"
+    [[ -n "$FOUND_CUDA_SERVER" ]] && printf 'llama_cuda=%s\n' "$FOUND_CUDA_SERVER"
+    [[ -n "$FOUND_LLAMA_SERVER" ]] && printf 'llama=%s\n' "$FOUND_LLAMA_SERVER"
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && printf 'fork=%s\n' "$f"
+    done <<<"${FOUND_FORK_SERVERS:-}"
+    return 0
+}
+
+link_existing_backend() {
+    local src="$1" dest="$2"
+    [[ -x "$src" && -n "$dest" ]] || return 1
+    mkdir -p "$INSTALL_DIR"
+    if [[ -e "$INSTALL_DIR/$dest" || -L "$INSTALL_DIR/$dest" ]]; then
+        return 0
+    fi
+    ln -sfn "$src" "$INSTALL_DIR/$dest"
+    ok "Using existing $dest at $src"
+}
+
+adopt_system_backends() {
+    local used=0
+    if [[ -n "$FOUND_IK_SERVER" ]]; then
+        link_existing_backend "$FOUND_IK_SERVER" ik_llama-server-cuda && used=1
+    fi
+    if [[ -n "$FOUND_VULKAN_SERVER" ]]; then
+        link_existing_backend "$FOUND_VULKAN_SERVER" llama-server-vulkan && used=1
+    fi
+    if [[ -n "$FOUND_CUDA_SERVER" && ! -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+        link_existing_backend "$FOUND_CUDA_SERVER" llama-server-cuda && used=1
+    fi
+    if [[ -n "$FOUND_LLAMA_SERVER" && ! -e "$INSTALL_DIR/llama-server" && ! -e "$INSTALL_DIR/llama-server-vulkan" ]]; then
+        link_existing_backend "$FOUND_LLAMA_SERVER" llama-server && used=1
+    fi
+    if [[ -n "$FOUND_CUDA_SERVER" && ! -e "$INSTALL_DIR/llama-server" && ! -e "$INSTALL_DIR/llama-server-vulkan" ]]; then
+        link_existing_backend "$FOUND_CUDA_SERVER" llama-server && used=1
+    fi
+    if [[ -n "$FOUND_FORK_SERVERS" && ! -e "$INSTALL_DIR/llama-server" && ! -e "$INSTALL_DIR/llama-server-vulkan" ]]; then
+        local fork
+        fork="$(printf '%s\n' "$FOUND_FORK_SERVERS" | sed '/^$/d' | head -n 1)"
+        if [[ -n "$fork" ]]; then
+            link_existing_backend "$fork" llama-server && used=1
+        fi
+    fi
+    link_default_llama_server
+    (( used ))
+}
+
+if (( DISCOVER_ONLY )); then
+    scan_system_installs || true
+    print_discover_kv || true
+    exit 0
+fi
 
 # Linux auto: CUDA first when an NVIDIA GPU is present, then Vulkan, then CPU.
 # macOS: Metal. Never pick CUDA on a machine with no NVIDIA device.
@@ -809,7 +1136,10 @@ PY
 # Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan or CPU).
 install_auto_release_backends() {
     local got=0
-    if has_nvidia_gpu; then
+    if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -e "$INSTALL_DIR/llama-server" || -e "$INSTALL_DIR/llama-server-cuda" ]]; then
+        got=1
+    fi
+    if has_nvidia_gpu && [[ ! -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
         BACKEND_CHOICE="cuda"
         say "Installing ik_llama.cpp (CUDA)..."
         if install_release_bundle ik_llama-server-cuda; then
@@ -817,17 +1147,24 @@ install_auto_release_backends() {
         else
             warn "No ggrun CUDA bundle. Publish ggrun-linux-x86_64-cuda.tar.gz for ik_llama.cpp."
         fi
+    elif [[ -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+        say "Keeping existing ik_llama.cpp (CUDA)."
     fi
-    BACKEND_CHOICE="vulkan"
-    say "Installing llama.cpp (Vulkan)..."
-    if install_release_bundle llama-server-vulkan || install_upstream_linux_prebuilt vulkan llama-server-vulkan; then
-        got=1
-    else
-        BACKEND_CHOICE="cpu"
-        say "Installing llama.cpp (CPU)..."
-        if install_release_bundle llama-server || install_upstream_linux_prebuilt cpu llama-server; then
+    if [[ ! -e "$INSTALL_DIR/llama-server-vulkan" && ! -e "$INSTALL_DIR/llama-server" ]]; then
+        BACKEND_CHOICE="vulkan"
+        say "Installing llama.cpp (Vulkan)..."
+        if install_release_bundle llama-server-vulkan || install_upstream_linux_prebuilt vulkan llama-server-vulkan; then
             got=1
+        else
+            BACKEND_CHOICE="cpu"
+            say "Installing llama.cpp (CPU)..."
+            if install_release_bundle llama-server || install_upstream_linux_prebuilt cpu llama-server; then
+                got=1
+            fi
         fi
+    else
+        say "Keeping existing llama.cpp backend."
+        [[ -e "$INSTALL_DIR/llama-server-vulkan" ]] && BACKEND_CHOICE="vulkan"
     fi
     link_default_llama_server
     if [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -e "$INSTALL_DIR/llama-server" ]]; then
@@ -986,12 +1323,22 @@ mkdir -p "$INSTALL_DIR" "$MODEL_DIR"
 RELEASE_INSTALLED=0
 
 if [[ "$INSTALL_MODE" == "auto" || "$INSTALL_MODE" == "release" ]]; then
+    if [[ "${LLM_INSTALL_SCAN_SYSTEM:-1}" != "0" ]]; then
+        say ""
+        scan_system_installs
+        report_system_installs
+        if adopt_system_backends; then
+            RELEASE_INSTALLED=1
+        fi
+    fi
     if [[ "$BACKEND_REQUEST" == "auto" && "$INSTALL_MODE" == "auto" ]]; then
         if install_auto_release_backends; then
             RELEASE_INSTALLED=1
         else
             warn "No prebuilt CUDA/Vulkan/CPU backend could be downloaded."
         fi
+    elif [[ -e "$INSTALL_DIR/ik_llama-server-cuda" || -e "$INSTALL_DIR/llama-server-vulkan" || -x "$INSTALL_DIR/llama-server" || -e "$INSTALL_DIR/llama-server-cuda" ]]; then
+        RELEASE_INSTALLED=1
     elif install_release_bundle; then
         RELEASE_INSTALLED=1
     elif [[ "$INSTALL_MODE" == "release" ]]; then
