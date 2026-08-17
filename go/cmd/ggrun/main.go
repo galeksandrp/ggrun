@@ -153,6 +153,7 @@ Commands:
                        preselect instead of the interactive picker)
   tune <model.gguf>    AI-tune model for best performance
   recommend [-n N]     Rank models that fit this machine (intelligence x speed)
+  recommend --first    Print the top Hugging Face repo only
   support              Native optional support expert / optimizer (status, install, doctor)
   models [list|browse|path|rm] List, browse, locate, or safely remove GGUF models
   config [show|edit|path|reset]  Manage settings
@@ -6921,6 +6922,7 @@ func tuneRoundsFromArgs(args []string, fallback int) (int, error) {
 
 func cmdRecommend(args []string) {
 	limit := 5
+	firstOnly := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-n", "--limit":
@@ -6930,6 +6932,8 @@ func cmdRecommend(args []string) {
 				}
 				i++
 			}
+		case "--first":
+			firstOnly = true
 		default:
 			if n, err := strconv.Atoi(strings.TrimPrefix(args[i], "-n")); err == nil && n > 0 {
 				limit = n
@@ -6972,6 +6976,10 @@ func cmdRecommend(args []string) {
 	cats := recommend.TopCategories(caps, limit)
 	if len(cats.Balanced) == 0 {
 		fmt.Println("No models in the catalog fit this machine.")
+		return
+	}
+	if firstOnly {
+		fmt.Println(cats.Balanced[0].Repo)
 		return
 	}
 	printRecGroup := func(title string, rows []recommend.Recommendation) {

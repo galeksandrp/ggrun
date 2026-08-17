@@ -56,6 +56,77 @@ if [[ "$PLATFORM" == "mac" && "$BACKEND" == "auto" ]]; then
     BACKEND="metal"
 fi
 
+GUIDE_DOWNLOAD_MODEL=0
+GUIDE_PATH=0
+
+ask_tty() {
+    local p="$1" d="${2:-n}" reply
+    if [[ "$NONINTERACTIVE" == "1" || ! -r /dev/tty ]]; then
+        [[ "$d" == "y" ]]
+        return
+    fi
+    read -r -p "$p " reply </dev/tty || reply=""
+    reply="${reply:-$d}"
+    [[ "$reply" =~ ^[Yy] ]]
+}
+
+read_tty() {
+    local prompt="$1" default="$2" reply
+    if [[ "$NONINTERACTIVE" == "1" || ! -r /dev/tty ]]; then
+        printf '%s\n' "$default"
+        return
+    fi
+    if [[ -n "$default" ]]; then
+        read -r -p "$prompt [$default]: " reply </dev/tty || reply=""
+    else
+        read -r -p "$prompt: " reply </dev/tty || reply=""
+    fi
+    printf '%s\n' "${reply:-$default}"
+}
+
+if [[ "$NONINTERACTIVE" != "1" && -r /dev/tty ]]; then
+    say ""
+    say "ggrun setup"
+    say "This install will put a working ggrun and a local model server on this machine."
+    say "Press Enter to keep a default."
+    say ""
+    APP_HOME="$(read_tty "Install directory" "$APP_HOME")"
+    APP_BIN="$APP_HOME/.bin"
+    APP_MODELS="$(read_tty "Model directory" "$APP_HOME/models")"
+    APP_LOGS="$APP_HOME/.logs"
+    APP_CACHE="$APP_HOME/.cache"
+    APP_CONFIG="$APP_HOME/.config"
+    APP_SRC="$APP_HOME/.src"
+    APP_ENV="$APP_HOME/.env.sh"
+
+    say ""
+    say "Backend (auto = CUDA if you have an NVIDIA GPU, else Vulkan, else CPU)."
+    say "auto downloads a prebuilt server. It does not compile."
+    if [[ "$PLATFORM" == "linux" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+        say "No nvidia-smi in PATH. CUDA needs an NVIDIA driver. auto will use Vulkan or CPU."
+    fi
+    reply="$(read_tty "Backend [auto/cuda/vulkan/cpu/metal/skip]" "$BACKEND")"
+    case "$reply" in
+        auto|cuda|vulkan|cpu|metal|skip) BACKEND="$reply" ;;
+        *) say "Using $BACKEND" ;;
+    esac
+    if [[ "$BACKEND" == "cuda" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
+        say "CUDA was requested but nvidia-smi is missing. Install the NVIDIA driver, or pick auto."
+        if ask_tty "Switch to auto (Vulkan/CPU if CUDA cannot be downloaded)? [Y/n]" y; then
+            BACKEND="auto"
+        fi
+    fi
+    if ask_tty "Download a model that fits this machine after install? [Y/n]" y; then
+        GUIDE_DOWNLOAD_MODEL=1
+    fi
+    if ask_tty "Add ggrun to PATH in your shell rc? [Y/n]" y; then
+        GUIDE_PATH=1
+    fi
+    export LLM_INSTALL_PROMPT=0
+    export LLM_INSTALL_PY_DEPS=install
+    say ""
+fi
+
 mkdir -p "$APP_BIN" "$APP_MODELS" "$APP_LOGS" "$APP_CACHE" "$APP_CONFIG" "$APP_SRC"
 LOG_FILE="$APP_LOGS/setup-$LOG_TS.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -178,6 +249,34 @@ if [[ -n "$backend_bin" ]] && ! "$backend_bin" --version >/dev/null 2>&1; then
 fi
 ok_msg="CLI, hardware detection, and backend startup checks passed"
 say "  ✓ $ok_msg"
+
+if (( GUIDE_DOWNLOAD_MODEL )); then
+    say ""
+    say "── Model that fits this machine ──"
+    LLM_APP_HOME="$APP_HOME" "$APP_BIN/ggrun" recommend -n 3 || true
+    first_repo="$(LLM_APP_HOME="$APP_HOME" "$APP_BIN/ggrun" recommend --first 2>/dev/null | tail -n 1 || true)"
+    repo="$(read_tty "Hugging Face repo to download (empty skips)" "$first_repo")"
+    if [[ -n "$repo" ]]; then
+        say "Downloading $repo …"
+        if LLM_APP_HOME="$APP_HOME" "$APP_BIN/ggrun" download "$repo"; then
+            say "  Model download finished"
+        else
+            warn "Download failed. You can retry: $APP_HOME/ggrun download $repo"
+        fi
+    fi
+fi
+
+if (( GUIDE_PATH )); then
+    SHELL_RC="$HOME/.bashrc"
+    [[ "$(uname -s)" == "Darwin" ]] && SHELL_RC="$HOME/.zshrc"
+    line="source \"$APP_ENV\""
+    if [[ -f "$SHELL_RC" ]] && grep -Fqs "$APP_ENV" "$SHELL_RC"; then
+        say "PATH already set in $SHELL_RC"
+    else
+        printf '\n# ggrun\n%s\n' "$line" >>"$SHELL_RC"
+        say "Added $line to $SHELL_RC"
+    fi
+fi
 
 say ""
 say "╔════════════════════════════════════════════════════════════╗"

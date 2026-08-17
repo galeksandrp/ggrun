@@ -51,8 +51,8 @@ GO_BOOTSTRAP_ROOT="${LLM_INSTALL_GO_ROOT:-$BACKEND_ROOT/.llm-server-go}"
 GO_CMD=""
 NONINTERACTIVE="${LLM_INSTALL_NONINTERACTIVE:-0}"
 MAIN_IMPL="${LLM_INSTALL_MAIN:-go}"
-# curl | bash has no stdin tty. Do not block on /dev/tty questions.
-[[ ! -t 0 && -z "${LLM_INSTALL_NONINTERACTIVE:-}" ]] && NONINTERACTIVE=1
+# CI / no terminal: silent defaults. A real curl | bash still has /dev/tty.
+[[ ! -t 0 && ! -r /dev/tty && -z "${LLM_INSTALL_NONINTERACTIVE:-}" ]] && NONINTERACTIVE=1
 
 SCRIPT_DIR=""
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
