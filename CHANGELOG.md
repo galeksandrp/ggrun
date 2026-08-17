@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v3.2.1 — 2026-08-17
+
+- **Linux CUDA bundle on latest.** Publishes `ggrun-linux-x86_64-cuda.tar.gz`
+  so one-command Linux setup downloads ik_llama.cpp instead of compiling it.
+  v3.2.0 was tagged but its release job died in preflight and never attached
+  assets.
+
 ## v3.2.0 — 2026-08-17
 
 - **Linux CUDA release bundle.** The tag publishes `ggrun-linux-x86_64-cuda.tar.gz`

@@ -44,15 +44,20 @@ jobs:
         working-directory: go
         run: go vet ./...
 
-      - name: Run shell and Python regression tests
-        run: |
-          python3 tests/test_parse_gguf.py
-          bash tests/test_estimator.sh
-          bash tests/test_safety.sh
-          bash tests/test_setup_home.sh
-          bash tests/test_model_index.sh
-          bash tests/test_moe_placement.sh
-          python3 -m pytest tests/test_downloader_quant.py tests/test_update_recommendations.py
+      - name: parse_gguf tests
+        run: python3 tests/test_parse_gguf.py
+      - name: estimator tests
+        run: bash tests/test_estimator.sh
+      - name: safety tests
+        run: bash tests/test_safety.sh
+      - name: setup-home tests
+        run: bash tests/test_setup_home.sh
+      - name: model-index tests
+        run: bash tests/test_model_index.sh
+      - name: moe-placement tests
+        run: bash tests/test_moe_placement.sh
+      - name: pytest
+        run: python3 -m pytest tests/test_downloader_quant.py tests/test_update_recommendations.py
 
   package:
     name: package ${{ matrix.asset }}
@@ -271,7 +276,19 @@ jobs:
         run: OUT_DIR=dist scripts/build-linux-cuda-bundle.sh
 
       - name: Smoke-test backend binary
-        run: tar -xzf dist/${{ env.ASSET }} -C /tmp && /tmp/ggrun-linux-x86_64-cuda/bin/llama-server --version
+        run: |
+          tar -xzf dist/${{ env.ASSET }} -C /tmp
+          box=/tmp/ggrun-linux-x86_64-cuda/bin
+          export LD_LIBRARY_PATH="$box${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          if ! "$box/llama-server" --version; then
+            out="$("$box/llama-server" --version 2>&1 || true)"
+            printf '%s\n' "$out"
+            if printf '%s\n' "$out" | grep -qE 'libcuda|libnvidia'; then
+              echo "No CUDA driver on this runner; the bundle is still the install we ship."
+            else
+              exit 1
+            fi
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

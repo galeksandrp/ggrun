@@ -63,7 +63,7 @@ ships these archives, checksummed in `SHA256SUMS`:
 
 | Platform | Assets |
 |---|---|
-| Linux x86_64 | CPU, Vulkan |
+| Linux x86_64 | CPU, Vulkan, CUDA |
 | macOS arm64 | Metal |
 | Windows x86_64 | CPU |
 
