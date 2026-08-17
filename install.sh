@@ -1412,6 +1412,107 @@ ensure_cuda_toolkit() {
     has_cuda_toolkit
 }
 
+compiler_major() {
+    local cc="$1" ver
+    [[ -x "$cc" || -n "$(command -v "$cc" 2>/dev/null)" ]] || return 1
+    ver="$("$cc" -dumpfullversion 2>/dev/null || "$cc" -dumpversion 2>/dev/null || true)"
+    [[ -n "$ver" ]] || return 1
+    printf '%s\n' "${ver%%.*}"
+}
+
+# nvcc ships a hard cap on the host GCC. CUDA 12.3 refuses GCC 13+.
+cuda_max_host_gcc_for() {
+    case "$1" in
+        11.*) printf '11\n' ;;
+        12.0|12.1|12.2|12.3) printf '12\n' ;;
+        12.4|12.5) printf '13\n' ;;
+        12.*) printf '13\n' ;;
+        13.*) printf '14\n' ;;
+        *) printf '12\n' ;;
+    esac
+}
+
+cuda_max_host_gcc() {
+    local nvcc ver
+    nvcc="$(cuda_nvcc_path 2>/dev/null || true)"
+    [[ -n "$nvcc" ]] || { printf '12\n'; return 0; }
+    ver="$("$nvcc" --version 2>/dev/null | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2; exit}')"
+    cuda_max_host_gcc_for "$ver"
+}
+
+# Newest g++ that this nvcc will accept. Fedora 42+ ships GCC 16; CUDA 12.3
+# needs gcc-12 / g++-12 from the distro.
+find_cuda_host_cxx() {
+    local max cand n best="" best_n=0
+    max="$(cuda_max_host_gcc)"
+    for cand in \
+        g++-14 g++-13 g++-12 g++-11 \
+        /usr/bin/g++-14 /usr/bin/g++-13 /usr/bin/g++-12 /usr/bin/g++-11 \
+        /usr/bin/g++14 /usr/bin/g++13 /usr/bin/g++12 \
+        "$(command -v g++ 2>/dev/null || true)"
+    do
+        [[ -n "$cand" ]] || continue
+        command -v "$cand" >/dev/null 2>&1 || [[ -x "$cand" ]] || continue
+        n="$(compiler_major "$cand" || true)"
+        [[ -n "$n" ]] || continue
+        if (( n <= max && n >= 9 && n > best_n )); then
+            best="$cand"
+            best_n="$n"
+        fi
+    done
+    [[ -n "$best" ]] || return 1
+    printf '%s\n' "$(command -v "$best" 2>/dev/null || printf '%s' "$best")"
+}
+
+cuda_host_compiler_packages() {
+    local max
+    max="$(cuda_max_host_gcc)"
+    if command -v apt-get >/dev/null 2>&1; then
+        printf 'gcc-%s\n' "$max"
+        printf 'g++-%s\n' "$max"
+    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+        printf 'gcc%s\n' "$max"
+        printf 'gcc%s-c++\n' "$max"
+    elif command -v zypper >/dev/null 2>&1; then
+        printf 'gcc%s\n' "$max"
+        printf 'gcc%s-c++\n' "$max"
+    fi
+}
+
+ensure_cuda_host_compiler() {
+    local max cur host pkgs=()
+    CUDA_HOST_CXX="${CUDA_HOST_CXX:-}"
+    CUDA_ALLOW_UNSUPPORTED="${CUDA_ALLOW_UNSUPPORTED:-0}"
+    max="$(cuda_max_host_gcc)"
+    cur="$(compiler_major g++ || compiler_major c++ || echo 99)"
+    if host="$(find_cuda_host_cxx)"; then
+        CUDA_HOST_CXX="$host"
+        if (( cur > max )); then
+            ok "CUDA host compiler: $host (system GCC $cur is newer than CUDA allows)"
+        fi
+        return 0
+    fi
+    [[ "$OS" == "Linux" ]] || return 1
+    [[ "$DEPS_MODE" == "skip" ]] && return 1
+    mapfile -t pkgs < <(cuda_host_compiler_packages)
+    if [[ ${#pkgs[@]} -gt 0 ]]; then
+        say "This CUDA toolkit does not support GCC $cur (max GCC $max)."
+        if (( NONINTERACTIVE )) && [[ "$DEPS_MODE" != "install" ]]; then
+            warn "Install a compatible host compiler: ${pkgs[*]}"
+        elif [[ "$DEPS_MODE" == "install" ]] || ask "Install ${pkgs[*]} so CUDA can compile? [Y/n]" y; then
+            install_distro_packages "${pkgs[@]}" || true
+            if host="$(find_cuda_host_cxx)"; then
+                CUDA_HOST_CXX="$host"
+                ok "CUDA host compiler: $host"
+                return 0
+            fi
+        fi
+    fi
+    warn "No GCC <= $max found. Passing nvcc --allow-unsupported-compiler (system GCC $cur)."
+    CUDA_ALLOW_UNSUPPORTED=1
+    return 0
+}
+
 # No published Linux CUDA tarball yet: build ik_llama.cpp when nvcc is here.
 install_cuda_backend_from_source() {
     has_cuda_toolkit || return 1
@@ -1460,7 +1561,8 @@ install_auto_release_backends() {
             if has_cuda_toolkit && install_cuda_backend_from_source; then
                 got=1
             else
-                warn "CUDA llama-server is still missing. Install the NVIDIA driver + CUDA toolkit, or wait for ggrun-linux-x86_64-cuda.tar.gz."
+                warn "CUDA llama-server did not build. Common cause: system GCC is newer than this CUDA toolkit allows."
+                warn "Install a matching gcc/g++ (for CUDA 12.3: gcc12 / g++-12) or a newer CUDA toolkit."
             fi
         fi
     elif installed_real_server ik_llama-server-cuda; then
@@ -1631,6 +1733,7 @@ refresh_backend_repo() {
 }
 
 build_backend() {
+    local nvcc_path="" host_cc="" cmake_args=()
     ensure_build_deps || return 1
     if [[ "$OS" == "Linux" && "$BACKEND_CHOICE" == "cuda" ]] && ! has_cuda_toolkit; then
         err "CUDA toolkit/nvcc not found for CUDA backend."
@@ -1638,11 +1741,32 @@ build_backend() {
     fi
     refresh_backend_repo || return 1
     cmake_env=()
+    cmake_args=("${BACKEND_CMAKE[@]}")
     if [[ "$BACKEND_CHOICE" == "cuda" ]]; then
         nvcc_path="$(cuda_nvcc_path 2>/dev/null || true)"
-        [[ -n "$nvcc_path" ]] && cmake_env=(CUDACXX="$nvcc_path")
+        [[ -n "$nvcc_path" ]] && cmake_env+=(CUDACXX="$nvcc_path")
+        ensure_cuda_host_compiler || true
+        if [[ -n "${CUDA_HOST_CXX:-}" ]]; then
+            host_cc="${CUDA_HOST_CXX}"
+            cmake_args+=(-DCMAKE_CUDA_HOST_COMPILER="$host_cc")
+            cmake_args+=(-DCMAKE_CXX_COMPILER="$host_cc")
+            if [[ "$host_cc" == *g++* ]]; then
+                cmake_args+=(-DCMAKE_C_COMPILER="${host_cc//g++/gcc}")
+            elif [[ "$host_cc" == *c++* ]]; then
+                cmake_args+=(-DCMAKE_C_COMPILER="${host_cc//c++/cc}")
+            fi
+        fi
+        if [[ "${CUDA_ALLOW_UNSUPPORTED:-0}" == "1" ]]; then
+            cmake_env+=(NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:+$NVCC_PREPEND_FLAGS }--allow-unsupported-compiler")
+            cmake_args+=(-DCMAKE_CUDA_FLAGS="--allow-unsupported-compiler")
+        fi
+        # A previous failed configure leaves a cache that ignores the new host
+        # compiler. Only wipe when the server is not already built.
+        if [[ ! -x "$(backend_server_path)" && -d "$BACKEND_BUILD" ]]; then
+            rm -rf "$BACKEND_BUILD"
+        fi
     fi
-    env "${cmake_env[@]}" cmake -S "$BACKEND_DIR" -B "$BACKEND_BUILD" -DCMAKE_BUILD_TYPE=Release "${BACKEND_CMAKE[@]}" \
+    env "${cmake_env[@]}" cmake -S "$BACKEND_DIR" -B "$BACKEND_BUILD" -DCMAKE_BUILD_TYPE=Release "${cmake_args[@]}" \
         && cmake --build "$BACKEND_BUILD" --config Release -j"$(nproc 2>/dev/null || echo 4)" -t llama-server
 }
 

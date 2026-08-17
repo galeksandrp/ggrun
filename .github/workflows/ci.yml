@@ -125,6 +125,8 @@ jobs:
         run: bash tests/test_place_isolated_backend.sh
       - name: Discover existing llama.cpp, forks, and CUDA
         run: bash tests/test_discover_system.sh
+      - name: CUDA host compiler cap
+        run: bash tests/test_cuda_host_compiler.sh
 
   model-index-tests:
     runs-on: ubuntu-latest
