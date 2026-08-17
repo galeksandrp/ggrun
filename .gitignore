@@ -37,6 +37,8 @@ dist/
 native/memguard/*.so
 native/memguard/test-target
 docs/brand.md
+docs/calibration-plan.json
+.claude/
 
 # Private lab. Research artifacts, manifests, and evidence belong in the
 # separate ggrun-lab repository and must never enter the public path.

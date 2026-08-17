@@ -21,8 +21,8 @@ const CalibrationSchemaVersion = 4
 // later launches, so the full placement is reproduced exactly rather than
 // partially deserialized.
 type CalibrationDecision struct {
-	SchemaVersion    int     `json:"schema_version"`
-	ScopeKey         string  `json:"scope_key"`
+	SchemaVersion int    `json:"schema_version"`
+	ScopeKey      string `json:"scope_key"`
 	// ModelBasename is the basename of the model this decision measured, written
 	// beside the scope hash so a "clear caches" action can find every decision a
 	// model created. The scope key is an opaque hash of model+backend+hardware
@@ -322,8 +322,8 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 		BasePlacement:   basePlacement,
 		MemoryPolicy: fmt.Sprintf("ram=%d,pct=%d,ram-head=%d,vram-head=%d,no-mmap=%t,force-mmap=%t,measured-buffers=%t",
 			opts.RamBudgetMB, opts.RAMLimitPercent, opts.RAMHeadroomMB, opts.VRAMHeadroomMB, opts.NoMMap, opts.ForceMMap, opts.RequireMeasuredBuffers),
-		SWAFull:       opts.SWAFull,
-		ChatTemplate:  opts.ChatTemplate,
+		SWAFull:      opts.SWAFull,
+		ChatTemplate: opts.ChatTemplate,
 	}
 }
 

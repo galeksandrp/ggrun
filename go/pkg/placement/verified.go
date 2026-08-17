@@ -29,10 +29,10 @@ const VerifiedConfigSchemaVersion = 1
 // --chat-template-file temp path — are excluded; those are rebuilt at each
 // launch.
 type VerifiedConfig struct {
-	SchemaVersion int           `json:"schema_version"`
-	ScopeKey      string        `json:"scope_key"` // opaque hash, filename basis
-	ModelBasename string        `json:"model_basename,omitempty"` // cache-clear matching, like cache.go:34
-	StrategyType  StrategyType  `json:"strategy_type"` // discriminator
+	SchemaVersion int          `json:"schema_version"`
+	ScopeKey      string       `json:"scope_key"`                // opaque hash, filename basis
+	ModelBasename string       `json:"model_basename,omitempty"` // cache-clear matching, like cache.go:34
+	StrategyType  StrategyType `json:"strategy_type"`            // discriminator
 
 	// Placement identity (per strategy type — one family is populated)
 	GPUAssignments []GPUAssignment `json:"gpu_assignments,omitempty"` // MoEOffload
@@ -43,38 +43,38 @@ type VerifiedConfig struct {
 	MainGPU        int             `json:"main_gpu,omitempty"` // SingleGPU/MultiGPUDense
 
 	// Runtime knobs that change the emitted flags (buildLaunchServerArgs)
-	ContextSize    int    `json:"context_size"`
-	KVPlacement    string `json:"kv_placement"`
-	KVType         string `json:"kv_type,omitempty"`
-	KVTypeV        string `json:"kv_type_v,omitempty"`
-	BatchSize      int    `json:"batch_size"`
-	UBatchSize     int    `json:"ubatch_size"`
-	Parallel       int    `json:"parallel"`
-	Threads        int    `json:"threads,omitempty"`
-	ThreadsBatch   int    `json:"threads_batch,omitempty"`
-	MMap           bool   `json:"mmap"`
-	MLock          bool   `json:"mlock,omitempty"`
-	FlashAttention bool   `json:"flash_attention"`
-	SWAFull        bool   `json:"swa_full"`
-	CRAM           int    `json:"cram,omitempty"`
-	MaxCheckpoints int    `json:"max_checkpoints,omitempty"`
-	CheckpointMinStep int `json:"checkpoint_min_step,omitempty"`
-	UseCUDAGraphs  bool   `json:"use_cuda_graphs,omitempty"`
-	Host           string `json:"host,omitempty"`
-	NoJinja        bool   `json:"no_jinja,omitempty"`
-	ReasoningOff   bool   `json:"reasoning_off"`
-	MMProjPath     string `json:"mmproj_path,omitempty"`
-	Draft          *DraftConfig `json:"draft,omitempty"`
-	BackendTag     string `json:"backend_tag,omitempty"` // emitted dialect
+	ContextSize       int          `json:"context_size"`
+	KVPlacement       string       `json:"kv_placement"`
+	KVType            string       `json:"kv_type,omitempty"`
+	KVTypeV           string       `json:"kv_type_v,omitempty"`
+	BatchSize         int          `json:"batch_size"`
+	UBatchSize        int          `json:"ubatch_size"`
+	Parallel          int          `json:"parallel"`
+	Threads           int          `json:"threads,omitempty"`
+	ThreadsBatch      int          `json:"threads_batch,omitempty"`
+	MMap              bool         `json:"mmap"`
+	MLock             bool         `json:"mlock,omitempty"`
+	FlashAttention    bool         `json:"flash_attention"`
+	SWAFull           bool         `json:"swa_full"`
+	CRAM              int          `json:"cram,omitempty"`
+	MaxCheckpoints    int          `json:"max_checkpoints,omitempty"`
+	CheckpointMinStep int          `json:"checkpoint_min_step,omitempty"`
+	UseCUDAGraphs     bool         `json:"use_cuda_graphs,omitempty"`
+	Host              string       `json:"host,omitempty"`
+	NoJinja           bool         `json:"no_jinja,omitempty"`
+	ReasoningOff      bool         `json:"reasoning_off"`
+	MMProjPath        string       `json:"mmproj_path,omitempty"`
+	Draft             *DraftConfig `json:"draft,omitempty"`
+	BackendTag        string       `json:"backend_tag,omitempty"` // emitted dialect
 
 	// Non-flag provenance (identity / evidence, not emitted)
-	BackendIdentity string         `json:"backend_identity"`   // be.Identity
-	BackendPath     string         `json:"backend_path"`       // be.Path
-	ChatTemplate    string         `json:"chat_template,omitempty"` // catalog Entry.Name
-	Reviewer        string         `json:"reviewer,omitempty"` // claudeCompanionProfile.Name
-	PlanFreeVRAM    map[int]int    `json:"plan_free_vram,omitempty"` // stale-plan guard (cache.go:121-129)
-	PlannedHostFootprintMB int     `json:"planned_host_footprint_mb,omitempty"`
-	MeasuredAt      string         `json:"measured_at"`
+	BackendIdentity        string      `json:"backend_identity"`         // be.Identity
+	BackendPath            string      `json:"backend_path"`             // be.Path
+	ChatTemplate           string      `json:"chat_template,omitempty"`  // catalog Entry.Name
+	Reviewer               string      `json:"reviewer,omitempty"`       // claudeCompanionProfile.Name
+	PlanFreeVRAM           map[int]int `json:"plan_free_vram,omitempty"` // stale-plan guard (cache.go:121-129)
+	PlannedHostFootprintMB int         `json:"planned_host_footprint_mb,omitempty"`
+	MeasuredAt             string      `json:"measured_at"`
 }
 
 // VerifiedConfigPath returns the cache file for one verified-config scope.
@@ -160,34 +160,34 @@ func DeleteVerifiedConfig(cacheDir, scopeKey string) error {
 // restored — the caller sets what it needs.
 func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilities) *Strategy {
 	s := &Strategy{
-		Type:             vc.StrategyType,
-		ContextSize:      vc.ContextSize,
-		KVPlacement:      vc.KVPlacement,
-		KVQuality:        kvTypeToQuality(vc.KVType),
-		KVType:           vc.KVType,
-		KVTypeV:          vc.KVTypeV,
-		NCPUMoE:          vc.NCPUMoE,
-		OTString:         vc.OTString,
-		MainGPU:          vc.MainGPU,
-		SplitMode:        vc.SplitMode,
-		Threads:          vc.Threads,
-		ThreadsBatch:     vc.ThreadsBatch,
-		MMap:             vc.MMap,
-		MLock:            vc.MLock,
-		FlashAttention:   vc.FlashAttention,
-		SWAFull:          vc.SWAFull,
-		CRAM:             vc.CRAM,
-		MaxCheckpoints:   vc.MaxCheckpoints,
-		CheckpointMinStep: vc.CheckpointMinStep,
-		UseCUDAGraphs:    vc.UseCUDAGraphs,
-		Host:             vc.Host,
-		NoJinja:          vc.NoJinja,
-		ReasoningOff:     vc.ReasoningOff,
-		MMProjPath:       vc.MMProjPath,
-		BackendTag:       vc.BackendTag,
-		GPULayers:        999,
-		ModelBasename:    vc.ModelBasename,
-		PlanFreeVRAM:     vc.PlanFreeVRAM,
+		Type:                   vc.StrategyType,
+		ContextSize:            vc.ContextSize,
+		KVPlacement:            vc.KVPlacement,
+		KVQuality:              kvTypeToQuality(vc.KVType),
+		KVType:                 vc.KVType,
+		KVTypeV:                vc.KVTypeV,
+		NCPUMoE:                vc.NCPUMoE,
+		OTString:               vc.OTString,
+		MainGPU:                vc.MainGPU,
+		SplitMode:              vc.SplitMode,
+		Threads:                vc.Threads,
+		ThreadsBatch:           vc.ThreadsBatch,
+		MMap:                   vc.MMap,
+		MLock:                  vc.MLock,
+		FlashAttention:         vc.FlashAttention,
+		SWAFull:                vc.SWAFull,
+		CRAM:                   vc.CRAM,
+		MaxCheckpoints:         vc.MaxCheckpoints,
+		CheckpointMinStep:      vc.CheckpointMinStep,
+		UseCUDAGraphs:          vc.UseCUDAGraphs,
+		Host:                   vc.Host,
+		NoJinja:                vc.NoJinja,
+		ReasoningOff:           vc.ReasoningOff,
+		MMProjPath:             vc.MMProjPath,
+		BackendTag:             vc.BackendTag,
+		GPULayers:              999,
+		ModelBasename:          vc.ModelBasename,
+		PlanFreeVRAM:           vc.PlanFreeVRAM,
 		PlannedHostFootprintMB: vc.PlannedHostFootprintMB,
 	}
 	if vc.TensorSplit != nil {
@@ -249,41 +249,41 @@ func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilit
 // strategy that actually served, so the record captures the full decision.
 func VerifiedConfigToRecord(scopeKey, modelBasename string, s *Strategy, backendIdentity, backendPath, chatTemplate, reviewer string) VerifiedConfig {
 	vc := VerifiedConfig{
-		SchemaVersion:    VerifiedConfigSchemaVersion,
-		ScopeKey:         scopeKey,
-		ModelBasename:    modelBasename,
-		StrategyType:     s.Type,
-		OTString:         s.OTString,
-		NCPUMoE:          s.NCPUMoE,
-		SplitMode:        s.SplitMode,
-		MainGPU:          s.MainGPU,
-		ContextSize:      s.ContextSize,
-		KVPlacement:      s.KVPlacement,
-		KVType:           s.KVType,
-		KVTypeV:          s.KVTypeV,
-		BatchSize:        s.BatchSize,
-		UBatchSize:       s.UBatchSize,
-		Parallel:         s.Parallel,
-		Threads:          s.Threads,
-		ThreadsBatch:     s.ThreadsBatch,
-		MMap:             s.MMap,
-		MLock:            s.MLock,
-		FlashAttention:   s.FlashAttention,
-		SWAFull:          s.SWAFull,
-		CRAM:             s.CRAM,
-		MaxCheckpoints:   s.MaxCheckpoints,
-		CheckpointMinStep: s.CheckpointMinStep,
-		UseCUDAGraphs:    s.UseCUDAGraphs,
-		Host:             s.Host,
-		NoJinja:          s.NoJinja,
-		ReasoningOff:     s.ReasoningOff,
-		MMProjPath:       s.MMProjPath,
-		BackendTag:       s.BackendTag,
-		BackendIdentity:  backendIdentity,
-		BackendPath:      backendPath,
-		ChatTemplate:     chatTemplate,
-		Reviewer:         reviewer,
-		PlanFreeVRAM:     s.PlanFreeVRAM,
+		SchemaVersion:          VerifiedConfigSchemaVersion,
+		ScopeKey:               scopeKey,
+		ModelBasename:          modelBasename,
+		StrategyType:           s.Type,
+		OTString:               s.OTString,
+		NCPUMoE:                s.NCPUMoE,
+		SplitMode:              s.SplitMode,
+		MainGPU:                s.MainGPU,
+		ContextSize:            s.ContextSize,
+		KVPlacement:            s.KVPlacement,
+		KVType:                 s.KVType,
+		KVTypeV:                s.KVTypeV,
+		BatchSize:              s.BatchSize,
+		UBatchSize:             s.UBatchSize,
+		Parallel:               s.Parallel,
+		Threads:                s.Threads,
+		ThreadsBatch:           s.ThreadsBatch,
+		MMap:                   s.MMap,
+		MLock:                  s.MLock,
+		FlashAttention:         s.FlashAttention,
+		SWAFull:                s.SWAFull,
+		CRAM:                   s.CRAM,
+		MaxCheckpoints:         s.MaxCheckpoints,
+		CheckpointMinStep:      s.CheckpointMinStep,
+		UseCUDAGraphs:          s.UseCUDAGraphs,
+		Host:                   s.Host,
+		NoJinja:                s.NoJinja,
+		ReasoningOff:           s.ReasoningOff,
+		MMProjPath:             s.MMProjPath,
+		BackendTag:             s.BackendTag,
+		BackendIdentity:        backendIdentity,
+		BackendPath:            backendPath,
+		ChatTemplate:           chatTemplate,
+		Reviewer:               reviewer,
+		PlanFreeVRAM:           s.PlanFreeVRAM,
 		PlannedHostFootprintMB: s.PlannedHostFootprintMB,
 	}
 	if s.TensorSplit != nil {

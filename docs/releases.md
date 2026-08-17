@@ -1,11 +1,13 @@
 # Release verification
 
-Each tagged release publishes platform bundles and a SHA256SUMS file. The
-installers verify the checksum before unpacking a release bundle.
+Each tag publishes platform archives, `install.sh`, `install.ps1`, and
+`SHA256SUMS`. The installer checks the checksum before unpacking. `ggrun --update`
+refuses an installer that is not listed in `SHA256SUMS`.
 
-Linux NVIDIA releases include ggrun-linux-x86_64-cuda.tar.gz. It contains the
-pinned ik_llama.cpp CUDA backend so a normal x86_64 installation does not need a
-local CUDA toolkit or compiler.
+The current latest tag (`v3.1.0`) includes Linux CPU, Linux Vulkan, macOS
+Metal, and Windows CPU. The release workflow can also attach
+`ggrun-linux-x86_64-cuda.tar.gz` (pinned ik_llama.cpp). When that file is on
+the release, setup uses it; otherwise Linux NVIDIA compiles the backend.
 
 The release workflow also publishes SHA256SUMS.bundle, a keyless Sigstore
 signature bundle for SHA256SUMS. To verify it manually with cosign:

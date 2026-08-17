@@ -1,6 +1,6 @@
 # ggrun backlog
 
-> Working engineering backlog — task IDs and priority tags are for internal tracking, not a curated public roadmap.
+Internal engineering backlog. Not a user-facing roadmap.
 
 Audited against `main` on 2026-07-14. This replaces the stale Claude Code task
 statuses with only the work that remains. Source references use

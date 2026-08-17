@@ -33,22 +33,22 @@ type Config struct {
 	// keeps between the backend's measured non-reclaimable footprint and its hard
 	// MemoryMax. 0 disables the automatic post-launch re-size (the pre-launch
 	// plan-derived ceiling stands).
-	CgroupHeadroomMB int `json:"cgroup_headroom_mb,omitempty"`
-	KVPlacement     string `json:"kv_placement"`
-	KVQuality       string `json:"kv_quality"`
-	SWAFull         bool   `json:"swa_full"`
-	AssumeYes       bool   `json:"assume_yes"`
-	Backend         string `json:"backend"`
-	LlamaServer     string `json:"llama_server"`
-	AppHome         string `json:"app_home"`
-	TuneRounds      int    `json:"tune_rounds"`
-	Vision          bool   `json:"vision"`
-	Parallel        int    `json:"parallel"`
-	Host            string `json:"host"`
-	Spec            string `json:"spec"`           // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
-	SupportExpert   string `json:"support_expert"` // off, auto (installed-only), on
-	SupportOnline   bool   `json:"support_online"` // official llama.cpp research only
-	SupportModel    string `json:"support_model"`  // optional verified local artifact override
+	CgroupHeadroomMB int    `json:"cgroup_headroom_mb,omitempty"`
+	KVPlacement      string `json:"kv_placement"`
+	KVQuality        string `json:"kv_quality"`
+	SWAFull          bool   `json:"swa_full"`
+	AssumeYes        bool   `json:"assume_yes"`
+	Backend          string `json:"backend"`
+	LlamaServer      string `json:"llama_server"`
+	AppHome          string `json:"app_home"`
+	TuneRounds       int    `json:"tune_rounds"`
+	Vision           bool   `json:"vision"`
+	Parallel         int    `json:"parallel"`
+	Host             string `json:"host"`
+	Spec             string `json:"spec"`           // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
+	SupportExpert    string `json:"support_expert"` // off, auto (installed-only), on
+	SupportOnline    bool   `json:"support_online"` // official llama.cpp research only
+	SupportModel     string `json:"support_model"`  // optional verified local artifact override
 
 	// sources is populated by Load and intentionally not serialized. Keeping
 	// provenance next to the merged value lets `config show` report the source
@@ -89,22 +89,22 @@ func Defaults() *Config {
 		// genuinely oversized plan sneaks under the whole-host clamp. 0 disables
 		// the auto re-size (see --cgroup-headroom).
 		CgroupHeadroomMB: 4096,
-		KVPlacement:     "auto",
-		KVQuality:       "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
-		SWAFull:         false,
-		AssumeYes:       false,
-		Backend:         "",
-		LlamaServer:     "",
-		AppHome:         "",
-		TuneRounds:      8,
-		Vision:          false,
-		Parallel:        1,
-		Host:            "127.0.0.1",
-		Spec:            "off",
-		SupportExpert:   "auto",
-		SupportOnline:   false,
-		SupportModel:    "",
-		sources:         defaultSources(),
+		KVPlacement:      "auto",
+		KVQuality:        "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
+		SWAFull:          false,
+		AssumeYes:        false,
+		Backend:          "",
+		LlamaServer:      "",
+		AppHome:          "",
+		TuneRounds:       8,
+		Vision:           false,
+		Parallel:         1,
+		Host:             "127.0.0.1",
+		Spec:             "off",
+		SupportExpert:    "auto",
+		SupportOnline:    false,
+		SupportModel:     "",
+		sources:          defaultSources(),
 	}
 }
 

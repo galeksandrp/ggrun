@@ -364,8 +364,8 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	}
 
 	pending := &placement.CalibrationDecision{
-		ScopeKey:      scopeKey, Winner: best.Name,
-		ModelBasename: filepath.Base(model.Path),
+		ScopeKey: scopeKey, Winner: best.Name,
+		ModelBasename:    filepath.Base(model.Path),
 		DefaultTPS:       defaultResult.GenTPS,
 		DefaultPromptTPS: defaultResult.PromptTPS,
 		DefaultScore:     1,

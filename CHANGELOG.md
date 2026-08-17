@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## v3.2.0 — 2026-08-17
+
+- **Linux CUDA release bundle.** The tag publishes `ggrun-linux-x86_64-cuda.tar.gz`
+  (pinned ik_llama.cpp) when the CUDA job succeeds. `install.sh` / `install.ps1`
+  are attached and listed in `SHA256SUMS`. Self-update refuses an installer that
+  is not in that file.
+- **Reviewed-recipe selection.** An already-registered MiniMax-M3 (or other
+  recipe) backend no longer exempts a *different* selected binary that does not
+  implement the architecture.
+- **Install docs** list the v3.1.0 assets (CPU/Vulkan/Metal/Windows CPU) and
+  treat Linux CUDA as a tagged asset, not a guaranteed historical file.
+
 - **Local Claude Code research no longer dies with `local is temporarily unavailable`.**
   Claude's Auto permission mode depends on a separate supported classifier path and can
   reject Workflow, MCP, WebFetch, and Bash calls before execution on a custom local

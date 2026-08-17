@@ -1,6 +1,7 @@
 name: Release
 
-# Release bundles cover Linux CPU/Vulkan/CUDA, macOS Metal, and Windows CPU.
+# Release bundles: Linux CPU/Vulkan, macOS Metal, Windows CPU.
+# Linux CUDA (ik_llama) is an extra job; attach the asset only when that job succeeds.
 
 on:
   push:
@@ -253,18 +254,18 @@ jobs:
       ASSET: ggrun-linux-x86_64-cuda.tar.gz
 
     steps:
+      - name: Install CUDA build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl git libcurl4-openssl-dev libgomp1
+
       - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: go/go.mod
           cache: false
-
-      - name: Install CUDA build dependencies
-        run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ca-certificates cmake curl git libcurl4-openssl-dev libgomp1
 
       - name: Build pinned ik_llama CUDA bundle
         run: OUT_DIR=dist scripts/build-linux-cuda-bundle.sh
@@ -284,15 +285,21 @@ jobs:
     needs: [package, package-windows, package-cuda]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      - name: Include installers in the checksum set
+        run: |
+          cp install.sh install.ps1 dist/
+
       - name: Generate checksums
         run: |
           cd dist
-          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+          find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name 'install.sh' -o -name 'install.ps1' \) -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -306,5 +313,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/install.sh
+            dist/install.ps1
             dist/SHA256SUMS
             dist/SHA256SUMS.bundle

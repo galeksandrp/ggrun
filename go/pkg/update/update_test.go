@@ -90,6 +90,31 @@ func TestUpdateDismissPath(t *testing.T) {
 	}
 }
 
+func TestParseSHA256SUMSAndVerifyInstallerName(t *testing.T) {
+	sums := parseSHA256SUMS([]byte("" +
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  install.sh\n" +
+		"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210 *install.ps1\n"))
+	if sums["install.sh"] != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("install.sh sum = %q", sums["install.sh"])
+	}
+	if sums["install.ps1"] != "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210" {
+		t.Fatalf("install.ps1 sum = %q", sums["install.ps1"])
+	}
+}
+
+func TestDownloadVerifiedInstallerRefusesUnsignedRefs(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "install.sh")
+	if err := downloadVerifiedInstaller("main", "install.sh", dst, 0755); err == nil {
+		t.Fatal("expected main installer download to fail")
+	}
+	if err := downloadVerifiedInstaller("", "install.sh", dst, 0755); err == nil {
+		t.Fatal("expected empty tag to fail")
+	}
+	if err := downloadVerifiedInstaller("v3.2.0", "setup.sh", dst, 0755); err == nil {
+		t.Fatal("expected unsupported installer name to fail")
+	}
+}
+
 func TestRawInstallerURL(t *testing.T) {
 	want := "https://raw.githubusercontent.com/raketenkater/ggrun/v3.0.1/install.sh"
 	if got := rawInstallerURL("v3.0.1"); got != want {

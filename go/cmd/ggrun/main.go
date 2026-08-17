@@ -1961,7 +1961,7 @@ func chooseAutoBackend(candidates []autoBackendCandidate, arch string, probe bac
 
 func reviewedRecipeRequiredForMain(arch string, be *backendInfo) *backends.Recipe {
 	recipes := backends.RecipesForArch(arch)
-	if len(recipes) == 0 || backends.ForArch(arch) != nil {
+	if len(recipes) == 0 {
 		return nil
 	}
 	if be != nil && be.Path != "" {

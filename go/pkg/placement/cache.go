@@ -165,15 +165,15 @@ func StrategyToCacheEntry(s *Strategy) *CacheEntry {
 		return nil
 	}
 	entry := &CacheEntry{
-		OTString:     s.OTString,
-		TensorSplit:  append([]float64(nil), s.TensorSplit...),
-		SplitMode:    s.SplitMode,
-		NCPUMoE:      s.NCPUMoE,
-		BatchSize:    s.BatchSize,
-		UBatchSize:   s.UBatchSize,
-		Parallel:     s.Parallel,
-		MMap:         s.MMap,
-		KVUnified:    s.KVPlacement == "gpu",
+		OTString:      s.OTString,
+		TensorSplit:   append([]float64(nil), s.TensorSplit...),
+		SplitMode:     s.SplitMode,
+		NCPUMoE:       s.NCPUMoE,
+		BatchSize:     s.BatchSize,
+		UBatchSize:    s.UBatchSize,
+		Parallel:      s.Parallel,
+		MMap:          s.MMap,
+		KVUnified:     s.KVPlacement == "gpu",
 		ModelBasename: s.ModelBasename,
 	}
 	if len(s.PlanFreeVRAM) > 0 {

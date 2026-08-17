@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,16 +21,20 @@ import (
 )
 
 const (
-	githubRepo        = "raketenkater/ggrun"
-	githubAPIURL      = "https://api.github.com/repos/%s/releases/latest"
-	rawInstallURL     = "https://raw.githubusercontent.com/%s/%s/install.sh"
-	rawInstallPSURL   = "https://raw.githubusercontent.com/%s/%s/install.ps1"
-	updateDismissDays = 7
+	githubRepo            = "raketenkater/ggrun"
+	githubAPIURL          = "https://api.github.com/repos/%s/releases/latest"
+	rawInstallURL         = "https://raw.githubusercontent.com/%s/%s/install.sh"
+	rawInstallPSURL       = "https://raw.githubusercontent.com/%s/%s/install.ps1"
+	githubReleaseAssetURL = "https://github.com/%s/releases/download/%s/%s"
+	updateDismissDays     = 7
+	maxInstallerBytes     = 2 << 20
+	maxChecksumBytes      = 64 << 10
+	maxDownloadBytes      = 32 << 20
 )
 
 // currentVersion is the single source of truth for the binary version.
 // Release builds override it: go build -ldflags "-X github.com/raketenkater/ggrun/pkg/update.currentVersion=vX.Y.Z"
-var currentVersion = "v3.1.0-go"
+var currentVersion = "v3.2.0-go"
 
 // PromptOnStartup checks local repos for updates and asks interactive users
 // whether to run the updater. It intentionally skips non-interactive shells so
@@ -453,9 +459,15 @@ func SelfUpdateFromReleaseInstaller() error {
 		}
 	}
 
-	installerURL := rawInstallerURL("main")
-	if res, err := Check(); err == nil && res.Latest != "" {
-		installerURL = rawInstallerURL(res.Latest)
+	res, err := Check()
+	if err != nil || strings.TrimSpace(res.Latest) == "" {
+		if backupPath != "" {
+			_ = os.Remove(backupPath)
+		}
+		if err != nil {
+			return fmt.Errorf("resolve latest release: %w", err)
+		}
+		return fmt.Errorf("resolve latest release: empty tag")
 	}
 	tmpDir, err := os.MkdirTemp("", "ggrun-update-*")
 	if err != nil {
@@ -463,7 +475,7 @@ func SelfUpdateFromReleaseInstaller() error {
 	}
 	defer os.RemoveAll(tmpDir)
 	installerPath := filepath.Join(tmpDir, "install.sh")
-	if err := downloadFile(installerURL, installerPath, 0755); err != nil {
+	if err := downloadVerifiedInstaller(res.Latest, "install.sh", installerPath, 0755); err != nil {
 		if backupPath != "" {
 			_ = os.Remove(backupPath)
 		}
@@ -525,9 +537,15 @@ func selfUpdateWindowsInstaller(appHome string) error {
 		}
 	}
 
-	installerURL := rawInstallerPSURLForRef("main")
-	if res, err := Check(); err == nil && res.Latest != "" {
-		installerURL = rawInstallerPSURLForRef(res.Latest)
+	res, err := Check()
+	if err != nil || strings.TrimSpace(res.Latest) == "" {
+		if backupPath != "" {
+			_ = os.Remove(backupPath)
+		}
+		if err != nil {
+			return fmt.Errorf("resolve latest release: %w", err)
+		}
+		return fmt.Errorf("resolve latest release: empty tag")
 	}
 	tmpDir, err := os.MkdirTemp("", "ggrun-update-*")
 	if err != nil {
@@ -535,7 +553,7 @@ func selfUpdateWindowsInstaller(appHome string) error {
 	}
 	defer os.RemoveAll(tmpDir)
 	installerPath := filepath.Join(tmpDir, "install.ps1")
-	if err := downloadFile(installerURL, installerPath, 0644); err != nil {
+	if err := downloadVerifiedInstaller(res.Latest, "install.ps1", installerPath, 0644); err != nil {
 		if backupPath != "" {
 			_ = os.Remove(backupPath)
 		}
@@ -620,7 +638,7 @@ func SelfUpdateAppHomeInstaller(appHome string) error {
 	if runtime.GOOS == "windows" {
 		return selfUpdateWindowsInstaller(appHome)
 	}
-	fmt.Println("═══ Updating ggrun app home from main ═══")
+	fmt.Println("═══ Updating ggrun app home from latest release ═══")
 	scriptPath := installedLLMServerPath()
 	backupPath := ""
 	if scriptPath != "" {
@@ -630,13 +648,23 @@ func SelfUpdateAppHomeInstaller(appHome string) error {
 		}
 	}
 
+	res, err := Check()
+	if err != nil || strings.TrimSpace(res.Latest) == "" {
+		if backupPath != "" {
+			_ = os.Remove(backupPath)
+		}
+		if err != nil {
+			return fmt.Errorf("resolve latest release: %w", err)
+		}
+		return fmt.Errorf("resolve latest release: empty tag")
+	}
 	tmpDir, err := os.MkdirTemp("", "ggrun-update-*")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmpDir)
 	installerPath := filepath.Join(tmpDir, "install.sh")
-	if err := downloadFile(rawInstallerURL("main"), installerPath, 0755); err != nil {
+	if err := downloadVerifiedInstaller(res.Latest, "install.sh", installerPath, 0755); err != nil {
 		if backupPath != "" {
 			_ = os.Remove(backupPath)
 		}
@@ -736,20 +764,98 @@ func installedLLMServerPath() string {
 }
 
 func downloadFile(url, dst string, mode os.FileMode) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("%s", resp.Status)
-	}
-	data, err := io.ReadAll(resp.Body)
+	data, err := downloadBytes(url, maxDownloadBytes)
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(dst, data, mode)
+}
+
+func releaseAssetURL(tag, name string) string {
+	return fmt.Sprintf(githubReleaseAssetURL, githubRepo, tag, name)
+}
+
+func downloadBytes(url string, limit int64) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("%s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("download exceeded %d bytes", limit)
+	}
+	return data, nil
+}
+
+func parseSHA256SUMS(data []byte) map[string]string {
+	out := make(map[string]string)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		name := strings.TrimPrefix(filepath.Base(fields[len(fields)-1]), "*")
+		if len(sum) != 64 {
+			continue
+		}
+		out[name] = sum
+	}
+	return out
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func downloadVerifiedInstaller(tag, name, dst string, mode os.FileMode) error {
+	tag = strings.TrimSpace(tag)
+	name = filepath.Base(strings.TrimSpace(name))
+	if tag == "" || tag == "main" || tag == "master" {
+		return fmt.Errorf("refusing installer download without a release tag")
+	}
+	if name != "install.sh" && name != "install.ps1" {
+		return fmt.Errorf("unsupported installer %q", name)
+	}
+	sums, err := downloadBytes(releaseAssetURL(tag, "SHA256SUMS"), maxChecksumBytes)
+	if err != nil {
+		return fmt.Errorf("download SHA256SUMS: %w", err)
+	}
+	want, ok := parseSHA256SUMS(sums)[name]
+	if !ok {
+		return fmt.Errorf("SHA256SUMS has no %s; refusing unsigned installer", name)
+	}
+	body, err := downloadBytes(releaseAssetURL(tag, name), maxInstallerBytes)
+	if err != nil {
+		body, err = downloadBytes(rawInstallerURLForName(tag, name), maxInstallerBytes)
+		if err != nil {
+			return err
+		}
+	}
+	if got := sha256Hex(body); got != want {
+		return fmt.Errorf("%s checksum mismatch", name)
+	}
+	return os.WriteFile(dst, body, mode)
+}
+
+func rawInstallerURLForName(tag, name string) string {
+	if name == "install.ps1" {
+		return rawInstallerPSURLForRef(tag)
+	}
+	return rawInstallerURL(tag)
 }
 
 // UpdateBackend updates a backend repo (ik_llama.cpp or llama.cpp).

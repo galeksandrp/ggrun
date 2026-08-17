@@ -144,4 +144,4 @@ The initial local smoke test (Qwen3.5-4B Q4_K_M, CUDA) showed why this matters:
 Auto caches a winner by artifact/backend/hardware/GPU-set/context/sampling and
 parallel scope and otherwise remains conservative. The remaining extended matrix
 (sampling and thinking variants, TTFT, resource peaks, and soak testing) is tracked
-in `TODO.md` and must be completed before broad performance claims.
+in `docs/dev/backlog.md`.
