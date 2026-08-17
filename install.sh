@@ -1000,44 +1000,44 @@ fi
 say ""
 say "── Installing scripts to $INSTALL_DIR ──"
 
-if (( RELEASE_INSTALLED )); then
-    ok "Scripts installed from release bundle"
-else
+install_ggrun_from_source() {
+    [[ "$MAIN_IMPL" == "go" && "$INSTALL_MODE" != "scripts" ]] || return 0
     ensure_source_repo
-    FILES=("setup.sh" "setup-linux.sh" "setup-mac.sh")
-    for f in "${FILES[@]}"; do
-        install_source_file "$f" "$f" 0755 || warn "$f not found in source; skipping"
-    done
-    install_source_file "tools/gguf/parse_gguf.py" "parse_gguf.py" 0755 || warn "parse_gguf.py not found in source; skipping"
-    install_source_file "tools/models/model_index.py" "model_index.py" 0755 || warn "model_index.py not found in source; skipping"
-    install_source_file "tools/download/download_any_gguf.py" "download_any_gguf.py" 0755 || warn "download_any_gguf.py not found in source; skipping"
-    install_legacy_bash_shim
-    # Build/install the Go binary directly as the single `ggrun` command —
-    # no separate llm-server-go copy. `ggrun` with no args opens the GUI,
-    # so no ggrun-gui wrapper is needed either.
-    if [[ -f "$SRC_DIR/go/go.mod" && "$MAIN_IMPL" == "go" && "$INSTALL_MODE" != "scripts" ]]; then
-        say "── Building Go ggrun ──"
+    if [[ -f "$SRC_DIR/go/go.mod" ]]; then
+        say "── Building ggrun from this checkout ──"
         go_build_tmp="$(mktemp -t ggrun-build.XXXXXX)"
         if build_go_binary "$go_build_tmp" && install_go_as_main "$go_build_tmp"; then
-            :
-        elif [[ -x "$SRC_DIR/go/ggrun" ]] && install_go_as_main "$SRC_DIR/go/ggrun"; then
-            :
-        else
-            warn "Could not build Go ggrun; rerun with LLM_INSTALL_GO=auto or use a release bundle."
+            rm -f "$go_build_tmp"
+            ok "Installed ggrun from source (not an older release binary)"
+            return 0
         fi
         rm -f "$go_build_tmp"
-    elif [[ -x "$SRC_DIR/go/ggrun" ]]; then
-        install_go_as_main "$SRC_DIR/go/ggrun" || true
+        if [[ -x "$SRC_DIR/go/ggrun" ]] && install_go_as_main "$SRC_DIR/go/ggrun"; then
+            ok "Installed prebuilt ggrun from this checkout"
+            return 0
+        fi
+        warn "Could not build ggrun from this checkout; keeping the release binary if present."
     fi
+}
 
-    if [[ "$OS" == "Linux" && "$BACKEND_CHOICE" == "cuda" && "$MAIN_IMPL" == "go" && "$INSTALL_MODE" != "scripts" ]]; then
-        [[ -d "$SRC_DIR/native/memguard" ]] || { err "CUDA source install is missing native/memguard"; exit 1; }
-        command -v make >/dev/null 2>&1 || { err "make is required to build the CUDA allocation firewall"; exit 1; }
-        command -v cc >/dev/null 2>&1 || { err "a C compiler is required to build the CUDA allocation firewall"; exit 1; }
-        make -C "$SRC_DIR/native/memguard" libggrun-memguard.so
-        install -m 0644 "$SRC_DIR/native/memguard/libggrun-memguard.so" "$INSTALL_DIR/libggrun-memguard.so"
-        ok "Installed GPU memory-safety guard (prevents out-of-memory crashes)"
-    fi
+ensure_source_repo
+FILES=("setup.sh" "setup-linux.sh" "setup-mac.sh")
+for f in "${FILES[@]}"; do
+    install_source_file "$f" "$f" 0755 || warn "$f not found in source; skipping"
+done
+install_source_file "tools/gguf/parse_gguf.py" "parse_gguf.py" 0755 || warn "parse_gguf.py not found in source; skipping"
+install_source_file "tools/models/model_index.py" "model_index.py" 0755 || warn "model_index.py not found in source; skipping"
+install_source_file "tools/download/download_any_gguf.py" "download_any_gguf.py" 0755 || warn "download_any_gguf.py not found in source; skipping"
+install_legacy_bash_shim
+install_ggrun_from_source
+
+if [[ "$OS" == "Linux" && "$BACKEND_CHOICE" == "cuda" && "$MAIN_IMPL" == "go" && "$INSTALL_MODE" != "scripts" && ! -e "$INSTALL_DIR/ik_llama-server-cuda" ]]; then
+    [[ -d "$SRC_DIR/native/memguard" ]] || { err "CUDA source install is missing native/memguard"; exit 1; }
+    command -v make >/dev/null 2>&1 || { err "make is required to build the CUDA allocation firewall"; exit 1; }
+    command -v cc >/dev/null 2>&1 || { err "a C compiler is required to build the CUDA allocation firewall"; exit 1; }
+    make -C "$SRC_DIR/native/memguard" libggrun-memguard.so
+    install -m 0644 "$SRC_DIR/native/memguard/libggrun-memguard.so" "$INSTALL_DIR/libggrun-memguard.so"
+    ok "Installed GPU memory-safety guard (prevents out-of-memory crashes)"
 fi
 
 if [[ "$MAIN_IMPL" == "go" && "$INSTALL_MODE" != "scripts" && ! -x "$INSTALL_DIR/ggrun" ]]; then
