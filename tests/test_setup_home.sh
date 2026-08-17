@@ -42,7 +42,7 @@ fi
 cat >"$TMP/llama-server" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --help|-h) echo "fake llama-server (setup test stub)"; exit 0 ;;
+    --help|-h) echo "usage: llama-server [--help] [--version]"; exit 0 ;;
     --version) echo "fake 0.0.0"; exit 0 ;;
 esac
 exit 0
@@ -54,7 +54,7 @@ python3 "$ROOT/tests/build_synthetic_gguf.py" --out "$APP_HOME/models/setup-mode
     --embd 64 --ff 128 --ctx-train 2048
 
 out=$(HOME="$TMP/home" LLM_ASSUME_YES=1 LLAMA_SERVER="$TMP/llama-server" \
-    "$APP_HOME/ggrun" --dry-run --cpu setup-model.gguf 2>&1)
+    "$APP_HOME/ggrun" --dry-run --cpu --server-bin "$TMP/llama-server" setup-model.gguf 2>&1)
 
 if [[ "$out" != *"$APP_HOME/models/setup-model.gguf"* ]]; then
     echo "  ✗ app-home model directory was not used"

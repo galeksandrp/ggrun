@@ -17,7 +17,7 @@ mkdir -p "$TMP/bin" "$TMP/models" "$TMP/cache"
 cat >"$TMP/llama-server" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --help|-h) echo "fake llama-server --reasoning --n-cpu-moe --kv-unified"; exit 0 ;;
+    --help|-h) echo "usage: llama-server [--help] [--version] --reasoning --n-cpu-moe --kv-unified"; exit 0 ;;
     --version) echo "fake 0.0.0"; exit 0 ;;
 esac
 exit 0
@@ -31,7 +31,7 @@ chmod +x "$TMP/llama-server"
 cat >"$TMP/ik-llama-server" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --help|-h) echo "fake ik llama-server --reasoning --n-cpu-moe --kv-unified --split-mode-graph"; exit 0 ;;
+    --help|-h) echo "usage: llama-server [--help] [--version] --reasoning --n-cpu-moe --kv-unified --split-mode-graph"; exit 0 ;;
     --version) echo "fake-ik 0.0.0"; exit 0 ;;
 esac
 exit 0

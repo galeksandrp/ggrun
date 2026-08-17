@@ -31,7 +31,7 @@ export LLM_KV_QUALITY=low
 cat >"$TMP/llama-server" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --help|-h) echo "fake llama-server (test stub)"; exit 0 ;;
+    --help|-h) echo "usage: llama-server [--help] [--version]"; exit 0 ;;
     --version) echo "fake 0.0.0"; exit 0 ;;
 esac
 exit 0
@@ -61,7 +61,13 @@ assert_contains() {
 }
 
 run_dry() {
-    "$GO_BIN" --dry-run --cpu --ram-budget 512000 "$@" 2>&1
+    local out
+    if ! out="$("$GO_BIN" --dry-run --cpu --server-bin "$LLAMA_SERVER" --ram-budget 512000 "$@" 2>&1)"; then
+        echo "dry-run failed:" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
 }
 
 build_gguf() {

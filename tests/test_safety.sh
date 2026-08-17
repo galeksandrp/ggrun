@@ -16,7 +16,7 @@ trap '[[ -n "${LISTENER_PID:-}" ]] && kill "$LISTENER_PID" 2>/dev/null || true; 
 cat >"$TMP/llama-server" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --help|-h) echo "fake llama-server (test stub)"; exit 0 ;;
+    --help|-h) echo "usage: llama-server [--help] [--version]"; exit 0 ;;
     --version) echo "fake 0.0.0"; exit 0 ;;
 esac
 exit 0
@@ -85,7 +85,7 @@ fi
 
 echo "Safety regression: foreign listener survived AI-tune pre-cleanup"
 
-out=$("$GO_BIN" --cpu --dry-run --vision "$TMP/model.gguf" 2>&1)
+out=$("$GO_BIN" --cpu --dry-run --server-bin "$TMP/llama-server" --vision "$TMP/model.gguf" 2>&1)
 if [[ "$out" != *"--mmproj $TMP/mmproj-F16.gguf"* ]]; then
     echo "expected matching local mmproj to be accepted"
     echo "$out"
@@ -94,7 +94,7 @@ fi
 
 echo "Safety regression: matching local mmproj accepted"
 
-if out=$("$GO_BIN" --cpu --dry-run --mmproj "$TMP/mmproj-other.gguf" "$TMP/model.gguf" 2>&1); then
+if out=$("$GO_BIN" --cpu --dry-run --server-bin "$TMP/llama-server" --mmproj "$TMP/mmproj-other.gguf" "$TMP/model.gguf" 2>&1); then
     echo "expected mismatched explicit mmproj to fail"
     echo "$out"
     exit 1
@@ -107,7 +107,7 @@ fi
 
 echo "Safety regression: mismatched explicit mmproj rejected"
 
-if out=$("$GO_BIN" --cpu --dry-run --mmproj "$TMP/mmproj-partial.gguf" "$TMP/model.gguf" 2>&1); then
+if out=$("$GO_BIN" --cpu --dry-run --server-bin "$TMP/llama-server" --mmproj "$TMP/mmproj-partial.gguf" "$TMP/model.gguf" 2>&1); then
     echo "expected incomplete explicit mmproj to fail"
     echo "$out"
     exit 1
@@ -120,7 +120,7 @@ fi
 
 echo "Safety regression: incomplete mmproj rejected"
 
-out=$("$GO_BIN" --cpu --dry-run "$TMP/model.gguf" 2>&1)
+out=$("$GO_BIN" --cpu --dry-run --server-bin "$TMP/llama-server" "$TMP/model.gguf" 2>&1)
 if [[ "$out" == *"Run AI Tune before launching"* ]]; then
     echo "first-run AI tune prompt leaked into dry-run/non-interactive path"
     echo "$out"
