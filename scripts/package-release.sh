@@ -86,6 +86,53 @@ if command -v ldd >/dev/null 2>&1; then
     )
 fi
 
+# CUDA runtime (not libcuda.so.1 — that is the driver) so a laptop can load
+# the bundle without nvcc. Next release ships these; current hosts harvest
+# the same names from a toolkit already on the machine.
+if [[ "$ASSET_NAME" == *cuda* ]]; then
+    copy_cuda_rt() {
+        local lib="$1" dest="$PAYLOAD/bin/$(basename "$1")" real
+        [[ -e "$dest" || -L "$dest" ]] && return 0
+        if [[ -L "$lib" ]]; then
+            real="$(readlink -f "$lib" 2>/dev/null || true)"
+            if [[ -n "$real" && -f "$real" ]]; then
+                install -m 0644 "$real" "$PAYLOAD/bin/$(basename "$real")"
+                [[ "$(basename "$real")" == "$(basename "$lib")" ]] \
+                    || ln -sfn "$(basename "$real")" "$dest"
+                return 0
+            fi
+        fi
+        install -m 0644 "$lib" "$dest"
+    }
+    for dir in \
+        "${CUDA_HOME:-}/lib64" "${CUDA_PATH:-}/lib64" \
+        /usr/local/cuda/lib64 /usr/local/cuda/lib \
+        /usr/local/cuda-12.8/lib64 /usr/lib/x86_64-linux-gnu /usr/lib64
+    do
+        [[ -d "$dir" ]] || continue
+        for base in libcudart libcublas libcublasLt libnccl; do
+            while IFS= read -r lib; do
+                copy_cuda_rt "$lib"
+            done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -name "${base}.so*" 2>/dev/null | sort)
+        done
+    done
+    if command -v ldd >/dev/null 2>&1; then
+        for so in "$PAYLOAD/bin/llama-server" "$PAYLOAD/bin"/libggml.so*; do
+            [[ -e "$so" ]] || continue
+            while IFS= read -r line; do
+                soname="${line%% *}"
+                case "$soname" in
+                    libcudart.so*|libcublas.so*|libcublasLt.so*|libnccl.so*) ;;
+                    *) continue ;;
+                esac
+                lib="$(printf '%s\n' "$line" | awk '$2 == "=>" && $3 ~ /^\// { print $3 }')"
+                [[ -n "$lib" && -e "$lib" ]] || continue
+                copy_cuda_rt "$lib"
+            done < <(ldd "$so" 2>/dev/null || true)
+        done
+    fi
+fi
+
 # Versioned files (libfoo.so.0.0.1) also need the SONAME the binary loads.
 for f in "$PAYLOAD/bin"/lib*.so.*; do
     [[ -e "$f" ]] || continue

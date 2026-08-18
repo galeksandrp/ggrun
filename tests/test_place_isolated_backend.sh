@@ -13,7 +13,8 @@ eval "$(
         /^ok\(\)/ {print; next}
         /^warn\(\)/ {print; next}
         /^host_libc\(\)|^host_can_run_ubuntu_prebuilt\(\)|^classify_probe_output\(\)/ {keep=1}
-        /^probe_llama_server\(\)|^copy_backend_libs\(\)|^backend_probe_kind\(\)/ {keep=1}
+        /^probe_llama_server\(\)|^warn_probe_detail\(\)|^copy_resolved_lib\(\)/ {keep=1}
+        /^harvest_cuda_runtime_libs\(\)|^copy_backend_libs\(\)|^backend_probe_kind\(\)/ {keep=1}
         /^place_isolated_backend\(\)|^link_default_llama_server\(\)/ {keep=1}
         /^_discover_abspath\(\)/ {keep=1}
         keep {print}
@@ -68,10 +69,23 @@ fi
 test ! -e "$INSTALL_DIR/llama-server-broken"
 echo "  ✓ reject a bundle that cannot load its own libllama"
 
+# Checksummed CUDA ELF is kept even when --version is "broken".
+if ! place_isolated_backend "$TMP/src/llama-server" ik_llama-server-cuda 1; then
+    echo "  ✗ keep=1 returned failure for a CUDA download"
+    exit 1
+fi
+test -x "$INSTALL_DIR/backends/ik_llama-server-cuda/llama-server"
+test -e "$INSTALL_DIR/ik_llama-server-cuda"
+echo "  ✓ keep a downloaded CUDA ELF when --version fails"
+rm -f "$INSTALL_DIR/ik_llama-server-cuda"
+rm -rf "$INSTALL_DIR/backends/ik_llama-server-cuda"
+
 # classify is distro-agnostic: GPU runtime vs broken vs runs
 [[ "$(classify_probe_output "version: 1234")" == "runs" ]]
 [[ "$(classify_probe_output "error while loading shared libraries: libvulkan.so.1: cannot open shared object file")" == "needs_gpu" ]]
 [[ "$(classify_probe_output "error while loading shared libraries: libcuda.so.1: cannot open shared object file")" == "needs_gpu" ]]
+[[ "$(classify_probe_output "error while loading shared libraries: libnccl.so.2: cannot open shared object file")" == "needs_gpu" ]]
+[[ "$(classify_probe_output "error while loading shared libraries: libcublas.so.12: cannot open shared object file")" == "needs_gpu" ]]
 [[ "$(classify_probe_output "error while loading shared libraries: libstdc++.so.6: cannot open shared object file")" == "broken" ]]
 [[ "$(classify_probe_output "version \`GLIBC_2.38' not found")" == "broken" ]]
 [[ "$(classify_probe_output "cannot execute binary file: Exec format error")" == "broken" ]]

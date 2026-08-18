@@ -69,11 +69,11 @@ ships these archives, checksummed in `SHA256SUMS`:
 
 Linux `auto` first searches the machine for an existing `llama-server`
 (ik_llama.cpp, llama.cpp, and forks) plus the NVIDIA driver and CUDA toolkit.
-It reuses those, then installs what is missing: Vulkan loader/ICD via the
-distro package manager, a CUDA/Vulkan/CPU prebuilt, and ik_llama.cpp from
-source when `nvcc` is already there. A prebuilt only counts if it starts on
-this host. CPU is last if nothing else runs. The NVIDIA proprietary driver is
-never auto-installed. Windows CUDA: `install.ps1 -Backend cuda`.
+It reuses those, then installs the CUDA prebuilt and llama.cpp (Vulkan).
+A downloaded CUDA binary is kept even if `--version` fails on a missing CUDA
+runtime library. Source compile happens only when no CUDA ELF landed and
+`nvcc` is already there. CPU is last if nothing else runs. The NVIDIA
+proprietary driver is never auto-installed. Windows CUDA: `install.ps1 -Backend cuda`.
 
 ## Classic install to `~/.local/bin`
 

@@ -56,6 +56,8 @@ GO_BOOTSTRAP_ROOT="${LLM_INSTALL_GO_ROOT:-$BACKEND_ROOT/.llm-server-go}"
 GO_CMD=""
 NONINTERACTIVE="${LLM_INSTALL_NONINTERACTIVE:-0}"
 MAIN_IMPL="${LLM_INSTALL_MAIN:-go}"
+PROBE_LAST_OUT=""
+PROBE_LAST_KIND=""
 # CI / no terminal: silent defaults. A real curl | bash still has /dev/tty.
 [[ ! -t 0 && ! -r /dev/tty && -z "${LLM_INSTALL_NONINTERACTIVE:-}" ]] && NONINTERACTIVE=1
 
@@ -1082,7 +1084,9 @@ install_release_bundle() {
     fi
     for candidate in "$payload_root/llama-server" "$payload_root/bin/llama-server"; do
         if [[ -f "$candidate" ]]; then
-            if place_isolated_backend "$candidate" "$dest_name"; then
+            # A checksummed CUDA ELF stays even if --version fails (missing
+            # NCCL/cudart). Deleting it made setup compile and skip llama.cpp.
+            if place_isolated_backend "$candidate" "$dest_name" 1; then
                 found_backend=1
                 ok "Installed $dest_name from $asset"
             fi
@@ -1128,8 +1132,8 @@ classify_probe_output() {
     fi
     if [[ "$out" == *"cannot open shared object file"* || "$out" == *"error while loading shared libraries"* ]]; then
         if [[ "$out" == *libvulkan* || "$out" == *libcuda* || "$out" == *libcudart* \
-            || "$out" == *libnvidia* || "$out" == *vulkan* || "$out" == *ICD* \
-            || "$out" == *icd* || "$out" == *cuInit* ]]; then
+            || "$out" == *libcublas* || "$out" == *libnccl* || "$out" == *libnvidia* \
+            || "$out" == *vulkan* || "$out" == *ICD* || "$out" == *icd* || "$out" == *cuInit* ]]; then
             printf 'needs_gpu\n'
             return 0
         fi
@@ -1137,8 +1141,8 @@ classify_probe_output() {
         return 0
     fi
     if [[ "$out" == *libvulkan* || "$out" == *libcuda* || "$out" == *libcudart* \
-        || "$out" == *libnvidia* || "$out" == *vulkan* || "$out" == *ICD* \
-        || "$out" == *icd* || "$out" == *cuInit* ]]; then
+        || "$out" == *libcublas* || "$out" == *libnccl* || "$out" == *libnvidia* \
+        || "$out" == *vulkan* || "$out" == *ICD* || "$out" == *icd* || "$out" == *cuInit* ]]; then
         printf 'needs_gpu\n'
         return 0
     fi
@@ -1151,6 +1155,8 @@ classify_probe_output() {
 
 probe_llama_server() {
     local bin="$1" libdir="${2:-}" out=""
+    PROBE_LAST_OUT=""
+    PROBE_LAST_KIND="broken"
     [[ -z "$libdir" ]] && libdir="$(dirname "$bin")"
     [[ -x "$bin" ]] || { printf 'broken\n'; return 1; }
     if command -v timeout >/dev/null 2>&1; then
@@ -1158,10 +1164,79 @@ probe_llama_server() {
     else
         out="$(env LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$bin" --version 2>&1)" || true
     fi
-    local kind
-    kind="$(classify_probe_output "$out")"
-    printf '%s\n' "$kind"
-    [[ "$kind" != "broken" ]]
+    PROBE_LAST_OUT="$out"
+    PROBE_LAST_KIND="$(classify_probe_output "$out")"
+    printf '%s\n' "$PROBE_LAST_KIND"
+    [[ "$PROBE_LAST_KIND" != "broken" ]]
+}
+
+warn_probe_detail() {
+    local line
+    line="$(printf '%s' "${PROBE_LAST_OUT:-}" | tr '\n' ' ' | sed 's/^[[:space:]]\+//;s/[[:space:]]\+$//;s/[[:space:]]\+/ /g')"
+    [[ ${#line} -gt 240 ]] && line="${line:0:240}…"
+    [[ -n "$line" ]] && warn "  $line"
+}
+
+# Copy a .so into the isolated box. Follow toolkit symlinks so libcudart.so.12
+# is a real file (or a symlink next to its target), not a dangling pointer.
+copy_resolved_lib() {
+    local lib="$1" box="$2" base dest real
+    [[ -e "$lib" || -L "$lib" ]] || return 0
+    base="$(basename "$lib")"
+    dest="$box/$base"
+    [[ -e "$dest" || -L "$dest" ]] && return 0
+    if [[ -L "$lib" ]]; then
+        real="$(readlink -f "$lib" 2>/dev/null || true)"
+        if [[ -n "$real" && -f "$real" ]]; then
+            if [[ "$(basename "$real")" != "$base" ]]; then
+                [[ -e "$box/$(basename "$real")" || -L "$box/$(basename "$real")" ]] \
+                    || install -m 0644 "$real" "$box/$(basename "$real")"
+                ln -sfn "$(basename "$real")" "$dest"
+            else
+                install -m 0644 "$real" "$dest"
+            fi
+            return 0
+        fi
+        cp -a "$lib" "$dest" || true
+        return 0
+    fi
+    install -m 0644 "$lib" "$dest"
+}
+
+# CUDA runtime only — never libcuda.so.1 (that is the driver).
+harvest_cuda_runtime_libs() {
+    local box="$1" dir base lib so line soname resolved
+    local dirs=()
+    [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}/lib64" ]] && dirs+=("${CUDA_HOME}/lib64")
+    [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}/lib" ]] && dirs+=("${CUDA_HOME}/lib")
+    [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}/lib64" ]] && dirs+=("${CUDA_PATH}/lib64")
+    dirs+=(/usr/local/cuda/lib64 /usr/local/cuda/lib /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu)
+    for dir in /usr/local/cuda-*/lib64 /usr/local/cuda/targets/*/lib; do
+        [[ -d "$dir" ]] && dirs+=("$dir")
+    done
+    for dir in "${dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        for base in libcudart libcublas libcublasLt libnccl; do
+            while IFS= read -r lib; do
+                copy_resolved_lib "$lib" "$box"
+            done < <(find "$dir" -maxdepth 1 \( -type f -o -type l \) -name "${base}.so*" 2>/dev/null | sort)
+        done
+    done
+    command -v ldd >/dev/null 2>&1 || return 0
+    for so in "$box"/llama-server "$box"/libggml.so "$box"/libggml.so.* "$box"/libllama.so "$box"/libllama.so.*; do
+        [[ -e "$so" ]] || continue
+        while IFS= read -r line; do
+            soname="${line%% *}"
+            case "$soname" in
+                libcudart.so*|libcublas.so*|libcublasLt.so*|libnccl.so*) ;;
+                *) continue ;;
+            esac
+            resolved="$(printf '%s\n' "$line" | awk '$2 == "=>" && $3 ~ /^\// { print $3 }')"
+            [[ -n "$resolved" && -e "$resolved" ]] || continue
+            copy_resolved_lib "$resolved" "$box"
+            [[ -e "$box/$soname" || -L "$box/$soname" ]] || ln -sfn "$(basename "$resolved")" "$box/$soname"
+        done < <(ldd "$so" 2>/dev/null || true)
+    done
 }
 
 copy_backend_libs() {
@@ -1176,6 +1251,7 @@ copy_backend_libs() {
             fi
         done < <(find "$extra" -maxdepth 1 \( -type f -o -type l \) \( -name 'lib*.so*' -o -name 'lib*.dylib' -o -name '*.dll' \) 2>/dev/null | sort)
     done
+    harvest_cuda_runtime_libs "$box"
     local f base soname
     for f in "$box"/lib*.so.*; do
         [[ -e "$f" ]] || continue
@@ -1197,23 +1273,35 @@ backend_probe_kind() {
 # Keep each backend's shared libraries next to its binary so ik_llama.cpp
 # and llama.cpp can both live in .bin without overwriting each other.
 place_isolated_backend() {
-    local src="$1" dest_name="$2" box kind
+    local src="$1" dest_name="$2" keep="${3:-0}" box kind
     [[ -f "$src" && -n "$dest_name" ]] || return 1
+    case "$dest_name" in
+        ik_llama-server-cuda|llama-server-cuda) keep=1 ;;
+    esac
     box="$INSTALL_DIR/backends/$dest_name"
     mkdir -p "$box"
     install -m 0755 "$src" "$box/llama-server"
     copy_backend_libs "$(dirname "$src")" "$box"
     ln -sfn "backends/$dest_name/llama-server" "$INSTALL_DIR/$dest_name"
     [[ -x "$box/llama-server" && -e "$INSTALL_DIR/$dest_name" ]] || return 1
-    kind="$(probe_llama_server "$box/llama-server" "$box" || true)"
+    # Do not capture stdout: probe stores the --version text in PROBE_LAST_OUT.
+    probe_llama_server "$box/llama-server" "$box" >/dev/null || true
+    kind="${PROBE_LAST_KIND:-broken}"
     case "$kind" in
         runs) return 0 ;;
         needs_gpu)
-            warn "$dest_name installed but needs a GPU runtime on this machine (kept; CPU backend will still be installed if nothing runs)"
+            warn "$dest_name installed but needs a GPU runtime on this machine (kept; llama.cpp will still be installed)"
+            warn_probe_detail
             return 0
             ;;
         *)
+            if [[ "$keep" == "1" ]]; then
+                warn "$dest_name did not start; keeping the downloaded binary"
+                warn_probe_detail
+                return 0
+            fi
             warn "$dest_name cannot start on this machine (wrong libc/arch or incomplete bundle)"
+            warn_probe_detail
             rm -f "$INSTALL_DIR/$dest_name"
             rm -rf "$box"
             return 1
@@ -1513,7 +1601,8 @@ ensure_cuda_host_compiler() {
     return 0
 }
 
-# No published Linux CUDA tarball yet: build ik_llama.cpp when nvcc is here.
+# Last resort only: a checksummed CUDA tarball already landed, or there is
+# no published bundle. Never compile just because --version failed.
 install_cuda_backend_from_source() {
     has_cuda_toolkit || return 1
     BACKEND_CHOICE="cuda"
@@ -1531,9 +1620,9 @@ install_cuda_backend_from_source() {
     ok "Installed ik_llama.cpp CUDA at $built"
 }
 
-# Standard auto install: ik_llama.cpp (CUDA) and llama.cpp (Vulkan and/or CPU).
-# Missing Vulkan loader/ICD and (when asked) CUDA toolkit are installed via
-# the distro. Missing ik_llama is built when nvcc is present. CPU is last.
+# Standard auto install: ik_llama.cpp (CUDA prebuilt) and llama.cpp (Vulkan).
+# llama.cpp is always installed. CUDA is compiled only when no CUDA ELF landed
+# and nvcc is already on this machine. CPU is last if nothing runs.
 install_auto_release_backends() {
     local got=0
     if ! host_can_run_ubuntu_prebuilt && [[ "$OS" == "Linux" ]]; then
@@ -1551,22 +1640,14 @@ install_auto_release_backends() {
     if has_nvidia_gpu && ! installed_real_server ik_llama-server-cuda; then
         BACKEND_CHOICE="cuda"
         say "Installing ik_llama.cpp (CUDA)..."
-        if install_release_bundle ik_llama-server-cuda; then
+        if install_release_bundle ik_llama-server-cuda || installed_real_server ik_llama-server-cuda; then
             got=1
         else
             warn "No published ggrun CUDA bundle for this host."
-            if ! has_cuda_toolkit; then
-                ensure_cuda_toolkit || true
-            fi
-            if has_cuda_toolkit && install_cuda_backend_from_source; then
-                got=1
-            else
-                warn "CUDA llama-server did not build. Common cause: system GCC is newer than this CUDA toolkit allows."
-                warn "Install a matching gcc/g++ (for CUDA 12.3: gcc12 / g++-12) or a newer CUDA toolkit."
-            fi
         fi
     elif installed_real_server ik_llama-server-cuda; then
         say "Keeping existing ik_llama.cpp (CUDA)."
+        got=1
     fi
 
     if ! installed_real_server llama-server-vulkan; then
@@ -1579,6 +1660,7 @@ install_auto_release_backends() {
         fi
     else
         say "Keeping existing llama.cpp Vulkan backend."
+        got=1
     fi
 
     if ! backend_kind_runs ik_llama-server-cuda && ! backend_kind_runs llama-server-vulkan \
@@ -1589,6 +1671,21 @@ install_auto_release_backends() {
             got=1
         fi
     fi
+
+    # Compile only if the CUDA tarball never landed. Do this after llama.cpp
+    # so a gcc/dnf stall cannot skip the Vulkan/CPU pair.
+    if has_nvidia_gpu && ! installed_real_server ik_llama-server-cuda; then
+        if ! has_cuda_toolkit; then
+            ensure_cuda_toolkit || true
+        fi
+        if has_cuda_toolkit && install_cuda_backend_from_source; then
+            got=1
+        else
+            warn "CUDA llama-server did not build. Common cause: system GCC is newer than this CUDA toolkit allows."
+            warn "Install a matching gcc/g++ (for CUDA 12.3: gcc12 / g++-12) or a newer CUDA toolkit."
+        fi
+    fi
+
     if backend_kind_runs llama-server-vulkan; then
         BACKEND_CHOICE="vulkan"
     elif backend_kind_runs ik_llama-server-cuda; then

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Install keeps the CUDA bundle and still installs llama.cpp.** A downloaded
+  CUDA `llama-server` is no longer deleted when `--version` fails on a missing
+  CUDA runtime library (NCCL, cublas, cudart). Setup then installs llama.cpp
+  Vulkan/CPU instead of compiling ik_llama.cpp. The real `--version` error is
+  printed. Source compile runs only when no CUDA ELF landed.
+
 ## v3.2.2 — 2026-08-17
 
 - **Linux CUDA bundle on latest.** Publishes `ggrun-linux-x86_64-cuda.tar.gz`
