@@ -1287,6 +1287,15 @@ place_isolated_backend() {
     # Do not capture stdout: probe stores the --version text in PROBE_LAST_OUT.
     probe_llama_server "$box/llama-server" "$box" >/dev/null || true
     kind="${PROBE_LAST_KIND:-broken}"
+    # The published CUDA libggml needs libnccl.so.2. That is not the NVIDIA
+    # driver and is not in a typical CUDA toolkit. Fetch it into the box.
+    if [[ "$kind" != "runs" ]] && [[ "$dest_name" == *cuda* ]] \
+        && [[ "${PROBE_LAST_OUT}" == *libnccl* ]]; then
+        if fetch_nccl_into_box "$box"; then
+            probe_llama_server "$box/llama-server" "$box" >/dev/null || true
+            kind="${PROBE_LAST_KIND:-broken}"
+        fi
+    fi
     case "$kind" in
         runs) return 0 ;;
         needs_gpu)
@@ -1307,6 +1316,51 @@ place_isolated_backend() {
             return 1
             ;;
     esac
+}
+
+box_has_libnccl() {
+    local box="$1" f
+    for f in "$box"/libnccl.so.2 "$box"/libnccl.so.2.*; do
+        [[ -e "$f" ]] && return 0
+    done
+    return 1
+}
+
+# NVIDIA redist (no login). NCCL is a separate ~210 MB library from the driver.
+# Override with LLM_INSTALL_NCCL_URL= (tests use a tiny local archive).
+NCCL_REDIST_URL="${LLM_INSTALL_NCCL_URL:-https://developer.download.nvidia.com/compute/redist/nccl/v2.21.5/nccl_2.21.5-1+cuda12.4_x86_64.txz}"
+
+fetch_nccl_into_box() {
+    local box="$1" tmp archive lib
+    [[ -d "$box" ]] || return 1
+    box_has_libnccl "$box" && return 0
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v tar >/dev/null 2>&1 || return 1
+    local url="${LLM_INSTALL_NCCL_URL:-${NCCL_REDIST_URL:-https://developer.download.nvidia.com/compute/redist/nccl/v2.21.5/nccl_2.21.5-1+cuda12.4_x86_64.txz}}"
+    say "Downloading NCCL (~210 MB) so the CUDA backend can load (not part of the NVIDIA driver)..."
+    tmp="$(mktemp -d -t ggrun-nccl.XXXXXX)"
+    archive="$tmp/nccl.txz"
+    if ! curl -fL --retry 3 -A ggrun-installer "$url" -o "$archive"; then
+        rm -rf "$tmp"
+        warn "Could not download NCCL. CUDA needs libnccl.so.2 next to llama-server."
+        return 1
+    fi
+    mkdir -p "$tmp/out"
+    if ! tar -xJf "$archive" -C "$tmp/out" 2>/dev/null && ! tar -xf "$archive" -C "$tmp/out" 2>/dev/null; then
+        rm -rf "$tmp"
+        warn "Could not extract NCCL archive."
+        return 1
+    fi
+    while IFS= read -r lib; do
+        copy_resolved_lib "$lib" "$box"
+    done < <(find "$tmp/out" \( -type f -o -type l \) -name 'libnccl.so*' 2>/dev/null | sort)
+    rm -rf "$tmp"
+    if box_has_libnccl "$box"; then
+        ok "Installed libnccl into $box"
+        return 0
+    fi
+    warn "NCCL archive did not contain libnccl.so.2"
+    return 1
 }
 
 link_default_llama_server() {

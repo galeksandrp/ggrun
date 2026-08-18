@@ -15,6 +15,7 @@ eval "$(
         /^host_libc\(\)|^host_can_run_ubuntu_prebuilt\(\)|^classify_probe_output\(\)/ {keep=1}
         /^probe_llama_server\(\)|^warn_probe_detail\(\)|^copy_resolved_lib\(\)/ {keep=1}
         /^harvest_cuda_runtime_libs\(\)|^copy_backend_libs\(\)|^backend_probe_kind\(\)/ {keep=1}
+        /^box_has_libnccl\(\)|^fetch_nccl_into_box\(\)/ {keep=1}
         /^place_isolated_backend\(\)|^link_default_llama_server\(\)/ {keep=1}
         /^_discover_abspath\(\)/ {keep=1}
         keep {print}
@@ -77,6 +78,36 @@ fi
 test -x "$INSTALL_DIR/backends/ik_llama-server-cuda/llama-server"
 test -e "$INSTALL_DIR/ik_llama-server-cuda"
 echo "  ✓ keep a downloaded CUDA ELF when --version fails"
+rm -f "$INSTALL_DIR/ik_llama-server-cuda"
+rm -rf "$INSTALL_DIR/backends/ik_llama-server-cuda"
+
+# Missing libnccl is fetched into the CUDA box, then --version can succeed.
+mkdir -p "$TMP/ncclpack/lib"
+printf 'nccl-stub\n' >"$TMP/ncclpack/lib/libnccl.so.2.21.5"
+ln -sfn libnccl.so.2.21.5 "$TMP/ncclpack/lib/libnccl.so.2"
+tar -C "$TMP" -cJf "$TMP/nccl.txz" ncclpack
+export LLM_INSTALL_NCCL_URL="file://$TMP/nccl.txz"
+cat >"$TMP/src/llama-server" <<'EOF'
+#!/usr/bin/env bash
+dir="$(cd "$(dirname "$0")" && pwd)"
+if [[ -e "$dir/libnccl.so.2" || -e "$dir/libnccl.so.2.21.5" ]]; then
+    echo "version: cuda-ok"
+    exit 0
+fi
+echo "error while loading shared libraries: libnccl.so.2: cannot open shared object file" >&2
+exit 127
+EOF
+chmod +x "$TMP/src/llama-server"
+if ! place_isolated_backend "$TMP/src/llama-server" ik_llama-server-cuda; then
+    echo "  ✗ CUDA place failed after NCCL fetch"
+    exit 1
+fi
+test -e "$INSTALL_DIR/backends/ik_llama-server-cuda/libnccl.so.2" \
+    -o -e "$INSTALL_DIR/backends/ik_llama-server-cuda/libnccl.so.2.21.5" \
+    || { echo "  ✗ libnccl was not copied into the CUDA box"; exit 1; }
+[[ "$(probe_llama_server "$INSTALL_DIR/backends/ik_llama-server-cuda/llama-server" "$INSTALL_DIR/backends/ik_llama-server-cuda")" == "runs" ]] \
+    || { echo "  ✗ CUDA backend still does not run after NCCL fetch"; exit 1; }
+echo "  ✓ fetch libnccl.so.2 so the CUDA backend can start"
 rm -f "$INSTALL_DIR/ik_llama-server-cuda"
 rm -rf "$INSTALL_DIR/backends/ik_llama-server-cuda"
 

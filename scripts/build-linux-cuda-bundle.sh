@@ -79,8 +79,12 @@ echo 'int main(void){return 0;}' | cc -xc - -o /tmp/cuda-stub-probe -lcuda \
 rm -f /tmp/cuda-stub-probe
 stub_dir="$(dirname "$stub")"
 # Default FA kernels only. ALL_QUANTS made CI take ~2h per attempt.
+# NCCL is multi-GPU only and is not part of the driver or a typical toolkit.
+# A laptop then fails to load libggml (DT_NEEDED libnccl.so.2). Leave it off
+# so the published bundle starts with nvidia-smi + bundled cudart/cublas.
 cmake -S "$IK_DIR" -B "$IK_DIR/build" \
     -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON \
+    -DGGML_CUDA_NCCL=OFF \
     "-DCMAKE_CUDA_ARCHITECTURES=75;80;86;89" \
     -DCMAKE_EXE_LINKER_FLAGS="-L${stub_dir} -Wl,-rpath-link,${stub_dir}" \
     -DCMAKE_SHARED_LINKER_FLAGS="-L${stub_dir} -Wl,-rpath-link,${stub_dir}"

@@ -10,6 +10,10 @@
 - **ggrun uses a backend that can start.** A CUDA binary that cannot load
   `libnccl.so.2` no longer becomes `LLAMA_SERVER` or wins auto-select over a
   working Vulkan/CPU llama.cpp.
+- **CUDA install fetches NCCL when the bundle needs it.** `libnccl.so.2` is
+  not the NVIDIA driver and is not in a typical CUDA toolkit. Setup downloads
+  NVIDIA's public NCCL redist into the isolated backend box so the existing
+  CUDA tarball can start.
 
 ## v3.2.2 — 2026-08-17
 
