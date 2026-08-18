@@ -1953,6 +1953,34 @@ func TestRouteArchBackendKeepsExplicitServerBinary(t *testing.T) {
 	}
 }
 
+func TestSelectBackendSkipsLoaderFailedCUDA(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake backend probe uses a shell script")
+	}
+	appHome := t.TempDir()
+	binDir := filepath.Join(appHome, ".bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cuda := filepath.Join(binDir, "ik_llama-server-cuda")
+	vulkan := filepath.Join(binDir, "llama-server-vulkan")
+	if err := os.WriteFile(cuda, []byte("#!/bin/sh\necho 'error while loading shared libraries: libnccl.so.2: cannot open shared object file' >&2\nexit 127\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(vulkan, []byte("#!/bin/sh\necho 'usage: llama-server [--help] [--version]'\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	req := &launchRequest{
+		ServerBin: cuda,
+		AppHome:   appHome,
+		Backend:   "auto",
+	}
+	be := selectBackend(&detect.Capabilities{}, req)
+	if be == nil || be.Path != vulkan {
+		t.Fatalf("loader-failed CUDA should lose to working Vulkan, got %#v", be)
+	}
+}
+
 func TestSelectBackendLegacyConfiguredSkipUsesConfiguredServerBin(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake backend probe uses a shell script")

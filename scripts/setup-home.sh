@@ -185,7 +185,7 @@ usable_llama_server() {
     t="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
     [[ -f "$t" && -x "$t" ]] || return 1
     case "$(basename "$t")" in
-        llama-server|llama-server.exe|ik_llama-server|ik_llama-server-cuda|ik_llama-server-vulkan) ;;
+        llama-server|llama-server.exe|ik_llama-server|ik_llama-server-cuda|ik_llama-server-vulkan|llama-server-vulkan|llama-server-cuda|llama-server-vulkan.exe|llama-server-cuda.exe) ;;
         *) return 1 ;;
     esac
     case "$t" in
@@ -195,22 +195,47 @@ usable_llama_server() {
     [[ "$hdr" == $'\x7fELF' || "${hdr:0:2}" == "MZ" ]]
 }
 
+# Prefer a backend that can actually start. A CUDA ELF that cannot load
+# libnccl must not hide a working Vulkan/CPU llama-server.
+backend_starts() {
+    local p="$1" t dir
+    usable_llama_server "$p" || return 1
+    t="$(readlink -f "$p" 2>/dev/null || printf '%s' "$p")"
+    dir="$(dirname "$t")"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 8 env LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$t" --version >/dev/null 2>&1
+    else
+        env LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$t" --version >/dev/null 2>&1
+    fi
+}
+
+backend_candidates() {
+    printf '%s\n' \
+        "$APP_BIN/llama-server-cuda" \
+        "$APP_BIN/ik_llama-server-cuda" \
+        "$APP_BIN/llama-server-vulkan" \
+        "$APP_BIN/llama-server" \
+        "$APP_SRC/llama.cpp/build-cuda/bin/llama-server" \
+        "$APP_SRC/ik_llama.cpp/build/bin/llama-server" \
+        "$APP_SRC/llama.cpp/build-vulkan/bin/llama-server" \
+        "$APP_SRC/llama.cpp/build/bin/llama-server"
+}
+
 backend_bin=""
-for cand in \
-    "$APP_BIN/llama-server-cuda" \
-    "$APP_BIN/ik_llama-server-cuda" \
-    "$APP_BIN/llama-server-vulkan" \
-    "$APP_BIN/llama-server" \
-    "$APP_SRC/llama.cpp/build-cuda/bin/llama-server" \
-    "$APP_SRC/ik_llama.cpp/build/bin/llama-server" \
-    "$APP_SRC/llama.cpp/build-vulkan/bin/llama-server" \
-    "$APP_SRC/llama.cpp/build/bin/llama-server"
-do
-    if usable_llama_server "$cand"; then
+while IFS= read -r cand; do
+    if backend_starts "$cand"; then
         backend_bin="$cand"
         break
     fi
-done
+done < <(backend_candidates)
+if [[ -z "$backend_bin" ]]; then
+    while IFS= read -r cand; do
+        if usable_llama_server "$cand"; then
+            backend_bin="$cand"
+            break
+        fi
+    done < <(backend_candidates)
+fi
 
 backend_real="$backend_bin"
 if [[ -n "$backend_bin" ]]; then

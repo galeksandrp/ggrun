@@ -1764,9 +1764,13 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 	}
 	if req.ServerBin != "" && !useExplicitServerBin {
 		if _, err := os.Stat(req.ServerBin); err == nil {
-			return detectBackend(req.ServerBin)
+			if info := detectUsableBackend(req.ServerBin); info != nil {
+				return info
+			}
+			fmt.Fprintf(os.Stderr, "Warning: configured backend %s did not start; trying another installed backend\n", req.ServerBin)
+		} else {
+			fmt.Fprintf(os.Stderr, "Warning: server binary not found: %s\n", req.ServerBin)
 		}
-		fmt.Fprintf(os.Stderr, "Warning: server binary not found: %s\n", req.ServerBin)
 	}
 	return findBackend(caps, req.AppHome)
 }
@@ -1801,8 +1805,12 @@ func autoBackendCandidates(caps *detect.Capabilities, req *launchRequest) []auto
 		if st, err := os.Stat(path); err != nil || st.IsDir() {
 			return
 		}
+		info := detectBackend(path)
+		if backendLoaderFailed(info.Help) {
+			return
+		}
 		out = append(out, autoBackendCandidate{
-			info:      detectBackend(path),
+			info:      info,
 			canonical: pathInsideDir(path, appHome),
 		})
 	}
@@ -2641,6 +2649,13 @@ func backendVerbosityArgs(args []string, backendHelp string) []string {
 func validateBackendLaunchArgs(be *backendInfo, args []string) error {
 	if be == nil || len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("cannot validate an empty backend launch command")
+	}
+	if backendLoaderFailed(be.Help) {
+		detail := strings.TrimSpace(firstNonEmptyLine(be.Help))
+		if detail == "" {
+			detail = "shared library or loader error"
+		}
+		return fmt.Errorf("backend %s cannot start: %s", be.Path, detail)
 	}
 	probeFlag := ""
 	switch {
@@ -7907,14 +7922,18 @@ func findBackend(caps *detect.Capabilities, configuredAppHome ...string) *backen
 	if caps != nil {
 		for _, b := range caps.Backends {
 			if b.Name == "llama-server" || b.Name == "ik_llama" || b.Name == "ik_llama-server" {
-				return detectBackend(b.Path)
+				if info := detectUsableBackend(b.Path); info != nil {
+					return info
+				}
 			}
 		}
 	}
 	for _, p := range backendSearchPaths(configuredAppHome...) {
 		if p != "" {
 			if _, err := os.Stat(p); err == nil {
-				return detectBackend(p)
+				if info := detectUsableBackend(p); info != nil {
+					return info
+				}
 			}
 		}
 	}
@@ -7983,6 +8002,24 @@ func backendSearchPaths(configuredAppHome ...string) []string {
 		"/usr/local/bin/llama-server",
 		"/usr/bin/llama-server",
 	)
+}
+
+// backendLoaderFailed reports a binary that cannot even load (missing NCCL,
+// wrong ELF, etc.). Those must not win auto-selection over a working Vulkan/CPU
+// backend sitting next to them.
+func backendLoaderFailed(help string) bool {
+	return strings.Contains(help, "cannot open shared object file") ||
+		strings.Contains(help, "error while loading shared libraries") ||
+		strings.Contains(help, "Exec format error") ||
+		strings.Contains(help, "cannot execute binary file")
+}
+
+func detectUsableBackend(path string) *backendInfo {
+	info := detectBackend(path)
+	if info == nil || backendLoaderFailed(info.Help) {
+		return nil
+	}
+	return info
 }
 
 // detectBackend runs --help to determine if this is ik_llama.cpp fork.

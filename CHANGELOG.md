@@ -7,6 +7,9 @@
   CUDA runtime library (NCCL, cublas, cudart). Setup then installs llama.cpp
   Vulkan/CPU instead of compiling ik_llama.cpp. The real `--version` error is
   printed. Source compile runs only when no CUDA ELF landed.
+- **ggrun uses a backend that can start.** A CUDA binary that cannot load
+  `libnccl.so.2` no longer becomes `LLAMA_SERVER` or wins auto-select over a
+  working Vulkan/CPU llama.cpp.
 
 ## v3.2.2 — 2026-08-17
 
