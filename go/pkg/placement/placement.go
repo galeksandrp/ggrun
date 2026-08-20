@@ -1703,50 +1703,7 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	// here the model demonstrably fits without it, so leaving it empty frees its
 	// context for the reviewer or another process.
 	if denseMemBandwidthKnown(caps.GPUs) {
-		gpuOrder := orderGPUsByMemoryBandwidth(caps.GPUs)
-		split := make([]float64, numGPUs)
-		combinedMB := totalSizeMB + kvTotalMB
-		if combinedMB <= 0 {
-			combinedMB = 1
-		}
-		capacityMB := make([]int, numGPUs)
-		totalCapacity := 0
-		for _, gi := range gpuOrder {
-			g := caps.GPUs[gi]
-			capacity := g.VRAMFreeMB() - cudaOverheadMB - computeBufForGPU(g.Index)
-			if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
-				capacity -= s.MMProjSizeMB
-			}
-			if capacity < 0 {
-				capacity = 0
-			}
-			capacityMB[gi] = capacity
-			totalCapacity += capacity
-		}
-		if totalCapacity >= combinedMB {
-			remaining := combinedMB
-			for _, gi := range gpuOrder {
-				if remaining <= 0 {
-					break
-				}
-				take := capacityMB[gi]
-				if take > remaining {
-					take = remaining
-				}
-				split[gi] = float64(take) / float64(combinedMB)
-				remaining -= take
-			}
-		} else {
-			// Not enough room even in aggregate. Load every card in proportion to
-			// what it can hold so checkMemoryOrDie reports the real shortfall
-			// instead of a split that blames one device.
-			for _, gi := range gpuOrder {
-				if totalCapacity > 0 {
-					split[gi] = float64(capacityMB[gi]) / float64(totalCapacity)
-				}
-			}
-		}
-		s.TensorSplit = normalizeSplit(split)
+		denseFillFastestFirstSplit(s, caps, numGPUs, cudaOverheadMB, computeBufForGPU, totalSizeMB, kvTotalMB)
 	} else {
 		// No card reports VRAM bandwidth (unknown hardware): keep the previous
 		// PCIe-derived balanced weighting rather than guessing.
@@ -7642,4 +7599,68 @@ func orderGPUsByMemoryBandwidth(gpus []detect.GPU) []int {
 		return gi.Index < gj.Index
 	})
 	return indices
+}
+
+// denseFillFastestFirstSplit divides the model+KV budget by filling the highest
+// VRAM-bandwidth GPU first, capping each card at what it can actually hold. See
+// buildMultiGPUDense for why a sum-minimising fill beats a balanced share under
+// --split-mode layer.
+func denseFillFastestFirstSplit(s *Strategy, caps *detect.Capabilities, numGPUs, cudaOverheadMB int, computeBufForGPU func(int) int, totalSizeMB, kvTotalMB int) {
+	gpuOrder := orderGPUsByMemoryBandwidth(caps.GPUs)
+	split := make([]float64, numGPUs)
+	combinedMB := totalSizeMB + kvTotalMB
+	if combinedMB <= 0 {
+		combinedMB = 1
+	}
+	capacityMB := make([]int, numGPUs)
+	totalCapacity := 0
+	for _, gi := range gpuOrder {
+		g := caps.GPUs[gi]
+		capacity := g.VRAMFreeMB() - cudaOverheadMB - computeBufForGPU(g.Index)
+		if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
+			capacity -= s.MMProjSizeMB
+		}
+		if capacity < 0 {
+			capacity = 0
+		}
+		capacityMB[gi] = capacity
+		totalCapacity += capacity
+	}
+	if totalCapacity >= combinedMB {
+		remaining := combinedMB
+		for _, gi := range gpuOrder {
+			if remaining <= 0 {
+				break
+			}
+			take := capacityMB[gi]
+			if take > remaining {
+				take = remaining
+			}
+			split[gi] = float64(take) / float64(combinedMB)
+			remaining -= take
+		}
+	} else if totalCapacity > 0 {
+		// Not enough room even in aggregate. Load every card in proportion to
+		// what it can hold so checkMemoryOrDie reports the real shortfall
+		// instead of a split that blames one device.
+		for _, gi := range gpuOrder {
+			split[gi] = float64(capacityMB[gi]) / float64(totalCapacity)
+		}
+	} else {
+		// Every card's free VRAM is already below its own fixed overhead, so
+		// capacity-proportional would be 0/0 and emit "--tensor-split 0,0,0"
+		// (the emit guard checks length, not content). Fall back to
+		// free-VRAM-proportional, which is what the balanced split does in the
+		// same situation, and let the OOM guard report the real shortfall.
+		totalFree := 0.0
+		for _, g := range caps.GPUs {
+			totalFree += float64(g.VRAMFreeMB())
+		}
+		if totalFree > 0 {
+			for _, gi := range gpuOrder {
+				split[gi] = float64(caps.GPUs[gi].VRAMFreeMB()) / totalFree
+			}
+		}
+	}
+	s.TensorSplit = normalizeSplit(split)
 }

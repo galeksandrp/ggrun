@@ -124,3 +124,61 @@ func TestOrderGPUsByMemoryBandwidthRanksFastestFirst(t *testing.T) {
 		t.Errorf("order = %v, want %v (3090Ti, 4070, 3060)", order, want)
 	}
 }
+
+// When every card's free VRAM is already below its own fixed overhead there is
+// no capacity to divide. The fully-resident dense split must still name real
+// devices rather than degenerate to all zeros, because the argv emitter guards
+// on the split's LENGTH, not its contents, and would pass "--tensor-split
+// 0,0,0" straight through to llama-server.
+//
+// NOTE: the dense_cpu_offload builder (untouched here) does emit [0 0 0] with
+// gpuLayers=999 under this same pressure. That is a separate pre-existing
+// defect, so this test asserts only the path it covers and skips otherwise
+// rather than silently passing on the wrong builder.
+func TestDenseSplitNeverEmitsAllZeroWhenCardsAreFull(t *testing.T) {
+	caps := benchBox()
+	// Leave a few hundred MiB free on each card: far below the CUDA context plus
+	// compute buffer, so every computed capacity clamps to zero.
+	for i := range caps.GPUs {
+		caps.GPUs[i].VRAMUsedMB = caps.GPUs[i].VRAMTotalMB - 200
+	}
+	strat, err := Compute(caps, qwen27B(), Options{
+		ContextSize: 131072, KVPlacement: "gpu", KVQuality: "low", CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Skipf("no plan produced for a full box: %v", err)
+	}
+	if strat.Type != MultiGPUDense {
+		t.Skipf("planner chose %s, not the fully-resident dense path under test", strat.Type)
+	}
+	if len(strat.TensorSplit) == 0 {
+		return // no split emitted at all is fine
+	}
+	for _, share := range strat.TensorSplit {
+		if share > 0 {
+			return
+		}
+	}
+	t.Errorf("split is all zeros and would emit --tensor-split 0,0,0: %v", strat.TensorSplit)
+}
+
+// The degenerate branch itself, exercised directly: with no usable capacity the
+// dense split falls back to free-VRAM-proportional instead of all zeros.
+func TestDenseSplitDegenerateFallbackIsProportional(t *testing.T) {
+	caps := benchBox()
+	for i := range caps.GPUs {
+		caps.GPUs[i].VRAMUsedMB = caps.GPUs[i].VRAMTotalMB - 200
+	}
+	s := &Strategy{Type: MultiGPUDense}
+	// Capacity clamps to zero for every card, so the greedy cannot place anything.
+	denseFillFastestFirstSplit(s, caps, len(caps.GPUs), 500, func(int) int { return 1024 }, 17093, 4352)
+	nonZero := 0
+	for _, share := range s.TensorSplit {
+		if share > 0 {
+			nonZero++
+		}
+	}
+	if nonZero == 0 {
+		t.Errorf("degenerate fallback produced an all-zero split: %v", s.TensorSplit)
+	}
+}
