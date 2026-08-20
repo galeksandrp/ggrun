@@ -110,6 +110,7 @@ INSTALL_STARTED=0
 LAST_ERR_MSG=""
 LAST_ERR_CMD=""
 LAST_ERR_LINE=""
+LAST_ERR_FN=""
 REPORT_FILE=""
 
 _redact() { sed -e "s#${HOME}#~#g" 2>/dev/null; }
@@ -128,7 +129,7 @@ collect_diagnostics() {
     printf -- '- backend: requested=%s chosen=%s | mode=%s release=%s\n' "$BACKEND_REQUEST" "$BACKEND_CHOICE" "$INSTALL_MODE" "$INSTALL_RELEASE"
     printf '\n### Failure\n'
     printf -- '- message: %s\n' "${LAST_ERR_MSG:-<none captured>}"
-    [[ -n "$LAST_ERR_CMD" ]] && printf -- '- command: `%s` (line %s)\n' "$LAST_ERR_CMD" "$LAST_ERR_LINE"
+    [[ -n "$LAST_ERR_CMD" ]] && printf -- '- command: `%s` (in %s, near line %s)\n' "$LAST_ERR_CMD" "${LAST_ERR_FN:-main}" "$LAST_ERR_LINE"
     printf '\n### Hardware\n'
     printf -- '- gpu: %s\n' "$(nvidia-smi -L 2>/dev/null | paste -sd'; ' - || echo 'nvidia-smi: none')"
     printf -- '- cpu: %s\n' "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | sed 's/^ *//' || uname -p 2>/dev/null)"
@@ -184,7 +185,11 @@ report_install_failure() {
     say "    $url"
 }
 
-_on_err() { LAST_ERR_CMD="$BASH_COMMAND"; LAST_ERR_LINE="${BASH_LINENO[0]:-?}"; }
+# BASH_COMMAND is the innermost failing command while BASH_LINENO[0] is the line
+# in the *calling* frame, so the two can name different places (issue 26 reported
+# `IFS= read -r f` against the line of the call site). Record the enclosing
+# function as well so a report identifies one unambiguous frame.
+_on_err() { LAST_ERR_CMD="$BASH_COMMAND"; LAST_ERR_LINE="${BASH_LINENO[0]:-?}"; LAST_ERR_FN="${FUNCNAME[1]:-main}"; }
 _on_exit() {
     local rc=$?
     set +e
@@ -639,6 +644,13 @@ report_system_installs() {
             [[ -n "$f" ]] && ok "fork:          $f"
         done <<<"$FOUND_FORK_SERVERS"
     fi
+    # FOUND_FORK_SERVERS always ends in a newline (see the fork case in
+    # scan_system_installs), so the loop above ends on an empty line and its
+    # final [[ -n "$f" ]] test is false. That false status would become this
+    # function's return value and abort the whole installer under `set -e`,
+    # which is exactly how an existing install used to break the upgrade.
+    # Reporting what was found can never fail the install.
+    return 0
 }
 
 print_discover_kv() {
@@ -1175,6 +1187,12 @@ warn_probe_detail() {
     line="$(printf '%s' "${PROBE_LAST_OUT:-}" | tr '\n' ' ' | sed 's/^[[:space:]]\+//;s/[[:space:]]\+$//;s/[[:space:]]\+/ /g')"
     [[ ${#line} -gt 240 ]] && line="${line:0:240}…"
     [[ -n "$line" ]] && warn "  $line"
+    # A probe that printed nothing leaves $line empty, making the test above
+    # false and this function return 1. Every caller invokes it bare under
+    # `set -e`, so that would abort the install before the `return 0` or the
+    # cleanup that follows it -- turning "backend did not start, fall back"
+    # into a hard failure. Printing a detail line can never fail the install.
+    return 0
 }
 
 # Copy a .so into the isolated box. Follow toolkit symlinks so libcudart.so.12
