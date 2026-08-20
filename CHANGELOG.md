@@ -12,6 +12,15 @@
   admission slot — they do run on that backend. The overflow threshold is the
   same constant that builds the reviewer's `--ctx-size`, so the routing window
   cannot drift from the launch.
+- **Explicit "off" reviewer option (no separate Auto reviewer).** Whether a
+  separate reviewer was seated was purely a VRAM decision — on a box with
+  headroom it always launched, with no way to decline it. `--claude-reviewer off`
+  and a matching "off" entry in the TUI reviewer/worker selector now seat no
+  reviewer at all: no companion reservation, the proactive VRAM gate returns
+  early instead of prompting (picking "off" IS the self-review consent), and no
+  reviewer process starts. The router then sees no separate reviewer and
+  self-classifies with the existing visible notice, so the choice stays explicit
+  rather than silent.
 - **Installer no longer aborts mid-upgrade on a fork-named llama-server.** With
   any backend path matching `fork-`/`fork_` detected, `report_system_installs`
   ended on a false loop test whose status became the function's return value,
