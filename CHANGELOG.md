@@ -1,7 +1,31 @@
 # Changelog
 
-## Unreleased
+## v3.2.8 — 2026-08-20
 
+- **An Auto review that cannot reach a separate reviewer goes to the main model.**
+  A classifier request used to route unconditionally to the reviewer, so when no
+  separate reviewer was seated it silently ran on the main model while being
+  recorded as a "reviewer" turn and skipping main admission control, and an
+  oversized prompt was sent into the reviewer's context regardless. Both cases
+  now route to the main model explicitly (self-classify), each with a visible
+  notice, and are recorded as `route=main` so they take and release a main
+  admission slot — they do run on that backend. The overflow threshold is the
+  same constant that builds the reviewer's `--ctx-size`, so the routing window
+  cannot drift from the launch.
+- **Installer no longer aborts mid-upgrade on a fork-named llama-server.** With
+  any backend path matching `fork-`/`fork_` detected, `report_system_installs`
+  ended on a false loop test whose status became the function's return value,
+  killing the whole install under `set -e` before any backend work — the failure
+  behind "install failed: Linux cuda". `warn_probe_detail` had the identical bug
+  and is fixed the same way, so "backend did not start, fall back" no longer
+  turns into a hard failure on the CUDA path. Failure reports now also name the
+  enclosing function so `BASH_COMMAND`/call-site lines cannot disagree.
+- **Config-screen lag, self-review, resume-across-model, decode-in-status.**
+  The model-config screen cached two expensive file reads so renders are O(1)
+  when config is unchanged; the separate reviewer is only dropped for a VRAM
+  model with explicit consent (never silent self-review); "resume latest"
+  launches the current model even when the recorded one differs; the status line
+  shows both prefill and decode tok/s when both are known.
 - **Install keeps the CUDA bundle and still installs llama.cpp.** A downloaded
   CUDA `llama-server` is no longer deleted when `--version` fails on a missing
   CUDA runtime library (NCCL, cublas, cudart). Setup then installs llama.cpp

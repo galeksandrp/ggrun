@@ -592,9 +592,10 @@ type launchRequest struct {
 	// small/light Qwen3.5-2B review-only profile, and "nanbeige" forces the
 	// Nanbeige4.2 big-MoE worker. Empty means auto. Set via --claude-reviewer.
 	ClaudeReviewerOverride string
-	// ClaudeReviewerDisabled is set only after the user accepts the resident
-	// fallback that routes Auto reviews through the main model. It is runtime
-	// state, not a placement-policy flag exposed on the command line.
+	// ClaudeReviewerDisabled routes Auto reviews through the main model
+	// (self-review) instead of seating a separate reviewer. It is set either
+	// after the user accepts the resident fallback at launch, or up front by
+	// --claude-reviewer off, which is the user asking for exactly that.
 	ClaudeReviewerDisabled bool
 	ClaudeProfile          string   // agent-interactive avoids the automatic parallel-4 floor
 	ClaudeResume           string   // session id or "latest": reopen a recorded Claude session
@@ -1258,6 +1259,14 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 	if req.ClaudeReviewerOverride != "" && req.ClaudeReviewerOverride != claudeReviewerAuto && !req.ClaudeCode {
 		return nil, fmt.Errorf("--claude-reviewer requires --claude-code")
 	}
+	// "off" is a placement decision, not a model choice: seat no reviewer at
+	// all. Setting it here means every downstream gate that already honours
+	// ClaudeReviewerDisabled (the reservation, the proactive VRAM gate, the
+	// reviewer launch) needs no new special case, and the router sees no
+	// separate reviewer and self-classifies with its usual notice.
+	if req.ClaudeReviewerOverride == claudeReviewerOff {
+		req.ClaudeReviewerDisabled = true
+	}
 	if err := resolveKVCacheTypeFlags(req); err != nil {
 		return nil, err
 	}
@@ -1283,15 +1292,19 @@ const (
 	claudeReviewerQwen     = "qwen"
 	claudeReviewerQwen2B   = "qwen2b"
 	claudeReviewerNanbeige = "nanbeige"
+	// claudeReviewerOff seats no separate reviewer at all. It is the user
+	// asking for self-review outright, which is why it is the one value that
+	// sets ClaudeReviewerDisabled straight from the command line.
+	claudeReviewerOff = "off"
 )
 
 func parseClaudeReviewer(flag, value string) (string, error) {
 	reviewer := strings.ToLower(strings.TrimSpace(value))
 	switch reviewer {
-	case claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige:
+	case claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige, claudeReviewerOff:
 		return reviewer, nil
 	default:
-		return "", fmt.Errorf("%s must be %q, %q, %q or %q, got %q", flag, claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige, value)
+		return "", fmt.Errorf("%s must be %q, %q, %q, %q or %q, got %q", flag, claudeReviewerAuto, claudeReviewerQwen, claudeReviewerQwen2B, claudeReviewerNanbeige, claudeReviewerOff, value)
 	}
 }
 

@@ -109,7 +109,8 @@ type Model struct {
 	// claudeReviewer picks the local worker/reviewer model for Claude Code:
 	// "auto" (and "qwen") resolve to the Qwen3.5-4B worker/reviewer, "qwen2b"
 	// forces the small/light Qwen3.5-2B review-only profile, and "nanbeige"
-	// forces the NanoBeige4.2 big-MoE worker. Empty means auto.
+	// forces the NanoBeige4.2 big-MoE worker. Empty means auto. "off" seats no
+	// reviewer at all, so the main model reviews its own output.
 	claudeReviewer string
 	supportExpert  string
 	supportOnline  bool
@@ -1109,7 +1110,7 @@ func (m *Model) cycleCfgRow(row string, dir int) {
 	case "claudecode":
 		m.claudeCode = !m.claudeCode
 	case "claudereviewer":
-		order := []string{"auto", "qwen", "qwen2b", "nanbeige"}
+		order := []string{"auto", "qwen", "qwen2b", "nanbeige", "off"}
 		if dir < 0 {
 			m.claudeReviewer = prevOption(order, m.claudeReviewer)
 		} else {
@@ -3810,7 +3811,8 @@ type LaunchRequest struct {
 	// ClaudeReviewerOverride picks the local worker/reviewer model in Claude
 	// Code mode: empty/"auto" and "qwen" resolve to the Qwen3.5-4B
 	// worker/reviewer, "qwen2b" forces the small/light Qwen3.5-2B review-only
-	// profile, and "nanbeige" forces the NanoBeige4.2 big-MoE worker.
+	// profile, and "nanbeige" forces the NanoBeige4.2 big-MoE worker. "off"
+	// seats no reviewer at all (main-model self-review).
 	ClaudeReviewerOverride string
 	ResumeSession          string // reopen this recorded Claude Code session
 	SupportExpert          string // optional native support/optimizer policy: off, auto, on
@@ -3991,6 +3993,8 @@ func claudeReviewerLabel(reviewer string) string {
 		return "lightest (Qwen3.5-2B, review-only)"
 	case "nanbeige":
 		return "big/fast worker (Nanbeige4.2, reviews + works)"
+	case "off":
+		return "off (no reviewer, main model self-reviews)"
 	default:
 		return "auto (automatic)"
 	}
