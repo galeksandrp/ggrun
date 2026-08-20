@@ -34,8 +34,16 @@ type GPU struct {
 	PCILanes        int    `json:"pci_lanes,omitempty"`
 	BandwidthMBps   int    `json:"bandwidth_mbps,omitempty"`
 	BandwidthSource string `json:"bandwidth_source,omitempty"`
-	PCIBusID        string `json:"pci_bus_id,omitempty"`
-	ComputeCap      string `json:"compute_cap,omitempty"`
+	// MemClockMHz and MemBandwidthMBps describe VRAM, not the PCIe link.
+	// BandwidthMBps above is link bandwidth, which is what a streaming MoE
+	// cares about; a fully-resident dense model reads its weights out of VRAM
+	// once per token and is bounded by MemBandwidthMBps instead. Zero means
+	// unknown (card not in the bus-width table), and callers fall back to
+	// BandwidthMBps.
+	MemClockMHz      int    `json:"mem_clock_mhz,omitempty"`
+	MemBandwidthMBps int    `json:"mem_bandwidth_mbps,omitempty"`
+	PCIBusID         string `json:"pci_bus_id,omitempty"`
+	ComputeCap       string `json:"compute_cap,omitempty"`
 }
 
 // RAMInfo represents system memory.
@@ -86,7 +94,7 @@ func Detect() (*Capabilities, error) {
 
 func detectNVIDIA() []GPU {
 	out, err := exec.Command("nvidia-smi",
-		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,memory.free,driver_version,compute_cap",
+		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,memory.free,driver_version,compute_cap,clocks.max.memory",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		return nil
@@ -135,6 +143,15 @@ func detectNVIDIA() []GPU {
 			Driver:         driver,
 			PCIBusID:       pciBusID,
 			ComputeCap:     computeCap,
+		}
+		// VRAM bandwidth: the memory clock comes from nvidia-smi, the bus width
+		// from the name table. Unknown cards leave both zero and dense placement
+		// falls back to PCIe weighting.
+		if len(parts) >= 9 {
+			if mhz, err := strconv.Atoi(strings.TrimSpace(parts[8])); err == nil && mhz > 0 {
+				gpu.MemClockMHz = mhz
+				gpu.MemBandwidthMBps = memoryBandwidthMBps(gpu.Name, mhz)
+			}
 		}
 		// Parse PCIe bandwidth.
 		if i < len(pcieLinks) {

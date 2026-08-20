@@ -1684,52 +1684,74 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	// idle-GPU bug being fixed. The log-damped factor still prefers fast links
 	// but bounds the ratio (~2.4x), so every contributing GPU keeps a nonzero
 	// share.
-	gpuOrder := orderGPUsByBandwidth(caps.GPUs)
-	split := make([]float64, numGPUs)
-	totalWeighted := 0.0
-	weightByGPU := make([]float64, numGPUs)
-	for idx := 0; idx < numGPUs; idx++ {
-		gi := gpuOrder[idx]
-		g := caps.GPUs[gi]
-		overhead := cudaOverheadMB + computeBufForGPU(g.Index) + gpuKVReserveMB[gi]
-		effective := g.VRAMFreeMB() - overhead
-		if effective < 0 {
-			effective = 0
+	// Fill the fastest VRAM first, when we know how fast each card's VRAM is.
+	//
+	// Under --split-mode layer the devices run SEQUENTIALLY: device A computes its
+	// layers, hands the activations to device B, and so on. Time per token is the
+	// SUM of each device's weight-read time, not the max -- and a sum is minimised
+	// by putting as many bytes as possible on the highest-bandwidth memory, not by
+	// giving every card a fair share. Spreading also charges a CUDA context and a
+	// compute buffer to every participating card, which costs a 12 GB card
+	// proportionally twice what it costs a 24 GB one.
+	//
+	// The budget divided here is model + KV COMBINED, because llama-server
+	// distributes both by the tensor ratio; a share sized against weights alone
+	// under-books the KV that lands beside them.
+	//
+	// A GPU not needed for capacity gets a zero share deliberately. That is the
+	// opposite of the old idle-GPU bug (a card dropped while its siblings OOM'd):
+	// here the model demonstrably fits without it, so leaving it empty frees its
+	// context for the reviewer or another process.
+	if denseMemBandwidthKnown(caps.GPUs) {
+		gpuOrder := orderGPUsByMemoryBandwidth(caps.GPUs)
+		split := make([]float64, numGPUs)
+		combinedMB := totalSizeMB + kvTotalMB
+		if combinedMB <= 0 {
+			combinedMB = 1
 		}
-		if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
-			effective -= s.MMProjSizeMB
-			if effective < 0 {
-				effective = 0
-			}
-		}
-		bwFactor := 1.0
-		if g.BandwidthMBps > 0 {
-			// 1 + log2(1 + bw/1024)/2 : 985 -> ~1.49, 31504 -> ~3.50.
-			bwFactor = 1.0 + math.Log2(1.0+float64(g.BandwidthMBps)/1024.0)/2.0
-		}
-		w := float64(effective) * bwFactor
-		weightByGPU[gi] = w
-		totalWeighted += w
-	}
-	if totalWeighted > 0 {
+		capacityMB := make([]int, numGPUs)
+		totalCapacity := 0
 		for _, gi := range gpuOrder {
-			split[gi] = weightByGPU[gi] / totalWeighted
+			g := caps.GPUs[gi]
+			capacity := g.VRAMFreeMB() - cudaOverheadMB - computeBufForGPU(g.Index)
+			if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
+				capacity -= s.MMProjSizeMB
+			}
+			if capacity < 0 {
+				capacity = 0
+			}
+			capacityMB[gi] = capacity
+			totalCapacity += capacity
 		}
-	} else {
-		// No GPU has usable effective VRAM after reserves. Fall back to a
-		// free-VRAM-proportional split so every GPU is still exercised; the OOM
-		// guard (checkMemoryOrDie) reports the true shortfall.
-		totalFree := 0.0
-		for _, g := range caps.GPUs {
-			totalFree += float64(g.VRAMFreeMB())
-		}
-		if totalFree > 0 {
+		if totalCapacity >= combinedMB {
+			remaining := combinedMB
 			for _, gi := range gpuOrder {
-				split[gi] = float64(caps.GPUs[gi].VRAMFreeMB()) / totalFree
+				if remaining <= 0 {
+					break
+				}
+				take := capacityMB[gi]
+				if take > remaining {
+					take = remaining
+				}
+				split[gi] = float64(take) / float64(combinedMB)
+				remaining -= take
+			}
+		} else {
+			// Not enough room even in aggregate. Load every card in proportion to
+			// what it can hold so checkMemoryOrDie reports the real shortfall
+			// instead of a split that blames one device.
+			for _, gi := range gpuOrder {
+				if totalCapacity > 0 {
+					split[gi] = float64(capacityMB[gi]) / float64(totalCapacity)
+				}
 			}
 		}
+		s.TensorSplit = normalizeSplit(split)
+	} else {
+		// No card reports VRAM bandwidth (unknown hardware): keep the previous
+		// PCIe-derived balanced weighting rather than guessing.
+		denseBalancedSplit(s, caps, numGPUs, cudaOverheadMB, computeBufForGPU, gpuKVReserveMB)
 	}
-	s.TensorSplit = normalizeSplit(split)
 
 	// Layer split is the portable default for heterogeneous GPUs. The tensor
 	// split path uses NCCL collectives during graph construction and can abort
@@ -7530,4 +7552,94 @@ func wholeDeviceOverheadMB(liveUsedMB, accountedMB, companionMB, vramTotalMB int
 		return 0, false
 	}
 	return delta, true
+}
+
+// denseBalancedSplit is the pre-existing PCIe-weighted balanced split, kept for
+// hardware whose VRAM bandwidth is unknown. It weights each GPU's effective free
+// VRAM by a log-damped PCIe factor, which bounds the ratio (~2.4x) so no
+// contributing card is rounded down to a zero share.
+func denseBalancedSplit(s *Strategy, caps *detect.Capabilities, numGPUs, cudaOverheadMB int, computeBufForGPU func(int) int, gpuKVReserveMB []int) {
+	gpuOrder := orderGPUsByBandwidth(caps.GPUs)
+	split := make([]float64, numGPUs)
+	totalWeighted := 0.0
+	weightByGPU := make([]float64, numGPUs)
+	for idx := 0; idx < numGPUs; idx++ {
+		gi := gpuOrder[idx]
+		g := caps.GPUs[gi]
+		overhead := cudaOverheadMB + computeBufForGPU(g.Index) + gpuKVReserveMB[gi]
+		effective := g.VRAMFreeMB() - overhead
+		if effective < 0 {
+			effective = 0
+		}
+		if gi == gpuOrder[0] && s.MMProjSizeMB > 0 {
+			effective -= s.MMProjSizeMB
+			if effective < 0 {
+				effective = 0
+			}
+		}
+		bwFactor := 1.0
+		if g.BandwidthMBps > 0 {
+			// 1 + log2(1 + bw/1024)/2 : 985 -> ~1.49, 31504 -> ~3.50.
+			bwFactor = 1.0 + math.Log2(1.0+float64(g.BandwidthMBps)/1024.0)/2.0
+		}
+		w := float64(effective) * bwFactor
+		weightByGPU[gi] = w
+		totalWeighted += w
+	}
+	if totalWeighted > 0 {
+		for _, gi := range gpuOrder {
+			split[gi] = weightByGPU[gi] / totalWeighted
+		}
+	} else {
+		// No GPU has usable effective VRAM after reserves. Fall back to a
+		// free-VRAM-proportional split so every GPU is still exercised; the OOM
+		// guard (checkMemoryOrDie) reports the true shortfall.
+		totalFree := 0.0
+		for _, g := range caps.GPUs {
+			totalFree += float64(g.VRAMFreeMB())
+		}
+		if totalFree > 0 {
+			for _, gi := range gpuOrder {
+				split[gi] = float64(caps.GPUs[gi].VRAMFreeMB()) / totalFree
+			}
+		}
+	}
+	s.TensorSplit = normalizeSplit(split)
+}
+
+// denseMemBandwidthKnown reports whether VRAM bandwidth is known for every GPU.
+// It is all-or-nothing on purpose: ordering a known 1008 GB/s card against a card
+// reporting 0 would rank the unknown one last on no evidence, so a single
+// unrecognised card keeps the whole plan on the PCIe-weighted fallback.
+func denseMemBandwidthKnown(gpus []detect.GPU) bool {
+	if len(gpus) == 0 {
+		return false
+	}
+	for _, g := range gpus {
+		if g.MemBandwidthMBps <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// orderGPUsByMemoryBandwidth ranks GPUs fastest-VRAM first, which is the order
+// the fully-resident dense split fills them in. Ties break on VRAM size (fewer
+// cards for the same bytes) and then index, so the order is deterministic.
+func orderGPUsByMemoryBandwidth(gpus []detect.GPU) []int {
+	indices := make([]int, len(gpus))
+	for i := range gpus {
+		indices[i] = i
+	}
+	sort.Slice(indices, func(i, j int) bool {
+		gi, gj := gpus[indices[i]], gpus[indices[j]]
+		if gi.MemBandwidthMBps != gj.MemBandwidthMBps {
+			return gi.MemBandwidthMBps > gj.MemBandwidthMBps
+		}
+		if gi.VRAMTotalMB != gj.VRAMTotalMB {
+			return gi.VRAMTotalMB > gj.VRAMTotalMB
+		}
+		return gi.Index < gj.Index
+	})
+	return indices
 }
