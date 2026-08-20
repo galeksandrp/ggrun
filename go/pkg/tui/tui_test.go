@@ -1142,6 +1142,95 @@ func TestModelConfigShowsFullSWAKVMemoryDelta(t *testing.T) {
 	}
 }
 
+// TestConfigMemoCachedMatchesUncachedAndInvalidates verifies the config-screen
+// memo: the memoized path (used by every render once the memo is seeded) returns
+// exactly the same Chat-template label and Full-SWA KV extra-MiB as the direct,
+// uncached path for the same input, that an unchanged-config render reuses the
+// cache instead of recomputing, and that setCtx / cycleCfgRow invalidate the
+// cache so the next render recomputes with the new value.
+func TestConfigMemoCachedMatchesUncachedAndInvalidates(t *testing.T) {
+	model := ModelItem{
+		Name:         "nanbeige.gguf",
+		Path:         "/models/nanbeige.gguf",
+		Architecture: "nanbeige",
+		// A known-broken embedded template (carries the raise_exception guard) so
+		// the catalog auto-fix resolves to a real entry rather than just "auto".
+		ChatTemplate: "{% if raise_exception %}{% endif %}",
+		KVProfile: &placement.ModelProfile{
+			NumLayers:     48,
+			HeadCountKV:   8,
+			KeyLength:     128,
+			ValueLength:   128,
+			SlidingWindow: 4096,
+			ModelArch:     "laguna",
+		},
+	}
+	base := func(memo *configMemo) Model {
+		return Model{
+			cfgMemo:       memo,
+			models:        []ModelItem{model},
+			selectedModel: 0,
+			ctxMode:       "manual",
+			ctxSize:       "131072",
+			kvQuality:     "q4_0",
+		}
+	}
+	cached := base(&configMemo{})
+	uncached := base(nil)
+
+	// 1) Cached path returns the same values as the uncached path.
+	if got, want := cached.chatTemplateLabel(model), uncached.chatTemplateLabel(model); got != want {
+		t.Fatalf("memoized template %q != direct %q", got, want)
+	}
+	if got, want := cached.swaExtraKVMB(model), uncached.swaExtraKVMB(model); got != want {
+		t.Fatalf("memoized KV %d != direct %d", got, want)
+	}
+	if cached.swaExtraKVMB(model) <= 0 {
+		t.Fatalf("Full SWA delta should be positive for a windowed model, got %d", cached.swaExtraKVMB(model))
+	}
+	if !strings.Contains(cached.chatTemplateLabel(model), "auto (") {
+		t.Fatalf("auto chat template was not resolved: %q", cached.chatTemplateLabel(model))
+	}
+
+	// 2) An unchanged-config render reuses the memo (O(1)); values stay stable.
+	firstTemplate, firstKV := cached.chatTemplateLabel(model), cached.swaExtraKVMB(model)
+	if cached.cfgMemo.key == "" {
+		t.Fatalf("memo was not populated on first render")
+	}
+	if got, want := cached.chatTemplateLabel(model), firstTemplate; got != want {
+		t.Fatalf("unchanged-template render changed: %q vs %q", got, want)
+	}
+	if got, want := cached.swaExtraKVMB(model), firstKV; got != want {
+		t.Fatalf("unchanged-config render recomputed KV: %d vs %d", got, want)
+	}
+
+	// 3) setCtx invalidates the memo and recomputes with the new context.
+	cached.setCtx("65536")
+	if cached.cfgMemo.key != "" {
+		t.Fatalf("setCtx did not invalidate the config memo")
+	}
+	uncached.ctxSize = "65536"
+	if got, want := cached.swaExtraKVMB(model), uncached.swaExtraKVMB(model); got != want {
+		t.Fatalf("after setCtx, memoized KV %d != direct %d", got, want)
+	}
+	if cached.cfgMemo.key == "" {
+		t.Fatalf("render after setCtx did not repopulate the memo")
+	}
+
+	// 4) cycleCfgRow invalidates the memo and recomputes with the new KV quality.
+	cached.cycleCfgRow("kvq", 1)
+	if cached.cfgMemo.key != "" {
+		t.Fatalf("cycleCfgRow did not invalidate the config memo")
+	}
+	if cached.kvQuality == "q4_0" {
+		t.Fatalf("cycleCfgRow did not change kvQuality")
+	}
+	uncached.kvQuality = cached.kvQuality
+	if got, want := cached.swaExtraKVMB(model), uncached.swaExtraKVMB(model); got != want {
+		t.Fatalf("after cycleCfgRow, memoized KV %d != direct %d", got, want)
+	}
+}
+
 func TestClaudeProfileSelectorCyclesPerLaunchOptions(t *testing.T) {
 	m := Model{}
 	if indexOf(m.cfgRows(), "claudeprofile") >= 0 {

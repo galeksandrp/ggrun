@@ -61,7 +61,12 @@ type claudeRequestProgress struct {
 	PromptTotal     int     `json:"prompt_total,omitempty"`
 	PromptFraction  float64 `json:"prompt_fraction,omitempty"`
 	Generated       int     `json:"generated,omitempty"`
+	// TokensPerSecond is retained as a single blended rate for backward
+	// compatibility. PrefillTPS and DecodeTPS carry the split prompt-eval vs
+	// eval rates that the status line prefers when both are known.
 	TokensPerSecond float64 `json:"tokens_per_second,omitempty"`
+	PrefillTPS      float64 `json:"prefill_tps,omitempty"`
+	DecodeTPS       float64 `json:"decode_tps,omitempty"`
 	ElapsedSeconds  int     `json:"elapsed_seconds,omitempty"`
 }
 
@@ -375,6 +380,7 @@ func parseClaudeLogSnapshot(text string) claudeLogSnapshot {
 				snapshot.Active[task] = claudeRequestProgress{
 					Slot: slot, Task: task, Stage: "prefill", PromptProcessed: processed,
 					PromptTotal: total, PromptFraction: fraction, TokensPerSecond: rate,
+					PrefillTPS: rate,
 				}
 				if slot+1 > snapshot.TotalSlots {
 					snapshot.TotalSlots = slot + 1
@@ -484,15 +490,23 @@ func pollClaudeProgress(client *http.Client, host string, port int, log claudePr
 			req.Stage = "prefill"
 			req.PromptProcessed = item.Processed
 			req.PromptFraction = item.Fraction
+			req.PrefillTPS = item.Rate
 			req.TokensPerSecond = item.Rate
 			if item.Fraction > 0 {
 				req.PromptTotal = int(float64(item.Processed)/item.Fraction + 0.5)
 			}
 		} else if slot.NextToken.NDecoded > 0 || slot.NextToken.HasNextToken {
 			req.Stage = "generating"
+			req.DecodeTPS = generationRate
 			req.TokensPerSecond = generationRate
+			// Retain the last known prefill rate so a mid-decode status can show
+			// both prompt and generation throughput over the sample window.
+			if item, ok := logged[slot.IDTask]; ok && item.Rate > 0 {
+				req.PrefillTPS = item.Rate
+			}
 		} else if slot.NPromptTokensProcessed > 0 {
 			req.Stage = "prefill"
+			req.PrefillTPS = promptRate
 			req.TokensPerSecond = promptRate
 		}
 		state.Requests = append(state.Requests, req)
@@ -667,7 +681,17 @@ func formatClaudeProgress(state claudeProgressState) string {
 	} else {
 		parts = append(parts, fmt.Sprintf("S%d working", primary.Slot))
 	}
-	if primary.TokensPerSecond > 0 {
+	// Show both prompt-eval (prefill) and eval (decode) throughput when both are
+	// known over the sample window; otherwise fall back to whichever single rate
+	// is available, and finally to the blended rate for backward compatibility.
+	switch {
+	case primary.PrefillTPS > 0 && primary.DecodeTPS > 0:
+		parts = append(parts, fmt.Sprintf("prefill %.1f tok/s · decode %.1f tok/s", primary.PrefillTPS, primary.DecodeTPS))
+	case primary.DecodeTPS > 0:
+		parts = append(parts, fmt.Sprintf("%.1f tok/s", primary.DecodeTPS))
+	case primary.PrefillTPS > 0:
+		parts = append(parts, fmt.Sprintf("%.1f tok/s", primary.PrefillTPS))
+	case primary.TokensPerSecond > 0:
 		parts = append(parts, fmt.Sprintf("%.1f tok/s", primary.TokensPerSecond))
 	}
 	if primary.ElapsedSeconds > 0 {

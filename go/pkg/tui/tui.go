@@ -124,6 +124,16 @@ type Model struct {
 	// "auto" — the launch auto-matches known-broken templates. Per-launch only.
 	chatTemplate string
 
+	// cfgMemo caches the two expensive per-render Advanced-config computations
+	// (the Full-SWA KV estimate and the Chat-template label). bubbletea calls
+	// View() after every Update, so on the model-config screen every keystroke —
+	// arrow-down row cycling and free-text typing included — used to re-run them
+	// synchronously on the single event-loop goroutine. They live behind a shared
+	// pointer so the cache survives the value copies of Model that bubbletea
+	// makes between Update and View, and are invalidated only by the setters that
+	// change the inputs they depend on (setCtx, cycleCfgRow, openCfgInput).
+	cfgMemo *configMemo
+
 	// Tuned config
 	tunedConfigs []tune.ConfigEntry
 	tunedIndex   int // -1 = auto, 0+ = selected
@@ -201,6 +211,10 @@ type ModelItem struct {
 	FitCtx        int                     // empirically proven fit context from probes
 	External      bool                    // found outside the configured primary model directory
 	KVProfile     *placement.ModelProfile // metadata for the live Full-SWA KV estimate
+	// ChatTemplate is the model's embedded tokenizer.chat_template, captured ONCE
+	// at enrich time (like KVProfile) so the config screen's chat-template row
+	// never re-opens the .gguf and walks its metadata on every render.
+	ChatTemplate string
 }
 
 type modelScanFinishedMsg struct {
@@ -241,6 +255,7 @@ func InitialModel() Model {
 	}
 	m := Model{
 		screen:          ScreenMain,
+		cfgMemo:         &configMemo{},
 		backend:         backend,
 		modelDir:        cfg.ModelDir,
 		settingsPath:    settingsPath,
@@ -983,6 +998,9 @@ func (m *Model) openCfgInput(mode, val, placeholder string) {
 	m.input.SetValue(val)
 	m.input.Placeholder = placeholder
 	m.input.Focus()
+	// Entering free-text edit mode signals that a config value may follow; clear
+	// the memo so the next render recomputes the Full-SWA KV / template rows.
+	m.invalidateConfigMemo()
 }
 
 func (m *Model) setCtx(val string) {
@@ -1004,6 +1022,9 @@ func (m *Model) setCtx(val string) {
 		m.ctxMode = "manual"
 		m.ctxSize = strconv.Itoa(n)
 	}
+	// Context is an input to the memoized Full-SWA KV estimate and Chat-template
+	// label, so a change forces the next render to recompute them.
+	m.invalidateConfigMemo()
 }
 
 // cycleCfgRow changes the focused Advanced-config row with ←/→ (dir -1/+1).
@@ -1033,6 +1054,11 @@ func kvQualityLabel(v string) string {
 }
 
 func (m *Model) cycleCfgRow(row string, dir int) {
+	// Rowing mutates one of the memoized Advanced-config inputs (kvQuality,
+	// swaFull, context, claudeCode, chatTemplate, ...), so the next render must
+	// recompute the Full-SWA KV estimate and Chat-template label rather than
+	// reuse the now-stale memo.
+	m.invalidateConfigMemo()
 	switch row {
 	case "kv":
 		order := []string{"auto", "gpu", "cpu"}
@@ -2695,6 +2721,10 @@ func enrichModelItems(models []ModelItem, cacheDir, backend string, caps *detect
 			models[i].IsMoE = info.IsMoE
 			models[i].Architecture = info.Architecture
 			models[i].KVProfile = kvProfileFromGGUF(info)
+			// Capture the embedded chat template once here, alongside KVProfile, so
+			// the config screen's per-render chat-template row never re-opens the
+			// .gguf and walks its metadata KV table (~700ms on a 17GB model).
+			models[i].ChatTemplate = gguf.ChatTemplate(models[i].Path)
 			if info.Architecture != "" {
 				models[i].Arch = info.Architecture
 			}
@@ -2768,7 +2798,91 @@ func (m Model) swaEstimateContext(model ModelItem) int {
 	return model.FitCtx
 }
 
+// configMemo caches the two expensive per-render Advanced-config computations:
+// the Full-SWA KV extra-MiB estimate (swaExtraKVMB) and the Chat-template
+// label (chatTemplateLabel). bubbletea calls View() after every Update, so on
+// the model-config screen every keystroke — arrow-down row cycling and free-text
+// typing included — used to re-run both on the single event-loop goroutine. The
+// template re-opened the .gguf and walked its metadata KV table to read
+// tokenizer.chat_template (~700ms per keystroke on a 17GB Qwen3.8-27B), and the
+// KV row re-ran the full placement estimate. Their results depend only on
+// (modelPath, ctxSize, kvQuality, swaFull, claudeCode), so they are memoized on
+// this shared pointer (which survives the value copies of Model bubbletea makes
+// between Update and View) and recomputed only when one of those inputs changes.
+// The setters that mutate those inputs (setCtx, cycleCfgRow, openCfgInput) call
+// invalidateConfigMemo to force the next render to recompute.
+type configMemo struct {
+	key      string // cfgMemoKeyFor of the currently cached values
+	template string // rendered Chat-template label, see chatTemplateLabel
+	kvMB     int    // Full-SWA KV extra MiB, see swaExtraKVMB
+	kvMBSet  bool
+}
+
+// cfgMemoKeyFor returns the key identifying the model-config inputs the memoized
+// values depend on. When unchanged, a render reads the cached values in O(1)
+// instead of re-opening the .gguf or re-running the placement estimate.
+func (m Model) cfgMemoKeyFor(model ModelItem) string {
+	return model.Path + "\x00" + m.ctxSize + "\x00" + m.kvQuality +
+		"\x00" + strconv.FormatBool(m.swaFull) + "\x00" + strconv.FormatBool(m.claudeCode)
+}
+
+// invalidateConfigMemo clears the memo so the next render recomputes it. Called
+// by every setter that changes an input the memo depends on.
+func (m *Model) invalidateConfigMemo() {
+	if m.cfgMemo == nil {
+		return
+	}
+	m.cfgMemo.key = ""
+	m.cfgMemo.kvMBSet = false
+}
+
+// ensure recomputes the memoized values when cfgMemoKeyFor changed since the
+// last computation. While the key is unchanged it is a no-op, so a render that
+// did not change the config is O(1).
+func (c *configMemo) ensure(m Model, model ModelItem) {
+	key := m.cfgMemoKeyFor(model)
+	if c.key == key {
+		return
+	}
+	c.key = key
+
+	// Chat-template label, mirroring chatTemplateLabel/autoChatTemplate. Uses the
+	// template captured once at enrich time (model.ChatTemplate), never reopening
+	// the .gguf here.
+	if v := strings.TrimSpace(m.chatTemplate); v != "" {
+		c.template = "forced: " + v
+	} else {
+		arch := model.Architecture
+		if arch == "" {
+			arch = model.Arch
+		}
+		basename := filepath.Base(model.Path)
+		if entry, ok := chattemplate.Resolve(arch, basename, model.ChatTemplate, true); ok {
+			c.template = "auto (" + entry.Name + ")"
+		} else {
+			c.template = "auto"
+		}
+	}
+
+	// Full-SWA KV extra MiB.
+	c.kvMB = swaExtraKVMBComputed(m, model)
+	c.kvMBSet = true
+}
+
+// swaExtraKVMB returns the extra MiB a Full-SWA cache needs over a plain KV
+// cache for this model at the current config, or -1 when it cannot be estimated.
+// The result is memoized on the config memo; see configMemo. When the memo is
+// not initialized (rare, e.g. a hand-built Model in tests), it computes directly.
 func (m Model) swaExtraKVMB(model ModelItem) int {
+	if m.cfgMemo == nil {
+		return swaExtraKVMBComputed(m, model)
+	}
+	m.cfgMemo.ensure(m, model)
+	return m.cfgMemo.kvMB
+}
+
+// swaExtraKVMBComputed is the uncached estimate used to populate the memo.
+func swaExtraKVMBComputed(m Model, model ModelItem) int {
 	if model.KVProfile == nil {
 		return -1
 	}
@@ -3804,6 +3918,16 @@ func (req *LaunchRequest) LaunchArgs() []string {
 // The resolved override is shown when the model's own template would already
 // be fixed by the catalog, so a user launching that model sees the active fix.
 func (m Model) chatTemplateLabel(model ModelItem) string {
+	if m.cfgMemo != nil {
+		m.cfgMemo.ensure(m, model)
+		return m.cfgMemo.template
+	}
+	return m.chatTemplateLabelComputed(model)
+}
+
+// chatTemplateLabelComputed renders the Chat-template label without consulting
+// the config memo (used as the memo's fallback when it is not initialized).
+func (m Model) chatTemplateLabelComputed(model ModelItem) string {
 	if v := strings.TrimSpace(m.chatTemplate); v != "" {
 		return "forced: " + v
 	}
@@ -3828,8 +3952,12 @@ func (m Model) autoChatTemplate(model ModelItem) (chattemplate.Entry, bool) {
 		arch = model.Arch
 	}
 	basename := filepath.Base(model.Path)
-	embedded := gguf.ChatTemplate(model.Path)
-	return chattemplate.Resolve(arch, basename, embedded, true)
+	// Use the template captured once at enrich time (model.ChatTemplate) instead
+	// of reopening the .gguf here, which used to happen on every config-screen
+	// render and cost ~700ms per keystroke. Models not captured at enrich (e.g.
+	// hand-built rows in tests) carry "" here, the same value gguf.ChatTemplate
+	// would return for an absent path.
+	return chattemplate.Resolve(arch, basename, model.ChatTemplate, true)
 }
 
 // chatTemplateOrdered returns the cycle order for the Chat template row. "auto"

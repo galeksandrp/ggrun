@@ -113,6 +113,70 @@ func TestFormatClaudeProgressGenerationAndReady(t *testing.T) {
 	}
 }
 
+func TestFormatClaudeProgressSplitRates(t *testing.T) {
+	// Prefill-only: only the prompt-eval rate is known.
+	prefill := formatClaudeProgress(claudeProgressState{
+		TotalSlots: 4,
+		Active:     1,
+		Requests: []claudeRequestProgress{{
+			Slot: 1, Stage: "prefill", PromptFraction: 0.5, PromptProcessed: 2049,
+			PrefillTPS: 29.42,
+		}},
+	})
+	for _, want := range []string{"S1 prefill 2,049", "29.4 tok/s"} {
+		if !strings.Contains(prefill, want) {
+			t.Fatalf("prefill status %q missing %q", prefill, want)
+		}
+	}
+	if strings.Contains(prefill, "decode") {
+		t.Fatalf("prefill-only status %q must not mention decode", prefill)
+	}
+
+	// Decode-only: only the eval rate is known.
+	decode := formatClaudeProgress(claudeProgressState{
+		TotalSlots: 4,
+		Active:     1,
+		Requests: []claudeRequestProgress{{
+			Slot: 2, Stage: "generating", Generated: 17, DecodeTPS: 5.88,
+		}},
+	})
+	for _, want := range []string{"S2 generating 17 tok", "5.9 tok/s"} {
+		if !strings.Contains(decode, want) {
+			t.Fatalf("decode status %q missing %q", decode, want)
+		}
+	}
+	if strings.Contains(decode, "prefill") {
+		t.Fatalf("decode-only status %q must not mention prefill", decode)
+	}
+
+	// Both rates known over the sample window: render a split two-part line.
+	both := formatClaudeProgress(claudeProgressState{
+		TotalSlots: 4,
+		Active:     1,
+		Requests: []claudeRequestProgress{{
+			Slot: 3, Stage: "generating", Generated: 512, PrefillTPS: 29.42, DecodeTPS: 5.88,
+		}},
+	})
+	for _, want := range []string{"prefill 29.4 tok/s · decode 5.9 tok/s", "S3 generating 512 tok"} {
+		if !strings.Contains(both, want) {
+			t.Fatalf("both-rates status %q missing %q", both, want)
+		}
+	}
+
+	// Backward compatibility: a struct carrying only the blended rate still
+	// renders the legacy single-rate line.
+	legacy := formatClaudeProgress(claudeProgressState{
+		TotalSlots: 4,
+		Active:     1,
+		Requests: []claudeRequestProgress{{
+			Slot: 0, Stage: "generating", Generated: 3, TokensPerSecond: 7.5,
+		}},
+	})
+	if !strings.Contains(legacy, "7.5 tok/s") {
+		t.Fatalf("legacy blended-rate status %q missing %q", legacy, "7.5 tok/s")
+	}
+}
+
 func TestClaudeProgressFallsBackToPassiveLogsWhenSlotsBusy(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/slots", func(w http.ResponseWriter, _ *http.Request) {

@@ -3096,33 +3096,32 @@ func tryResidentWithoutClaudeReviewer(
 	return candidate, nil
 }
 
-// proactiveReviewerDropMinHeadroomMB is the minimum spare VRAM a fully-resident
-// dense main-model plan must have, after the reviewer's reservation is reclaimed,
-// for the proactive gate to drop the separate Auto reviewer. Review traffic then
-// routes through the main model (the router already supports that), which must be
-// able to absorb the extra load without threatening the launch — a barely-fitting
-// plan keeps its dedicated reviewer instead.
-const proactiveReviewerDropMinHeadroomMB = 3072 // 3 GiB conservative spare
-
 // proactivelyDropReviewerForVRAMModel is the proactive counterpart to
 // tryResidentWithoutClaudeReviewer. Where the fallback reacts to a placement that
-// FAILS with the reviewer seated, this gate acts up front: for a dense model that
-// fits fully on GPU, the reviewer's separate VRAM seat is pure overhead while the
-// main model has plenty of spare capacity to serve Auto review itself. It re-runs
-// the exact placement engine WITHOUT the reviewer reservation (the same compute
-// replay pattern the reactive fallback uses) and, only when the recomputed plan
-// still fits comfortably, drops the reviewer and adopts the recomputed plan. The
-// conservative spare-capacity requirement guarantees the gate never silently
-// drops the reviewer when doing so could risk an OOM. Returns the strategy to
-// launch with: the recomputed main-model-only plan when the reviewer was dropped,
-// or the original strategy otherwise.
+// FAILS with the reviewer seated, this gate acts up front on the first plan that
+// fits with the reviewer seated. Its one job is to shed a separate Auto reviewer
+// that genuinely cannot be co-resident with the main model — and, crucially, to
+// NEVER silently route Auto review through the main model.
+//
+// A reviewer exists to be a SEPARATE model judging the main model's output;
+// dropping it makes the main model review itself, which is both unwanted and
+// (for a safety/security classifier) insecure. So the gate keeps the reviewer
+// whenever the recomputed main-model-only plan leaves enough spare VRAM for the
+// configured reviewer to sit alongside the main model. Only when the main model
+// consumes the device with no room for a separate reviewer is the drop even
+// considered — and that self-review is permitted only with the user's explicit
+// consent, mirroring confirmMainModelReviewerFallback. Returns the strategy to
+// launch with: the recomputed main-model-only plan when the reviewer was dropped
+// (self-review, consented), or the original strategy otherwise.
 func proactivelyDropReviewerForVRAMModel(
 	req *launchRequest,
 	caps *detect.Capabilities,
 	model *placement.ModelProfile,
 	strategy *placement.Strategy,
 	compute func(*launchRequest) (*placement.Strategy, error),
+	input io.Reader,
 	output io.Writer,
+	interactive bool,
 	cacheDir string,
 ) *placement.Strategy {
 	if req == nil || strategy == nil || compute == nil {
@@ -3154,18 +3153,50 @@ func proactivelyDropReviewerForVRAMModel(
 		(candidate.Type != placement.SingleGPU && candidate.Type != placement.MultiGPUDense) {
 		return strategy
 	}
-	// Conservative spare-capacity requirement: never drop the reviewer unless the
-	// main model fits with comfortable VRAM to spare once the reviewer's seat is
-	// reclaimed. A barely-fitting plan keeps the separate reviewer so review
-	// traffic cannot push the main model into an OOM.
 	headroom := placement.StrategyVRAMHeadroomMB(caps, model, candidate, cacheDir)
-	if headroom < proactiveReviewerDropMinHeadroomMB {
+	// A separate reviewer is only ever worth shedding if it cannot already sit
+	// alongside the main model. When the main model's plan leaves room for the
+	// configured reviewer's own footprint in the spare VRAM, the reviewer stays
+	// co-resident so a separate model keeps reviewing — dropping it here would
+	// silently hand the review to the main model (the self-review regression).
+	if headroom >= req.ReviewerReservation.VRAMMB {
+		return strategy
+	}
+	// The main model alone leaves no room for a separate reviewer: the only way to
+	// shed the reviewer is to have the main model review itself. That is never
+	// silent — it requires the user's explicit approval, or fail-closed.
+	if err := confirmProactiveSelfReview(input, output, interactive); err != nil {
 		return strategy
 	}
 	req.ReviewerReservation = nil
 	req.ClaudeReviewerDisabled = true
-	fmt.Fprintf(output, "[launch] main model fits with spare VRAM (%d MiB); separate Auto reviewer disabled, Auto reviews will use the main model\n", headroom)
+	fmt.Fprintf(output, "[launch] no VRAM room for a separate Auto reviewer next to the main model; Auto reviews will use the main model (self-review)\n")
 	return candidate
+}
+
+// confirmProactiveSelfReview asks before letting the main model review its own
+// output. Self-review is insecure for a safety classifier, so it is fail-closed:
+// non-interactive launches need the explicit GGRUN_CLAUDE_AUTO_SELF_REVIEW=on
+// opt-in, and an interactive decline keeps the separate reviewer. This mirrors
+// the safety posture of confirmMainModelReviewerFallback.
+func confirmProactiveSelfReview(input io.Reader, output io.Writer, interactive bool) error {
+	if !interactive {
+		if strings.EqualFold(strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_AUTO_SELF_REVIEW")), "on") {
+			return nil
+		}
+		return fmt.Errorf("no VRAM room for a separate Auto reviewer next to the main model; the main model would review its own output (insecure). set GGRUN_CLAUDE_AUTO_SELF_REVIEW=on to allow self-review explicitly")
+	}
+	fmt.Fprint(output, "No VRAM room for a separate Auto reviewer next to the main model. Let the main model review its own output (insecure)? [y/N] ")
+	answer, err := bufio.NewReader(input).ReadString('\n')
+	if err != nil && len(answer) == 0 {
+		return fmt.Errorf("read self-review confirmation: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return nil
+	default:
+		return fmt.Errorf("main-model self-review declined")
+	}
 }
 
 func confirmLiveMemoryProbe(req *launchRequest, reason string, input io.Reader, output io.Writer, interactive bool) error {
@@ -5079,7 +5110,7 @@ func cmdLaunch(args []string) {
 	// traffic routes through the main model. This runs only on the FIRST
 	// successful plan; happened-before any reactive retry path, and never on a
 	// plan that only fits because the reviewer was already dropped.
-	strategy = proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, computeStrategy, os.Stderr, cfg.CacheDir)
+	strategy = proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, computeStrategy, os.Stdin, os.Stderr, stdinIsTerminal(), cfg.CacheDir)
 	if err := confirmRequiredMMap(req, strategy, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
 		if !errors.Is(err, errMMapDeclined) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)

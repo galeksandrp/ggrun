@@ -156,18 +156,22 @@ func TestResidentReviewerFallbackIsClaudeOnlyAndExplicitWhenNonInteractive(t *te
 	}
 }
 
-// TestProactivelyDropReviewerForVRAMModelFires confirms the proactive gate drops
-// the separate Auto reviewer for a dense model that fits fully on GPU with
-// comfortable spare VRAM: the request loses its reservation, review is routed to
-// the main model, and the recomputed (reviewer-free) plan is adopted.
-func TestProactivelyDropReviewerForVRAMModelFires(t *testing.T) {
+// TestProactivelyDropReviewerKeepsWhenReviewerStillFits confirms the proactive
+// gate does NOT drop the separate Auto reviewer when the main model's plan still
+// leaves room for a co-resident reviewer. Dropping here would silently route
+// Auto review through the main model (self-review, insecure and unwanted); a
+// separate model must keep judging the main whenever it can sit alongside it.
+func TestProactivelyDropReviewerKeepsWhenReviewerStillFits(t *testing.T) {
 	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 4600}
 	req := &launchRequest{ClaudeCode: true, ReviewerReservation: reservation}
 	caps := &detect.Capabilities{GPUs: []detect.GPU{
 		{Index: 0, VRAMTotalMB: 24564, VRAMUsedMB: 0, BandwidthMBps: 15754},
 	}}
 	// A small dense model on a 24 GB card: model + KV + overhead + compute floor
-	// leaves thousands of MiB of spare VRAM, so the reviewer's seat is pure waste.
+	// leave thousands of MiB of spare VRAM — far more than the reviewer's own
+	// 4600 MiB reservation — so a separate reviewer fits comfortably alongside.
+	// The old gate treated that spare seat as "pure overhead" and dropped the
+	// reviewer, making the main model review itself. The gate must keep it.
 	model := &placement.ModelProfile{
 		Path:        "/models/qwen3.5-4b-q4.gguf",
 		Basename:    "qwen3.5-4b-q4.gguf",
@@ -176,25 +180,24 @@ func TestProactivelyDropReviewerForVRAMModelFires(t *testing.T) {
 		NumLayers:   36,
 	}
 	strategy := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q8_0", KVPlacement: "gpu", IsMoE: false}
-	want := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q8_0", KVPlacement: "gpu", IsMoE: false}
 	called := 0
 	compute := func(candidateReq *launchRequest) (*placement.Strategy, error) {
 		called++
 		if candidateReq.ReviewerReservation != nil || !candidateReq.ClaudeReviewerDisabled {
 			t.Fatalf("gate candidate did not isolate only the reviewer: %#v", candidateReq)
 		}
-		return want, nil
+		return strategy, nil
 	}
 	var output bytes.Buffer
-	got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, compute, &output, "")
-	if got != want || called != 1 {
-		t.Fatalf("gate result=%#v calls=%d, want recomputed plan and one recompute", got, called)
+	got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, compute, strings.NewReader("n\n"), &output, true, "")
+	if got != strategy || called != 1 {
+		t.Fatalf("gate result=%#v calls=%d, want original strategy and one recompute", got, called)
 	}
-	if req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
-		t.Fatalf("gate accepted without retaining the drop on request: %#v", req)
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("gate dropped a reviewer that could stay co-resident: %#v", req)
 	}
-	if !strings.Contains(output.String(), "separate Auto reviewer disabled") {
-		t.Fatalf("gate notice did not explain routing: %q", output.String())
+	if strings.Contains(output.String(), "separate Auto reviewer disabled") {
+		t.Fatalf("gate dropped a reviewer that could stay co-resident, yet printed a drop notice: %q", output.String())
 	}
 }
 
@@ -212,7 +215,7 @@ func TestProactivelyDropReviewerSkipsWhenRecomputeOOMs(t *testing.T) {
 	recomputeFails := func(*launchRequest) (*placement.Strategy, error) {
 		return nil, fmt.Errorf("does not fit without reviewer either")
 	}
-	if got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, recomputeFails, io.Discard, ""); got != strategy {
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, recomputeFails, strings.NewReader("n\n"), io.Discard, true, ""); got != strategy {
 		t.Fatalf("gate dropped reviewer on a failed recompute; result=%#v", got)
 	}
 	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
@@ -226,26 +229,28 @@ func TestProactivelyDropReviewerSkipsWhenRecomputeOOMs(t *testing.T) {
 	mmapPlan := &placement.Strategy{Type: placement.MoEOffload, MMapRequired: true, IsMoE: true}
 	if got := proactivelyDropReviewerForVRAMModel(req, caps, model, strategy, func(*launchRequest) (*placement.Strategy, error) {
 		return mmapPlan, nil
-	}, io.Discard, ""); got != strategy {
+	}, strings.NewReader("n\n"), io.Discard, true, ""); got != strategy {
 		t.Fatalf("gate dropped reviewer into an mmap/offload plan; result=%#v", got)
 	}
 	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
 		t.Fatalf("mmap-plan recompute mutated request: %#v", req)
 	}
 
-	// Recompute succeeds, dense, but WITHOUT comfortable spare VRAM: the model
-	// barely fits, so a separate reviewer must stay to absorb review traffic.
+	// Recompute succeeds, dense, but the main model leaves NO room for a separate
+	// co-resident reviewer (headroom below the reviewer's own reservation). The
+	// drop would mean self-review, which stays fail-closed: an interactive
+	// decline keeps the reviewer.
 	req.ReviewerReservation = reservation
 	req.ClaudeReviewerDisabled = false
 	// 22 GB weights on a 24 GB card: free 24564 - (22000 + 1024 floor + 0 kv) =
-	// 1540 MiB headroom, comfortably below the 3072 MiB conservative gate
-	// threshold, so the reviewer stays.
+	// 1540 MiB headroom, well below the 4600 MiB reviewer reservation, so a
+	// separate reviewer no longer fits alongside.
 	tightModel := &placement.ModelProfile{Path: "/models/tight.gguf", TotalSizeMB: 22000, SizeBytes: 22000 * 1024 * 1024}
 	tightPlan := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q4_0", KVPlacement: "gpu", IsMoE: false}
 	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, strategy, func(*launchRequest) (*placement.Strategy, error) {
 		return tightPlan, nil
-	}, io.Discard, ""); got != strategy {
-		t.Fatalf("gate dropped reviewer on a barely-fitting plan; result=%#v", got)
+	}, strings.NewReader("n\n"), io.Discard, true, ""); got != strategy {
+		t.Fatalf("gate dropped reviewer into self-review without consent; result=%#v", got)
 	}
 	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
 		t.Fatalf("tight-plan recompute mutated request: %#v", req)
@@ -267,7 +272,7 @@ func TestProactivelyDropReviewerSkipsMoEAndOffload(t *testing.T) {
 			t.Fatalf("%s: gate must not recompute for an ineligible strategy", name)
 			return nil, nil
 		}
-		if got := proactivelyDropReviewerForVRAMModel(req, &detect.Capabilities{}, model, strategy, compute, io.Discard, ""); got != strategy {
+		if got := proactivelyDropReviewerForVRAMModel(req, &detect.Capabilities{}, model, strategy, compute, strings.NewReader("n\n"), io.Discard, true, ""); got != strategy {
 			t.Fatalf("%s: gate dropped reviewer for an ineligible strategy; result=%#v", name, got)
 		}
 		if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
@@ -308,8 +313,78 @@ func TestProactiveGateKeepsReactiveFallbackIntact(t *testing.T) {
 	if got := proactivelyDropReviewerForVRAMModel(noReservation, nil, nil, strategy, func(*launchRequest) (*placement.Strategy, error) {
 		t.Fatal("gate must not recompute when there is no reviewer reservation")
 		return nil, nil
-	}, io.Discard, ""); got != strategy {
+	}, strings.NewReader("n\n"), io.Discard, true, ""); got != strategy {
 		t.Fatalf("gate fired without a reviewer reservation; result=%#v", got)
+	}
+}
+
+// TestProactivelyDropReviewerSelfReviewRequiresConsent confirms that when the
+// main model leaves no room for a separate co-resident reviewer, dropping the
+// reviewer into self-review is NEVER silent: an interactive "yes" drops it with a
+// clear self-review notice, an interactive decline keeps it, and a non-interactive
+// launch fail-closes unless GGRUN_CLAUDE_AUTO_SELF_REVIEW=on is set.
+func TestProactivelyDropReviewerSelfReviewRequiresConsent(t *testing.T) {
+	reservation := &placement.CompanionReservation{Name: claudeReviewerCompanionName, VRAMMB: 4600}
+	req := &launchRequest{ClaudeCode: true, ReviewerReservation: reservation}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24564}}}
+	// 22 GB weights on a 24 GB card leave ~1540 MiB headroom — below the 4600 MiB
+	// reviewer reservation, so no separate reviewer can sit alongside.
+	tightModel := &placement.ModelProfile{Path: "/models/tight.gguf", TotalSizeMB: 22000, SizeBytes: 22000 * 1024 * 1024}
+	tightPlan := &placement.Strategy{Type: placement.SingleGPU, MainGPU: 0, ContextSize: 65536, KVType: "q4_0", KVPlacement: "gpu", IsMoE: false}
+	compute := func(candidateReq *launchRequest) (*placement.Strategy, error) {
+		if candidateReq.ReviewerReservation != nil || !candidateReq.ClaudeReviewerDisabled {
+			t.Fatalf("gate candidate did not isolate only the reviewer: %#v", candidateReq)
+		}
+		return tightPlan, nil
+	}
+
+	// Interactive decline keeps the reviewer.
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, tightPlan, compute, strings.NewReader("n\n"), io.Discard, true, ""); got != tightPlan {
+		t.Fatalf("interactive decline dropped the reviewer; result=%#v", got)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("interactive decline mutated request into self-review: %#v", req)
+	}
+
+	// Interactive "yes" drops the reviewer, retains the drop, and prints a clear
+	// self-review notice.
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	var output bytes.Buffer
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, tightPlan, compute, strings.NewReader("yes\n"), &output, true, ""); got != tightPlan {
+		t.Fatalf("consented drop did not adopt the recomputed plan; result=%#v", got)
+	}
+	if req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
+		t.Fatalf("consented drop was not retained on request: %#v", req)
+	}
+	if !strings.Contains(output.String(), "self-review") {
+		t.Fatalf("consented drop did not surface a self-review notice: %q", output.String())
+	}
+
+	// Non-interactive without the explicit opt-in fail-closes and keeps the
+	// reviewer (no silent self-review).
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	t.Setenv("GGRUN_CLAUDE_AUTO_SELF_REVIEW", "")
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, tightPlan, compute, strings.NewReader(""), io.Discard, false, ""); got != tightPlan {
+		t.Fatalf("non-interactive without opt-in dropped the reviewer; result=%#v", got)
+	}
+	if req.ReviewerReservation != reservation || req.ClaudeReviewerDisabled {
+		t.Fatalf("non-interactive without opt-in mutated request into self-review: %#v", req)
+	}
+
+	// Non-interactive with the explicit GGRUN_CLAUDE_AUTO_SELF_REVIEW=on opt-in
+	// is the one non-interactive way to permit self-review.
+	req.ReviewerReservation = reservation
+	req.ClaudeReviewerDisabled = false
+	t.Setenv("GGRUN_CLAUDE_AUTO_SELF_REVIEW", "on")
+	if got := proactivelyDropReviewerForVRAMModel(req, caps, tightModel, tightPlan, compute, strings.NewReader(""), io.Discard, false, ""); got != tightPlan {
+		t.Fatalf("explicit opt-in did not adopt the recomputed plan; result=%#v", got)
+	}
+	if req.ReviewerReservation != nil || !req.ClaudeReviewerDisabled {
+		t.Fatalf("explicit opt-in was not retained on request: %#v", req)
 	}
 }
 

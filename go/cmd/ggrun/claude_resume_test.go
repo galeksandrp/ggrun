@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -75,7 +76,7 @@ func TestClaudeResumeSpecRefusesAShrunkSlot(t *testing.T) {
 	// Half the context, same slot count: each slot shrinks 262144 -> 131072.
 	changed := []string{"--ctx-size", "524288", "--parallel", "4", "--n-cpu-moe", "27"}
 
-	if _, err := claudeResumeSpec(rec, changed, false); err == nil {
+	if _, err := claudeResumeSpec(rec, changed, false, true, ""); err == nil {
 		t.Fatal("resume accepted a slot too small for the recorded session")
 	} else if !strings.Contains(err.Error(), "262144") {
 		t.Errorf("error does not state the recorded slot size: %v", err)
@@ -84,17 +85,17 @@ func TestClaudeResumeSpecRefusesAShrunkSlot(t *testing.T) {
 	// Placement drift alone must not block a resume: ggrun recomputes it from
 	// live VRAM and a companion model shifts it by a few expert layers.
 	placementOnly := []string{"--ctx-size", "1048576", "--parallel", "4", "--n-cpu-moe", "27"}
-	if _, err := claudeResumeSpec(rec, placementOnly, false); err != nil {
+	if _, err := claudeResumeSpec(rec, placementOnly, false, true, ""); err != nil {
 		t.Errorf("placement drift blocked a resume: %v", err)
 	}
 	// A larger slot is fine.
 	bigger := []string{"--ctx-size", "2097152", "--parallel", "4"}
-	if _, err := claudeResumeSpec(rec, bigger, false); err != nil {
+	if _, err := claudeResumeSpec(rec, bigger, false, true, ""); err != nil {
 		t.Errorf("a larger slot was refused: %v", err)
 	}
 
 	// The override exists so the user can truncate deliberately.
-	spec, err := claudeResumeSpec(rec, changed, true)
+	spec, err := claudeResumeSpec(rec, changed, true, true, "")
 	if err != nil {
 		t.Fatalf("forced resume rejected: %v", err)
 	}
@@ -106,7 +107,7 @@ func TestClaudeResumeSpecRefusesAShrunkSlot(t *testing.T) {
 func TestClaudeResumeSpecAcceptsAnIdenticalShape(t *testing.T) {
 	args := []string{"--ctx-size", "1048576", "--parallel", "4"}
 	rec := claudesession.Record{SessionID: "072e63a1-819a-4682-a742-559695c3cd76", ServerArgs: args}
-	spec, err := claudeResumeSpec(rec, args, false)
+	spec, err := claudeResumeSpec(rec, args, false, true, "")
 	if err != nil {
 		t.Fatalf("identical shape rejected: %v", err)
 	}
@@ -271,19 +272,102 @@ func TestResolveClaudeResumeSkipsAnEmptyLatestSession(t *testing.T) {
 
 // A record whose model has been removed must be refused with the stale path
 // named, not allowed to fail deep inside the loader as a "missing shard".
+// This is the explicit-ID case: the user named that exact session, so its
+// recorded backend is the only one that can reopen it.
 func TestClaudeResumeSpecRefusesAMissingRecordedModel(t *testing.T) {
 	rec := claudesession.Record{
 		SessionID:  "072e63a1-819a-4682-a742-559695c3cd76",
 		ModelPath:  "/definitely/not/on/disk/missing.gguf",
 		ServerArgs: []string{"--ctx-size", "1048576", "--parallel", "4"},
 	}
-	_, err := claudeResumeSpec(rec, rec.ServerArgs, false)
+	_, err := claudeResumeSpec(rec, rec.ServerArgs, false, true, "")
 	if err == nil {
-		t.Fatal("resume accepted a session whose recorded model is gone")
+		t.Fatal("an explicit resume accepted a session whose recorded model is gone")
 	}
 	if !strings.Contains(err.Error(), "recorded model no longer present") ||
 		!strings.Contains(err.Error(), "missing.gguf") {
 		t.Errorf("error does not name the stale model path: %v", err)
+	}
+}
+
+// "latest" is a request for the newest conversation, not for a specific backend.
+// The recorded model is informational: a resume reopens the session against the
+// launch's current model, so a different recorded model must not block, and the
+// difference is announced so the user knows the conversation continues elsewhere.
+func TestClaudeResumeSpecLatestAllowsADifferentModelWithANotice(t *testing.T) {
+	oldModel := filepath.Join(t.TempDir(), "old.gguf")
+	newModel := filepath.Join(t.TempDir(), "new.gguf")
+	if err := os.WriteFile(oldModel, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newModel, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := claudesession.Record{
+		SessionID:  "072e63a1-819a-4682-a742-559695c3cd76",
+		ModelPath:  oldModel,
+		WorkDir:    "/tmp/wd",
+		ServerArgs: []string{"--ctx-size", "1048576", "--parallel", "4"},
+	}
+	capture := captureStdout(t)
+
+	spec, err := claudeResumeSpec(rec, rec.ServerArgs, false, false, newModel)
+	got := capture()
+	if err != nil {
+		t.Fatalf("latest resume with a different current model was refused: %v", err)
+	}
+	if !spec.Resume || spec.ID != rec.SessionID {
+		t.Errorf("latest resume produced a wrong spec: %+v", spec)
+	}
+	if !strings.Contains(got, rec.SessionID) ||
+		!strings.Contains(got, "old.gguf") || !strings.Contains(got, "new.gguf") {
+		t.Errorf("notice does not name session and both models: %q", got)
+	}
+}
+
+// Even when the recorded model has been removed, a "latest" resume still picks
+// the session and launches the current model instead of failing closed.
+func TestClaudeResumeSpecLatestUsesCurrentModelWhenRecordedIsMissing(t *testing.T) {
+	rec := claudesession.Record{
+		SessionID:  "072e63a1-819a-4682-a742-559695c3cd76",
+		ModelPath:  "/definitely/not/on/disk/missing.gguf",
+		WorkDir:    "/tmp/wd",
+		ServerArgs: []string{"--ctx-size", "1048576", "--parallel", "4"},
+	}
+	spec, err := claudeResumeSpec(rec, rec.ServerArgs, false, false, "/current/model.gguf")
+	if err != nil {
+		t.Fatalf("latest resume was blocked by a removed recorded model: %v", err)
+	}
+	if !spec.Resume || spec.ID != rec.SessionID {
+		t.Errorf("latest resume produced a wrong spec: %+v", spec)
+	}
+}
+
+// captureStdout redirects process stdout to a buffer for the duration of the
+// test. Calling the returned function restores stdout, flushes the pipe and
+// returns whatever was printed, so a resume notice written by the code under
+// test can be asserted synchronously. A failing assertion still restores stdout
+// because the pipe writer is closed on read, and t.Cleanup guards any path that
+// never reads.
+func captureStdout(t *testing.T) func() string {
+	t.Helper()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = w
+	var buf strings.Builder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(&buf, r)
+	}()
+	return func() string {
+		os.Stdout = orig
+		_ = w.Close()
+		<-done
+		return buf.String()
 	}
 }
 

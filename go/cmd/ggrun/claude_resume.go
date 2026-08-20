@@ -50,6 +50,15 @@ func newClaudeSessionSpec() (*claudeSessionSpec, error) {
 	return &claudeSessionSpec{ID: id}, nil
 }
 
+// isLatestResumeValue reports whether a --claude-resume value means "the newest
+// recoverable session" rather than a specific session ID. The claudeResumeSpec
+// model guard needs the same distinction: an explicit ID names its backend, a
+// "latest" pick does not.
+func isLatestResumeValue(value string) bool {
+	value = strings.TrimSpace(value)
+	return value == "" || strings.EqualFold(value, "latest") || strings.EqualFold(value, "last")
+}
+
 // resolveClaudeResume loads a recorded session for --claude-resume. The value
 // is a session ID, or "latest" for the newest session in this directory.
 //
@@ -59,8 +68,7 @@ func newClaudeSessionSpec() (*claudeSessionSpec, error) {
 // to the newest recoverable session and an explicit ID is refused with a
 // message instead of reopening an empty conversation.
 func resolveClaudeResume(cacheDir, workDir, value string) (claudesession.Record, error) {
-	value = strings.TrimSpace(value)
-	if value == "" || strings.EqualFold(value, "latest") || strings.EqualFold(value, "last") {
+	if isLatestResumeValue(value) {
 		return claudesession.LatestRecoverable(cacheDir, workDir)
 	}
 	rec, err := claudesession.Load(cacheDir, value)
@@ -75,11 +83,33 @@ func resolveClaudeResume(cacheDir, workDir, value string) (claudesession.Record,
 
 // claudeResumeSpec turns a recorded session into a launch spec, refusing only
 // when the proposed launch cannot hold the recorded conversation.
-func claudeResumeSpec(rec claudesession.Record, serverArgs []string, force bool) (*claudeSessionSpec, error) {
-	// The recorded model must still exist to be launched. The alternative is an
-	// opaque "missing shard" failure from deep inside the loader; name the stale
-	// path here instead.
-	if !rec.ModelPathExists() {
+//
+// The recorded model is informational — what the session ran under THEN. A
+// resume reopens the conversation against whatever model this launch starts
+// now, so a recorded model that differs is announced rather than blocking, and
+// the launch uses the current model even when the recorded one has since been
+// removed. The "recorded model no longer present" error is reserved for an
+// explicit resume by session ID, which names that backend and cannot be
+// reopened by anything else; "latest"/empty picks have no such commitment.
+//
+// explicit is true when the user named a specific session ID (rather than
+// "latest"), and currentModel is the path of the model this launch is starting,
+// when it is known, so a difference from the recorded model can be reported.
+func claudeResumeSpec(rec claudesession.Record, serverArgs []string, force bool, explicit bool, currentModel string) (*claudeSessionSpec, error) {
+	// Resuming reopens the conversation against the current model. A record that
+	// points at a different model is not an error — it just means the session's
+	// earlier turns ran on another backend — but the user should know the
+	// conversation is being continued on a different model.
+	if rec.ModelPath != "" && currentModel != "" && rec.ModelPath != currentModel {
+		fmt.Printf("[claude-code] resuming session %s recorded under %s using current model %s\n",
+			rec.SessionID, filepath.Base(rec.ModelPath), filepath.Base(currentModel))
+	}
+	// Only an explicit resume commits to the recorded backend. If that model is
+	// gone, the alternative is an opaque "missing shard" failure from deep inside
+	// the loader; name the stale path here instead. A "latest" pick is a request
+	// for the newest conversation, not for a specific model, so it launches the
+	// current model and is not blocked by a recorded model that has disappeared.
+	if explicit && !rec.ModelPathExists() {
 		return nil, fmt.Errorf("recorded model no longer present: %s", rec.ModelPath)
 	}
 	if mismatches := rec.ShapeMismatches(serverArgs); len(mismatches) > 0 && !force {
@@ -149,7 +179,10 @@ func claudeLaunchSession(cfg *config.Config, req *launchRequest, serverArgs []st
 		if err != nil {
 			return nil, err
 		}
-		return claudeResumeSpec(rec, serverArgs, req.ClaudeResumeForce)
+		// An explicit session ID owns its recorded backend (its recorded model
+		// must still exist); "latest"/empty picks are requests for the newest
+		// conversation and are reopened against this launch's current model.
+		return claudeResumeSpec(rec, serverArgs, req.ClaudeResumeForce, !isLatestResumeValue(req.ClaudeResume), req.ModelPath)
 	}
 	spec, err := newClaudeSessionSpec()
 	if err != nil {

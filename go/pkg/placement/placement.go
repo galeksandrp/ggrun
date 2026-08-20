@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -5131,11 +5132,50 @@ func loadMeasuredKVRates(cacheDir string, model *ModelProfile) map[string]float6
 	return out
 }
 
+// measuredKVGeometryCache memoizes loadMeasuredKVGeometry results keyed on the
+// cache path plus the file's mtime, so planning never re-reads the measured-KV
+// cache file more than once per process. The model-config screen triggers KV
+// estimates on every render (viewModelConfig -> swaLabel -> EstimateKVCacheMB),
+// so without a cache a single-page session reopened the file on every keystroke.
+// The mtime in the key means a freshly written cache file (e.g. after a launch)
+// is still picked up within the same process.
+var measuredKVGeometryCache = struct {
+	sync.Mutex
+	byKey map[string]measuredKVGeometryCacheEntry
+}{byKey: map[string]measuredKVGeometryCacheEntry{}}
+
+type measuredKVGeometryCacheEntry struct {
+	mtime time.Time
+	geom  map[string]KVGeometry
+}
+
 // loadMeasuredKVGeometry reads the per-KV-type cache layout recorded by a
 // previous launch. Kept separate from the rate loader so an older cache file
-// that predates the geometry still yields its rate rather than nothing.
+// that predates the geometry still yields its rate rather than nothing. Results
+// are memoized per (cache path, mtime) at package scope.
 func loadMeasuredKVGeometry(cacheDir string, model *ModelProfile) map[string]KVGeometry {
-	data, err := os.ReadFile(kvCachePath(cacheDir, model))
+	path := kvCachePath(cacheDir, model)
+	var mtime time.Time
+	if fi, err := os.Stat(path); err == nil {
+		mtime = fi.ModTime()
+	}
+	measuredKVGeometryCache.Lock()
+	if e, ok := measuredKVGeometryCache.byKey[path]; ok && e.mtime.Equal(mtime) {
+		measuredKVGeometryCache.Unlock()
+		return e.geom
+	}
+	measuredKVGeometryCache.Unlock()
+
+	geom := loadMeasuredKVGeometryFile(path)
+	measuredKVGeometryCache.Lock()
+	measuredKVGeometryCache.byKey[path] = measuredKVGeometryCacheEntry{mtime: mtime, geom: geom}
+	measuredKVGeometryCache.Unlock()
+	return geom
+}
+
+// loadMeasuredKVGeometryFile parses the per-KV-type geometry cache file at path.
+func loadMeasuredKVGeometryFile(path string) map[string]KVGeometry {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
