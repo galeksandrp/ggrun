@@ -488,11 +488,18 @@ func reviewerArchFromName(basename string) string {
 	}
 }
 
+// claudeReviewerContextTokens is the context window every separate reviewer
+// backend is launched with (see claudeReviewerArgsWithKV). The router uses it as
+// the overflow threshold: a classifier prompt estimated to exceed this window is
+// routed to the main model (self-classify) with a visible notice instead of
+// being sent into an oversized context the reviewer cannot accept.
+const claudeReviewerContextTokens = 65536
+
 func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, kvType string, cacheDir string) []string {
 	args := []string{
 		binary, "-m", modelPath,
 		"--host", "127.0.0.1", "--port", strconv.Itoa(port),
-		"--ctx-size", "65536", "--parallel", "1",
+		"--ctx-size", strconv.Itoa(claudeReviewerContextTokens), "--parallel", "1",
 		"--alias", "local",
 		"--temp", "0", "--presence-penalty", "0", "--repeat-penalty", "1",
 	}
@@ -760,6 +767,11 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	// so cheap-tier work continues to the main model rather than into a lane
 	// that loops back to the same server.
 	router.SetCompanion("local", r.reviewerPort > 0)
+	// The separate reviewer always runs with claudeReviewerContextTokens of
+	// context (see claudeReviewerArgsWithKV). Tell the router that window so a
+	// classifier prompt too large for the reviewer falls back to the main model
+	// (self-classify) with a visible notice instead of failing.
+	router.SetReviewerContext(claudeReviewerContextTokens)
 	// The pass-cost decomposition needs to know how many tokens a prefill pass
 	// carried, which is the micro-batch the backend was launched with.
 	router.SetUBatch(argIntValue(serverArgs, "-ub", "--ubatch-size"))

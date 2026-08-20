@@ -342,6 +342,21 @@ type Router struct {
 	companionAlias string
 	hasCompanion   bool
 	mainBaseURL    string
+	// separateReviewer reports whether the reviewer runs on its own backend
+	// distinct from the main model. When false (no-room fallback), classifier
+	// requests route to the main model with a visible notice — never silently.
+	separateReviewer bool
+	// reviewerContext is the separate reviewer's context window in tokens. A
+	// classifier prompt estimated to exceed it is routed to the main model with
+	// a visible notice (reviewer overflow) instead of being sent where it cannot
+	// fit. Non-positive disables the overflow fallback.
+	reviewerContext int
+	// Claude Code issues a classifier request per tool call, so an unguarded
+	// notice would repeat on every one of them and bury the rest of the run's
+	// output. Each fallback explains itself the first time it happens and stays
+	// quiet after that; the route is still recorded on every request.
+	noRoomNotice   sync.Once
+	overflowNotice sync.Once
 	// msgDelimiters are the chat role markers read from the backend's own
 	// startup output. They are injected into main-route requests that carry
 	// none, because a sliding-window model can only reuse a prefix from a
@@ -371,6 +386,26 @@ func (r *Router) SetCompanion(alias string, hasSeparateBackend bool) {
 	r.hasCompanion = hasSeparateBackend
 }
 
+// SetReviewerContext sets the separate reviewer's context window in tokens.
+// When a separate reviewer is seated and a classifier prompt is estimated to
+// exceed this window, the router falls back to the main model (self-classify)
+// with a visible notice instead of forwarding a prompt the reviewer cannot
+// accept. A non-positive value disables the overflow fallback.
+func (r *Router) SetReviewerContext(tokens int) {
+	if r != nil {
+		r.reviewerContext = tokens
+	}
+}
+
+// estimatedPromptTokens conservatively estimates how many context tokens a
+// routed request consumes from its JSON body size. The underestimate must err
+// on the high side so an oversized prompt is caught rather than silently sent
+// into an overflow: ~3 bytes per token is denser than most model vocabularies,
+// so this never under-counts a real prompt.
+func estimatedPromptTokens(body []byte) int {
+	return (len(body) + 2) / 3
+}
+
 // utilityEnabled reports whether cheap-tier requests have somewhere to go.
 func (r *Router) utilityEnabled() bool {
 	return r != nil && r.hasCompanion
@@ -393,6 +428,7 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	mainProxy.ErrorHandler = proxyError
 	reviewerProxy.ErrorHandler = proxyError
 	router := &Router{maxMainActive: maxMainActive, mainBaseURL: strings.TrimRight(mainBaseURL, "/")}
+	router.separateReviewer = strings.TrimRight(reviewerBaseURL, "/") != strings.TrimRight(mainBaseURL, "/")
 	if maxMainActive > 0 {
 		router.sched = newScheduler(maxMainActive)
 	}
@@ -438,6 +474,27 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 			r.ContentLength = int64(len(body))
 		}
 		if IsClassifierRequest(body) {
+			// A classifier/security request is normally the separate reviewer's
+			// job. Two user-approved (Option A) cases route it to the MAIN model
+			// instead, each with a visible notice — never silently:
+			//   1) no-room: no separate reviewer was seated (reviewer proxy
+			//      targets the main model), so the main model classifies its own
+			//      request.
+			//   2) overflow: a separate reviewer IS seated, but this prompt
+			//      exceeds the reviewer's context window, so it cannot accept it.
+			proxy, route := reviewerProxy, routeReviewer
+			switch {
+			case !router.separateReviewer:
+				router.noRoomNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] no separate Auto reviewer seated; the main model is classifying its own requests (self-classify, user-approved)\n")
+				})
+				proxy, route = mainProxy, routeMain
+			case router.reviewerContext > 0 && estimatedPromptTokens(body) > router.reviewerContext:
+				router.overflowNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] an Auto review prompt exceeded the reviewer context window (%d tokens); such reviews go to the main model instead (self-classify, reviewer overflow)\n", router.reviewerContext)
+				})
+				proxy, route = mainProxy, routeMain
+			}
 			alias := MainAlias
 			if router.utilityEnabled() {
 				alias = router.companionAlias
@@ -445,7 +502,7 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 			body = retargetModel(body, alias)
 			r.Body = io.NopCloser(bodyReader(body))
 			r.ContentLength = int64(len(body))
-			router.serve(w, r, reviewerProxy, routeReviewer, body)
+			router.serve(w, r, proxy, route, body)
 			return
 		}
 		// Decide the cheap-tier destination before injecting any main-backend

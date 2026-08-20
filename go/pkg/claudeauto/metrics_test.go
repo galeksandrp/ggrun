@@ -26,11 +26,22 @@ data: {"type":"message_delta","usage":{"output_tokens":211}}
 
 `
 
+// newTestRouter builds a router whose reviewer shares the main backend, which
+// is the no-room seating: with nowhere separate to send a review, the main model
+// classifies its own requests. Use newTestRouterPair for a seated reviewer.
 func newTestRouter(t *testing.T, backend string, maxMainActive int) (*Router, string) {
+	t.Helper()
+	return newTestRouterPair(t, backend, backend, maxMainActive)
+}
+
+// newTestRouterPair builds a router over distinct main and reviewer backends,
+// which is what "a separate reviewer is seated" means to the router: it compares
+// the two base URLs.
+func newTestRouterPair(t *testing.T, mainBackend, reviewerBackend string, maxMainActive int) (*Router, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "requests.jsonl")
-	router, err := StartRouter(backend, backend, true, maxMainActive)
+	router, err := StartRouter(mainBackend, reviewerBackend, true, maxMainActive)
 	if err != nil {
 		t.Fatalf("StartRouter: %v", err)
 	}
@@ -240,8 +251,14 @@ func TestRouterRecordsReviewerRouteWithoutAdmissionControl(t *testing.T) {
 		_, _ = w.Write([]byte(`{"usage":{"input_tokens":25000,"output_tokens":3}}`))
 	}))
 	defer backend.Close()
+	// A reviewer on its own backend, so the review really does take the reviewer
+	// route rather than falling back to the main model.
+	reviewer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"usage":{"input_tokens":25000,"output_tokens":3}}`))
+	}))
+	defer reviewer.Close()
 
-	router, path := newTestRouter(t, backend.URL, 1)
+	router, path := newTestRouterPair(t, backend.URL, reviewer.URL, 1)
 	body := `{"model":"local","system":[{"type":"text","text":"` + ClassifierMarker + ` Review it."}],` +
 		`"messages":[{"role":"user","content":"rm -rf /"}]}`
 	post(t, router, body)
