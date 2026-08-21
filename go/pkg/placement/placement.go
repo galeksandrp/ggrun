@@ -930,7 +930,15 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			}
 			multiFits := (totalSizeMB+perGPUOH*len(caps.GPUs)+multiKVM) <= multiFree && multiCtx >= 32768
 
-			if multiFits && multiCtx > singleCtx {
+			// A bigger window is not automatically the better plan. Spreading a
+			// dense model across GPUs runs them SEQUENTIALLY, so decode slows by
+			// roughly the ratio of weight-read times; measured on a
+			// 4070/3090Ti/3060 box that is 21.6 vs 38.4 tok/s, 1.78x, to buy 1.41x
+			// the context. Take the extra window only when it outweighs the speed
+			// it costs, and keep the old prefer-larger behaviour whenever the
+			// hardware cannot be compared (unknown VRAM bandwidth).
+			if multiFits && multiCtx > singleCtx &&
+				(!singleFits || contextGainOutweighsSpread(caps, totalSizeMB, perGPUOH, singleCtx, singleKVM, multiCtx, multiKVM)) {
 				s.ContextSize, s.KVType = multiCtx, multiKV
 			} else if singleFits {
 				s.ContextSize, s.KVType = singleCtx, singleKV
@@ -4496,6 +4504,86 @@ func defaultContextSize(model *ModelProfile, caps *detect.Capabilities) int {
 		return model.ContextSize
 	}
 	return 32768
+}
+
+// contextGainOutweighsSpread reports whether a larger multi-GPU window is worth
+// the decode speed it costs. Under --split-mode layer the cards run one after
+// another, so generation time is the SUM of each card's weight read: holding the
+// whole model on the fastest card is strictly quicker, and a KV cache big enough
+// to push weights onto a slower card slows every token for the whole session.
+//
+// The comparison is a ratio against a ratio -- how much more context, against how
+// much slower each token becomes. It returns true only when the window grows by
+// more than the slowdown, and stays neutral (true, the previous prefer-larger
+// behaviour) whenever the hardware cannot be compared.
+func contextGainOutweighsSpread(caps *detect.Capabilities, weightsMB, perGPUOverheadMB, singleCtx, singleKVMB, multiCtx, multiKVMB int) bool {
+	if singleCtx <= 0 || multiCtx <= singleCtx {
+		return false
+	}
+	cost := spreadDecodeCostRatio(caps, weightsMB, weightsMB+multiKVMB, perGPUOverheadMB)
+	if cost <= 1 {
+		return true // no measurable penalty, so take the bigger window
+	}
+	gain := float64(multiCtx) / float64(singleCtx)
+	return gain > cost
+}
+
+// spreadDecodeCostRatio estimates how much slower each token becomes when a
+// footprint of combinedMB (weights plus its KV cache) has to span several GPUs
+// instead of sitting on the fastest one. llama-server distributes weights AND KV
+// by the same tensor ratio, so a KV cache that does not fit beside the weights
+// on one card is what actually pushes weights onto slower memory.
+//
+// Returns 1 when the comparison cannot be made: fewer than two GPUs, unknown
+// VRAM bandwidth, or a footprint no single card could hold anyway -- in those
+// cases there is no faster alternative being given up.
+func spreadDecodeCostRatio(caps *detect.Capabilities, weightsMB, combinedMB, perGPUOverheadMB int) float64 {
+	if caps == nil || len(caps.GPUs) < 2 || weightsMB <= 0 || combinedMB <= 0 || !denseMemBandwidthKnown(caps.GPUs) {
+		return 1
+	}
+	order := orderGPUsByMemoryBandwidth(caps.GPUs)
+	fastest := caps.GPUs[order[0]]
+	if fastest.MemBandwidthMBps <= 0 {
+		return 1
+	}
+	if fastest.VRAMFreeMB()-perGPUOverheadMB < weightsMB {
+		// The weights alone do not fit on the fastest card, so there is no
+		// single-GPU plan being given up and nothing to weigh the window against.
+		return 1
+	}
+	// Fill fastest-first, the order buildMultiGPUDense actually places in, and
+	// carry the weights along at each card's share of the combined footprint.
+	remaining := combinedMB
+	spreadTime := 0.0
+	placed := 0
+	for _, gi := range order {
+		if remaining <= 0 {
+			break
+		}
+		g := caps.GPUs[gi]
+		capacity := g.VRAMFreeMB() - perGPUOverheadMB
+		if capacity <= 0 {
+			continue
+		}
+		take := capacity
+		if take > remaining {
+			take = remaining
+		}
+		share := float64(take) / float64(combinedMB)
+		spreadTime += share * float64(weightsMB) / float64(g.MemBandwidthMBps)
+		remaining -= take
+		placed++
+	}
+	if remaining > 0 || spreadTime <= 0 || placed < 2 {
+		// Either it does not fit at all, or it never left the fastest card -- no
+		// slowdown is being traded away.
+		return 1
+	}
+	singleTime := float64(weightsMB) / float64(fastest.MemBandwidthMBps)
+	if singleTime <= 0 {
+		return 1
+	}
+	return spreadTime / singleTime
 }
 
 // contextMinimum is the smallest window auto-sizing will settle for before it
