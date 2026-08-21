@@ -1811,6 +1811,27 @@ func buildDenseCPUOffload(s *Strategy, caps *detect.Capabilities, model *ModelPr
 				split[gi] = float64(effective) * bw / totalWeighted
 			}
 		}
+		if totalWeighted <= 0 {
+			// Every GPU's free VRAM is already below its own CUDA/compute/KV
+			// reserve, so effective clamped to 0 for all of them and the loop
+			// above assigned nothing -- leaving split all zeros. normalizeSplit
+			// returns an all-zero slice unchanged (its total is 0), and the argv
+			// emitter guards on the split's LENGTH, not its contents, so this
+			// shipped "--tensor-split 0,0,0" alongside -ngl 999: a plan that says
+			// put every layer on GPU while naming no GPU to put them on. Fall back
+			// to free-VRAM-proportional, which is what the fully resident dense
+			// path does in exactly this situation, and let the OOM guard report
+			// the real shortfall.
+			totalFree := 0.0
+			for _, g := range caps.GPUs {
+				totalFree += float64(g.VRAMFreeMB())
+			}
+			if totalFree > 0 {
+				for _, gi := range gpuOrder {
+					split[gi] = float64(caps.GPUs[gi].VRAMFreeMB()) / totalFree
+				}
+			}
+		}
 		s.TensorSplit = normalizeSplit(split)
 
 		// Keep the same portable heterogeneous-GPU policy as the fully resident

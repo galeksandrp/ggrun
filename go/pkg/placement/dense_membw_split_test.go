@@ -131,10 +131,10 @@ func TestOrderGPUsByMemoryBandwidthRanksFastestFirst(t *testing.T) {
 // on the split's LENGTH, not its contents, and would pass "--tensor-split
 // 0,0,0" straight through to llama-server.
 //
-// NOTE: the dense_cpu_offload builder (untouched here) does emit [0 0 0] with
-// gpuLayers=999 under this same pressure. That is a separate pre-existing
-// defect, so this test asserts only the path it covers and skips otherwise
-// rather than silently passing on the wrong builder.
+// This holds whichever builder the planner picks: the fully resident dense path
+// and dense_cpu_offload both fall back to free-VRAM-proportional when no GPU has
+// usable VRAM left. dense_cpu_offload used to emit [0 0 0] with gpuLayers=999 --
+// every layer on GPU, naming no GPU to hold them.
 func TestDenseSplitNeverEmitsAllZeroWhenCardsAreFull(t *testing.T) {
 	caps := benchBox()
 	// Leave a few hundred MiB free on each card: far below the CUDA context plus
@@ -147,9 +147,6 @@ func TestDenseSplitNeverEmitsAllZeroWhenCardsAreFull(t *testing.T) {
 	})
 	if err != nil {
 		t.Skipf("no plan produced for a full box: %v", err)
-	}
-	if strat.Type != MultiGPUDense {
-		t.Skipf("planner chose %s, not the fully-resident dense path under test", strat.Type)
 	}
 	if len(strat.TensorSplit) == 0 {
 		return // no split emitted at all is fine
