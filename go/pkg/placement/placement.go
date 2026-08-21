@@ -4498,6 +4498,32 @@ func defaultContextSize(model *ModelProfile, caps *detect.Capabilities) int {
 	return 32768
 }
 
+// contextMinimum is the smallest window auto-sizing will settle for before it
+// tries a more compact KV type instead.
+const contextMinimum = 32768
+
+// contextGranularity is the boundary an auto-sized context is rounded down to.
+// llama.cpp accepts any n_ctx, so this only keeps slot arithmetic and logs tidy.
+const contextGranularity = 1024
+
+// maxContextForBudget returns the largest usable context at or below capCtx, or
+// 0 when even the minimum will not fit (the caller then tries a more compact KV
+// type). Auto-sizing used to snap down to a power of two, which discarded up to
+// half of the window it had just proved would fit: on a 24 GB card holding a 27B
+// model, ~210k tokens fit but the ladder handed back 131072 -- 38% of the budget
+// thrown away. ggrun sizes for agentic sessions where the window IS the product,
+// so take what fits rather than the nearest round number below it.
+func maxContextForBudget(capCtx int) int {
+	if capCtx < contextMinimum {
+		return 0
+	}
+	ctx := capCtx / contextGranularity * contextGranularity
+	if ctx < contextMinimum {
+		return 0
+	}
+	return ctx
+}
+
 // computeAutoContextSizeSingleGPU computes the largest context that fits on
 // a SINGLE GPU (the best one). Used to prefer single-GPU mode (faster).
 func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProfile, totalSizeMB int, preferredKVType string, opts Options) (int, string) {
@@ -4543,15 +4569,7 @@ func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProf
 			hwCapCtx = model.CTXTrain
 		}
 
-		powerOfTwoValues := []int{32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
-		suggestedCtx := 32768
-		for _, c := range powerOfTwoValues {
-			if c <= hwCapCtx {
-				suggestedCtx = c
-			}
-		}
-
-		if suggestedCtx >= 32768 {
+		if suggestedCtx := maxContextForBudget(hwCapCtx); suggestedCtx > 0 {
 			return suggestedCtx, kvType
 		}
 	}
@@ -4663,20 +4681,35 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 	// pick the model's native context on any RAM-rich box, and a KV that large
 	// then has to be offloaded to the host -- the exact speed loss fit exists to
 	// avoid. computeAutoContextSizeSingleGPU already refuses to spend system RAM
-	// for this reason; this multi-GPU twin never got the same treatment. The same
-	// 4 GB slack is allowed, and CPU-only callers (no GPUs) still budget RAM,
-	// which is where their KV genuinely lives.
-	totalVRAM := 0
+	// for this reason; this multi-GPU twin never got the same treatment.
+	// CPU-only callers (no GPUs) still budget RAM, which is where their KV
+	// genuinely lives.
+	totalFreeVRAM := 0
 	for _, g := range caps.GPUs {
-		totalVRAM += g.VRAMTotalMB
+		totalFreeVRAM += g.VRAMFreeMB()
 	}
 	totalHWMB := caps.RAM.FreeMB
-	if totalVRAM > 0 {
-		totalHWMB = totalVRAM + 4096
+	if totalFreeVRAM > 0 {
+		// No host-RAM slack: any allowance here is precisely the overflow that
+		// ends up offloaded, and free VRAM (not total) is what the KV can
+		// actually claim next to whatever is already resident.
+		totalHWMB = totalFreeVRAM
 	}
 
-	// Fixed overhead: model weights + model-aware headroom.
-	fixedOverheadMB := totalSizeMB + plannedModelAwareHeadroom(model, opts)
+	// Fixed overhead: model weights plus the non-weight reserve. With GPUs the
+	// reserve is the per-GPU VRAM overhead (measured CUDA context + compute
+	// buffer) summed across the cards -- the same accounting the caller's own fit
+	// check uses. The whole-model headroom is a plan-wide safety margin and is
+	// markedly larger; spending it out of the KV budget leaves a big slice of
+	// VRAM unclaimed, which is the window this exists to maximise.
+	overheadMB := plannedModelAwareHeadroom(model, opts)
+	if len(caps.GPUs) > 0 {
+		perGPU := plannedPerGPUVRAMOverheadMB(loadSystemProbe(opts.CacheDir, caps.GPUs), 0, opts)
+		if gpuOverhead := perGPU * len(caps.GPUs); gpuOverhead < overheadMB {
+			overheadMB = gpuOverhead
+		}
+	}
+	fixedOverheadMB := totalSizeMB + overheadMB
 
 	// If model doesn't fit at all, return minimum
 	if totalHWMB <= fixedOverheadMB {
@@ -4705,15 +4738,7 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 			hwCapCtx = model.CTXTrain
 		}
 
-		powerOfTwoValues := []int{32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304}
-		suggestedCtx := 32768
-		for _, c := range powerOfTwoValues {
-			if c <= hwCapCtx {
-				suggestedCtx = c
-			}
-		}
-
-		if suggestedCtx >= 32768 {
+		if suggestedCtx := maxContextForBudget(hwCapCtx); suggestedCtx > 0 {
 			return suggestedCtx, kvType
 		}
 	}

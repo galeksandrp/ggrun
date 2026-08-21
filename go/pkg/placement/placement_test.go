@@ -4959,14 +4959,22 @@ func TestComputeDenseAutoReducePicksLargestFit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compute failed: %v", err)
 	}
-	// 65536 fits (KV ~4250, total ~38126 <= 41509); 131072 does not (total ~42376).
-	if strat.ContextSize != 65536 {
-		t.Fatalf("expected the largest fitting context 65536, got %d", strat.ContextSize)
+	// Auto-sizing takes the largest window the VRAM holds, not the largest power
+	// of two below it: the old ladder answered 65536 here where ~116k fits, so
+	// nearly half the window was discarded. Assert the property rather than a
+	// constant -- the chosen context must fit, and one granule more must not.
+	free := caps.GPUs[0].VRAMFreeMB() + caps.GPUs[1].VRAMFreeMB() + caps.GPUs[2].VRAMFreeMB()
+	fixed := 30804 + 3*computeFloorMB
+	kv := computeKVTotalMB(model, strat.ContextSize, strat.KVType, true)
+	if fixed+kv > free {
+		t.Fatalf("ctx=%d does not fit: model+overhead+kv = %d > %d free", strat.ContextSize, fixed+kv, free)
 	}
-	// The next rung up must NOT fit, proving 65536 is the largest.
-	nextKV := computeKVTotalMB(model, 131072, strat.KVType, true)
-	if 30804+3*computeFloorMB+nextKV <= caps.GPUs[0].VRAMFreeMB()+caps.GPUs[1].VRAMFreeMB()+caps.GPUs[2].VRAMFreeMB() {
-		t.Fatalf("expected ctx=131072 to overflow GPU, but it fits; the reduction test setup is wrong")
+	if strat.ContextSize <= 65536 {
+		t.Fatalf("ctx=%d is no better than the old power-of-two rung; the window is not being maximised", strat.ContextSize)
+	}
+	nextKV := computeKVTotalMB(model, strat.ContextSize+contextGranularity, strat.KVType, true)
+	if fixed+nextKV <= free {
+		t.Fatalf("ctx=%d is not maximal: %d also fits", strat.ContextSize, strat.ContextSize+contextGranularity)
 	}
 }
 
