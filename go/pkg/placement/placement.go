@@ -4658,12 +4658,22 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 // hardware memory, .
 // Uses TOTAL_VRAM + RAM_AVAIL.
 func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, totalSizeMB int, preferredKVType string, opts Options) (int, string) {
-	// Total hardware = all GPU VRAM + free RAM
+	// Budget the KV where it will actually live. With GPUs present, "fit" has to
+	// mean "fits in VRAM": counting the whole of free system RAM here made fit
+	// pick the model's native context on any RAM-rich box, and a KV that large
+	// then has to be offloaded to the host -- the exact speed loss fit exists to
+	// avoid. computeAutoContextSizeSingleGPU already refuses to spend system RAM
+	// for this reason; this multi-GPU twin never got the same treatment. The same
+	// 4 GB slack is allowed, and CPU-only callers (no GPUs) still budget RAM,
+	// which is where their KV genuinely lives.
 	totalVRAM := 0
 	for _, g := range caps.GPUs {
 		totalVRAM += g.VRAMTotalMB
 	}
-	totalHWMB := totalVRAM + caps.RAM.FreeMB
+	totalHWMB := caps.RAM.FreeMB
+	if totalVRAM > 0 {
+		totalHWMB = totalVRAM + 4096
+	}
 
 	// Fixed overhead: model weights + model-aware headroom.
 	fixedOverheadMB := totalSizeMB + plannedModelAwareHeadroom(model, opts)
@@ -4711,6 +4721,30 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 	// Preset qualities may fall back to the compact type. An exact llama.cpp
 	// type is user-owned, so preserve it and lower context instead.
 	return 32768, fallbackKVType(preferredKVType, opts.KVQuality)
+}
+
+// AutoContextFitVRAM reports the largest context whose KV cache fits alongside
+// the model weights in the VRAM this machine has, and the KV type that achieves
+// it. It is the "fit" answer: callers that want a large window can use it as a
+// ceiling so a generous default does not silently push the KV cache onto the
+// host, which costs far more speed than the extra window is worth.
+//
+// Returns 0 when there is nothing to size against, so callers keep their own
+// default rather than treating an unknown as a constraint.
+func AutoContextFitVRAM(caps *detect.Capabilities, model *ModelProfile, totalSizeMB int, kvType string, opts Options) (int, string) {
+	if caps == nil || model == nil || len(caps.GPUs) == 0 {
+		return 0, kvType
+	}
+	if totalSizeMB <= 0 {
+		totalSizeMB = model.TotalSizeMB
+	}
+	if totalSizeMB <= 0 {
+		totalSizeMB = int(model.SizeBytes / 1024 / 1024)
+	}
+	if totalSizeMB <= 0 {
+		return 0, kvType
+	}
+	return computeAutoContextSize(caps, model, totalSizeMB, kvType, opts)
 }
 
 // Args converts a Strategy into llama-server command-line arguments.

@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -2292,8 +2293,16 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 // optional caps argument used to derive the verified-config scope key. When
 // caps is nil the scope key is left unset (callers that do not want verified
 // config reuse, or cannot derive hardware, get today's behavior).
+// ctxOffloadWarning keeps the "your context will offload" notice to one line:
+// placement is recomputed several times per launch (measured re-plan, recovery),
+// and the notice is about the user's choice, not about any individual plan.
+var ctxOffloadWarning sync.Once
+
 func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelProfile, be *backendInfo, cacheDir string, caps *detect.Capabilities) placement.Options {
 	ctxSize := resolveCtxFlag(req.CtxFlag, model.CTXTrain)
+	// A resolved size here means the user named one (a number, or "max"); "fit"
+	// and the empty default both resolve to 0.
+	userSetCtx := ctxSize > 0
 	if req.ClaudeCode && ctxSize <= 0 {
 		// Claude Code needs a large shared window for its main conversation plus
 		// background work. In auto/fit mode use the model's native window, capped
@@ -2307,6 +2316,33 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 			// 1M KV cache. Two 64k slots are a portable Claude Code baseline; models
 			// that advertise a larger native window still get it automatically.
 			ctxSize = 131072
+		}
+		// ...but a large window is not worth buying with an offloaded KV cache.
+		// Taking the native window unconditionally made "fit" mean "max" in Claude
+		// Code mode, and a KV that does not fit in VRAM lands on the host, which
+		// costs far more speed than the extra window is worth. Bound the default
+		// by what actually fits; an explicit numeric/max context is a user override
+		// and is resolved above, so it is never lowered here.
+		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
+			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
+		}); fitCtx > 0 && fitCtx < ctxSize {
+			fmt.Fprintf(os.Stderr, "[launch] context sized to %d to keep the KV cache in VRAM (native %d would offload it)\n", fitCtx, ctxSize)
+			ctxSize = fitCtx
+		}
+	}
+	// An explicit context is the user's call and is never lowered, but it can
+	// quietly push the KV cache onto the host, which costs far more throughput
+	// than the extra window is worth. Say so once instead of letting generation
+	// speed collapse without explanation.
+	if userSetCtx {
+		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
+			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
+		}); fitCtx > 0 && ctxSize > fitCtx {
+			ctxOffloadWarning.Do(func() {
+				fmt.Fprintf(os.Stderr,
+					"[launch] warning: --ctx %d exceeds what fits in VRAM (%d); the KV cache will be offloaded to host RAM and generation will be markedly slower. Use --ctx fit, or --ctx %d, to keep it resident.\n",
+					ctxSize, fitCtx, fitCtx)
+			})
 		}
 	}
 	samplingProfile := requestSamplingProfile(req, model)
