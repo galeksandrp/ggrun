@@ -82,6 +82,23 @@ type claudeCompanionProfile struct {
 	KVType            string
 	ReservationVRAMMB int
 	NanoBeige         bool
+	// Artifact is the pinned model this profile runs. The launcher installs
+	// exactly this one: ReservationVRAMMB describes THIS model, so installing
+	// another artifact under it under-reserves the companion.
+	Artifact claudeauto.ModelSpec
+}
+
+// claudeReviewerArtifactSpec returns the pinned artifact a profile runs. The
+// NanoBeige worker is provisioned through the advisor, not the reviewer cache,
+// so it has no pinned reviewer spec.
+func claudeReviewerArtifactSpec(p *claudeCompanionProfile) claudeauto.ModelSpec {
+	if p == nil || p.NanoBeige {
+		return claudeauto.ModelSpec{}
+	}
+	if p.Artifact.Name != "" {
+		return p.Artifact
+	}
+	return claudeauto.DefaultReviewerSpec()
 }
 
 func (p *claudeCompanionProfile) companionMeasurementKey() string {
@@ -182,6 +199,7 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			MeasurementKey:    "claude-reviewer-qwen35-2b-q4-k-m",
 			KVType:            "q8_0",
 			ReservationVRAMMB: claudeSmallReviewerReservationVRAMMB,
+			Artifact:          claudeauto.SmallReviewerSpec(),
 		}
 	}
 	// Fallback (env override, degraded NanoBeige, or any unmapped value): the
@@ -197,6 +215,7 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			MeasurementKey:    "claude-reviewer-qwen35-4b-q4-k-m",
 			KVType:            "q8_0",
 			ReservationVRAMMB: claudeReviewerReservationVRAMMB,
+			Artifact:          claudeauto.DefaultReviewerSpec(),
 		}
 	}
 	if req != nil {
@@ -346,9 +365,13 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		}
 	} else {
 		var err error
-		modelPath, err = claudeauto.EnsureReviewerModelWithModelDir(context.Background(), appHome, modelDir, os.Stdout)
+		// Install the artifact THIS profile runs. Always ensuring the 4B meant
+		// --claude-reviewer qwen2b planned a 2600 MB seat and then launched the
+		// 4600 MB model in it, and the 2B was never downloaded at all.
+		modelPath, err = claudeauto.EnsureReviewerSpec(context.Background(), appHome, modelDir,
+			claudeReviewerArtifactSpec(profile), os.Stdout)
 		if err != nil {
-			return nil, fmt.Errorf("prepare local Auto reviewer: %w", err)
+			return nil, fmt.Errorf("prepare local Auto reviewer %s: %w", profile.DisplayName, err)
 		}
 	}
 	var be *backendInfo

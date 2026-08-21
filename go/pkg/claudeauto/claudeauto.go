@@ -90,6 +90,21 @@ var defaultModel = ModelSpec{
 	Size: DefaultReviewerSize, SHA256: DefaultReviewerSHA,
 }
 
+// smallModel pins the 2B review-only artifact. It exists so the qwen2b profile
+// installs the model it actually runs: the profile is planned with the smaller
+// reservation, so installing the 4B under it leaves the companion badly
+// under-reserved.
+var smallModel = ModelSpec{
+	URL: DefaultSmallReviewerURL, Name: DefaultSmallReviewerFile,
+	Size: DefaultSmallReviewerSize, SHA256: DefaultSmallReviewerSHA,
+}
+
+// DefaultReviewerSpec is the pinned Qwen3.5-4B worker/reviewer artifact.
+func DefaultReviewerSpec() ModelSpec { return defaultModel }
+
+// SmallReviewerSpec is the pinned Qwen3.5-2B review-only artifact.
+func SmallReviewerSpec() ModelSpec { return smallModel }
+
 // ReviewerModelPath returns the user override, or ggrun's private reviewer
 // cache path. The reviewer is deliberately kept out of the normal model list.
 func ReviewerModelPath(appHome string) string {
@@ -154,31 +169,56 @@ func EnsureReviewerModel(ctx context.Context, appHome string, progress io.Writer
 // folder name in DefaultReviewerLocalDir), it is verified and used directly
 // instead of downloading a private copy.
 func EnsureReviewerModelWithModelDir(ctx context.Context, appHome, modelDir string, progress io.Writer) (string, error) {
-	path := ReviewerModelPath(appHome)
-	if strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" {
+	return EnsureReviewerSpec(ctx, appHome, modelDir, defaultModel, progress)
+}
+
+// EnsureReviewerSpec validates or downloads one pinned reviewer artifact. The
+// caller passes the spec for the profile it is about to launch, because the
+// profile's VRAM reservation describes THAT model: installing a different
+// artifact under it under-reserves the companion and OOMs a card the planner
+// believed had room.
+func EnsureReviewerSpec(ctx context.Context, appHome, modelDir string, spec ModelSpec, progress io.Writer) (string, error) {
+	isDefault := spec.Name == defaultModel.Name
+	path := reviewerSpecPath(appHome, spec)
+	// The single GGRUN_CLAUDE_REVIEWER_MODEL override selects the worker/reviewer
+	// only. It must not silently satisfy a request for the 2B review-only lane.
+	if isDefault && strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" {
 		if err := validateGGUF(path, 0); err != nil {
 			return "", fmt.Errorf("GGRUN_CLAUDE_REVIEWER_MODEL: %w", err)
 		}
 		return path, nil
 	}
-	if err := validatePinnedGGUF(path, defaultModel); err == nil {
+	if err := validatePinnedGGUF(path, spec); err == nil {
 		return path, nil
 	}
 	// The model directory already holds the pinned artifact: use it without
-	// downloading (the 4B ships with ggrun's model set).
-	if local, ok := LocalReviewerModelPath(modelDir); ok {
-		if err := validatePinnedGGUF(local, defaultModel); err == nil {
-			return local, nil
+	// downloading (the 4B ships with ggrun's model set). Only the 4B has a
+	// known model-set folder; the 2B always lives in the reviewer cache.
+	if isDefault {
+		if local, ok := LocalReviewerModelPath(modelDir); ok {
+			if err := validatePinnedGGUF(local, spec); err == nil {
+				return local, nil
+			}
 		}
 	}
 	if progress != nil {
-		fmt.Fprintf(progress, "[claude-code] downloading pinned local Auto reviewer (%.1f GB)...\n", float64(defaultModel.Size)/(1024*1024*1024))
+		fmt.Fprintf(progress, "[claude-code] downloading pinned local Auto reviewer %s (%.1f GB)...\n",
+			spec.Name, float64(spec.Size)/(1024*1024*1024))
 	}
-	client := &http.Client{Timeout: 30 * time.Minute}
-	if err := downloadModel(ctx, client, defaultModel, path, progress); err != nil {
+	if err := downloadModel(ctx, reviewerHTTPClient(), spec, path, progress); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// reviewerSpecPath is where a pinned reviewer artifact lives. The 4B honours
+// GGRUN_CLAUDE_REVIEWER_MODEL through ReviewerModelPath; every other pinned
+// artifact sits in the private reviewer cache under its own name.
+func reviewerSpecPath(appHome string, spec ModelSpec) string {
+	if spec.Name == defaultModel.Name {
+		return ReviewerModelPath(appHome)
+	}
+	return filepath.Join(appHome, ".cache", "claude-reviewer", spec.Name)
 }
 
 func validateGGUF(path string, wantSize int64) error {
@@ -223,68 +263,227 @@ func validatePinnedGGUF(path string, spec ModelSpec) error {
 	return nil
 }
 
+const (
+	// A multi-GB artifact on a slow link is not a hung request, so the download
+	// has no whole-request deadline. Progress is policed by a stall watchdog
+	// instead: bytes must keep arriving, but they may take as long as they take.
+	// The previous 30-minute client timeout meant the pinned 2.55 GiB reviewer
+	// could only ever install on a link sustaining ~1.5 MB/s; anything slower
+	// failed at the deadline and threw away every byte it had fetched.
+	reviewerDownloadAttempts = 4
+	reviewerStallTimeout     = 2 * time.Minute
+	reviewerHeaderTimeout    = 60 * time.Second
+)
+
+// reviewerHTTPClient builds the client used for pinned reviewer downloads.
+func reviewerHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ResponseHeaderTimeout: reviewerHeaderTimeout,
+			ExpectContinueTimeout: time.Second,
+		},
+	}
+}
+
+// downloadModel fetches a pinned artifact, resuming an interrupted attempt
+// rather than starting over. The partial file keeps a stable name so a download
+// interrupted in an earlier run is continued instead of re-fetched, and the
+// artifact is only verified and installed once it is complete.
 func downloadModel(ctx context.Context, client *http.Client, spec ModelSpec, dest string, progress io.Writer) error {
 	if client == nil {
-		client = http.DefaultClient
+		client = reviewerHTTPClient()
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return fmt.Errorf("create reviewer cache: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dest), ".reviewer-*.part")
-	if err != nil {
-		return fmt.Errorf("create reviewer download: %w", err)
-	}
-	tmpPath := tmp.Name()
-	keep := false
-	defer func() {
-		tmp.Close()
-		if !keep {
-			_ = os.Remove(tmpPath)
-		}
-	}()
+	part := dest + ".part"
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
+	var lastErr error
+	for attempt := 1; attempt <= reviewerDownloadAttempts; attempt++ {
+		have := partialSize(part)
+		if have > spec.Size {
+			// A stale or foreign part file: start clean rather than resume into
+			// the middle of something that is not this artifact.
+			_ = os.Remove(part)
+			have = 0
+		}
+		if have == spec.Size {
+			break
+		}
+		if have > 0 && progress != nil {
+			fmt.Fprintf(progress, "[claude-code] resuming Auto reviewer download at %d%%\n", int(have*100/spec.Size))
+		}
+		lastErr = fetchIntoPart(ctx, client, spec, part, have, progress)
+		if lastErr == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return fmt.Errorf("download Auto reviewer: %w", ctx.Err())
+		}
+		if attempt < reviewerDownloadAttempts && progress != nil {
+			fmt.Fprintf(progress, "[claude-code] Auto reviewer download interrupted (%v); retrying\n", lastErr)
+		}
+	}
+	if size := partialSize(part); size != spec.Size {
+		if lastErr != nil {
+			return fmt.Errorf("download Auto reviewer: %w", lastErr)
+		}
+		return fmt.Errorf("download Auto reviewer: got %d bytes, want %d", size, spec.Size)
+	}
+	// Verify the assembled file rather than a running hash: with resume the bytes
+	// come from more than one response, and what matters is what landed on disk.
+	sum, err := fileSHA256(part)
 	if err != nil {
-		return err
+		return fmt.Errorf("verify Auto reviewer: %w", err)
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("download Auto reviewer: %w", err)
+	if !strings.EqualFold(sum, spec.SHA256) {
+		_ = os.Remove(part)
+		return fmt.Errorf("download Auto reviewer: checksum mismatch (got %s); the partial download was discarded", sum)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download Auto reviewer: HTTP %s", resp.Status)
-	}
-	h := sha256.New()
-	w := io.MultiWriter(tmp, h)
-	if progress != nil {
-		w = io.MultiWriter(tmp, h, &progressWriter{out: progress, total: spec.Size, next: 256 << 20})
-	}
-	n, err := io.Copy(w, resp.Body)
-	if err != nil {
-		return fmt.Errorf("download Auto reviewer: %w", err)
-	}
-	if n != spec.Size {
-		return fmt.Errorf("download Auto reviewer: got %d bytes, want %d", n, spec.Size)
-	}
-	gotSHA := hex.EncodeToString(h.Sum(nil))
-	if !strings.EqualFold(gotSHA, spec.SHA256) {
-		return fmt.Errorf("download Auto reviewer: checksum mismatch (got %s)", gotSHA)
-	}
-	if err := tmp.Sync(); err != nil {
-		return fmt.Errorf("sync Auto reviewer: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close Auto reviewer: %w", err)
-	}
-	if err := os.Rename(tmpPath, dest); err != nil {
+	if err := os.Rename(part, dest); err != nil {
 		return fmt.Errorf("install Auto reviewer: %w", err)
 	}
-	keep = true
 	if progress != nil {
 		fmt.Fprintln(progress, "[claude-code] local Auto reviewer downloaded and verified.")
 	}
 	return nil
+}
+
+// partialSize is how many bytes of a resumable download are already on disk.
+func partialSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// fetchIntoPart appends to the partial file, asking the server to resume from
+// what is already there. A server that ignores Range answers 200 with the whole
+// artifact, so the file is truncated first and the transfer starts over.
+func fetchIntoPart(ctx context.Context, client *http.Client, spec ModelSpec, part string, have int64, progress io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec.URL, nil)
+	if err != nil {
+		return err
+	}
+	if have > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		have = 0 // Range ignored (or not requested): this is the whole artifact.
+	case http.StatusPartialContent:
+		if have == 0 {
+			return fmt.Errorf("unexpected HTTP 206 for a fresh download")
+		}
+	case http.StatusRequestedRangeNotSatisfiable:
+		// Already have everything the server will give us; let the caller verify.
+		return nil
+	default:
+		return fmt.Errorf("HTTP %s", resp.Status)
+	}
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if have > 0 {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(part, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Watchdog: bytes must keep arriving. A connection that goes quiet is
+	// cancelled so the retry loop can resume, instead of hanging until the
+	// process is killed.
+	body, stop := stallGuard(ctx, resp.Body)
+	defer stop()
+
+	var w io.Writer = f
+	if progress != nil {
+		w = io.MultiWriter(f, &progressWriter{out: progress, total: spec.Size, done: have, next: have + (256 << 20)})
+	}
+	if _, err := io.Copy(w, body); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// stallGuard wraps a response body so a transfer that stops producing bytes for
+// reviewerStallTimeout fails instead of hanging forever.
+func stallGuard(ctx context.Context, body io.Reader) (io.Reader, func()) {
+	guarded, cancel := context.WithCancel(ctx)
+	counter := &stallCounter{}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(reviewerStallTimeout / 4)
+		defer ticker.Stop()
+		var lastSeen int64
+		idle := time.Duration(0)
+		for {
+			select {
+			case <-done:
+				return
+			case <-guarded.Done():
+				return
+			case <-ticker.C:
+				now := counter.read.Load()
+				if now != lastSeen {
+					lastSeen, idle = now, 0
+					continue
+				}
+				idle += reviewerStallTimeout / 4
+				if idle >= reviewerStallTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	counter.r = body
+	return counter, func() { close(done); cancel() }
+}
+
+type stallCounter struct {
+	r    io.Reader
+	read atomic.Int64
+}
+
+func (c *stallCounter) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.read.Add(int64(n))
+	}
+	return n, err
+}
+
+// fileSHA256 hashes a completed download so resumed transfers are verified
+// against what actually landed on disk.
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type progressWriter struct {
