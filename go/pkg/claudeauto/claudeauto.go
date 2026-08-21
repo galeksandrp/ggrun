@@ -357,6 +357,9 @@ type Router struct {
 	// quiet after that; the route is still recorded on every request.
 	noRoomNotice   sync.Once
 	overflowNotice sync.Once
+	// reviewerFailNotice covers the runtime case: a seated reviewer that could
+	// not answer. Announced once rather than per tool call, like the others.
+	reviewerFailNotice sync.Once
 	// msgDelimiters are the chat role markers read from the backend's own
 	// startup output. They are injected into main-route requests that carry
 	// none, because a sliding-window model can only reuse a prefix from a
@@ -427,6 +430,10 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 	reviewerProxy := httputil.NewSingleHostReverseProxy(reviewerURL)
 	mainProxy.ErrorHandler = proxyError
 	reviewerProxy.ErrorHandler = proxyError
+	// Classifier traffic marks its attempts on the request context so a failed
+	// review can be retried on the main model; utility traffic carries no
+	// attempt and keeps surfacing errors directly.
+	installReviewerFallbackHooks(reviewerProxy)
 	router := &Router{maxMainActive: maxMainActive, mainBaseURL: strings.TrimRight(mainBaseURL, "/")}
 	router.separateReviewer = strings.TrimRight(reviewerBaseURL, "/") != strings.TrimRight(mainBaseURL, "/")
 	if maxMainActive > 0 {
@@ -495,11 +502,26 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 				})
 				proxy, route = mainProxy, routeMain
 			}
-			alias := MainAlias
-			if router.utilityEnabled() {
-				alias = router.companionAlias
+			// Try the separate reviewer first. A reviewer that crashed, never
+			// came up, or rejected this prompt (a context that will not hold it,
+			// a template it cannot apply) must not take the review down with it:
+			// nothing is written to the client until the response is known good,
+			// so a failed attempt falls through to the main model instead of
+			// returning 502.
+			if route == routeReviewer {
+				alias := MainAlias
+				if router.utilityEnabled() {
+					alias = router.companionAlias
+				}
+				if router.tryReviewer(w, r, reviewerProxy, retargetModel(body, alias)) {
+					return
+				}
+				router.reviewerFailNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] the Auto reviewer could not answer a review; routing it to the main model instead (self-classify, reviewer unavailable)\n")
+				})
+				proxy, route = mainProxy, routeMain
 			}
-			body = retargetModel(body, alias)
+			body = retargetModel(body, MainAlias)
 			r.Body = io.NopCloser(bodyReader(body))
 			r.ContentLength = int64(len(body))
 			router.serve(w, r, proxy, route, body)

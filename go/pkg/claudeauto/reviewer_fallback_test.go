@@ -2,6 +2,7 @@ package claudeauto
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -140,5 +141,134 @@ func TestEstimatedPromptTokensNeverUnderCountsAtFourBytesPerToken(t *testing.T) 
 		if want := size / 4; got < want {
 			t.Errorf("estimatedPromptTokens(%d bytes) = %d, want >= %d", size, got, want)
 		}
+	}
+}
+
+// A seated reviewer that is down must not take the review with it: the router
+// retries on the main model and the client sees a normal answer, never a 502.
+func TestReviewerFailureFallsBackToMainModel(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	// A reviewer that is reachable but broken, the shape a backend takes when it
+	// cannot serve the prompt it was given.
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		http.Error(w, "context too small", http.StatusInternalServerError)
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json",
+		strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200; the reviewer's failure reached the client", resp.StatusCode)
+	}
+	if !strings.Contains(string(payload), "input_tokens") {
+		t.Errorf("client got %q, want the main model's answer", string(payload))
+	}
+	// The attempt is withheld until it is known good, so the reviewer's error
+	// body must never have reached the client on its way to being abandoned.
+	if strings.Contains(string(payload), "context too small") {
+		t.Errorf("the failed reviewer's error leaked to the client: %q", string(payload))
+	}
+	if reviewerHits.Load() != 1 {
+		t.Errorf("reviewer hits = %d, want 1 (it must be tried first)", reviewerHits.Load())
+	}
+	if mainHits.Load() != 1 {
+		t.Errorf("main hits = %d, want 1 (the fallback)", mainHits.Load())
+	}
+	records := waitForRecords(t, path, 1)
+	if records[0].Route != routeMain {
+		t.Errorf("route = %q, want %q for a fallback", records[0].Route, routeMain)
+	}
+}
+
+// An unreachable reviewer is the other failure shape: nothing listening at all.
+func TestUnreachableReviewerFallsBackToMainModel(t *testing.T) {
+	var mainHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // nothing is listening on deadURL any more
+
+	router, _ := newTestRouterPair(t, mainBackend.URL, deadURL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json",
+		strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200 via the main model", resp.StatusCode)
+	}
+	if mainHits.Load() != 1 {
+		t.Errorf("main hits = %d, want 1", mainHits.Load())
+	}
+}
+
+// A healthy reviewer must still answer normally: the fallback must not divert
+// working reviews to the main model.
+func TestHealthyReviewerStillAnswersItself(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := countingBackend(t, &reviewerHits)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json",
+		strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	// Headers are buffered with the body while the attempt is undecided; a
+	// successful review has to replay them, not drop them.
+	if got := resp.Header.Get("Content-Type"); got == "" {
+		t.Error("withheld response headers were not replayed on success")
+	}
+
+	if reviewerHits.Load() != 1 || mainHits.Load() != 0 {
+		t.Errorf("reviewer=%d main=%d; want 1 and 0", reviewerHits.Load(), mainHits.Load())
+	}
+	records := waitForRecords(t, path, 1)
+	if records[0].Route != routeReviewer {
+		t.Errorf("route = %q, want %q", records[0].Route, routeReviewer)
+	}
+}
+
+// Cheap-tier traffic shares the reviewer's backend but not this fallback: it
+// installs no attempt on its context, so a failure still surfaces directly
+// rather than being silently re-run on the expensive main model.
+func TestUtilityTrafficDoesNotTakeTheReviewerFallback(t *testing.T) {
+	var mainHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "companion exploded", http.StatusInternalServerError)
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, _ := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	router.SetCompanion("local", true)
+
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"local-fast","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want the 500 passed through for utility traffic", resp.StatusCode)
+	}
+	if got := mainHits.Load(); got != 0 {
+		t.Errorf("a utility failure was retried on the main model %d time(s); want 0", got)
 	}
 }
