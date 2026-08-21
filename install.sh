@@ -1994,7 +1994,16 @@ install_ggrun_from_source() {
             ok "Installed prebuilt ggrun from this checkout"
             return 0
         fi
-        warn "Could not build ggrun from this checkout; keeping the release binary if present."
+        # A failed build must surface to the caller (a self-update rolls back /
+        # reports a failed update), not silently "keep the release binary" and
+        # claim success. On a fresh install the prebuilt fallback above usually
+        # saves us; reaching this line with no runnable binary is a real failure.
+        if [[ -x "$INSTALL_DIR/ggrun" || -x "$INSTALL_DIR/ggrun.exe" ]]; then
+            warn "Could not build ggrun from this checkout; keeping the existing binary."
+        else
+            warn "Could not build ggrun from this checkout and no existing binary is installed."
+            return 1
+        fi
     fi
 }
 

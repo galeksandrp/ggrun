@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/raketenkater/ggrun/pkg/backends"
 )
 
 const (
@@ -183,6 +185,18 @@ func updateRepoCandidates() []repoCandidate {
 		add("llama.cpp", filepath.Join(appHome, ".src", "llama.cpp"))
 		for _, target := range BackendBuildTargetsAt(appHome) {
 			add(target.Label, target.RepoDir)
+		}
+	}
+	// The app home is normally tied to a source checkout the update layer can
+	// pull directly (a release-bundle app home holds no .git and is skipped).
+	// backends.AppHome() resolves the same pointer/discovery chain cmdUpdate
+	// already trusts for backend updates, so ggrun self-update stops missing a
+	// source tree that lives outside ~/ggrun (e.g. ~/ggrun-project/ggrun).
+	if appHome := backends.AppHome(); appHome != "" {
+		if repo := repoFromAppHome(appHome); repo != "" && repo != appHome {
+			add("ggrun", repo)
+		} else if repoDir := filepath.Join(appHome, ".src", "ggrun"); repoDir != "" {
+			add("ggrun", repoDir)
 		}
 	}
 	if home != "" {
@@ -425,7 +439,15 @@ func rebuildSelfUpdateBinary(repoDir, scriptPath string) error {
 	}
 	staging := scriptPath + ".next"
 	_ = os.Remove(staging)
-	cmd := exec.Command("go", "build", "-trimpath", "-ldflags=-s -w", "-o", staging, "./cmd/ggrun")
+	// Stamp the rebuilt binary with the version the repo is at now. Without a
+	// stamp it keeps the in-source default (v3.2.0-go), which then permanently
+	// reports "a newer version is available" after every source update.
+	version := gitDescribeVersion(repoDir)
+	if version == "" {
+		version = Version()
+	}
+	ldflags := "-s -w -X github.com/raketenkater/ggrun/pkg/update.currentVersion=" + version
+	cmd := exec.Command("go", "build", "-trimpath", "-ldflags="+ldflags, "-o", staging, "./cmd/ggrun")
 	cmd.Dir = goDir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		_ = os.Remove(staging)
@@ -709,13 +731,33 @@ func installedSourceRepoDir() string {
 		}
 	}
 	if appHome := strings.TrimSpace(os.Getenv("LLM_APP_HOME")); appHome != "" {
-		repoDir := filepath.Join(appHome, ".src", "ggrun")
-		if _, err := os.Stat(filepath.Join(repoDir, ".git")); err == nil {
+		if repoDir := repoFromAppHome(appHome); repoDir != "" {
+			return repoDir
+		}
+	}
+	if appHome := backends.AppHome(); appHome != "" && appHome != os.Getenv("LLM_APP_HOME") {
+		if repoDir := repoFromAppHome(appHome); repoDir != "" {
 			return repoDir
 		}
 	}
 	if home := homeDir(); home != "" {
 		return filepath.Join(home, "ggrun")
+	}
+	return ""
+}
+
+// repoFromAppHome returns the ggrun git checkout inside an app home, or "" when
+// that directory holds none. A source install's app home IS the repo root, so
+// the directory itself is checked first; a release-bundle app home (which holds
+// no .git) falls through to the conventional nested locations.
+func repoFromAppHome(appHome string) string {
+	if appHome == "" {
+		return ""
+	}
+	for _, cand := range []string{appHome, filepath.Join(appHome, "ggrun"), filepath.Join(appHome, ".src", "ggrun")} {
+		if _, err := os.Stat(filepath.Join(cand, ".git")); err == nil {
+			return cand
+		}
 	}
 	return ""
 }
@@ -1571,19 +1613,48 @@ func collectCMakeFlags(buildDir string) []string {
 	return flags
 }
 
+// versionPartParts splits one dotted version component into its integer base and
+// whether it carries a git-describe "commits ahead" suffix. A build stamped
+// v3.2.8-4-g44f99a0 is 4 commits ahead of tag v3.2.8, so it must compare NEWER
+// than the bare tag, never as an unparseable 0 (which made it look older and
+// triggered a false "newer version available" for a build already past the tag).
+func versionPartParts(s string) (base int, ahead bool, ok bool) {
+	num := s
+	if idx := strings.IndexByte(s, '-'); idx >= 0 {
+		num = s[:idx]
+		ahead = true
+	}
+	n, err := strconv.Atoi(num)
+	if err != nil {
+		return 0, false, false
+	}
+	return n, ahead, true
+}
+
 func compareVersions(a, b string) int {
-	a = strings.TrimPrefix(a, "v")
-	b = strings.TrimPrefix(b, "v")
+	a = strings.TrimPrefix(strings.TrimSpace(a), "v")
+	b = strings.TrimPrefix(strings.TrimSpace(b), "v")
 	aParts := strings.Split(a, ".")
 	bParts := strings.Split(b, ".")
 	for i := 0; i < len(aParts) && i < len(bParts); i++ {
-		ai, _ := strconv.Atoi(aParts[i])
-		bi, _ := strconv.Atoi(bParts[i])
-		if ai < bi {
+		ai, aAhead, aOK := versionPartParts(aParts[i])
+		bi, bAhead, bOK := versionPartParts(bParts[i])
+		switch {
+		case !aOK && !bOK:
+			continue
+		case !aOK:
 			return -1
-		}
-		if ai > bi {
+		case !bOK:
 			return 1
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return 1
+		case ai == bi && aAhead != bAhead:
+			if aAhead {
+				return 1
+			}
+			return -1
 		}
 	}
 	if len(aParts) < len(bParts) {
@@ -1604,6 +1675,17 @@ func gitRevParse(dir, rev string) (string, error) {
 func gitSymbolicRef(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD").Output()
 	return strings.TrimSpace(string(out)), err
+}
+
+// gitDescribeVersion reports the version to stamp a self-rebuilt binary with:
+// the repo's current git describe (e.g. v3.2.8 or v3.2.8-4-g44f99a0), or "" if it
+// cannot be determined.
+func gitDescribeVersion(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "describe", "--tags", "--always").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func gitPullFFOnly(dir string) (string, error) {

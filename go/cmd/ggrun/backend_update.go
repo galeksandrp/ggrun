@@ -172,6 +172,8 @@ func updateRegisteredBackend(tag string) error {
 	}
 
 	fmt.Printf("[backend] updating %s (%s)\n", tag, layout.srcDir)
+	oldCommit, _ := gitOutput(layout.srcDir, "rev-parse", "HEAD")
+	oldCommit = strings.TrimSpace(oldCommit)
 	if err := prepareForkCheckoutRecipe(layout.srcDir, branch, commit, recipe); err != nil {
 		return fmt.Errorf("source checkout failed: %w", err)
 	}
@@ -185,6 +187,19 @@ func updateRegisteredBackend(tag string) error {
 
 	candidateBuildDir := fmt.Sprintf("%s-candidate-%s-%d", layout.buildDir, shortCommit(newCommit), time.Now().UnixNano())
 	promoted := false
+	restoreSource := func(reason string) {
+		// A failed build leaves the fork detached at the new (unbuildable)
+		// commit with recipe patches applied. Return the checkout to the
+		// commit we started from so the source state survives a failed
+		// update the same way the generic backend path restores it.
+		if oldCommit != "" {
+			if _, err := gitOutput(layout.srcDir, "checkout", oldCommit); err != nil {
+				fmt.Fprintf(os.Stderr, "[backend] %s: after %s, restore checkout %s failed: %v\n", tag, reason, oldCommit, err)
+			} else {
+				fmt.Printf("[backend] %s: %s; restored source checkout to %s\n", tag, reason, shortCommit(oldCommit))
+			}
+		}
+	}
 	defer func() {
 		if !promoted {
 			_ = pruneCandidateBuildDir(candidateBuildDir, layout.buildDir)
@@ -193,9 +208,11 @@ func updateRegisteredBackend(tag string) error {
 	fmt.Printf("[backend] building isolated candidate (%s)… this can take 30–60 min\n", layout.accel)
 	candidateBin, err := buildLlamaForkAt(layout.srcDir, candidateBuildDir, layout.accel, "")
 	if err != nil {
+		restoreSource("build failed")
 		return fmt.Errorf("build failed: %w", err)
 	}
 	if err := validateBackendCandidate(candidateBin, be.RouteArch, layout.accel); err != nil {
+		restoreSource("candidate conformance failed")
 		return fmt.Errorf("candidate conformance failed; active backend unchanged: %w", err)
 	}
 	fmt.Printf("[backend] candidate passed server/architecture/accelerator conformance: %s\n", candidateBin)

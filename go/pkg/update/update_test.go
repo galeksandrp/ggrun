@@ -49,6 +49,16 @@ func TestCompareVersionsWithSuffix(t *testing.T) {
 	if compareVersions("v3.1.0", "v3.0.9") <= 0 {
 		t.Fatal("expected v3.1.0 to compare newer than v3.0.9")
 	}
+	// A build carrying git-describe commits-ahead is not older than the bare tag.
+	if compareVersions("v3.2.8-4-g44f99a0", "v3.2.8") <= 0 {
+		t.Fatal("expected a build 4 commits ahead of v3.2.8 to compare newer than v3.2.8")
+	}
+	if compareVersions("v3.2.8", "v3.2.8-4-g44f99a0") >= 0 {
+		t.Fatal("expected bare v3.2.8 to compare older than the ahead build")
+	}
+	if compareVersions("v3.2.8-4-g44f99a0", "v3.2.9") >= 0 {
+		t.Fatal("expected v3.2.9 to still be newer than a build ahead of v3.2.8")
+	}
 }
 
 func TestSmokeBackendRequiresServerSurfaceAndConfiguredDevice(t *testing.T) {
@@ -425,6 +435,32 @@ func TestInstalledSourceRepoDirEnvOverride(t *testing.T) {
 	t.Setenv("LLM_APP_HOME", filepath.Join(t.TempDir(), "app"))
 	if got := installedSourceRepoDir(); got != want {
 		t.Fatalf("source repo override mismatch: got %s want %s", got, want)
+	}
+}
+
+// TestInstalledSourceRepoDirFindsNonDefaultLayout covers the ~/ggrun-project/ggrun
+// layout (any source checkout not at $HOME/ggrun and unrelated to the binary's
+// own directory): the app-home resolver backends use must surface it even when
+// neither LLM_SERVER_REPO nor LLM_APP_HOME is set.
+func TestInstalledSourceRepoDirFindsNonDefaultLayout(t *testing.T) {
+	home := t.TempDir()
+	repoDir := filepath.Join(home, "ggrun-project", "ggrun")
+	// A git checkout …
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// … that is also a ggrun app home (holds state).
+	if err := os.MkdirAll(filepath.Join(repoDir, ".config"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".config", "backends.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("LLM_SERVER_REPO", "")
+	t.Setenv("LLM_APP_HOME", "")
+	if got := installedSourceRepoDir(); got != repoDir {
+		t.Fatalf("source repo from non-default layout = %q, want %q", got, repoDir)
 	}
 }
 
