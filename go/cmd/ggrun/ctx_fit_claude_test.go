@@ -50,8 +50,14 @@ func TestClaudeCodeDefaultContextIsBoundedByVRAM(t *testing.T) {
 		t.Fatalf("no context chosen: %d", opts.ContextSize)
 	}
 	// The exact size that fits is asserted in the placement package; here the
-	// contract is that the Claude Code default consults it at all.
-	if fit, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, "", placement.Options{}); opts.ContextSize > fit {
+	// contract is that the Claude Code default consults it at all. The query has
+	// to use the same options the launcher does -- RequireMeasuredBuffers in
+	// particular changes the answer, and comparing against a differently-computed
+	// fit is the very mismatch this pairing exists to prevent.
+	fit, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, "", placement.Options{
+		RequireMeasuredBuffers: true,
+	})
+	if fit > 0 && opts.ContextSize > fit {
 		t.Errorf("chose ctx=%d above the VRAM fit of %d", opts.ContextSize, fit)
 	}
 }

@@ -2333,6 +2333,38 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 // optional caps argument used to derive the verified-config scope key. When
 // caps is nil the scope key is left unset (callers that do not want verified
 // config reuse, or cannot derive hardware, get today's behavior).
+// warnIfContextForcesOffload tells the user when the context they named will push
+// the KV cache onto the host. An explicit context is never lowered -- it is their
+// call -- but a silent collapse in generation speed is not a good way to find out.
+//
+// The comparison asks the planner the same question it is about to answer, with
+// the same options and only ContextSize cleared, rather than re-deriving a fit
+// separately. An independent estimate answered a subtly different question and
+// named a fallback context that did not match what the planner would actually
+// choose -- in both directions.
+func warnIfContextForcesOffload(caps *detect.Capabilities, model *placement.ModelProfile, req *launchRequest, opts placement.Options, userSetCtx bool) {
+	if !userSetCtx || caps == nil || model == nil || opts.ContextSize <= 0 || len(caps.GPUs) == 0 {
+		return
+	}
+	fitOpts := opts
+	fitOpts.ContextSize = 0
+	// A prompt hook would block on a background comparison, and this must never
+	// ask the user anything.
+	fitOpts.DenseCPUOffloadPrompt = nil
+	fitPlan, err := placement.Compute(caps, model, fitOpts)
+	if err != nil || fitPlan == nil || fitPlan.ContextSize <= 0 {
+		return
+	}
+	if opts.ContextSize <= fitPlan.ContextSize {
+		return
+	}
+	ctxOffloadWarning.Do(func() {
+		fmt.Fprintf(os.Stderr,
+			"[launch] warning: --ctx %d exceeds what fits in VRAM (%d); the KV cache will be offloaded to host RAM and generation will be markedly slower. Use --ctx fit, or --ctx %d, to keep it resident.\n",
+			opts.ContextSize, fitPlan.ContextSize, fitPlan.ContextSize)
+	})
+}
+
 // ctxOffloadWarning keeps the "your context will offload" notice to one line:
 // placement is recomputed several times per launch (measured re-plan, recovery),
 // and the notice is about the user's choice, not about any individual plan.
@@ -2365,27 +2397,19 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 		// and is resolved above, so it is never lowered here.
 		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
 			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
+			// Must match the options the real plan is computed with, or the answer
+			// is a different question: RequireMeasuredBuffers in particular drops
+			// the plan-wide headroom, and without it this reported 76800 where the
+			// planner went on to fit 102400 -- a threshold that warns correctly but
+			// names a needlessly small context to fall back to.
+			RequireMeasuredBuffers: true,
+			SWAFull:                hasArg(req.ExtraArgs, "--swa-full"),
 		}); fitCtx > 0 && fitCtx < ctxSize {
 			native := ctxSize
 			ctxOffloadWarning.Do(func() {
 				fmt.Fprintf(os.Stderr, "[launch] context sized to %d to keep the KV cache in VRAM (native %d would offload it)\n", fitCtx, native)
 			})
 			ctxSize = fitCtx
-		}
-	}
-	// An explicit context is the user's call and is never lowered, but it can
-	// quietly push the KV cache onto the host, which costs far more throughput
-	// than the extra window is worth. Say so once instead of letting generation
-	// speed collapse without explanation.
-	if userSetCtx {
-		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
-			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
-		}); fitCtx > 0 && ctxSize > fitCtx {
-			ctxOffloadWarning.Do(func() {
-				fmt.Fprintf(os.Stderr,
-					"[launch] warning: --ctx %d exceeds what fits in VRAM (%d); the KV cache will be offloaded to host RAM and generation will be markedly slower. Use --ctx fit, or --ctx %d, to keep it resident.\n",
-					ctxSize, fitCtx, fitCtx)
-			})
 		}
 	}
 	samplingProfile := requestSamplingProfile(req, model)
@@ -2456,6 +2480,7 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 		claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile),
 		opts.ContextSize, req.ClaudeCode, req.ParallelSet,
 	)
+	warnIfContextForcesOffload(caps, model, req, opts, userSetCtx)
 	// Derive the strategy-free verified-config scope key from the finalized opts.
 	// It is what the reuse lookup in placement.Compute hashes against, and the
 	// save path uses the same computation, so save and load can never disagree.
