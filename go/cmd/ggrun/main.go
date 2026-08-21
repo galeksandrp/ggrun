@@ -2326,7 +2326,10 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
 			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
 		}); fitCtx > 0 && fitCtx < ctxSize {
-			fmt.Fprintf(os.Stderr, "[launch] context sized to %d to keep the KV cache in VRAM (native %d would offload it)\n", fitCtx, ctxSize)
+			native := ctxSize
+			ctxOffloadWarning.Do(func() {
+				fmt.Fprintf(os.Stderr, "[launch] context sized to %d to keep the KV cache in VRAM (native %d would offload it)\n", fitCtx, native)
+			})
 			ctxSize = fitCtx
 		}
 	}
@@ -4917,6 +4920,13 @@ func saveVerifiedConfigForLaunch(cfg *config.Config, req *launchRequest, model *
 // hardware fields are the scope: a change to ctx/parallel/batch/ubatch/KV/
 // mmap/memory-policy/swa-full/chat-template/backend/GPU set all produce a
 // different key and a clean miss.
+// planLogicVersion identifies the placement logic that produced a verified
+// config. Bump it whenever a planner change should retire stored plans: VRAM
+// bandwidth-aware dense splits, VRAM-budgeted context fit, and granular context
+// maximisation all changed what a good plan looks like, and records written
+// before them would otherwise replay the old answer indefinitely.
+const planLogicVersion = "2"
+
 func verifiedConfigScopeKey(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) string {
 	if req == nil || model == nil || be == nil {
 		return ""
@@ -4925,7 +4935,14 @@ func verifiedConfigScopeKey(req *launchRequest, model *placement.ModelProfile, b
 		return ""
 	}
 	opts := placementOptionsFromRequestCaps(req, model, be, "", caps)
-	return placement.NewCalibrationScopeKey(model, caps, opts, nil).String()
+	// A verified config REPLAYS a whole plan and bypasses placement.Compute, so
+	// nothing in the hardware/model/backend scope changes when ggrun's own
+	// planning logic does -- a record written by an older planner would keep
+	// replaying its plan forever. Bind the record to the planner that produced
+	// it: bumping planLogicVersion retires every stored config exactly once.
+	// Only verified configs carry this; measured calibration data describes the
+	// hardware, not our arithmetic, and stays valid across planner changes.
+	return placement.NewCalibrationScopeKey(model, caps, opts, nil).String() + "-plan" + planLogicVersion
 }
 
 func requestedLaunchPolicyIdentity(req *launchRequest, model *placement.ModelProfile) string {

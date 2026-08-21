@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -90,5 +91,31 @@ func TestExplicitMaxContextIsNeverLowered(t *testing.T) {
 	opts := placementOptionsFromRequestCaps(req, model, fitTestBackend(), t.TempDir(), caps)
 	if opts.ContextSize != model.CTXTrain {
 		t.Errorf("--ctx max became %d, want the native %d", opts.ContextSize, model.CTXTrain)
+	}
+}
+
+// A verified config replays a whole plan and never re-runs placement, so a
+// record written by an older planner must not survive a planner change. The
+// scope key is bound to planLogicVersion for exactly that reason.
+func TestVerifiedConfigScopeKeyIsBoundToThePlanner(t *testing.T) {
+	model := fitTestModel(262144, 7000)
+	caps := fitTestCaps(24564)
+	req := &launchRequest{ClaudeCode: true, CtxFlag: "fit"}
+
+	key := verifiedConfigScopeKey(req, model, fitTestBackend(), caps)
+	if key == "" {
+		t.Fatal("no scope key produced")
+	}
+	if !strings.HasSuffix(key, "-plan"+planLogicVersion) {
+		t.Errorf("scope key %q is not bound to the planner version; stored plans would outlive a planner change", key)
+	}
+}
+
+// --no-cached-config must still disable the record entirely.
+func TestVerifiedConfigScopeKeyEmptyWhenCacheDisabled(t *testing.T) {
+	model := fitTestModel(262144, 7000)
+	req := &launchRequest{ClaudeCode: true, CtxFlag: "fit", NoCachedConfig: true}
+	if key := verifiedConfigScopeKey(req, model, fitTestBackend(), fitTestCaps(24564)); key != "" {
+		t.Errorf("scope key = %q, want empty with --no-cached-config", key)
 	}
 }
