@@ -1579,6 +1579,46 @@ func parseGPUIndices(raw string) ([]int, error) {
 	return indices, nil
 }
 
+// validateRequestedGPUs rejects a --gpus selection naming hardware this machine
+// does not have. parseGPUIndices only checks the syntax; existence can only be
+// checked once the hardware is known, and it has to be an error rather than a
+// silent narrowing -- reserving a GPU for other work is exactly the case where
+// quietly using it anyway is worst.
+func validateRequestedGPUs(caps *detect.Capabilities, req *launchRequest) error {
+	if req == nil || strings.TrimSpace(req.GPUsFlag) == "" {
+		return nil
+	}
+	requested, err := parseGPUIndices(req.GPUsFlag)
+	if err != nil {
+		return fmt.Errorf("--gpus: %w", err)
+	}
+	if len(requested) == 0 {
+		return nil
+	}
+	available := map[int]bool{}
+	present := []string{}
+	if caps != nil {
+		for _, gpu := range caps.GPUs {
+			available[gpu.Index] = true
+			present = append(present, fmt.Sprintf("%d (%s)", gpu.Index, gpu.Name))
+		}
+	}
+	missing := []string{}
+	for _, idx := range requested {
+		if !available[idx] {
+			missing = append(missing, strconv.Itoa(idx))
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	if len(present) == 0 {
+		return fmt.Errorf("--gpus %s: no GPUs were detected on this machine", req.GPUsFlag)
+	}
+	return fmt.Errorf("--gpus %s: no GPU with index %s; this machine has %s",
+		req.GPUsFlag, strings.Join(missing, ", "), strings.Join(present, ", "))
+}
+
 // runtimeGPUCapabilities mirrors the device renumbering performed by
 // CUDA_VISIBLE_DEVICES/GGML_VK_VISIBLE_DEVICES. Placement.Compute accepts the
 // physical --gpus indices and restricts internally, but launch-time preflight,
@@ -5072,6 +5112,14 @@ func cmdLaunch(args []string) {
 	caps, err := detect.Detect()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
+		os.Exit(1)
+	}
+	// --gpus selects real hardware, so a name that is not there is a mistake, not
+	// a hint. Silently dropping it narrowed the selection (--gpus 0,3 quietly ran
+	// on one card) and dropping all of it fell back to EVERY GPU -- the opposite
+	// of what someone reserving a card for other work asked for.
+	if err := validateRequestedGPUs(caps, req); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
