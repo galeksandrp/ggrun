@@ -898,6 +898,7 @@ func adviseUnclassifiedLaunchFailure(req *launchRequest, cfg *config.Config, mod
 		return
 	}
 	if mode == "auto" && !statusArtifactReady(cfg) {
+		fmt.Fprintln(os.Stderr, "[support] optional crash diagnosis skipped; install it with: ggrun support install")
 		return
 	}
 	incident := unclassifiedFailureIncident(req, model, be, caps, logExcerpt)

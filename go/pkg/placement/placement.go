@@ -1331,9 +1331,27 @@ func resolveKVQuality(model *ModelProfile, requested, backendTag string) (string
 		// q8_0 KV cache: near-lossless for architectures without a stricter
 		// correctness rule. The fitting logic falls back to q4_0 only when VRAM
 		// genuinely cannot hold q8_0.
-		return "mid", nil
+		requested = "mid"
 	}
-	return requested, nil
+	return resolveHeadDimCompatibleKVQuality(model, requested)
+}
+
+// resolveHeadDimCompatibleKVQuality prevents a quantized cache type from
+// reaching llama.cpp when the model's K or V head width cannot be represented
+// by that ggml block type. Presets are policy, so they may promote to the safe
+// f16 tier. An exact cache type is user intent and fails clearly instead.
+func resolveHeadDimCompatibleKVQuality(model *ModelProfile, requested string) (string, error) {
+	kvType, err := NormalizeKVType(requested)
+	if err != nil {
+		return "", fmt.Errorf("KV cache type: %w", err)
+	}
+	if kvTypeFitsHeadDim(model, kvType) {
+		return requested, nil
+	}
+	if exactKVTypeRequested(requested) {
+		return "", fmt.Errorf("KV cache type %s requires K and V head dimensions divisible by %d (model has key_length=%d, value_length=%d); use --kv-quality f16", kvType, kvCacheBlockSize(kvType), model.KeyLength, model.ValueLength)
+	}
+	return "high", nil
 }
 
 // ResolveKVQuality exposes the same backend/model correctness gate used by
@@ -3706,6 +3724,33 @@ func NormalizeKVType(value string) (string, error) {
 	}
 }
 
+// kvCacheBlockSize returns the number of scalar values in one ggml storage
+// block for the KV types accepted above. Plain floating-point types are scalar;
+// every supported quantized cache type uses 32-value blocks.
+func kvCacheBlockSize(value string) int {
+	typeName, err := NormalizeKVType(value)
+	if err != nil {
+		return 0
+	}
+	switch typeName {
+	case "f32", "f16", "bf16":
+		return 1
+	default:
+		return 32
+	}
+}
+
+func kvTypeFitsHeadDim(model *ModelProfile, kvType string) bool {
+	if model == nil || model.KeyLength <= 0 || model.ValueLength <= 0 {
+		return true
+	}
+	blockSize := kvCacheBlockSize(kvType)
+	if blockSize <= 0 {
+		return false
+	}
+	return model.KeyLength%blockSize == 0 && model.ValueLength%blockSize == 0
+}
+
 func kvTypeFromQuality(quality string) string {
 	typeName, err := NormalizeKVType(quality)
 	if err != nil {
@@ -3730,14 +3775,14 @@ func vCacheType(s *Strategy) string {
 
 func exactKVTypeRequested(quality string) bool {
 	switch strings.ToLower(strings.TrimSpace(quality)) {
-	case "", "high", "mid", "low":
+	case "", "auto", "high", "mid", "low":
 		return false
 	default:
 		return true
 	}
 }
 
-func kvTypesForAutoContext(preferred, quality string) []string {
+func kvTypesForAutoContext(model *ModelProfile, preferred, quality string) []string {
 	values := []string{preferred}
 	if !exactKVTypeRequested(quality) {
 		values = append(values, "q8_0", "q4_0")
@@ -3745,19 +3790,28 @@ func kvTypesForAutoContext(preferred, quality string) []string {
 	seen := make(map[string]bool, len(values))
 	out := make([]string, 0, len(values))
 	for _, value := range values {
-		if value != "" && !seen[value] {
+		if value != "" && !seen[value] && kvTypeFitsHeadDim(model, value) {
 			seen[value] = true
 			out = append(out, value)
 		}
 	}
+	if len(out) == 0 && kvTypeFitsHeadDim(model, "f16") {
+		out = append(out, "f16")
+	}
 	return out
 }
 
-func fallbackKVType(preferred, quality string) string {
+func fallbackKVType(model *ModelProfile, preferred, quality string) string {
 	if exactKVTypeRequested(quality) {
 		return preferred
 	}
-	return "q4_0"
+	if kvTypeFitsHeadDim(model, "q4_0") {
+		return "q4_0"
+	}
+	if kvTypeFitsHeadDim(model, preferred) {
+		return preferred
+	}
+	return "f16"
 }
 
 func kvTypeBytesPerElement(kvType string) (float64, bool) {
@@ -4641,7 +4695,7 @@ func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProf
 		return 32768, preferredKVType
 	}
 
-	orderedTypes := kvTypesForAutoContext(preferredKVType, opts.KVQuality)
+	orderedTypes := kvTypesForAutoContext(model, preferredKVType, opts.KVQuality)
 
 	for _, kvType := range orderedTypes {
 		refCtx := 32768
@@ -4662,7 +4716,7 @@ func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProf
 		}
 	}
 
-	return 32768, fallbackKVType(preferredKVType, opts.KVQuality)
+	return 32768, fallbackKVType(model, preferredKVType, opts.KVQuality)
 }
 
 // resolveAutoKVPlacement decides gpu vs cpu for the KV cache when --kv-placement
@@ -4736,7 +4790,7 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 		return 32768, preferredKVType
 	}
 
-	for _, kvType := range kvTypesForAutoContext(preferredKVType, opts.KVQuality) {
+	for _, kvType := range kvTypesForAutoContext(model, preferredKVType, opts.KVQuality) {
 		refCtx := 32768
 		refKVMB := computeKVTotalMB(model, refCtx, kvType, opts.SWAFull)
 		if refKVMB <= 0 {
@@ -4757,7 +4811,7 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 			return best, kvType
 		}
 	}
-	return 32768, fallbackKVType(preferredKVType, opts.KVQuality)
+	return 32768, fallbackKVType(model, preferredKVType, opts.KVQuality)
 }
 
 // computeAutoContextSize computes the largest context that fits in available
@@ -4810,7 +4864,7 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 		return 32768, preferredKVType
 	}
 
-	orderedTypes := kvTypesForAutoContext(preferredKVType, opts.KVQuality)
+	orderedTypes := kvTypesForAutoContext(model, preferredKVType, opts.KVQuality)
 
 	for _, kvType := range orderedTypes {
 		refCtx := 32768
@@ -4833,7 +4887,7 @@ func computeAutoContextSize(caps *detect.Capabilities, model *ModelProfile, tota
 
 	// Preset qualities may fall back to the compact type. An exact llama.cpp
 	// type is user-owned, so preserve it and lower context instead.
-	return 32768, fallbackKVType(preferredKVType, opts.KVQuality)
+	return 32768, fallbackKVType(model, preferredKVType, opts.KVQuality)
 }
 
 // AutoContextFitVRAM reports the largest context whose KV cache fits alongside

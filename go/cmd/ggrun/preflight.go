@@ -702,12 +702,8 @@ func runGuardedAllocationPreflight(req *launchRequest, be *backendInfo, cfg *con
 		if adjustment := backendAdjustmentFromLog(logData); adjustment != nil {
 			return memoryPlanEvidence{}, &backendLaunchAdjustmentError{Adjustment: *adjustment}
 		}
-		detail := backendLoadFailureDiagnostic(logData)
-		message := "contained backend memory probe did not complete"
-		if detail != "" {
-			message += ": " + detail
-		}
-		cause := fmt.Errorf("%s: %w", withEvidence(message), startErr)
+		message := failedAllocationPreflightMessage(logData, failureLogPath)
+		cause := fmt.Errorf("%s: %w", message, startErr)
 		// The unclassified path: no OOM, no firewall/cgroup rejection, and no
 		// backendAdjustmentFromLog rule matched the log. Mark it explicitly so the
 		// launch caller can consult the advisor for a diagnosis. The wrapper is
@@ -763,6 +759,22 @@ func runGuardedAllocationPreflight(req *launchRequest, be *backendInfo, cfg *con
 		fmt.Fprintln(os.Stderr, "[launch] warning: allocation coverage was incomplete; using this explicitly approved live result once and not caching it")
 	}
 	return evidence, nil
+}
+
+// failedAllocationPreflightMessage keeps an unclassified backend failure from
+// becoming a dead end. It retains the backend's strongest diagnostic and the
+// persisted evidence path, then names bounded launch controls that can avoid a
+// cache/shape incompatibility while the optional advisor is unavailable.
+func failedAllocationPreflightMessage(logData, failureLogPath string) string {
+	message := "contained backend memory probe did not complete"
+	if detail := backendLoadFailureDiagnostic(logData); detail != "" {
+		message += ": " + detail
+	}
+	message += "; try --kv-quality f16, a smaller --ctx-size, or --kv-placement cpu"
+	if failureLogPath != "" {
+		message += " (full probe evidence: " + failureLogPath + ")"
+	}
+	return message
 }
 
 // TotalMB is the device's planned VRAM demand at load time.

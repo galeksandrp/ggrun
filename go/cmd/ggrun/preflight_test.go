@@ -379,6 +379,22 @@ func TestBackendUnclassifiedProbeErrorWrapsCause(t *testing.T) {
 	}
 }
 
+func TestFailedAllocationPreflightMessageIncludesCauseAndNextStep(t *testing.T) {
+	assertion := "GGML_ASSERT failed: n_embd_head_k % blck(type_k) == 0"
+	message := failedAllocationPreflightMessage("loading model\n"+assertion+"\nunable to load model\n", "/tmp/probe.log")
+	if !strings.Contains(message, assertion) {
+		t.Fatalf("preflight message lost backend assertion: %q", message)
+	}
+	for _, flag := range []string{"--kv-quality f16", "--ctx-size", "--kv-placement cpu"} {
+		if !strings.Contains(message, flag) {
+			t.Errorf("preflight message lacks actionable flag %q: %q", flag, message)
+		}
+	}
+	if !strings.Contains(message, "/tmp/probe.log") {
+		t.Fatalf("preflight message lost evidence path: %q", message)
+	}
+}
+
 func TestBackendAdjustmentFromLogDisablesUnsupportedKHadamard(t *testing.T) {
 	log := "DeepSeek4 K-cache Hadamard is not supported; use an untransformed K-cache\n"
 	got := backendAdjustmentFromLog(log)

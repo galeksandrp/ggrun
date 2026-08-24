@@ -243,6 +243,26 @@ func knownCommand(cmd string) bool {
 	}
 }
 
+// firstWordCouldBeAModel distinguishes the legacy `ggrun model.gguf` launch
+// form from a misspelled command. A missing .gguf path is still treated as a
+// model attempt so cmdLaunch can report the useful file error; existing paths
+// and names found in the configured model directory preserve the other legacy
+// launch forms.
+func firstWordCouldBeAModel(word string) bool {
+	if strings.EqualFold(filepath.Ext(word), ".gguf") {
+		return true
+	}
+	if _, err := os.Stat(word); err == nil {
+		return true
+	}
+	cfg, err := config.Load()
+	if err != nil || cfg.ModelDir == "" {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(cfg.ModelDir, word))
+	return err == nil
+}
+
 func dispatchCompat(args []string) bool {
 	if len(args) == 0 || knownCommand(args[0]) {
 		return false
@@ -278,6 +298,15 @@ func dispatchCompat(args []string) bool {
 	}
 	if strings.HasPrefix(args[0], "-") && firstPositional(args) == "" {
 		return false
+	}
+	modelWord := args[0]
+	if strings.HasPrefix(modelWord, "-") {
+		modelWord = firstPositional(args)
+	}
+	if modelWord == "" || !firstWordCouldBeAModel(modelWord) {
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
+		usage()
+		os.Exit(2)
 	}
 	cmdLaunch(args)
 	return true
@@ -5136,6 +5165,18 @@ func cmdLaunch(args []string) {
 	}
 
 	cfg := loadConfigOrExit()
+	req.ModelPath = resolveModelPath(req.ModelPath, cfg.ModelDir)
+
+	model, err := parseModel(req.ModelPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error parsing model: %v\n", err)
+		os.Exit(1)
+	}
+	warnModelCompatibility(model)
+	// Freeze the user's requested serving policy before backend compatibility,
+	// placement recovery, or the support controller adjusts generated knobs.
+	// Those adjusted argv are candidates within this family, not new families.
+	req.ProfilePolicyIdentity = requestedLaunchPolicyIdentity(req, model)
 
 	// A restart races the previous server's teardown: it can hold tens of GB
 	// of VRAM for seconds after ggrun exits, and a plan computed in that window
@@ -5161,19 +5202,6 @@ func cmdLaunch(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-
-	req.ModelPath = resolveModelPath(req.ModelPath, cfg.ModelDir)
-
-	model, err := parseModel(req.ModelPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing model: %v\n", err)
-		os.Exit(1)
-	}
-	warnModelCompatibility(model)
-	// Freeze the user's requested serving policy before backend compatibility,
-	// placement recovery, or the support controller adjusts generated knobs.
-	// Those adjusted argv are candidates within this family, not new families.
-	req.ProfilePolicyIdentity = requestedLaunchPolicyIdentity(req, model)
 
 	be := resolveLaunchBackend(req, model, caps)
 	if recipe := reviewedRecipeRequiredForMain(model.ModelArch, be); recipe != nil {
@@ -7365,18 +7393,81 @@ func guardPortFree(port int, context string) error {
 }
 
 func cmdBenchmark(args []string) {
-	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
-	port := fs.Int("port", 8081, "Server port")
-	model := fs.String("model", "default", "Model name")
-	fs.Parse(args)
-	if _, err := config.ParsePort(strconv.Itoa(*port)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: --port %v\n", err)
+	port, model, err := parseBenchmarkArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(2)
 	}
-	if err := runOneShotBenchmark(*port, *model); err != nil {
+	if err := requireBenchmarkServer(port, time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	if err := runOneShotBenchmark(port, model); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// parseBenchmarkArgs accepts a local GGUF as the command's sole positional
+// argument even when flags follow it. The standard flag package stops at the
+// first positional, which previously discarded both that model and every
+// later flag and could benchmark an unrelated server on the default port.
+func parseBenchmarkArgs(args []string) (int, string, error) {
+	fs := flag.NewFlagSet("benchmark", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	port := fs.Int("port", 8081, "Server port")
+	model := fs.String("model", "default", "Model name")
+
+	flagArgs := make([]string, 0, len(args))
+	positionals := make([]string, 0, 1)
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--port" || arg == "-port" || arg == "--model" || arg == "-model" {
+			flagArgs = append(flagArgs, arg)
+			if i+1 >= len(args) {
+				return 0, "", fmt.Errorf("%s requires a value", arg)
+			}
+			i++
+			flagArgs = append(flagArgs, args[i])
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			flagArgs = append(flagArgs, arg)
+			continue
+		}
+		positionals = append(positionals, arg)
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		return 0, "", err
+	}
+	positionals = append(positionals, fs.Args()...)
+	if len(positionals) > 1 {
+		return 0, "", fmt.Errorf("benchmark accepts at most one model file; usage: ggrun benchmark [model.gguf] [--port N]")
+	}
+	if _, err := config.ParsePort(strconv.Itoa(*port)); err != nil {
+		return 0, "", fmt.Errorf("--port %v", err)
+	}
+	if len(positionals) == 1 {
+		cfg, err := config.Load()
+		if err != nil {
+			return 0, "", fmt.Errorf("load config: %w", err)
+		}
+		resolved := resolveModelPath(positionals[0], cfg.ModelDir)
+		if _, err := parseModel(resolved); err != nil {
+			return 0, "", fmt.Errorf("model %q: %w", positionals[0], err)
+		}
+		*model = filepath.Base(resolved)
+	}
+	return *port, *model, nil
+}
+
+func requireBenchmarkServer(port int, timeout time.Duration) error {
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), timeout)
+	if err != nil {
+		return fmt.Errorf("no llama-server on port %d; start one or pass --port", port)
+	}
+	_ = conn.Close()
+	return nil
 }
 
 func runOneShotBenchmark(port int, model string) error {

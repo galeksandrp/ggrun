@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1583,6 +1584,73 @@ func TestKnownCommandAcceptsUpdateAlias(t *testing.T) {
 	}
 	if !knownCommand("--update") {
 		t.Fatal("expected legacy --update alias to be known")
+	}
+}
+
+func TestFirstWordCouldBeAModelRejectsTyposAndPreservesLegacyLaunches(t *testing.T) {
+	modelDir := t.TempDir()
+	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "missing-config"))
+	t.Setenv("LLM_MODEL_DIR", modelDir)
+	modelInDir := filepath.Join(modelDir, "named-model")
+	if err := os.WriteFile(modelInDir, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	relativeModel := filepath.Join(t.TempDir(), "relative-model")
+	if err := os.WriteFile(relativeModel, []byte("GGUF"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, word := range []string{"missing.gguf", relativeModel, "named-model"} {
+		if !firstWordCouldBeAModel(word) {
+			t.Errorf("legacy model launch %q was rejected", word)
+		}
+	}
+	if firstWordCouldBeAModel("flurb") {
+		t.Fatal("misspelled command was accepted as a model launch")
+	}
+}
+
+func TestParseBenchmarkArgsKeepsPositionalModelAndTrailingFlags(t *testing.T) {
+	modelDir := t.TempDir()
+	modelPath := filepath.Join(modelDir, "bench.gguf")
+	writeGGUFWithTemplate(t, modelPath, "llama", "template")
+	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "missing-config"))
+	t.Setenv("LLM_MODEL_DIR", modelDir)
+
+	for _, args := range [][]string{
+		{"bench.gguf", "--port", "9090"},
+		{"--port", "9090", "bench.gguf"},
+	} {
+		port, model, err := parseBenchmarkArgs(args)
+		if err != nil {
+			t.Fatalf("parse %v: %v", args, err)
+		}
+		if port != 9090 || model != "bench.gguf" {
+			t.Fatalf("parse %v = port %d model %q", args, port, model)
+		}
+	}
+	if _, _, err := parseBenchmarkArgs([]string{"missing.gguf", "--port", "9090"}); err == nil || !strings.Contains(err.Error(), "missing.gguf") {
+		t.Fatalf("missing positional model error = %v", err)
+	}
+	if _, _, err := parseBenchmarkArgs([]string{"bench.gguf", "other.gguf"}); err == nil || !strings.Contains(err.Error(), "at most one") {
+		t.Fatalf("multiple positional models error = %v", err)
+	}
+}
+
+func TestRequireBenchmarkServerFailsFastAndClearly(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	if err := requireBenchmarkServer(port, time.Second); err != nil {
+		t.Fatalf("listening benchmark server rejected: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireBenchmarkServer(port, 100*time.Millisecond); err == nil || !strings.Contains(err.Error(), "no llama-server on port") || !strings.Contains(err.Error(), "--port") {
+		t.Fatalf("closed benchmark port error = %v", err)
 	}
 }
 

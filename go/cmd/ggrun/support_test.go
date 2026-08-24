@@ -148,6 +148,31 @@ func TestAdviseUnclassifiedLaunchFailurePolicyAndAdvisory(t *testing.T) {
 	}
 }
 
+func TestAdviseUnclassifiedLaunchFailureExplainsMissingOptionalAdvisor(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.CacheDir = t.TempDir()
+	cfg.SupportExpert = "auto"
+	cfg.SupportModel = filepath.Join(t.TempDir(), "missing.gguf")
+
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = writeEnd
+	adviseUnclassifiedLaunchFailure(nil, cfg, nil, nil, nil, "backend failed")
+	_ = writeEnd.Close()
+	os.Stderr = originalStderr
+	output, readErr := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !strings.Contains(string(output), "crash diagnosis skipped") || !strings.Contains(string(output), "ggrun support install") {
+		t.Fatalf("missing-advisor note = %q", output)
+	}
+}
+
 // A device-scoped CUDA OOM is the one failure where shedding a layer from the
 // failing card beats cutting global prefill throughput, and it is what the
 // deterministic ladder already prefers. Before this, the advisor could only ever

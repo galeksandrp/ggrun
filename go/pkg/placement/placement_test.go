@@ -3990,11 +3990,72 @@ func TestExactKVTypesAreSizedAndPreserved(t *testing.T) {
 		t.Fatalf("q5_1 must use less memory than q8_0: q5=%d q8=%d", q5, q8)
 	}
 
-	if got := kvTypesForAutoContext("q5_1", "q5_1"); len(got) != 1 || got[0] != "q5_1" {
+	if got := kvTypesForAutoContext(model, "q5_1", "q5_1"); len(got) != 1 || got[0] != "q5_1" {
 		t.Fatalf("explicit cache type must not silently fall back: %v", got)
 	}
-	if got := fallbackKVType("q5_1", "q5_1"); got != "q5_1" {
+	if got := fallbackKVType(model, "q5_1", "q5_1"); got != "q5_1" {
 		t.Fatalf("exact cache type fallback = %q, want q5_1", got)
+	}
+}
+
+func TestOddHeadDimensionUsesSafeKVType(t *testing.T) {
+	model := &ModelProfile{
+		Path: "stories15m.gguf", SizeBytes: 32 * 1024 * 1024,
+		NumLayers: 6, ContextSize: 2048, HeadCountKV: 1,
+		KeyLength: 48, ValueLength: 48,
+	}
+	for _, quality := range []string{"", "auto", "mid", "low"} {
+		got, err := resolveKVQuality(model, quality, "llama")
+		if err != nil {
+			t.Fatalf("preset %q rejected instead of promoting safely: %v", quality, err)
+		}
+		if kvTypeFromQuality(got) != "f16" {
+			t.Fatalf("preset %q resolved to %q/%q, want f16", quality, got, kvTypeFromQuality(got))
+		}
+	}
+
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 8192, FreeMB: 8192},
+		CPU: detect.CPUInfo{Cores: 4},
+	}
+	strategy, err := Compute(caps, model, Options{CPUMode: true, ContextSize: 2048, KVQuality: "auto"})
+	if err != nil {
+		t.Fatalf("compute odd-head-dimension model: %v", err)
+	}
+	if strategy.KVType != "f16" {
+		t.Fatalf("odd-head-dimension plan selected %q KV, want f16", strategy.KVType)
+	}
+}
+
+func TestOddHeadDimensionRejectsExactQuantizedKVType(t *testing.T) {
+	model := &ModelProfile{KeyLength: 48, ValueLength: 48}
+	for _, kvType := range []string{"q8_0", "q5_1", "q4_0"} {
+		_, err := resolveKVQuality(model, kvType, "llama")
+		if err == nil || !strings.Contains(err.Error(), "--kv-quality f16") {
+			t.Fatalf("exact %s error = %v, want a calm f16 recovery hint", kvType, err)
+		}
+	}
+}
+
+func TestAutoContextKVLadderFiltersUnsafeBlockTypes(t *testing.T) {
+	model := &ModelProfile{KeyLength: 48, ValueLength: 48}
+	for _, quality := range []string{"high", "auto", "mid"} {
+		got := kvTypesForAutoContext(model, "f16", quality)
+		if len(got) != 1 || got[0] != "f16" {
+			t.Fatalf("quality %q unsafe ladder = %v, want [f16]", quality, got)
+		}
+		if fallback := fallbackKVType(model, "f16", quality); fallback != "f16" {
+			t.Fatalf("quality %q unsafe fallback = %q, want f16", quality, fallback)
+		}
+	}
+}
+
+func TestUnknownHeadDimensionSkipsKVBlockGuard(t *testing.T) {
+	for _, model := range []*ModelProfile{{KeyLength: 0, ValueLength: 48}, {KeyLength: 48, ValueLength: 0}} {
+		got, err := resolveKVQuality(model, "q8_0", "llama")
+		if err != nil || got != "q8_0" {
+			t.Fatalf("unknown head dimension must preserve q8_0: got %q, err %v", got, err)
+		}
 	}
 }
 
