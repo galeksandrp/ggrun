@@ -88,6 +88,22 @@ func waitForRecords(t *testing.T, path string, want int) []RequestRecord {
 	return nil
 }
 
+// waitForQueued polls the router's queued counter until it reaches want. A fixed
+// sleep here raced admission under load: too short and the second request had
+// not yet blocked on the slot when the backend was released, so no queue wait
+// was ever recorded and the assertion below failed spuriously.
+func waitForQueued(t *testing.T, router *Router, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := router.mainQueued.Load(); n >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("router never reported %d queued request(s)", want)
+}
+
 // postErr sends one routed request and drains the response, so the proxy has
 // finished before the caller inspects metrics. It returns an error rather than
 // failing the test so it is also safe to call from a goroutine.
@@ -222,7 +238,7 @@ func TestRouterRecordsQueueWaitSeparatelyFromPrefill(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() { done <- postErr(router, body) }()
 	}
-	time.Sleep(120 * time.Millisecond)
+	waitForQueued(t, router, 1)
 	close(release)
 	for i := 0; i < 2; i++ {
 		if err := <-done; err != nil {

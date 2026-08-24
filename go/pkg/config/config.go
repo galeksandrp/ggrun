@@ -666,9 +666,15 @@ func (c *Config) Show() string {
 	return b.String()
 }
 
-// Edit opens the config file in the user's preferred editor.
+// Edit opens the config file in the user's preferred editor. Without an
+// interactive terminal it refuses up front: a curses editor launched against a
+// pipe sprays escape sequences and then dies confusingly, and the caller cannot
+// tell the user where the config actually lives.
 func Edit() error {
 	path := Path()
+	if !stdinIsTerminal() {
+		return fmt.Errorf("config edit needs an interactive terminal; edit %s directly", path)
+	}
 	if !fileExists(path) {
 		cfg := Defaults()
 		if err := cfg.Save(); err != nil {
@@ -697,6 +703,27 @@ func Edit() error {
 		return fmt.Errorf("configuration saved but is invalid: %w", err)
 	}
 	return nil
+}
+
+// stdinIsTerminal reports whether standard input is a terminal the editor could
+// actually run on. The ModeCharDevice test alone is not enough: /dev/null is a
+// character device too, and redirecting from it is exactly what a scripted run
+// does. On Linux the fd's target names the device, which separates a real tty
+// from /dev/null; elsewhere fall back to the mode test.
+func stdinIsTerminal() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return false // pipe or regular file: certainly not interactive
+	}
+	if target, err := os.Readlink("/proc/self/fd/0"); err == nil {
+		return strings.HasPrefix(target, "/dev/pts/") ||
+			strings.HasPrefix(target, "/dev/tty") ||
+			strings.HasPrefix(target, "/dev/console")
+	}
+	return true
 }
 
 // Reset removes the config file (with backup).

@@ -323,3 +323,21 @@ func TestPathRespectsExplicitOverride(t *testing.T) {
 		t.Errorf("Path() = %q, want the explicit override", got)
 	}
 }
+
+// Under a test runner stdin is a pipe (or /dev/null), never a terminal. Edit
+// must refuse before launching $EDITOR: nano against a pipe sprays curses
+// output and then dies, and the user is left without the config path.
+func TestEditRefusesNonInteractiveTerminal(t *testing.T) {
+	t.Setenv("EDITOR", "/bin/true") // would "succeed" instantly if launched
+	if err := Edit(); err == nil {
+		t.Fatal("Edit succeeded without an interactive terminal; editor guard missing")
+	} else {
+		msg := err.Error()
+		if !strings.Contains(msg, "interactive terminal") {
+			t.Errorf("error %q does not mention the interactive-terminal requirement", msg)
+		}
+		if !strings.Contains(msg, Path()) {
+			t.Errorf("error %q does not name the config path %q", msg, Path())
+		}
+	}
+}

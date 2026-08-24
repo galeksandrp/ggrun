@@ -3994,3 +3994,90 @@ func TestParseLaunchArgsNoCachedConfigFeedsPlacement(t *testing.T) {
 		t.Fatalf("expected placement options to receive SkipCachedConfig")
 	}
 }
+
+// The help text is the only place a user learns the full --claude-reviewer
+// value set; "off" was selectable but absent from the enumeration, and the
+// bare list said nothing about what each value actually seats.
+func TestClaudeReviewerHelpEnumeratesOffAndDescribesEachValue(t *testing.T) {
+	help := usageText()
+	// Assert inside the --claude-reviewer block only: bare words like "off"
+	// appear under other flags too, and a global Contains would pass even if
+	// the enumeration lost the value again.
+	start := strings.Index(help, "--claude-reviewer")
+	if start < 0 {
+		t.Fatal("help text has no --claude-reviewer entry")
+	}
+	block := help[start:]
+	if end := strings.Index(block, "\n  --"); end >= 0 {
+		block = block[:end]
+	}
+	for _, want := range []string{"off", "auto", "qwen2b", "nanbeige"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("--claude-reviewer help block does not enumerate %q: %q", want, block)
+		}
+	}
+	// Each description must match engine semantics (resolveClaudeCompanionProfile):
+	// auto/qwen share the 4B worker+reviewer, qwen2b is review-only, nanbeige is
+	// the big worker, off seats nothing.
+	if !strings.Contains(block, "Qwen3.5-4B") {
+		t.Errorf("help block does not say which model auto/qwen resolve to: %q", block)
+	}
+	if !strings.Contains(block, "review-only") {
+		t.Errorf("help block does not describe qwen2b as review-only: %q", block)
+	}
+	if !strings.Contains(block, "Nanbeige4.2") {
+		t.Errorf("help block does not name the nanbeige worker: %q", block)
+	}
+	if !strings.Contains(block, "self-review") {
+		t.Errorf("help block does not say what off means for reviews: %q", block)
+	}
+}
+
+// With --claude-reviewer off no reviewer process starts, so a dry-run that
+// promises one contradicts the real launch. The notice must switch to what
+// actually happens.
+func TestDryRunClaudeNoticeOmittedWhenReviewerOff(t *testing.T) {
+	capture := captureStdout(t)
+	printDryRunClaudeNotice(true, true)
+	out := capture()
+	if strings.Contains(out, "starts the local Auto reviewer") {
+		t.Errorf("reviewer-off dry-run still promised a reviewer: %q", out)
+	}
+	if !strings.Contains(out, "no separate reviewer") {
+		t.Errorf("reviewer-off dry-run did not explain self-review: %q", out)
+	}
+}
+
+// The default notice must keep promising the companion, and a plain launch
+// must print nothing at all.
+func TestDryRunClaudeNoticeKeptWhenReviewerSeated(t *testing.T) {
+	capture := captureStdout(t)
+	printDryRunClaudeNotice(true, false)
+	out := capture()
+	if !strings.Contains(out, "starts the local Auto reviewer/router") {
+		t.Errorf("seated-reviewer dry-run lost its notice: %q", out)
+	}
+
+	capture = captureStdout(t)
+	printDryRunClaudeNotice(false, false)
+	if out := capture(); out != "" {
+		t.Errorf("non-Claude dry-run printed %q, want silence", out)
+	}
+}
+
+// Every explicit --claude-reviewer value now hits the same requires-claude-code
+// gate. "auto" used to bypass it, silently accepting a flag that could never
+// take effect outside Claude Code mode.
+func TestClaudeReviewerAutoRequiresClaudeCodeLikeOtherValues(t *testing.T) {
+	isolateConfig(t)
+	for _, value := range []string{"auto", "qwen", "qwen2b", "nanbeige", "off"} {
+		_, err := parseLaunchArgs([]string{"model.gguf", "--claude-reviewer", value})
+		if err == nil {
+			t.Errorf("--claude-reviewer %s without --claude-code was accepted", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), "--claude-code") {
+			t.Errorf("--claude-reviewer %s failed with %v, want the --claude-code gate", value, err)
+		}
+	}
+}

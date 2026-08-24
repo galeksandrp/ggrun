@@ -1341,7 +1341,7 @@ func TestPrelaunchHidesKVContextSuggestionWhenDenseFitsAllGPU(t *testing.T) {
 func TestClaudeReviewerLabelPresentsProfilesByTradeoff(t *testing.T) {
 	for reviewer, wantParts := range map[string][]string{
 		"nanbeige": {"big/fast worker", "Nanbeige4.2", "reviews + works"},
-		"qwen":     {"small/light", "Qwen3.5-4B", "review-only"},
+		"qwen":     {"small/light", "Qwen3.5-4B", "worker+reviewer"},
 		"auto":     {"auto", "automatic"},
 	} {
 		label := claudeReviewerLabel(reviewer)
@@ -1350,9 +1350,36 @@ func TestClaudeReviewerLabelPresentsProfilesByTradeoff(t *testing.T) {
 				t.Fatalf("reviewer %q label %q missing %q", reviewer, label, part)
 			}
 		}
-		// The big profile must name a WORKER model (Nanbeige), never a reviewer-only model.
-		if reviewer == "nanbeige" && strings.Contains(label, "review-only") {
-			t.Fatalf("big/fast worker profile must not be labelled review-only: %q", label)
+		// The engine resolves both "nanbeige" and the historical "qwen" to
+		// worker/reviewer models (main.go, claudeauto.go); only qwen2b is
+		// review-only, so neither dual-role profile may carry that label.
+		if (reviewer == "nanbeige" || reviewer == "qwen") && strings.Contains(label, "review-only") {
+			t.Fatalf("%q profile serves worker+reviewer and must not be labelled review-only: %q", reviewer, label)
+		}
+	}
+}
+
+// A bare "ggrun" under cron/CI has no controlling terminal. The caller only
+// prints "Error: %v", so the message itself must carry the subcommand guidance
+// instead of bubbletea's raw /dev/tty open failure.
+func TestRunWithoutTerminalReturnsGuidanceNotRawTTYError(t *testing.T) {
+	if terminalAvailable() {
+		t.Skip("test environment has a controlling terminal; the no-TTY path is unreachable")
+	}
+	req, err := Run()
+	if req != nil {
+		t.Fatalf("no-TTY run returned a launch request %+v", req)
+	}
+	if err == nil {
+		t.Fatal("no-TTY run returned nil error")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "/dev/tty") {
+		t.Errorf("error leaks the raw TTY open failure: %q", msg)
+	}
+	for _, want := range []string{"no terminal available", "ggrun recommend", "ggrun models list", "ggrun <model.gguf>"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("no-TTY error %q missing guidance %q", msg, want)
 		}
 	}
 }

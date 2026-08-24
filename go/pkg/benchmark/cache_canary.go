@@ -121,7 +121,10 @@ func (r *Runner) RunCacheCanary() (*CacheCanaryResult, error) {
 		return result, nil
 	}
 	if !result.Deterministic {
-		result.Reason = "identical branch replay produced different output"
+		// Factual rather than alarming: sampling-heavy or very small models can
+		// legitimately answer differently across replays, and this only means the
+		// profile is not promoted to a verified config.
+		result.Reason = "output varied across replay (expected on very small models)"
 		return result, nil
 	}
 	if !result.Supported {

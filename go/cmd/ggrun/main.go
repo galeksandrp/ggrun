@@ -137,7 +137,13 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `Usage: ggrun [command] [args]
+	fmt.Fprint(os.Stderr, usageText())
+}
+
+// usageText returns the full help text so tests can assert on it without
+// capturing stderr.
+func usageText() string {
+	return `Usage: ggrun [command] [args]
 
 With no command, launches the interactive TUI (same as ggrun gui).
 
@@ -206,7 +212,11 @@ Launch flags:
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
   --claude-reviewer str  Local reviewer/worker for Claude Code (requires --claude-code):
-                       auto|qwen|qwen2b|nanbeige (default auto)
+                       auto|qwen|qwen2b|nanbeige|off (default auto). auto and qwen
+                       run the Qwen3.5-4B worker+reviewer; qwen2b the light
+                       Qwen3.5-2B review-only lane; nanbeige the Nanbeige4.2
+                       big-MoE worker; off seats no reviewer and the main model
+                       self-reviews
   --chat-template str   Force a corrected chat template from the data-driven catalog
                        by entry name (e.g. nanbeige4.2-3b, qwen3.8-27b) for models whose
                        embedded template llama.cpp's minja engine cannot parse; a value
@@ -221,7 +231,7 @@ Launch flags:
   --support-expert str Optional native expert/optimizer: off|auto|on (default auto)
   --support-online     Allow typed official llama.cpp research for support incidents
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
-`)
+`
 }
 
 func knownCommand(cmd string) bool {
@@ -1257,7 +1267,11 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 	if req.ClaudeProfile != "" && !req.ClaudeCode {
 		return nil, fmt.Errorf("--claude-profile requires --claude-code")
 	}
-	if req.ClaudeReviewerOverride != "" && req.ClaudeReviewerOverride != claudeReviewerAuto && !req.ClaudeCode {
+	// Every --claude-reviewer value is gated the same way. "auto" was once
+	// exempt because it merely restated the default, but it is a real choice
+	// now (it selects the Qwen3.5-4B companion), and letting it pass without
+	// --claude-code would silently accept a flag that can never take effect.
+	if req.ClaudeReviewerOverride != "" && !req.ClaudeCode {
 		return nil, fmt.Errorf("--claude-reviewer requires --claude-code")
 	}
 	// "off" is a placement decision, not a model choice: seat no reviewer at
@@ -6400,9 +6414,22 @@ func cmdDryRun(args []string) {
 	if s := placement.DraftSummary(strategy.Draft); s != "" {
 		fmt.Printf("[spec] %s\n", s)
 	}
-	if req.ClaudeCode {
-		fmt.Println("[claude-code] A real launch also starts the local Auto reviewer/router and then opens Claude Code.")
+	printDryRunClaudeNotice(req.ClaudeCode, req.ClaudeReviewerDisabled)
+}
+
+// printDryRunClaudeNotice closes a dry-run with the same promise the real
+// launch keeps: which Claude Code companion (if any) will start. With the
+// reviewer off no reviewer process starts, so promising one would contradict
+// the shipped v3.2.8 behavior; say what does happen instead.
+func printDryRunClaudeNotice(claudeCode, reviewerDisabled bool) {
+	if !claudeCode {
+		return
 	}
+	if reviewerDisabled {
+		fmt.Println("[claude-code] A real launch opens Claude Code with reviews handled by the main model (no separate reviewer, per --claude-reviewer off).")
+		return
+	}
+	fmt.Println("[claude-code] A real launch also starts the local Auto reviewer/router and then opens Claude Code.")
 }
 
 // launchPlanEnvironment exports the process settings that ggrun's real server

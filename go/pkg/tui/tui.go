@@ -3983,12 +3983,13 @@ func supportExpertLabel(mode string) string {
 // converting its empty default into an explicit launch flag. The profiles are
 // presented by tradeoff rather than raw model names: the "big/fast worker"
 // profile is Nanbeige4.2 — a WORKER model that both reviews and does real work
-// (heavier, stays resident); the "small/light" profile is the Qwen3.5-4B
-// reviewer (cheaper, review-only). "auto" keeps ggrun's automatic choice.
+// (heavier, stays resident); the "small/light" profile is Qwen3.5-4B, which —
+// like Nanbeige — serves both worker and reviewer roles, just lighter.
+// Only "qwen2b" is review-only. "auto" keeps ggrun's automatic choice.
 func claudeReviewerLabel(reviewer string) string {
 	switch strings.TrimSpace(reviewer) {
 	case "qwen":
-		return "small/light (Qwen3.5-4B, review-only)"
+		return "small/light (Qwen3.5-4B, worker+reviewer)"
 	case "qwen2b":
 		return "lightest (Qwen3.5-2B, review-only)"
 	case "nanbeige":
@@ -4038,6 +4039,26 @@ func (m Model) prelaunchParallelLabel() string {
 	return m.parallel
 }
 
+// noTerminalError is what a bare "ggrun" prints when there is no TTY to drive
+// the interactive UI (cron jobs, CI, piped stdin). The caller only wraps this in
+// "Error: %v", so the subcommand guidance has to travel inside the message.
+func noTerminalError() error {
+	return errors.New("no terminal available for the interactive UI; use subcommands instead, e.g. ggrun recommend | ggrun models list | ggrun <model.gguf>")
+}
+
+// terminalAvailable reports whether the process has an interactive terminal it
+// could run the full-screen UI on. Bubbletea opens /dev/tty itself, so checking
+// that device directly is what actually predicts its failure; /dev/null counts
+// as a character device but is not a terminal.
+func terminalAvailable() bool {
+	f, err := os.Open("/dev/tty")
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 func runModel(initial Model) (*LaunchRequest, error) {
 	p := tea.NewProgram(initial, tea.WithAltScreen())
 	m, err := p.Run()
@@ -4051,7 +4072,13 @@ func runModel(initial Model) (*LaunchRequest, error) {
 }
 
 // Run starts the TUI and returns a launch request if the user chose to launch.
+// The terminal check happens before InitialModel: building the model scans every
+// discovered GGUF header, which is wasted seconds when there is no TTY to show
+// the result on.
 func Run() (*LaunchRequest, error) {
+	if !terminalAvailable() {
+		return nil, noTerminalError()
+	}
 	return runModel(InitialModel())
 }
 
@@ -4060,6 +4087,9 @@ func Run() (*LaunchRequest, error) {
 // this request; it does not overwrite the user's default backend for unrelated
 // models.
 func RunAfterBackendInstall(req *LaunchRequest) (*LaunchRequest, error) {
+	if !terminalAvailable() {
+		return nil, noTerminalError()
+	}
 	m := InitialModel()
 	if req == nil {
 		return runModel(m)

@@ -100,7 +100,9 @@ build_gguf --out "$TMP/mla.gguf" --arch deepseek2 --name 'Test-DeepSeek' \
     --kv-lora 512 --q-lora 1536 --ctx-train 163840
 out=$(run_dry "$TMP/mla.gguf")
 assert_contains "$out" "$TMP/mla.gguf" "mla_deepseek: model path included"
-assert_contains "$out" "--ctx-size 131072" "mla_deepseek: auto context selected"
+# 70098f2 maximises auto context instead of snapping to a power of two, so the
+# trained 163840 now passes through at full width rather than clamping to 131072.
+assert_contains "$out" "--ctx-size 163840" "mla_deepseek: auto context selected"
 
 # ── Test 4: ISWA / Gemma-class ───────────────────────────────────────────
 echo "Test: iswa_gemma"
@@ -141,10 +143,10 @@ echo "Test: max_ctx_suggestion_skipped_under_assume_yes"
 out=$(run_dry "$TMP/dense.gguf")
 if [[ "$out" == *"Use max context"* ]]; then
     echo "  ✗ max_ctx prompt leaked into LLM_ASSUME_YES=1 run"
-    ((FAIL++))
+    FAIL=$((FAIL + 1))
 else
     echo "  ✓ max_ctx prompt suppressed under LLM_ASSUME_YES"
-    ((PASS++))
+    PASS=$((PASS + 1))
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────
