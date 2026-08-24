@@ -501,15 +501,19 @@ type Options struct {
 	// BatchSize and UBatchSize are explicit launcher requests. A positive value
 	// must be accounted for before placement is chosen; treating it as a late
 	// backend override can make the emitted server graph exceed the plan.
-	BatchSize   int
-	UBatchSize  int
-	CacheFile   string // path to placement cache for MoE recovery
-	CacheDir    string // path to ggrun cache dir (for probes)
-	Host        string // listen address (default 127.0.0.1)
-	VisionAuto  bool   // auto-detect mmproj for vision
-	MMProjPath  string // explicit vision projector GGUF
-	SpecMode    string // off, auto, draft, eagle3, dflash, ngram, ngram-mod, ngram-k4v, mtp
-	BackendHelp string // llama-server --help output for dialect-specific flags
+	BatchSize  int
+	UBatchSize int
+	// UBatchSizeExplicit distinguishes a user-owned microbatch from the cold
+	// planner default. First-live calibration may challenge an automatic MoE
+	// default with larger measured values, but must never override this intent.
+	UBatchSizeExplicit bool
+	CacheFile          string // path to placement cache for MoE recovery
+	CacheDir           string // path to ggrun cache dir (for probes)
+	Host               string // listen address (default 127.0.0.1)
+	VisionAuto         bool   // auto-detect mmproj for vision
+	MMProjPath         string // explicit vision projector GGUF
+	SpecMode           string // off, auto, draft, eagle3, dflash, ngram, ngram-mod, ngram-k4v, mtp
+	BackendHelp        string // llama-server --help output for dialect-specific flags
 	// SpecCandidateValidator asks the selected backend to load a proposed
 	// companion without allocating model buffers. GGUF metadata establishes
 	// target compatibility; this hook establishes runtime compatibility for

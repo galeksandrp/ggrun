@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/raketenkater/ggrun/pkg/detect"
@@ -13,7 +14,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 4
+const CalibrationSchemaVersion = 5
 
 // CalibrationDecision records which candidate won a measured first-launch
 // calibration for one scope, with the numbers that decided it. The winner is
@@ -107,13 +108,61 @@ func DeleteCalibrationDecision(cacheDir, scopeKey string) error {
 	return nil
 }
 
+// DeleteCalibrationDecisionsForModel removes every named calibration decision
+// for a model. A promoted candidate can have a different placement/ubatch scope
+// from the default key under which its decision was saved; model-scoped cleanup
+// is the fail-closed runtime-OOM path that prevents that winner being replayed.
+func DeleteCalibrationDecisionsForModel(cacheDir string, model *ModelProfile) error {
+	if model == nil {
+		return nil
+	}
+	if cacheDir == "" {
+		home, _ := os.UserHomeDir()
+		cacheDir = filepath.Join(home, ".cache", "ggrun")
+	}
+	want := filepath.Base(model.Path)
+	if want == "." || want == "" {
+		want = filepath.Base(model.Basename)
+	}
+	if want == "." || want == "" {
+		return nil
+	}
+	dir := filepath.Join(cacheDir, "calibration")
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		var decision CalibrationDecision
+		if json.Unmarshal(data, &decision) != nil || filepath.Base(decision.ModelBasename) != want {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // CalibrationCandidate is one alternative placement to measure at first launch.
 // The base strategy (index 0 in the slice returned by CalibrationCandidates) is
-// the estimated default; the rest are deliberate variations the planner believes
-// also fit, generated from the same Compute ledger rather than hand-tuned per
-// model. A candidate is only ever a different *choice* of where things live —
-// never a different context size, slot count, or KV type, so a single scope key
-// covers the whole set.
+// the estimated default; the rest are deliberate, bounded variations. Placement
+// alternatives are generated from the same Compute ledger; larger MoE ubatches
+// must prove themselves through the launcher's contained allocation preflight.
+// Context, slot count, and KV type remain fixed. Offloaded MoE plans may
+// additionally challenge an automatic cold microbatch with bounded larger
+// values; the base microbatch and whether it was explicit remain in the scope.
 type CalibrationCandidate struct {
 	Name     string
 	Strategy *Strategy
@@ -124,9 +173,9 @@ type CalibrationCandidate struct {
 // (length 1) — i.e. "nothing to calibrate" — whenever the alternatives collapse
 // onto the default or the planner cannot prove they fit:
 //
-//   - single GPU or CPU-only: expert/KV relocation has no meaning
+//   - CPU-only: GPU microbatch/placement calibration has no meaning
 //   - non-MoE single-GPU: there is only one place for the weights to go
-//   - no alternative survives the same free-VRAM ledger the default passed
+//   - no bounded ubatch exists and no relocation survives the placement ledger
 //
 // The launcher measures each candidate with the same micro-probe and keeps the
 // fastest under the scope key; the default is always candidate 0 so a failed or
@@ -136,12 +185,34 @@ func CalibrationCandidates(caps *detect.Capabilities, model *ModelProfile, base 
 		return nil
 	}
 	out := []CalibrationCandidate{{Name: "default", Strategy: base}}
-	if len(caps.GPUs) < 2 || base.Type == CPUOnly {
+	if base.Type == CPUOnly {
 		return out
 	}
 
 	switch base.Type {
 	case MoEOffload:
+		// A cold offloaded-MoE plan commonly lands on ubatch 512 because the
+		// whole model cannot fit on one GPU, even when the distributed graph has
+		// room for a much larger prefill microbatch. Challenge 1024 and 2048 and
+		// measure them. This is never a blind default promotion: the launcher
+		// still subjects each candidate to
+		// allocation preflight, live benchmarking, lifecycle canaries, and the
+		// cached-decision invalidation path.
+		if !opts.UBatchSizeExplicit {
+			for _, ubatch := range []int{512, 1024, 2048} {
+				if ubatch <= base.UBatchSize || ubatch > base.BatchSize {
+					continue
+				}
+				alt := cloneStrategy(base)
+				alt.UBatchSize = ubatch
+				alt.CheckpointMinStep = checkpointMinStep(model, ubatch)
+				out = append(out, CalibrationCandidate{Name: fmt.Sprintf("ubatch-%d", ubatch), Strategy: alt})
+			}
+		}
+
+		if len(caps.GPUs) < 2 {
+			return out
+		}
 		// KV-alternate: move the KV cache between GPU and CPU while keeping the
 		// expert policy. Changing KV placement changes both VRAM expert capacity
 		// and host RAM, so this must be a fresh Compute pass. Flipping the field on
@@ -151,25 +222,8 @@ func CalibrationCandidates(caps *detect.Capabilities, model *ModelProfile, base 
 		if base.KVPlacement == "cpu" {
 			altKV = "gpu"
 		}
-		altOpts := opts
+		altOpts := calibrationBaseOptions(opts, base)
 		altOpts.KVPlacement = altKV
-		altOpts.SkipPlacementCache = true
-		altOpts.CacheFile = ""
-		if base.ContextSize > 0 {
-			altOpts.ContextSize = base.ContextSize
-		}
-		if base.Parallel > 0 {
-			altOpts.Parallel = base.Parallel
-		}
-		if base.BatchSize > 0 {
-			altOpts.BatchSize = base.BatchSize
-		}
-		if base.UBatchSize > 0 {
-			altOpts.UBatchSize = base.UBatchSize
-		}
-		if base.KVQuality != "" {
-			altOpts.KVQuality = base.KVQuality
-		}
 		if alt, err := Compute(caps, model, altOpts); err == nil && alt != nil && alt.Type == MoEOffload && alt.KVPlacement == altKV {
 			out = append(out, CalibrationCandidate{Name: "kv-alternate", Strategy: alt})
 		}
@@ -184,6 +238,31 @@ func CalibrationCandidates(caps *detect.Capabilities, model *ModelProfile, base 
 		}
 	}
 	return out
+}
+
+func calibrationBaseOptions(opts Options, base *Strategy) Options {
+	alt := opts
+	alt.SkipPlacementCache = true
+	alt.CacheFile = ""
+	if base == nil {
+		return alt
+	}
+	if base.ContextSize > 0 {
+		alt.ContextSize = base.ContextSize
+	}
+	if base.Parallel > 0 {
+		alt.Parallel = base.Parallel
+	}
+	if base.BatchSize > 0 {
+		alt.BatchSize = base.BatchSize
+	}
+	if base.UBatchSize > 0 {
+		alt.UBatchSize = base.UBatchSize
+	}
+	if base.KVQuality != "" {
+		alt.KVQuality = base.KVQuality
+	}
+	return alt
 }
 
 // cloneStrategy deep-copies the placement-affecting fields of a strategy so a
@@ -256,6 +335,7 @@ type CalibrationScopeKey struct {
 	Parallel        int
 	BatchSize       int
 	UBatchSize      int
+	UBatchExplicit  bool
 	KVQuality       string
 	KVType          string
 	GPUSet          string
@@ -316,6 +396,7 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 		Parallel:        parallel,
 		BatchSize:       batchSize,
 		UBatchSize:      ubatchSize,
+		UBatchExplicit:  opts.UBatchSizeExplicit,
 		KVQuality:       kvQuality,
 		KVType:          kvType,
 		GPUSet:          specGPUSet(opts.GPUs),
@@ -333,6 +414,7 @@ func (k CalibrationScopeKey) String() string {
 		k.ModelIdentity, k.BackendIdentity, k.HardwareID, k.WorkloadProfile,
 		fmt.Sprintf("%d", k.ContextSize), fmt.Sprintf("%d", k.Parallel),
 		fmt.Sprintf("%d", k.BatchSize), fmt.Sprintf("%d", k.UBatchSize),
+		fmt.Sprintf("%t", k.UBatchExplicit),
 		k.KVQuality, k.KVType, k.GPUSet, k.BasePlacement, k.MemoryPolicy,
 		fmt.Sprintf("%t", k.SWAFull), k.ChatTemplate,
 	)

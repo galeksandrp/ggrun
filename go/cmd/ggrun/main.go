@@ -2490,9 +2490,10 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 		// one: it decides whether sliding-window layers hold the whole context,
 		// which on Laguna is the difference between 13.8 GB and 54.0 GB of KV
 		// and therefore between fitting and not fitting.
-		SWAFull:    hasArg(req.ExtraArgs, "--swa-full"),
-		BatchSize:  req.BatchSize,
-		UBatchSize: req.UBatchSize,
+		SWAFull:            hasArg(req.ExtraArgs, "--swa-full"),
+		BatchSize:          req.BatchSize,
+		UBatchSize:         req.UBatchSize,
+		UBatchSizeExplicit: req.UBatchSizeSet,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
 		// normal launch keeps reasoning on so tools like Claude Code can think.
 		ReasoningOff: req.Benchmark || req.WorkerBenchmark,
@@ -5792,6 +5793,13 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 		if err := placement.DeleteCalibrationDecision(cfg.CacheDir, key); err != nil {
 			return fmt.Errorf("remove stale calibration decision: %w", err)
 		}
+	}
+	// A ubatch winner does not naturally generate the lower cold default as a
+	// reverse candidate, so its serving scope cannot reveal the key under which
+	// the decision was saved. Production decisions carry ModelBasename; remove
+	// every decision for this model after a runtime OOM rather than risk replay.
+	if err := placement.DeleteCalibrationDecisionsForModel(cfg.CacheDir, model); err != nil {
+		return fmt.Errorf("remove model calibration decisions: %w", err)
 	}
 	// A runtime OOM is evidence the saved full config is unsafe at runtime. The
 	// verified-config record is scoped by the same strategy-free key the reuse

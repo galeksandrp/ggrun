@@ -29,7 +29,7 @@ const (
 	// Auto mode gets one live challenger regardless of model size. This is the
 	// critical first-live feedback path for large MoE models, while the bounded
 	// start/failure/time budget prevents an unattended restart spiral.
-	calibrationAutoMaxCandidates   = 2 // includes the already-running default
+	calibrationAutoMaxCandidates   = 3 // default plus the bounded 1024/2048 MoE ladder
 	calibrationForcedMaxCandidates = 4
 	calibrationAutoFailureBudget   = 1
 	calibrationForcedFailureBudget = 2
@@ -169,6 +169,10 @@ type calibrationMeasurement struct {
 	Score    float64
 }
 
+func exactCalibrationCandidate(candidateArgs, measuredArgs []string) bool {
+	return formatCommand(candidateArgs) == formatCommand(measuredArgs)
+}
+
 func validCalibrationResult(result *benchmark.Result) bool {
 	if result == nil || result.GenTPS <= 0 || result.PromptTPS <= 0 || result.GenTokens <= 0 || result.PromptTokens <= 0 {
 		return false
@@ -282,6 +286,22 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		cp, measuredStrategy, measuredArgs, serr := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, cand.Strategy, be, caps, candArgs, candidateTimeout, memoryRecovery)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s failed to start (%v); skipping\n", cand.Name, serr)
+			failures++
+			if failures >= budget.MaxFailures {
+				fmt.Fprintln(os.Stderr, "[calibrate] failure budget reached; stopping candidate search")
+				break
+			}
+			continue
+		}
+		// A larger ubatch candidate is useful only when that exact candidate
+		// passed admission. Recovery may make it start by moving experts or
+		// derating ubatch; measuring that different argv and caching the original
+		// candidate name would replay an unverified shape on the next launch.
+		if !exactCalibrationCandidate(candArgs, measuredArgs) {
+			fmt.Fprintf(os.Stderr, "[calibrate] %s needed memory recovery; skipping the altered candidate\n", cand.Name)
+			if !stopCalibrationProcessAndWait(cp, cand.Name+" after memory recovery", resourceBaseline, 30*time.Second) {
+				return cp, measuredStrategy, measuredArgs, nil
+			}
 			failures++
 			if failures >= budget.MaxFailures {
 				fmt.Fprintln(os.Stderr, "[calibrate] failure budget reached; stopping candidate search")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -34,8 +35,8 @@ func calibrateTestSetup(sizeMB int) (*launchRequest, *config.Config, *placement.
 func TestCalibrationPlanIncludesOneBoundedLargeModelChallengerInAuto(t *testing.T) {
 	req, cfg, model, be, caps := calibrateTestSetup(60 * 1024) // 60 GB MoE
 	strategy := &placement.Strategy{Type: placement.MoEOffload, KVPlacement: "cpu", NCPUMoE: 40}
-	if got := calibrationPlan(req, cfg, model, be, caps, strategy); len(got) != calibrationAutoMaxCandidates {
-		t.Fatalf("auto calibration must retain one challenger regardless of size, got %d candidates", len(got))
+	if got := calibrationPlan(req, cfg, model, be, caps, strategy); len(got) < 2 || len(got) > calibrationAutoMaxCandidates {
+		t.Fatalf("auto calibration must retain a bounded challenger regardless of size, got %d candidates", len(got))
 	}
 }
 
@@ -51,7 +52,7 @@ func TestCalibrationPlanForcedOnIgnoresSizeGate(t *testing.T) {
 func TestCalibrationBudgetsAreFinite(t *testing.T) {
 	auto := calibrationBudgetFor(calibrateAuto)
 	forced := calibrationBudgetFor(calibrateOn)
-	if auto.MaxCandidates != 2 || auto.MaxFailures != 1 || auto.MaxElapsed != 20*time.Minute {
+	if auto.MaxCandidates != 3 || auto.MaxFailures != 1 || auto.MaxElapsed != 20*time.Minute {
 		t.Fatalf("unexpected automatic budget: %#v", auto)
 	}
 	if forced.MaxCandidates < auto.MaxCandidates || forced.MaxFailures < auto.MaxFailures || forced.MaxElapsed <= auto.MaxElapsed {
@@ -68,6 +69,17 @@ func TestCalibrationScoreBalancesDecodeAndPrefill(t *testing.T) {
 	invalid := &benchmark.Result{GenTPS: 100, PromptTPS: 0, GenTokens: 256, PromptTokens: 100}
 	if got := calibrationScore(invalid, baseline); got != 0 {
 		t.Fatalf("incomplete candidate received score %v", got)
+	}
+}
+
+func TestExactCalibrationCandidateRejectsRecoveredArgv(t *testing.T) {
+	candidate := []string{"llama-server", "-ub", "1024", "--n-cpu-moe", "40"}
+	if !exactCalibrationCandidate(candidate, append([]string(nil), candidate...)) {
+		t.Fatal("identical candidate argv was rejected")
+	}
+	recovered := []string{"llama-server", "-ub", "512", "--n-cpu-moe", "41"}
+	if exactCalibrationCandidate(candidate, recovered) {
+		t.Fatal("memory-recovered argv was accepted under the original candidate name")
 	}
 }
 
@@ -146,6 +158,29 @@ func TestApplyCalibrationDecisionRestoresWinner(t *testing.T) {
 	// The base estimate must be untouched for the next caller.
 	if base.KVPlacement != "cpu" {
 		t.Fatalf("base strategy mutated to %q", base.KVPlacement)
+	}
+}
+
+func TestApplyCalibrationDecisionRestoresMeasuredUBatchWinner(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	base := &placement.Strategy{
+		Type: placement.MoEOffload, KVPlacement: "cpu", KVQuality: "mid", KVType: "q8_0",
+		ContextSize: 8192, Parallel: 1, BatchSize: 2048, UBatchSize: 512, NCPUMoE: 40,
+	}
+	scopeKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: scopeKey, ModelBasename: filepath.Base(model.Path), Winner: "ubatch-1024",
+		DefaultTPS: 10, WinnerTPS: 10.2, DefaultPromptTPS: 63.4, WinnerPromptTPS: 99.4,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	got := applyCalibrationDecision(req, cfg, model, be, caps, base)
+	if got == base || got.UBatchSize != 1024 {
+		t.Fatalf("cached ubatch winner was not restored: %+v", got)
+	}
+	if base.UBatchSize != 512 {
+		t.Fatalf("base strategy mutated to ubatch %d", base.UBatchSize)
 	}
 }
 
@@ -232,6 +267,33 @@ func TestRuntimeOOMInvalidatesWinnerStrategyCalibrationDecision(t *testing.T) {
 	}
 	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, defaultKey); err == nil {
 		t.Fatal("calibration decision saved under the default key survived an OOM on the winner")
+	}
+}
+
+func TestRuntimeOOMInvalidatesUBatchWinnerCalibrationDecision(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(39 * 1024)
+	cfg.CacheDir = t.TempDir()
+	base := &placement.Strategy{
+		Type: placement.MoEOffload, KVPlacement: "cpu", KVQuality: "mid", KVType: "q8_0",
+		ContextSize: 8192, Parallel: 1, BatchSize: 2048, UBatchSize: 512, NCPUMoE: 40,
+	}
+	defaultKey := calibrationScopeKey(req, model, be, caps, base)
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
+		ScopeKey: defaultKey, ModelBasename: filepath.Base(model.Path), Winner: "ubatch-1024",
+		DefaultTPS: 10, WinnerTPS: 10.2,
+	}); err != nil {
+		t.Fatalf("seed decision: %v", err)
+	}
+	winner := *base
+	winner.UBatchSize = 1024
+	if calibrationScopeKey(req, model, be, caps, &winner) == defaultKey {
+		t.Fatal("test setup: winner ubatch must have a distinct serving scope")
+	}
+	if err := invalidateRuntimeOOMLaunch(req, cfg, model, be, caps, &winner, nil, "runtime oom"); err != nil {
+		t.Fatalf("invalidate: %v", err)
+	}
+	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, defaultKey); err == nil {
+		t.Fatal("ubatch winner decision survived runtime OOM invalidation")
 	}
 }
 

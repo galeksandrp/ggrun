@@ -1539,6 +1539,10 @@ func TestExplicitBatchFlagsFeedPlacementInsteadOfExtraArgs(t *testing.T) {
 	if len(req.ExtraArgs) != 0 {
 		t.Fatalf("explicit placement flags must not remain late extra args: %v", req.ExtraArgs)
 	}
+	opts := placementOptionsFromRequest(req, &placement.ModelProfile{}, &backendInfo{Tag: "llama"}, t.TempDir())
+	if !opts.UBatchSizeExplicit || opts.UBatchSize != 256 {
+		t.Fatalf("explicit ubatch intent did not reach calibration scope: %#v", opts)
+	}
 	if _, err := parseLaunchArgs([]string{"model.gguf", "--batch-size", "128", "--ubatch-size", "256"}); err == nil {
 		t.Fatal("batch smaller than microbatch was accepted")
 	}
