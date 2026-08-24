@@ -21,6 +21,7 @@ test -x "$APP_HOME/ggrun"
 test -x "$APP_HOME/.bin/ggrun"
 test -x "$APP_HOME/.bin/download_any_gguf.py"
 test -x "$APP_HOME/.bin/model_index.py"
+test -x "$APP_HOME/.bin/measure_bandwidth.py"
 test -f "$APP_HOME/.env.sh"
 test -f "$APP_HOME/.config/config"
 grep -q '^LLM_BACKEND="auto"$' "$APP_HOME/.config/config"
@@ -31,6 +32,7 @@ test -d "$APP_HOME/.logs"
 test -d "$APP_HOME/.src"
 test ! -e "$APP_HOME/models/download_any_gguf.py"
 test ! -e "$APP_HOME/models/model_index.py"
+test ! -e "$APP_HOME/models/measure_bandwidth.py"
 
 version_out=$("$APP_HOME/ggrun" version 2>&1)
 if [[ "$version_out" != ggrun* ]]; then

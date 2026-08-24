@@ -38,7 +38,8 @@ try {
     foreach ($spec in @(
         @('tools\gguf\parse_gguf.py', 'parse_gguf.py'),
         @('tools\models\model_index.py', 'model_index.py'),
-        @('tools\download\download_any_gguf.py', 'download_any_gguf.py')
+        @('tools\download\download_any_gguf.py', 'download_any_gguf.py'),
+        @('tools\hardware\measure_bandwidth.py', 'measure_bandwidth.py')
     )) {
         $src = Join-Path $Root $spec[0]
         if (Test-Path $src) { Copy-Item $src (Join-Path $bin $spec[1]) -Force }

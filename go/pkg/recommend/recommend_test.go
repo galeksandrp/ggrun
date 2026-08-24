@@ -412,6 +412,24 @@ func TestMoESpeedEstimateIncludesDispatchCost(t *testing.T) {
 	}
 }
 
+func TestMoESpeedEstimateUsesMeasuredHostMemoryBandwidth(t *testing.T) {
+	candidate := Candidate{MoE: true, TotalParamsB: 200, ActiveParamsB: 12}
+	quant := QuantOption{Name: "Q4_K_M", SizeGB: 110}
+	slow := &detect.Capabilities{
+		HostMemoryBandwidthMBps: 30000,
+		GPUs:                    []detect.GPU{{Name: "NVIDIA GeForce RTX 3090 Ti", VRAMTotalMB: 8192}},
+	}
+	fast := &detect.Capabilities{
+		HostMemoryBandwidthMBps: 120000,
+		GPUs:                    []detect.GPU{{Name: "NVIDIA GeForce RTX 3090 Ti", VRAMTotalMB: 8192}},
+	}
+	slowTPS := predictDecodeTPS(slow, candidate, quant)
+	fastTPS := predictDecodeTPS(fast, candidate, quant)
+	if fastTPS <= slowTPS*2 {
+		t.Fatalf("measured host bandwidth did not materially affect offload estimate: slow %.2f, fast %.2f", slowTPS, fastTPS)
+	}
+}
+
 func TestPredictDecodeTPSDenseSingleGPUUsesFastestFittingCard(t *testing.T) {
 	caps := &detect.Capabilities{GPUs: []detect.GPU{
 		{Name: "NVIDIA GeForce RTX 3090 Ti", VRAMTotalMB: 24564},

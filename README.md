@@ -50,12 +50,26 @@ ggrun unsloth/Qwen3.6-27B-GGUF --download
 ggrun
 ```
 
+On NVIDIA hardware, run this once (and again after changing GPUs or slots) to
+replace topology estimates with measured host-memory and pinned PCIe transfer
+bandwidth:
+
+```bash
+ggrun detect --bandwidth
+```
+
+The cached profile is accepted only on the exact CPU/RAM/GPU/PCI layout that
+produced it. Normal `ggrun detect` and launches fall back to derived PCIe values
+when the profile is absent, stale, incomplete, or corrupt.
+
 ![ggrun TUI demo](demo.gif)
 
 ## What it does
 
 - Plans large-MoE placement from the GGUF, available VRAM and RAM, GPU
   bandwidth, and backend capabilities.
+- Can measure each NVIDIA GPU's pinned host-to-device bandwidth and use the
+  hardware-matched result for MoE placement and recommendation speed estimates.
 - Checks model, KV-cache, and safety-headroom memory before it starts a server.
 - Supports dense and MoE models across single GPU, multi-GPU, CPU, and RAM
   offload configurations.

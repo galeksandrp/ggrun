@@ -4105,6 +4105,12 @@ func TestClaudeReviewerHelpEnumeratesOffAndDescribesEachValue(t *testing.T) {
 	}
 }
 
+func TestHelpAdvertisesMeasuredBandwidthDetection(t *testing.T) {
+	if help := usageText(); !strings.Contains(help, "detect --bandwidth") {
+		t.Fatalf("help does not advertise the hardware bandwidth profiler")
+	}
+}
+
 // With --claude-reviewer off no reviewer process starts, so a dry-run that
 // promises one contradicts the real launch. The notice must switch to what
 // actually happens.

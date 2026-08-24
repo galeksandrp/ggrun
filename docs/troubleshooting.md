@@ -14,6 +14,11 @@ They show the installed build, detected hardware, currently free memory,
 configuration precedence, and the exact backend command ggrun intends to run.
 Do not post private paths, model files, tokens, or prompts in a public issue.
 
+If a multi-GPU MoE split looks wrong for the real PCIe topology, run
+`ggrun detect --bandwidth` once. It performs a short pinned CUDA transfer test,
+caches it for the exact hardware layout, and prints the measured values. The
+ordinary derived PCIe estimate remains the fallback.
+
 ## Installation
 
 ### The installer wants to build a backend

@@ -14,12 +14,14 @@ import (
 
 // Capabilities represents the full hardware and environment profile.
 type Capabilities struct {
-	OS       string    `json:"os"`
-	Arch     string    `json:"arch"`
-	GPUs     []GPU     `json:"gpus"`
-	RAM      RAMInfo   `json:"ram"`
-	CPU      CPUInfo   `json:"cpu"`
-	Backends []Backend `json:"backends"`
+	OS                        string    `json:"os"`
+	Arch                      string    `json:"arch"`
+	GPUs                      []GPU     `json:"gpus"`
+	RAM                       RAMInfo   `json:"ram"`
+	CPU                       CPUInfo   `json:"cpu"`
+	Backends                  []Backend `json:"backends"`
+	HostMemoryBandwidthMBps   int       `json:"host_memory_bandwidth_mbps,omitempty"`
+	HostMemoryBandwidthSource string    `json:"host_memory_bandwidth_source,omitempty"`
 }
 
 // GPU represents a single GPU device.
@@ -82,14 +84,19 @@ func Detect() (*Capabilities, error) {
 	cpu := detectCPU()
 	backends := detectBackends()
 
-	return &Capabilities{
+	caps := &Capabilities{
 		OS:       runtime.GOOS,
 		Arch:     runtime.GOARCH,
 		GPUs:     gpus,
 		RAM:      ram,
 		CPU:      cpu,
 		Backends: backends,
-	}, nil
+	}
+	// A profile is optional measured evidence. Missing, corrupt, or stale
+	// profiles never make hardware detection fail: the PCIe topology derived
+	// above remains the conservative fallback.
+	_ = ApplyCachedBandwidthProfile(caps)
+	return caps, nil
 }
 
 func detectNVIDIA() []GPU {

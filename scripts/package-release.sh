@@ -62,7 +62,8 @@ fi
 for spec in \
     "tools/gguf/parse_gguf.py:parse_gguf.py" \
     "tools/models/model_index.py:model_index.py" \
-    "tools/download/download_any_gguf.py:download_any_gguf.py"; do
+    "tools/download/download_any_gguf.py:download_any_gguf.py" \
+    "tools/hardware/measure_bandwidth.py:measure_bandwidth.py"; do
     src="${spec%%:*}"
     dst="${spec##*:}"
     [[ -f "$ROOT_DIR/$src" ]] && install -m 0755 "$ROOT_DIR/$src" "$PAYLOAD/bin/$dst"

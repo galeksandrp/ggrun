@@ -257,8 +257,12 @@ func predictDecodeTPS(caps *detect.Capabilities, c Candidate, quant QuantOption)
 	if vramBW > 0 {
 		f = clampF(usableVRAMGB/quant.SizeGB, 0, 1)
 	}
-	// blended seconds-per-GB: VRAM-resident bytes read fast, RAM-resident slow.
-	secPerGB := f/vramBWorRAM(vramBW) + (1-f)/ramBandwidthGBps
+	// Blended seconds-per-GB: VRAM-resident bytes read fast, RAM-resident slow.
+	// An explicit hardware profile replaces the generic RAM fallback. The host
+	// parallel memcpy probe reports aggregate read+write memory-controller
+	// traffic, a practical ceiling for the CPU-resident weight stream.
+	ramBW := hostMemoryBandwidthGBps(caps)
+	secPerGB := f/vramBWorRAM(vramBW, ramBW) + (1-f)/ramBW
 	if secPerGB <= 0 {
 		return 0
 	}
@@ -277,9 +281,16 @@ func predictDecodeTPS(caps *detect.Capabilities, c Candidate, quant QuantOption)
 	return clampF(tps, 0, maxPredictedTPS)
 }
 
-func vramBWorRAM(vramBW float64) float64 {
+func hostMemoryBandwidthGBps(caps *detect.Capabilities) float64 {
+	if caps != nil && caps.HostMemoryBandwidthMBps > 0 {
+		return float64(caps.HostMemoryBandwidthMBps) / 1000.0
+	}
+	return ramBandwidthGBps
+}
+
+func vramBWorRAM(vramBW, ramBW float64) float64 {
 	if vramBW <= 0 {
-		return ramBandwidthGBps
+		return ramBW
 	}
 	return vramBW
 }

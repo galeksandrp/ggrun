@@ -80,7 +80,7 @@ func main() {
 	case "version", "--version", "-v":
 		fmt.Println("ggrun", version)
 	case "detect":
-		cmdDetect()
+		cmdDetect(args[1:])
 	case "launch":
 		// `launch --dry-run` must never start a server. Without this reroute the
 		// flag was silently swallowed by parseLaunchArgs and the "dry run" did
@@ -150,6 +150,7 @@ With no command, launches the interactive TUI (same as ggrun gui).
 Commands:
   version              Show version
   detect               Detect hardware capabilities
+  detect --bandwidth   Measure and cache host/CUDA transfer bandwidth
   launch <model.gguf>  Launch model with auto-placement
   benchmark <model>    Benchmark a running server
   daemon               Start persistent daemon
@@ -560,11 +561,44 @@ func firstPositional(args []string) string {
 	return ""
 }
 
-func cmdDetect() {
+func cmdDetect(args []string) {
+	if len(args) == 1 && args[0] == "bandwidth" {
+		args = []string{"--bandwidth"}
+	}
+	flags := flag.NewFlagSet("detect", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	flags.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: ggrun detect [--bandwidth]")
+		flags.PrintDefaults()
+	}
+	measureBandwidth := flags.Bool("bandwidth", false, "measure and cache host/CUDA transfer bandwidth")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(2)
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "Usage: ggrun detect [--bandwidth]")
+		os.Exit(2)
+	}
 	caps, err := detect.Detect()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	if *measureBandwidth {
+		fmt.Fprintln(os.Stderr, "[detect] measuring host memcpy and pinned CUDA transfer bandwidth...")
+		profile, path, measureErr := detect.MeasureAndSaveBandwidth(caps)
+		if measureErr != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", measureErr)
+			os.Exit(1)
+		}
+		if !detect.ApplyBandwidthProfile(caps, profile) {
+			fmt.Fprintln(os.Stderr, "Error: measured bandwidth profile did not match current hardware")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "[detect] saved hardware-matched bandwidth profile: %s\n", path)
 	}
 	data, err := caps.JSON()
 	if err != nil {

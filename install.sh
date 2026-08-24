@@ -1075,7 +1075,7 @@ install_release_bundle() {
     # llm-server-go is listed only for backward compatibility with pre-3.0.1
     # bundles, which shipped the binary under that name. New bundles ship it as
     # ggrun directly, and no ggrun-gui wrapper.
-    for f in setup.sh setup-linux.sh setup-mac.sh ggrun llm-server-bash llm-server-go parse_gguf.py model_index.py download_any_gguf.py; do
+    for f in setup.sh setup-linux.sh setup-mac.sh ggrun llm-server-bash llm-server-go parse_gguf.py model_index.py download_any_gguf.py measure_bandwidth.py; do
         if install_payload_file "$payload_root/$f" "$INSTALL_DIR/$f"; then
             ok "Installed $f"
         elif install_payload_file "$payload_root/bin/$f" "$INSTALL_DIR/$f"; then
@@ -2015,6 +2015,7 @@ done
 install_source_file "tools/gguf/parse_gguf.py" "parse_gguf.py" 0755 || warn "parse_gguf.py not found in source; skipping"
 install_source_file "tools/models/model_index.py" "model_index.py" 0755 || warn "model_index.py not found in source; skipping"
 install_source_file "tools/download/download_any_gguf.py" "download_any_gguf.py" 0755 || warn "download_any_gguf.py not found in source; skipping"
+install_source_file "tools/hardware/measure_bandwidth.py" "measure_bandwidth.py" 0755 || warn "measure_bandwidth.py not found in source; skipping"
 install_legacy_bash_shim
 install_ggrun_from_source
 
