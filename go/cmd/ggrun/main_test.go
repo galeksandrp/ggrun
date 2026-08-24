@@ -1589,6 +1589,9 @@ func TestKnownCommandAcceptsUpdateAlias(t *testing.T) {
 	if !knownCommand("--update") {
 		t.Fatal("expected legacy --update alias to be known")
 	}
+	if !knownCommand("freetoken") {
+		t.Fatal("expected explicit FreeToken adapter command to be known")
+	}
 }
 
 func TestFirstWordCouldBeAModelRejectsTyposAndPreservesLegacyLaunches(t *testing.T) {

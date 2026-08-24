@@ -92,6 +92,8 @@ func main() {
 		}
 	case "benchmark":
 		cmdBenchmark(args[1:])
+	case "freetoken":
+		cmdFreeToken(args[1:])
 	case "daemon":
 		cmdDaemon(args[1:])
 	case "claude-status":
@@ -153,6 +155,7 @@ Commands:
   detect --bandwidth   Measure and cache host/CUDA transfer bandwidth
   launch <model.gguf>  Launch model with auto-placement
   benchmark <model>    Benchmark a running server
+  freetoken <model>    Experimental single-GPU FreeToken server adapter
   daemon               Start persistent daemon
   dry-run <model.gguf> Print computed flags without launching
                        (--emit-server-argv-json supported)
@@ -237,7 +240,7 @@ Launch flags:
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "download", "tune", "spec-test", "recommend", "support", "advisor", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
+	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "freetoken", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "download", "tune", "spec-test", "recommend", "support", "advisor", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
 		return true
 	default:
 		return false
@@ -3695,7 +3698,7 @@ func promptsForUpdates(args []string) bool {
 		return false
 	}
 	for _, a := range args {
-		if a == "--emit-server-argv-json" || a == "--json" {
+		if a == "--emit-server-argv-json" || a == "--json" || a == "--dry-run" {
 			return false
 		}
 	}

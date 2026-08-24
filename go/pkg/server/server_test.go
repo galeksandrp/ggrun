@@ -508,3 +508,78 @@ func TestLoadProgressRetainsClosedShardOffsets(t *testing.T) {
 		t.Fatalf("completed split progress = %d, want 300", got)
 	}
 }
+
+func TestStructuredHealthReadinessWaitsForServing(t *testing.T) {
+	recognized, ready, err := structuredHealthReadiness([]byte(`{"status":"ok","maintenance":"loading"}`))
+	if err != nil || !recognized || ready {
+		t.Fatalf("loading health = recognized %v ready %v err %v", recognized, ready, err)
+	}
+	recognized, ready, err = structuredHealthReadiness([]byte(`{"status":"ok","maintenance":"serving"}`))
+	if err != nil || !recognized || !ready {
+		t.Fatalf("serving health = recognized %v ready %v err %v", recognized, ready, err)
+	}
+}
+
+func TestStructuredHealthReadinessFailsFastOnError(t *testing.T) {
+	recognized, ready, err := structuredHealthReadiness([]byte(`{"status":"error","detail":"worker died"}`))
+	if err == nil || !recognized || ready || !strings.Contains(err.Error(), "worker died") {
+		t.Fatalf("error health = recognized %v ready %v err %v", recognized, ready, err)
+	}
+}
+
+func TestStructuredHealthReadinessPreservesLlamaHealth(t *testing.T) {
+	recognized, ready, err := structuredHealthReadiness([]byte(`{"status":"ok"}`))
+	if err != nil || recognized || ready {
+		t.Fatalf("llama health should stay generic: recognized %v ready %v err %v", recognized, ready, err)
+	}
+}
+
+func TestWaitReadyDoesNotFallThroughToModelsWhileHealthIsLoading(t *testing.T) {
+	var mu sync.Mutex
+	healthCalls := 0
+	modelCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		healthCalls++
+		call := healthCalls
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if call < 3 {
+			_, _ = io.WriteString(w, `{"status":"ok","maintenance":"loading"}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"status":"ok","maintenance":"serving"}`)
+	})
+	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		modelCalls++
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	httpServer := httptest.NewServer(mux)
+	defer httpServer.Close()
+	parsed, err := url.Parse(httpServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, portText, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := (&Process{Port: port}).waitReady(3 * time.Second); err != nil {
+		t.Fatalf("waitReady: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if healthCalls != 3 {
+		t.Fatalf("health calls = %d, want 3", healthCalls)
+	}
+	if modelCalls != 0 {
+		t.Fatalf("/v1/models was probed %d times before structured health became serving", modelCalls)
+	}
+}

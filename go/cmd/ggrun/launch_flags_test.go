@@ -283,6 +283,8 @@ func TestUpdatePromptSkipsQuietCommands(t *testing.T) {
 		{"version"}, {"--version"}, {"help"}, {"-h"},
 		{"update"}, {"dry-run", "m.gguf"}, {"detect"},
 		{"launch", "m.gguf", "--emit-server-argv-json"},
+		{"launch", "m.gguf", "--dry-run"},
+		{"freetoken", "repo/model", "--dry-run"},
 	} {
 		if promptsForUpdates(args) {
 			t.Errorf("%v would block on an update prompt", args)

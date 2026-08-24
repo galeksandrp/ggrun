@@ -178,6 +178,9 @@ ggrun does not own are forwarded unchanged.
 - **macOS:** mainline llama.cpp with Metal and unified-memory detection.
 - **Windows:** CPU bundles and native NVIDIA CUDA support.
 - **Custom binaries:** select one with `--server-bin` or `LLAMA_SERVER`.
+- **FreeToken (experimental):** `ggrun freetoken <checkpoint> --gpu N` provides
+  a strict single-NVIDIA-GPU process/API adapter without pretending FreeToken is
+  a llama.cpp flag dialect. See [the adapter boundary](docs/freetoken.md).
 
 ## Documentation
 
@@ -190,6 +193,7 @@ ggrun does not own are forwarded unchanged.
 [Benchmarks](docs/launch-performance.md) ·
 [Speculative decoding](docs/speculative-decoding.md) ·
 [Model recommendations](docs/model-recommendations.md) ·
+[FreeToken adapter](docs/freetoken.md) ·
 [Docker](docker/README.md) ·
 [Release verification](docs/releases.md) ·
 [Changelog](CHANGELOG.md) ·

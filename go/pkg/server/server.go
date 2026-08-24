@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -366,8 +367,33 @@ func (p *Process) waitReady(timeout time.Duration) error {
 			}
 			resp, requestErr := client.Do(request)
 			if requestErr == nil {
-				_ = resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
+				statusCode := resp.StatusCode
+				if strings.HasSuffix(url, "/health") {
+					body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+					_ = resp.Body.Close()
+					if readErr != nil {
+						cancel()
+						return fmt.Errorf("read server health: %w", readErr)
+					}
+					recognized, ready, stateErr := structuredHealthReadiness(body)
+					if stateErr != nil {
+						cancel()
+						return stateErr
+					}
+					if recognized {
+						cancel()
+						if ready && statusCode == http.StatusOK {
+							return nil
+						}
+						// A structured health endpoint is authoritative. Do not
+						// fall through to /v1/models while it explicitly says the
+						// engine is still loading.
+						break
+					}
+				} else {
+					_ = resp.Body.Close()
+				}
+				if statusCode == http.StatusOK {
 					cancel()
 					return nil
 				}
@@ -391,6 +417,40 @@ func (p *Process) waitReady(timeout time.Duration) error {
 		}
 	}
 	return fmt.Errorf("timeout waiting for server on port %d", p.Port)
+}
+
+// structuredHealthReadiness recognizes engines whose HTTP health endpoint is
+// live before their weights are ready. llama.cpp's {"status":"ok"} remains a
+// generic successful health response; FreeToken-style maintenance states are
+// authoritative, so "loading" must not be confused with "serving".
+func structuredHealthReadiness(body []byte) (recognized, ready bool, err error) {
+	var state struct {
+		Status      string `json:"status"`
+		Maintenance string `json:"maintenance"`
+	}
+	if len(body) == 0 || json.Unmarshal(body, &state) != nil {
+		return false, false, nil
+	}
+	status := strings.ToLower(strings.TrimSpace(state.Status))
+	maintenance := strings.ToLower(strings.TrimSpace(state.Maintenance))
+	if status == "error" || maintenance == "error" || maintenance == "failed" {
+		detail := strings.TrimSpace(string(body))
+		if len(detail) > 512 {
+			detail = detail[:512] + "..."
+		}
+		return true, false, fmt.Errorf("server health reported an error: %s", detail)
+	}
+	if maintenance != "" {
+		return true, maintenance == "serving" || maintenance == "ready", nil
+	}
+	switch status {
+	case "loading", "starting", "initializing", "warming":
+		return true, false, nil
+	default:
+		// Preserve existing llama.cpp and community-backend behavior: a 200
+		// response with no explicit lifecycle field is ready.
+		return false, false, nil
+	}
 }
 
 // Stop terminates the server process gracefully then forcefully.

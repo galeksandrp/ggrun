@@ -13,6 +13,7 @@ backends.
 ggrun --backend ik_llama model.gguf
 ggrun --backend llama model.gguf
 ggrun --backend vulkan model.gguf
+ggrun freetoken Qwen/Qwen3.6-35B-A3B --gpu 0  # experimental separate engine
 
 # Placement and memory
 ggrun model.gguf --gpus 0,1
