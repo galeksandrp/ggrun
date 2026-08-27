@@ -95,20 +95,21 @@ func TestSuggestionUnmarshalObjectFlags(t *testing.T) {
 }
 
 // AI-tune (autonomous loop, cached files, and community configs all route
-// through QualityProtectedFlags) must never override output-quality or context
-// knobs: KV-cache quantization and --parallel. The user's own values survive.
+// through QualityProtectedFlags) must never override placement, output-quality,
+// or context knobs. The user's own values survive.
 func TestQualityProtectedFlagsBlockQualityKnobs(t *testing.T) {
-	base := []string{"-m", "model.gguf", "-b", "4096", "--cache-type-k", "f16", "--parallel", "4", "--ctx-size", "32768"}
+	base := []string{"-m", "model.gguf", "-b", "4096", "-ub", "1024", "--cache-type-k", "f16", "--parallel", "4", "--ctx-size", "32768"}
 	overrides := map[string]interface{}{
-		"-b":             8192,   // perf knob: allowed
+		"-b":             8192,   // placement-owned: must be blocked
+		"-ub":            2048,   // placement-owned: must be blocked
 		"--cache-type-k": "q4_0", // quality: must be blocked
 		"--cache-type-v": "q4_0", // quality: must be blocked
 		"--parallel":     8,      // context-shrinking: must be blocked
 	}
 	result := ApplyOverrides(base, overrides, QualityProtectedFlags())
 	m := flagMap(result)
-	if m["-b"] != "8192" {
-		t.Fatalf("expected batch override to apply, got %v", result)
+	if m["-b"] != "4096" || m["-ub"] != "1024" {
+		t.Fatalf("expected placement-owned batch pair to survive, got %v", result)
 	}
 	if m["--cache-type-k"] != "f16" {
 		t.Fatalf("expected user KV quant f16 preserved, got %q", m["--cache-type-k"])
@@ -138,6 +139,20 @@ func TestApplyOverridesProtectsPlacement(t *testing.T) {
 	}
 	if m["--device"] != "CUDA0" {
 		t.Fatalf("expected protected device to stay CUDA0, got %v", result)
+	}
+}
+
+func TestApplyOverridesProtectsPlacementOwnedBatchPair(t *testing.T) {
+	base := []string{"-m", "model.gguf", "-b", "128", "-ub", "128"}
+	result := ApplyOverrides(base, map[string]interface{}{"-ub": 512}, QualityProtectedFlags())
+	m := flagMap(result)
+	if m["-b"] != "128" || m["-ub"] != "128" {
+		t.Fatalf("unsafe tune overlay survived normalization: %v", result)
+	}
+	result = ApplyOverrides([]string{"-b", "512", "-ub", "128"}, map[string]interface{}{"-ub": 256}, QualityProtectedFlags())
+	m = flagMap(result)
+	if m["-b"] != "512" || m["-ub"] != "128" {
+		t.Fatalf("AI Tune changed a placement-owned batch pair: %v", result)
 	}
 }
 
@@ -363,6 +378,36 @@ func TestDeterministicPlanDoesNotEnableSpecForMoEByDefault(t *testing.T) {
 	}
 }
 
+func TestPlacementSafeTunePlanExcludesBatchMutations(t *testing.T) {
+	generic := []Suggestion{
+		{Name: "batch", FlagValues: map[string]interface{}{"-b": "256"}},
+		{Name: "ubatch", FlagValues: map[string]interface{}{"-ub": "256"}},
+		{Name: "threads", FlagValues: map[string]interface{}{"--threads": "6"}},
+	}
+	plan := placementSafeTunePlan(generic)
+	if len(plan) != 1 || plan[0].Name != "threads" {
+		t.Fatalf("AI Tune should leave coupled batch search to placement calibration: %#v", plan)
+	}
+	for _, candidate := range plan {
+		if _, ok := candidate.FlagValues["-b"]; ok {
+			t.Fatalf("generic one-sided batch candidate survived: %#v", candidate)
+		}
+		if _, ok := candidate.FlagValues["-ub"]; ok {
+			t.Fatalf("generic one-sided ubatch candidate survived: %#v", candidate)
+		}
+	}
+}
+
+func TestAgentWorkloadScoringUsesTurnTime(t *testing.T) {
+	baseline := BenchmarkResult{AgentTurnTimeS: 10}
+	fastComponentsButSlowTurn := BenchmarkResult{GenTPS: 150, PromptTPS: 180, MixedGenTPS: 160, AgentTurnTimeS: 12}
+	lowerTurn := BenchmarkResult{GenTPS: 90, PromptTPS: 90, MixedGenTPS: 90, AgentTurnTimeS: 8}
+	if agentWorkloadScore(fastComponentsButSlowTurn, baseline) >= 1 || agentWorkloadScore(lowerTurn, baseline) <= 1 {
+		t.Fatalf("turn time was not authoritative: slow=%.3f fast=%.3f",
+			agentWorkloadScore(fastComponentsButSlowTurn, baseline), agentWorkloadScore(lowerTurn, baseline))
+	}
+}
+
 func msgsContain(msgs []string, sub string) bool {
 	for _, m := range msgs {
 		if strings.Contains(m, sub) {
@@ -384,6 +429,7 @@ func TestRunConfirmationRevertsUnreproducibleWinner(t *testing.T) {
 		Model:   "m.gguf",
 		Rounds:  3,
 		Backend: "ik_llama",
+		Cache:   NewCache(t.TempDir()),
 		StartServer: func(flags []string) (func(), error) {
 			lastFlags = append([]string(nil), flags...)
 			return func() {}, nil
@@ -410,6 +456,10 @@ func TestRunConfirmationRevertsUnreproducibleWinner(t *testing.T) {
 	}
 	if best.Name != "baseline" || len(best.OverrideFlags) != 0 {
 		t.Fatalf("expected revert to baseline, got name=%q overrides=%v gentps=%.1f", best.Name, best.OverrideFlags, best.Result.GenTPS)
+	}
+	cached, err := e.Cache.FindBest("m.gguf", "")
+	if err != nil || cached == nil || cached.Name != "baseline" {
+		t.Fatalf("unconfirmed one-sample winner leaked into cache: cached=%#v err=%v", cached, err)
 	}
 }
 
@@ -448,5 +498,58 @@ func TestRunConfirmationKeepsReproducibleWinner(t *testing.T) {
 	}
 	if best.Result.GenTPS != 130 {
 		t.Fatalf("expected confirmed gen tok/s 130, got %.1f", best.Result.GenTPS)
+	}
+}
+
+func TestRunAgentWorkloadChoosesConfirmedLowerTurnWithoutChangingBatch(t *testing.T) {
+	initial := []string{"-m", "m.gguf", "-b", "128", "-ub", "128", "--threads", "8"}
+	var lastFlags []string
+	e := &Engine{
+		Model:         "m.gguf",
+		Rounds:        1,
+		Backend:       "ik_llama",
+		AgentParallel: 2,
+		Cache:         NewCache(t.TempDir()),
+		StartServer: func(flags []string) (func(), error) {
+			lastFlags = append([]string(nil), flags...)
+			return func() {}, nil
+		},
+	}
+	e.benchmarkFn = func() (*benchmark.Result, error) {
+		turn, slowest := 10.0, 11.0
+		if !equalFlags(lastFlags, initial) {
+			turn, slowest = 8, 9
+		}
+		return &benchmark.Result{
+			GenTPS: 98, PromptTPS: 120, MixedGenTPS: 160,
+			GenTokens: 128, PromptTokens: 4096, MixedGenTokens: 64, Parallel: 2,
+			AgentSamples: 2, AgentTurnTimeS: turn, AgentTurnMaxS: slowest,
+			AgentCachedTokens: 1800, AgentNewPromptTokens: 80,
+		}, nil
+	}
+	best, err := e.Run("m.gguf", initial)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	flags := flagMap(ApplyOverrides(initial, best.OverrideFlags, QualityProtectedFlags()))
+	if flags["-b"] != "128" || flags["-ub"] != "128" {
+		t.Fatalf("agent AI Tune changed placement-owned batch values: %v (%s)", flags, best.Name)
+	}
+	if best.Result.Score <= 100 {
+		t.Fatalf("expected workload score above baseline, got %.2f", best.Result.Score)
+	}
+	cached, err := e.Cache.FindBestForWorkload("m.gguf", "", "agent-parallel-v2-p2")
+	if err != nil || cached == nil || cached.Result.Score <= 100 {
+		t.Fatalf("confirmed workload winner was not cached by score: cached=%#v err=%v", cached, err)
+	}
+}
+
+func TestRoundRunningAgentRejectsIncompleteConcurrentMetrics(t *testing.T) {
+	e := &Engine{AgentParallel: 2}
+	e.benchmarkFn = func() (*benchmark.Result, error) {
+		return &benchmark.Result{Parallel: 2, PromptTokens: 100, PromptTPS: 100, GenTokens: 64, GenTPS: 20}, nil
+	}
+	if _, err := e.roundRunning(0, "m.gguf", nil); err == nil || !strings.Contains(err.Error(), "incomplete concurrent metrics") {
+		t.Fatalf("expected incomplete mixed phase to fail, got %v", err)
 	}
 }

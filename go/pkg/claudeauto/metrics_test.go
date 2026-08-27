@@ -270,7 +270,8 @@ func TestRouterRecordsReviewerRouteWithoutAdmissionControl(t *testing.T) {
 	// A reviewer on its own backend, so the review really does take the reviewer
 	// route rather than falling back to the main model.
 	reviewer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":25000,"output_tokens":3}}`))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"<block>no</block>"}],"usage":{"input_tokens":25000,"output_tokens":3}}`))
 	}))
 	defer reviewer.Close()
 
@@ -324,6 +325,56 @@ func TestMetricsSummaryAppearsOnRouterEndpoint(t *testing.T) {
 	}
 	if got, ok := status.Metrics["prompt_tokens"].(float64); !ok || got != 100 {
 		t.Errorf("prompt_tokens = %v, want 100", status.Metrics["prompt_tokens"])
+	}
+}
+
+func TestMetricsSummarySeparatesAbortsAndFailuresFromModelWork(t *testing.T) {
+	sink := &metricsSink{}
+	sink.record(RequestRecord{
+		Status:  http.StatusOK,
+		QueueMS: 2,
+		TTFBMS:  12,
+		TotalMS: 112,
+		Usage:   Usage{InputTokens: 100, OutputTokens: 10},
+	})
+	// This is the exact shape of a client that gives up while waiting in the
+	// admission queue: no response writer, first byte, status, or output.
+	sink.record(RequestRecord{
+		Aborted: true,
+		QueueMS: 50,
+		TotalMS: 75,
+	})
+	sink.record(RequestRecord{
+		Status:  http.StatusBadRequest,
+		QueueMS: 3,
+		TTFBMS:  4,
+		TotalMS: 5,
+	})
+
+	summary := sink.summary()
+	for key, want := range map[string]int64{
+		"requests":                 3,
+		"successful":               1,
+		"failed":                   1,
+		"aborted":                  1,
+		"aborted_ms_total":         75,
+		"aborted_queue_ms_total":   50,
+		"aborted_service_ms_total": 25,
+		"queue_ms_total":           55,
+		"prefill_ms_total":         10,
+		"decode_ms_total":          100,
+		"prompt_tokens":            100,
+		"output_tokens":            10,
+	} {
+		if got := summary[key]; got != want {
+			t.Errorf("%s = %v, want %d", key, got, want)
+		}
+	}
+	if got := (RequestRecord{Aborted: true, TotalMS: 75}).DecodeMS(); got != 0 {
+		t.Errorf("aborted decode time = %dms, want 0", got)
+	}
+	if got := summary["decode_tokens_per_s"]; got != float64(100) {
+		t.Errorf("decode throughput = %v, want 100", got)
 	}
 }
 

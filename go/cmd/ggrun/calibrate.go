@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/raketenkater/ggrun/pkg/advisor"
@@ -26,16 +28,23 @@ import (
 const calibrationMinImprovementPct = 3.0
 
 const (
-	// Auto mode gets one live challenger regardless of model size. This is the
-	// critical first-live feedback path for large MoE models, while the bounded
-	// start/failure/time budget prevents an unattended restart spiral.
-	calibrationAutoMaxCandidates   = 3 // default plus the bounded 1024/2048 MoE ladder
-	calibrationForcedMaxCandidates = 4
+	// Standard launch measures the already-running baseline plus one finalist
+	// selected from the calculated candidate set. A wider live sweep belongs to
+	// explicit maintenance mode; ordinary TUI/CLI launch must not reload a large
+	// model once per feasible neighbor.
+	calibrationAutoMaxCandidates   = 2
+	calibrationForcedMaxCandidates = 9
 	calibrationAutoFailureBudget   = 1
 	calibrationForcedFailureBudget = 2
 	calibrationAutoMaxElapsed      = 20 * time.Minute
 	calibrationForcedMaxElapsed    = 60 * time.Minute
 	calibrationAdvisorTiePct       = 3.0
+	// Automatic launch sizes one identical per-lane prompt from a short baseline
+	// prefill so two repeated baseline/finalist scenarios fit inside the finite
+	// controller budget even for a slow CPU-expert MoE. Maintenance calibration
+	// keeps benchmark.Runner's full prompt geometry.
+	calibrationAutoAgentWaveTarget = time.Minute
+	calibrationAutoProbeTimeout    = 2 * time.Minute
 )
 
 type calibrationBudget struct {
@@ -51,40 +60,178 @@ func calibrationBudgetFor(mode string) calibrationBudget {
 	return calibrationBudget{calibrationAutoMaxCandidates, calibrationAutoFailureBudget, calibrationAutoMaxElapsed}
 }
 
+func effectiveCalibrationMode(req *launchRequest) string {
+	if req == nil || req.Calibrate == "" {
+		return calibrateAuto
+	}
+	return req.Calibrate
+}
+
 // calibrationPlan decides whether this launch should run first-launch
 // calibration and, if so, the candidate set to measure. It is a pure function
 // of the request, model, hardware, and whether a prior decision exists, so the
 // policy is unit-testable without starting a server.
 //
-// Returns nil when there is nothing to do: calibration disabled, a decision
-// already cached for this exact scope, or the placement has no alternatives
-// (single GPU, CPU-only, non-MoE single-GPU, symmetric dense split).
-func calibrationPlan(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy) []placement.CalibrationCandidate {
+// Returns nil when there is nothing to do: optimization is disabled, a
+// decision is already cached for this exact scope, or the active workload
+// exposes no bounded full-placement alternate. Automatic mode owns this search
+// for ordinary launch; --calibrate on only widens its maintenance budget.
+func calibrationPlan(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, rejected ...func(*placement.Strategy) bool) []placement.CalibrationCandidate {
 	if req == nil || cfg == nil || model == nil || be == nil || caps == nil || strategy == nil {
 		return nil
 	}
-	mode := req.Calibrate
-	if mode == "" {
-		mode = calibrateAuto
+	if strategy.PerformanceTuned {
+		return nil
 	}
+	mode := effectiveCalibrationMode(req)
 	if mode == calibrateOff {
 		return nil
 	}
+	if mode == calibrateAuto && (req.Benchmark || req.WorkerBenchmark) {
+		// One-shot benchmark commands measure the requested baseline; recursively
+		// benchmarking optimizer candidates first would make their output
+		// non-reproducible. Explicit maintenance mode may still request it.
+		return nil
+	}
+	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
 	candidates := calibrationCandidates(req, cfg, model, be, caps, strategy)
+	if len(rejected) > 0 && rejected[0] != nil {
+		candidates = filterCalibrationCandidates(candidates, rejected[0])
+	}
 	if len(candidates) < 2 {
 		return nil
 	}
+	if decision, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey); err == nil {
+		// A reusable recorded decision (including "default won") makes the
+		// controller finite. A merely screened explicit result is intentionally
+		// not reusable by auto mode and therefore must not suppress the core
+		// workflow search that can promote complete evidence. Likewise, a named
+		// winner that no longer exists in the deterministic candidate set cannot
+		// block a fresh bounded search.
+		reusable := mode == calibrateOn || decision.AutomaticEligible()
+		if reusable && decision.Winner == "default" {
+			return nil
+		}
+		if reusable {
+			for _, candidate := range candidates {
+				if candidate.Name == decision.Winner {
+					return nil
+				}
+			}
+		}
+	}
 	budget := calibrationBudgetFor(mode)
+	if mode == calibrateAuto {
+		candidates = automaticCalibrationFinalistPlan(req, cfg, model, be, caps, candidates)
+	}
+	if len(candidates) < 2 {
+		return nil
+	}
 	if len(candidates) > budget.MaxCandidates {
 		candidates = candidates[:budget.MaxCandidates]
 	}
-	// One decision per scope: once any candidate has won, later launches apply
-	// it directly instead of re-measuring.
-	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
-	if _, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey); err == nil {
-		return nil
-	}
 	return candidates
+}
+
+// filterCalibrationCandidates removes only challengers. Candidate zero is the
+// currently serving baseline and must always remain available for measurement
+// and restoration. This lets a recovered launch continue into the performance
+// lane without ever retrying an argv already disproved in the same lifecycle.
+func filterCalibrationCandidates(candidates []placement.CalibrationCandidate, rejected func(*placement.Strategy) bool) []placement.CalibrationCandidate {
+	if len(candidates) < 2 || rejected == nil {
+		return candidates
+	}
+	out := make([]placement.CalibrationCandidate, 0, len(candidates))
+	out = append(out, candidates[0])
+	for _, candidate := range candidates[1:] {
+		if candidate.Strategy == nil || rejected(candidate.Strategy) {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+// automaticCalibrationFinalistPlan reduces the calculated candidate set to the
+// stable baseline plus one live finalist. The placement package first rejects
+// candidates that do not fit its common device/host ledger and orders the rest
+// with a topology-aware relative performance model. Existing exact allocation
+// evidence wins ties because it can skip an otherwise speculative admission;
+// the live agent benchmark remains the only authority that can promote a win.
+func automaticCalibrationFinalistPlan(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, candidates []placement.CalibrationCandidate) []placement.CalibrationCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	cacheDir := ""
+	if cfg != nil {
+		cacheDir = cfg.CacheDir
+	}
+	opts := placementOptionsFromRequest(req, model, be, cacheDir)
+	candidates = placement.AnalyzeCandidateFrontier(caps, model, opts, candidates)
+	if len(candidates) > 0 && candidates[0].Strategy != nil &&
+		candidates[0].Strategy.Residency == placement.ResidencyNonResident {
+		// Required mmap/dense CPU offload is the last-resort fit lane. Its stable
+		// baseline may collect evidence, but ordinary launch must not pay another
+		// very long load to chase a low-confidence performance estimate. An
+		// explicit --calibrate on maintenance run remains available.
+		return candidates[:1]
+	}
+	ranked := candidates
+	if len(candidates) > 0 && candidates[0].Strategy != nil &&
+		candidates[0].Strategy.Residency == placement.ResidencyTight &&
+		candidates[0].Strategy.ResourceLedger != nil &&
+		candidates[0].Strategy.ResourceLedger.Exact {
+		// Tight launches keep the allocation-proven shape, except a denser
+		// GPU-expert pack may still be live-tested so a too-conservative baseline
+		// can recover. Topology reshuffles remain calculated-only. Without an
+		// exact ledger the launch is merely unmeasured, not proven tight.
+		if tight := placement.TightLiveCandidates(candidates); len(tight) >= 2 {
+			ranked = tight
+		} else {
+			return candidates[:1]
+		}
+	} else {
+		feasible := make([]placement.CalibrationCandidate, 0, len(candidates))
+		if len(candidates) > 0 {
+			feasible = append(feasible, candidates[0])
+		}
+		for _, candidate := range candidates[1:] {
+			if candidate.Estimate.Feasible {
+				feasible = append(feasible, candidate)
+			}
+		}
+		if len(feasible) >= 2 {
+			ranked = feasible
+		}
+	}
+	// An estimated miss is not a product gate on a roomy launch. Contained
+	// admission remains the fail-closed proof.
+	return selectAutomaticCalibrationFinalist(ranked, func(strategy *placement.Strategy) bool {
+		return strategy != nil && strategy.ResourceLedger != nil &&
+			strategy.ResourceLedger.Exact && strategy.ResourceLedger.Fits
+	})
+}
+
+func selectAutomaticCalibrationFinalist(candidates []placement.CalibrationCandidate, hasExactAllocation func(*placement.Strategy) bool) []placement.CalibrationCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	if hasExactAllocation != nil {
+		bestCost := candidates[1].Estimate.AgentCost
+		for _, candidate := range candidates[1:] {
+			candidateCost := candidate.Estimate.AgentCost
+			withinEstimateTie := bestCost <= 0 || candidateCost <= 0 ||
+				candidateCost <= bestCost*(1+calibrationAdvisorTiePct/100)
+			if withinEstimateTie && hasExactAllocation(candidate.Strategy) {
+				return []placement.CalibrationCandidate{candidates[0], candidate}
+			}
+		}
+	}
+	// No alternate shares exact allocation evidence yet. The candidate generator
+	// has already run every option through a complete placement computation and
+	// orders nearest coordinate changes first, so validate only its first
+	// calculated finalist. Contained admission remains the fail-closed proof.
+	return []placement.CalibrationCandidate{candidates[0], candidates[1]}
 }
 
 // applyCalibrationDecision returns the strategy to serve with when a prior
@@ -106,16 +253,122 @@ func applyCalibrationDecision(req *launchRequest, cfg *config.Config, model *pla
 	if req.NoCachedConfig {
 		return strategy
 	}
+	// The decision was measured after the Claude slot/fairness baseline was
+	// finalized. Reproduce that same base before deriving its scope key; looking
+	// up against placement's cold 4096/512 pair can never find a decision saved
+	// under the effective 128/128 workload. A returned batch candidate carries
+	// BatchTuned, so later idempotent slot adjustment preserves the measured win.
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
 	decision, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey)
-	if err != nil || decision.Winner == "" || decision.Winner == "default" {
+	if err != nil || decision.Winner == "" {
+		return strategy
+	}
+	mode := effectiveCalibrationMode(req)
+	if mode != calibrateOn && !decision.AutomaticEligible() {
+		return strategy
+	}
+	if decision.Winner == "default" {
+		strategy.PerformanceTuned = true
+		attachOptimizationEvidence(strategy, decision)
+		req.AppliedCalibration = decision
+		printOptimizationReuse(decision)
 		return strategy
 	}
 	for _, cand := range calibrationCandidates(req, cfg, model, be, caps, strategy) {
 		if cand.Name == decision.Winner {
-			fmt.Printf("[calibrate] applying cached winner %s (%.1f vs default %.1f tok/s)\n", decision.Winner, decision.WinnerTPS, decision.DefaultTPS)
+			req.CalibrationScreened = !decision.AutomaticEligible()
+			cand.Strategy.PerformanceTuned = true
+			attachOptimizationEvidence(cand.Strategy, decision)
+			req.AppliedCalibration = decision
+			printOptimizationReuse(decision)
 			return cand.Strategy
 		}
+	}
+	return strategy
+}
+
+// attachOptimizationEvidence copies the finite recorded search onto the serving
+// strategy so later launches and dry-runs explain the same settled boundary
+// instead of re-analyzing a one-candidate placeholder.
+func attachOptimizationEvidence(strategy *placement.Strategy, decision *placement.CalibrationDecision) {
+	if strategy == nil || decision == nil {
+		return
+	}
+	if decision.ExploredBoundary != nil {
+		strategy.OptimizationBoundary = decision.ExploredBoundary
+	}
+	if strategy.Residency == "" && decision.BaselineResidency != "" {
+		strategy.Residency = decision.BaselineResidency
+	}
+	if strategy.OptimizationBottleneck == "" && decision.BaselineBottleneck != "" {
+		strategy.OptimizationBottleneck = decision.BaselineBottleneck
+	}
+}
+
+func printOptimizationReuse(decision *placement.CalibrationDecision) {
+	if decision == nil || decision.Winner == "" {
+		return
+	}
+	label := "optimize"
+	if decision.ValidationLevel == placement.CalibrationValidationScreened {
+		label = "calibrate"
+	}
+	outcome := decision.FinalistOutcome
+	if outcome == "" {
+		if decision.Winner == "default" {
+			outcome = "baseline-won"
+		} else {
+			outcome = "promoted"
+		}
+	}
+	explored := ""
+	if b := decision.ExploredBoundary; b != nil {
+		explored = fmt.Sprintf("; explored %d candidates (%d feasible), batch %d..%d, ubatch %d..%d, parallel %d..%d",
+			b.CandidateCount, b.FeasibleCount, b.MinBatch, b.MaxBatch, b.MinUBatch, b.MaxUBatch, b.MinParallel, b.MaxParallel)
+	}
+	measured := ""
+	if decision.MeasuredAt != "" {
+		measured = ", measured " + decision.MeasuredAt
+	}
+	fmt.Printf("[%s] reusing %s %s (%s%s, agent workload %.2fs vs default %.2fs%s)\n",
+		label, decision.ValidationLevel, decision.Winner, outcome, measured,
+		decision.WinnerTurnTimeS, decision.DefaultTurnTimeS, explored)
+}
+
+// explainServingOptimization annotates the strategy that launch/dry-run will
+// actually serve. A cached winner already carries its recorded boundary; a cold
+// estimate may compute the full frontier for inspectability, but that ranking
+// never replaces a measured winner with an unbenchmarked neighbor.
+func explainServingOptimization(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, fullFrontier bool) *placement.Strategy {
+	if strategy == nil {
+		return nil
+	}
+	if strategy.OptimizationBoundary != nil && (!fullFrontier || strategy.PerformanceTuned) {
+		return strategy
+	}
+	cacheDir := ""
+	if cfg != nil {
+		cacheDir = cfg.CacheDir
+	}
+	opts := placementOptionsFromRequest(req, model, be, cacheDir)
+	if fullFrontier && !strategy.PerformanceTuned {
+		frontier := calibrationCandidates(req, cfg, model, be, caps, strategy)
+		if len(frontier) == 0 {
+			frontier = []placement.CalibrationCandidate{{Name: "default", Strategy: strategy}}
+		}
+		frontier = placement.AnalyzeCandidateFrontier(caps, model, opts, frontier)
+		if len(frontier) > 0 && frontier[0].Strategy != nil {
+			return frontier[0].Strategy
+		}
+		return strategy
+	}
+	if strategy.OptimizationBoundary != nil {
+		return strategy
+	}
+	analyzed := placement.AnalyzeCandidateFrontier(caps, model, opts, []placement.CalibrationCandidate{{Name: "default", Strategy: strategy}})
+	if len(analyzed) > 0 && analyzed[0].Strategy != nil {
+		return analyzed[0].Strategy
 	}
 	return strategy
 }
@@ -177,19 +430,107 @@ func validCalibrationResult(result *benchmark.Result) bool {
 	if result == nil || result.GenTPS <= 0 || result.PromptTPS <= 0 || result.GenTokens <= 0 || result.PromptTokens <= 0 {
 		return false
 	}
-	return !math.IsNaN(result.GenTPS) && !math.IsInf(result.GenTPS, 0) &&
-		!math.IsNaN(result.PromptTPS) && !math.IsInf(result.PromptTPS, 0)
+	if math.IsNaN(result.GenTPS) || math.IsInf(result.GenTPS, 0) ||
+		math.IsNaN(result.PromptTPS) || math.IsInf(result.PromptTPS, 0) {
+		return false
+	}
+	if result.AgentSamples > 0 {
+		return result.MixedGenTokens > 0 && result.MixedGenTPS > 0 &&
+			result.AgentSamples >= 2 && result.AgentTurnTimeS > 0 && result.AgentTurnMaxS > 0 &&
+			result.AgentScenarioTimeS > 0 && result.AgentScenarioMaxS > 0 && result.AgentPromptBytes > 0 &&
+			result.AgentCachedTokens > 0 && result.AgentNewPromptTokens > 0 &&
+			!math.IsNaN(result.MixedGenTPS) && !math.IsInf(result.MixedGenTPS, 0)
+	}
+	return result.GenTimeS > 0 && !math.IsNaN(result.GenTimeS) && !math.IsInf(result.GenTimeS, 0)
 }
 
-// calibrationScore balances interactive decode and prompt ingestion. Ratios
-// keep the two different units comparable, and the measured default is exactly
-// 1.0. Correctness remains a hard gate: a candidate without a complete valid
-// benchmark never receives a score and is never offered to the advisor.
+func automaticCalibrationEvidenceValid(decision *placement.CalibrationDecision) bool {
+	if decision == nil {
+		return false
+	}
+	return decision.DefaultAgentSamples >= 2 && decision.WinnerAgentSamples >= 2 &&
+		decision.DefaultTurnTimeS > 0 && decision.WinnerTurnTimeS > 0 &&
+		decision.DefaultTurnMaxS > 0 && decision.WinnerTurnMaxS > 0 &&
+		decision.AgentPromptBytes > 0 &&
+		decision.DefaultCachedTokens > 0 && decision.WinnerCachedTokens > 0 &&
+		decision.DefaultNewPromptTokens > 0 && decision.WinnerNewPromptTokens > 0 &&
+		decision.DefaultMixedTPS > 0 && decision.WinnerMixedTPS > 0
+}
+
+func calibrationTurnTime(result *benchmark.Result) float64 {
+	if result == nil {
+		return 0
+	}
+	if result.AgentWorkloadTimeS > 0 {
+		return result.AgentWorkloadTimeS
+	}
+	if result.AgentScenarioTimeS > 0 {
+		return result.AgentScenarioTimeS
+	}
+	if result.AgentSamples > 0 {
+		return result.AgentTurnTimeS
+	}
+	// Runner.Run's generation request includes both prompt ingestion and decode,
+	// so its request wall time is already the end-to-end serial turn. Adding the
+	// separate prefill probe would double-count prompt work.
+	return result.GenTimeS
+}
+
+// calibrationWorstWorkloadTime compares confirmation samples at the same
+// requested agent concurrency. Raw per-wave latency is not comparable across
+// slot widths because a wider server intentionally performs more work in each
+// wave.
+func calibrationWorstWorkloadTime(result *benchmark.Result) float64 {
+	if result == nil {
+		return 0
+	}
+	if result.AgentWorkloadMaxS > 0 {
+		return result.AgentWorkloadMaxS
+	}
+	if result.AgentScenarioMaxS > 0 {
+		return result.AgentScenarioMaxS
+	}
+	worst := result.AgentTurnMaxS
+	if worst <= 0 {
+		return 0
+	}
+	lanes := max(1, result.AgentWorkloadLanes)
+	active := max(1, result.Parallel)
+	if active > lanes {
+		active = lanes
+	}
+	waves := (lanes + active - 1) / active
+	return worst * float64(waves)
+}
+
+// calibrationScore is a direct relative workflow-time objective: baseline
+// cold-ingest-plus-append wall time divided by the candidate's identical
+// scenario. Throughput remains visible for diagnosis and tie-breaking but
+// cannot outweigh a slower user-visible workflow.
 func calibrationScore(result, baseline *benchmark.Result) float64 {
 	if !validCalibrationResult(result) || !validCalibrationResult(baseline) {
 		return 0
 	}
-	return 0.75*(result.GenTPS/baseline.GenTPS) + 0.25*(result.PromptTPS/baseline.PromptTPS)
+	if result.AgentSamples > 0 && result.AgentPromptBytes != baseline.AgentPromptBytes {
+		return 0
+	}
+	baseTime, resultTime := calibrationTurnTime(baseline), calibrationTurnTime(result)
+	if baseTime <= 0 || resultTime <= 0 {
+		return 0
+	}
+	return baseTime / resultTime
+}
+
+func calibrationCandidateBetter(candidate, current calibrationMeasurement) bool {
+	if candidate.Score <= current.Score*(1+calibrationMinImprovementPct/100) {
+		return false
+	}
+	if candidate.Result != nil && current.Result != nil && candidate.Result.AgentSamples > 0 {
+		// The mean must win beyond the noise floor and the slower confirmation
+		// sample must not regress. This prevents one lucky append from winning.
+		return calibrationWorstWorkloadTime(candidate.Result) <= calibrationWorstWorkloadTime(current.Result)
+	}
+	return true
 }
 
 func boundedCalibrationTimeout(configured, remaining time.Duration) time.Duration {
@@ -199,55 +540,131 @@ func boundedCalibrationTimeout(configured, remaining time.Duration) time.Duratio
 	return configured
 }
 
-// runCalibration measures each candidate placement with a live micro-benchmark
-// and returns the strategy to actually serve with. Automatic mode tries one
-// challenger even for very large models, but a start/failure/elapsed budget
-// makes the controller finite. The optional support optimizer only sees typed,
-// already-measured candidates after every main-model process has stopped.
+// runCalibration measures each candidate placement/runtime pair with a live
+// workload benchmark and returns the strategy to actually serve with. Automatic
+// mode walks a bounded ladder even for very large models, but a
+// start/failure/elapsed budget makes the controller finite. The optional support
+// optimizer only sees typed, already-measured candidates after every main-model
+// process has stopped.
 //
 // The decision is returned pending: the caller persists it only after the
 // winner passes the normal functional/cache/profile lifecycle and becomes
 // active. A benchmark alone must never become last-known-good state.
-func runCalibration(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, serverArgs []string, timeout time.Duration, p *server.Process, memoryRecovery *launchMemoryRecovery, resourceBaseline *detect.Capabilities) (*server.Process, *placement.Strategy, []string, *placement.CalibrationDecision) {
-	candidates := calibrationPlan(req, cfg, model, be, caps, strategy)
+func runCalibration(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, serverArgs []string, timeout time.Duration, p *server.Process, memoryRecovery *launchMemoryRecovery, resourceBaseline *detect.Capabilities, planned ...[]placement.CalibrationCandidate) (*server.Process, *placement.Strategy, []string, *placement.CalibrationDecision) {
+	candidates := []placement.CalibrationCandidate(nil)
+	if len(planned) > 0 {
+		candidates = planned[0]
+	} else {
+		candidates = calibrationPlan(req, cfg, model, be, caps, strategy)
+	}
 	if len(candidates) < 2 {
 		return p, strategy, serverArgs, nil
 	}
-	mode := req.Calibrate
-	if mode == "" {
-		mode = calibrateAuto
-	}
+	mode := effectiveCalibrationMode(req)
 	budget := calibrationBudgetFor(mode)
 	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
 	startedAt := time.Now()
-	fmt.Printf("[calibrate] first live profile: measuring at most %d placements (failures=%d, elapsed=%s)\n",
-		budget.MaxCandidates, budget.MaxFailures, budget.MaxElapsed)
+	if mode == calibrateAuto {
+		fmt.Printf("[optimize] measuring the live baseline plus one calculated finalist (elapsed budget=%s)\n", budget.MaxElapsed)
+		printOptimizationSummary("optimize", candidates[0].Strategy, false)
+		finalist := candidates[1]
+		relative := 0.0
+		if candidates[0].Estimate.AgentCost > 0 && finalist.Estimate.AgentCost > 0 &&
+			!math.IsInf(candidates[0].Estimate.AgentCost, 0) && !math.IsInf(finalist.Estimate.AgentCost, 0) {
+			relative = candidates[0].Estimate.AgentCost / finalist.Estimate.AgentCost
+		}
+		fmt.Printf("[optimize] calculated finalist %s: predicted relative %.3f, bottleneck %s, confidence %s; live agent workflows decide\n",
+			finalist.Name, relative, finalist.Estimate.Bottleneck, finalist.Estimate.Confidence)
+	} else {
+		fmt.Printf("[calibrate] explicit maintenance sweep: measuring at most %d placements (failures=%d, elapsed=%s)\n",
+			budget.MaxCandidates, budget.MaxFailures, budget.MaxElapsed)
+	}
 
 	baseURL := fmt.Sprintf("http://localhost:%d", req.Port)
-	bench := func() (*benchmark.Result, error) {
+	workloadLanes := requestWorkloadConcurrency(req)
+	utilizationCaps, _ := runtimeGPUCapabilities(caps, req)
+	agentPromptBytes := 0
+	if mode == calibrateAuto {
+		activeSlots := 1
+		if strategy != nil && strategy.Parallel > 1 {
+			activeSlots = strategy.Parallel
+		}
+		if activeSlots > workloadLanes {
+			activeSlots = workloadLanes
+		}
+		// RunAgentParallel deliberately caps a bounded screen at four lanes.
+		if activeSlots > 4 {
+			activeSlots = 4
+		}
+		maxUBatch := 0
+		for _, candidate := range candidates {
+			if candidate.Strategy != nil && candidate.Strategy.UBatchSize > maxUBatch {
+				maxUBatch = candidate.Strategy.UBatchSize
+			}
+		}
+		probeTimeout := calibrationAutoProbeTimeout
+		if remaining := budget.MaxElapsed - time.Since(startedAt); remaining/4 < probeTimeout {
+			probeTimeout = remaining / 4
+		}
+		probeRunner := &benchmark.Runner{
+			BaseURL: baseURL, Model: model.Basename, Timeout: probeTimeout, WorkloadID: scopeKey,
+		}
+		probe, probeErr := probeRunner.ProbeAgentPrefill()
+		agentPromptBytes = benchmark.SuggestedAgentPromptBytes(probe, activeSlots, maxUBatch, calibrationAutoAgentWaveTarget)
+		if probeErr != nil {
+			fmt.Fprintf(os.Stderr, "[optimize] short prefill pilot failed (%v); using bounded %d-byte/lane fallback\n",
+				probeErr, agentPromptBytes)
+		} else {
+			approxTokens := agentPromptBytes / 4
+			if probe.PromptBytes > 0 && probe.PromptTokens > 0 {
+				approxTokens = agentPromptBytes * probe.PromptTokens / probe.PromptBytes
+			}
+			fmt.Printf("[optimize] prefill pilot %.1f tok/s; bounded screen uses %d bytes (~%d tokens) per lane for both placements\n",
+				probe.PromptTPS, agentPromptBytes, approxTokens)
+		}
+	}
+	bench := func(active *placement.Strategy) (*benchmark.Result, error) {
 		remaining := budget.MaxElapsed - time.Since(startedAt)
 		if remaining <= 3*time.Second {
 			return nil, fmt.Errorf("calibration elapsed-time budget exhausted")
 		}
-		// Runner performs three requests. Dividing the remaining wall budget keeps
-		// a stalled endpoint from multiplying the overall controller deadline.
+		// Bound each request by a fraction of the remaining controller budget. The
+		// agent runner issues several requests concurrently, so this is deliberately
+		// a per-request guard rather than an estimate of total call count.
 		requestTimeout := 5 * time.Minute
 		if perRequest := remaining / 3; perRequest < requestTimeout {
 			requestTimeout = perRequest
 		}
-		runner := &benchmark.Runner{BaseURL: baseURL, Model: model.Basename, Timeout: requestTimeout}
-		res, err := runner.Run()
+		runner := &benchmark.Runner{
+			BaseURL: baseURL, Model: model.Basename, Timeout: requestTimeout,
+			WorkloadID: scopeKey, AgentPromptBytes: agentPromptBytes,
+			SampleGPUUtilization: func() []benchmark.GPUUtilization {
+				return sampleLaunchGPUUtilization(utilizationCaps)
+			},
+		}
+		slots := 1
+		if active != nil && active.Parallel > 1 {
+			slots = active.Parallel
+		}
+		if slots > workloadLanes {
+			slots = workloadLanes
+		}
+		res, err := runner.RunAgentParallel(slots)
 		if err != nil {
 			return nil, err
 		}
 		if !validCalibrationResult(res) {
 			return nil, fmt.Errorf("benchmark returned incomplete metrics")
 		}
+		waves := (workloadLanes + slots - 1) / slots
+		res.AgentWorkloadLanes = workloadLanes
+		res.AgentWorkloadTimeS = res.AgentScenarioTimeS * float64(waves)
+		res.AgentWorkloadMaxS = res.AgentScenarioMaxS * float64(waves)
 		return res, nil
 	}
 
 	// The default is already running: measure it in place.
-	defaultResult, err := bench()
+	defaultResult, err := bench(strategy)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[calibrate] baseline measurement failed (%v); serving default placement\n", err)
 		return p, strategy, serverArgs, nil
@@ -256,8 +673,41 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		Name: "default", Strategy: strategy, Args: serverArgs,
 		Result: defaultResult, Score: 1,
 	}}
-	fmt.Printf("[calibrate] default: decode %.1f tok/s, prefill %.1f tok/s, score %.3f\n",
-		defaultResult.GenTPS, defaultResult.PromptTPS, 1.0)
+	fmt.Printf("[calibrate] default: workload makespan %.2fs, decode %.1f tok/s, prefill %.1f tok/s\n",
+		calibrationTurnTime(defaultResult), defaultResult.GenTPS, defaultResult.PromptTPS)
+	if bottleneck := deviceBalanceBottleneckFromResult(strategy, defaultResult); bottleneck != "" {
+		fmt.Printf("[optimize] device balance: %s\n", bottleneck)
+		if strategy != nil && (strategy.OptimizationBottleneck == "" || strings.Contains(strategy.OptimizationBottleneck, "layer service")) {
+			strategy.OptimizationBottleneck = bottleneck
+		}
+	}
+	if defaultResult.AgentSamples > 0 {
+		fmt.Printf("[calibrate] default agent evidence: %d active lanes for %d-agent target, %d samples, %d bytes/lane, reuse >=%d tokens/lane, slowest workflow %.2fs, mixed foreground %.1f tok/s\n",
+			defaultResult.Parallel, defaultResult.AgentWorkloadLanes, defaultResult.AgentSamples, defaultResult.AgentPromptBytes,
+			defaultResult.AgentCachedTokens, calibrationWorstWorkloadTime(defaultResult), defaultResult.MixedGenTPS)
+	}
+	if mode == calibrateAuto {
+		signal := deviceBalanceSignalFromResult(strategy, defaultResult)
+		if signal.Imbalanced {
+			measuredBottleneck := placement.DeviceBalanceBottleneck(strategy, gpuUtilSamplesFromResult(defaultResult))
+			if strategy != nil && strategy.Residency != placement.ResidencyRoomy {
+				fmt.Printf("[optimize] measured device imbalance, but the exact launch is %s; retaining its proven live-search boundary\n",
+					strategy.Residency)
+			} else if finalist, ok := telemetryDirectedCalibrationFinalist(req, cfg, model, be, caps, strategy, signal, memoryRecovery); ok {
+				if candidates[1].Name != finalist.Name {
+					fmt.Printf("[optimize] replacing calculated finalist %s with telemetry-directed %s to move work off saturated GPU %d\n",
+						candidates[1].Name, finalist.Name, signal.BusyGPU)
+				}
+				candidates = []placement.CalibrationCandidate{candidates[0], finalist}
+			} else {
+				fmt.Printf("[optimize] measured device imbalance, but no non-rejected same-workload topology can relieve GPU %d; keeping calculated finalist %s\n",
+					signal.BusyGPU, candidates[1].Name)
+			}
+			if measuredBottleneck != "" {
+				strategy.OptimizationBottleneck = measuredBottleneck
+			}
+		}
+	}
 
 	curP := p
 	failures := 0
@@ -300,6 +750,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		if !exactCalibrationCandidate(candArgs, measuredArgs) {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s needed memory recovery; skipping the altered candidate\n", cand.Name)
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after memory recovery", resourceBaseline, 30*time.Second) {
+				req.CalibrationScreened = true
 				return cp, measuredStrategy, measuredArgs, nil
 			}
 			failures++
@@ -309,10 +760,11 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			}
 			continue
 		}
-		result, berr := bench()
+		result, berr := bench(measuredStrategy)
 		if berr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s measurement failed (%v); skipping\n", cand.Name, berr)
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after failed measurement", resourceBaseline, 30*time.Second) {
+				req.CalibrationScreened = true
 				return cp, measuredStrategy, measuredArgs, nil
 			}
 			failures++
@@ -323,37 +775,59 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			continue
 		}
 		score := calibrationScore(result, defaultResult)
-		fmt.Printf("[calibrate] %s: decode %.1f tok/s, prefill %.1f tok/s, score %.3f\n",
-			cand.Name, result.GenTPS, result.PromptTPS, score)
+		fmt.Printf("[calibrate] %s: workload makespan %.2fs, decode %.1f tok/s, prefill %.1f tok/s, relative %.3f\n",
+			cand.Name, calibrationTurnTime(result), result.GenTPS, result.PromptTPS, score)
+		if result.AgentSamples > 0 {
+			fmt.Printf("[calibrate] %s agent evidence: %d active lanes for %d-agent target, %d samples, %d bytes/lane, reuse >=%d tokens/lane, slowest workflow %.2fs, mixed foreground %.1f tok/s\n",
+				cand.Name, result.Parallel, result.AgentWorkloadLanes, result.AgentSamples, result.AgentPromptBytes,
+				result.AgentCachedTokens, calibrationWorstWorkloadTime(result), result.MixedGenTPS)
+		}
 		measurements = append(measurements, calibrationMeasurement{
 			Name: cand.Name, Strategy: measuredStrategy, Args: measuredArgs,
 			Result: result, Score: score,
 		})
 		if !stopCalibrationProcessAndWait(cp, "measured candidate "+cand.Name, resourceBaseline, 30*time.Second) {
+			req.CalibrationScreened = true
 			return cp, measuredStrategy, measuredArgs, nil
 		}
 	}
 
-	// A failed challenger still leaves the known-good default stopped. Bring it
-	// back immediately; no incomplete candidate is ever cached or advised.
+	// A failed finalist still leaves a complete baseline workload measurement.
+	// Bring the known-good default back and return a default-won decision so the
+	// exact scope does not repeat the same failed experiment next launch. The
+	// caller still withholds persistence until the restored baseline passes the
+	// ordinary functional/cache/lifecycle gates.
 	if len(measurements) < 2 {
-		if curP != nil {
-			return curP, strategy, serverArgs, nil
+		if curP == nil {
+			curP = restartPlacement(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery)
 		}
-		curP = restartPlacement(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery)
-		return curP, strategy, serverArgs, nil
+		if curP == nil {
+			return nil, strategy, serverArgs, nil
+		}
+		pending := newCalibrationDecision(scopeKey, model, defaultResult, measurements[0])
+		annotateOptimizationDecision(pending, candidates, measurements)
+		if mode == calibrateAuto {
+			fmt.Printf("[optimize] calculated finalist was unavailable; restored measured baseline and will record that bounded result after launch validation\n")
+		} else {
+			fmt.Printf("[calibrate] no challenger completed; restored measured baseline pending launch validation\n")
+		}
+		return curP, strategy, serverArgs, pending
 	}
 
 	best := measurements[0]
 	for _, measured := range measurements[1:] {
-		if measured.Score > best.Score*(1+calibrationMinImprovementPct/100) {
+		if calibrationCandidateBetter(measured, best) {
 			best = measured
 		}
 	}
-	selected, optimized, optimizerErr := maybeOptimizeCalibration(req, cfg, model, be, caps, scopeKey, measurements)
-	if optimizerErr != nil {
-		fmt.Fprintf(os.Stderr, "[calibrate] refusing main-model restart: %v\n", optimizerErr)
-		return nil, strategy, serverArgs, nil
+	selected, optimized := "", false
+	if mode == calibrateOn && defaultResult.Parallel <= 1 {
+		var optimizerErr error
+		selected, optimized, optimizerErr = maybeOptimizeCalibration(req, cfg, model, be, caps, scopeKey, measurements)
+		if optimizerErr != nil {
+			fmt.Fprintf(os.Stderr, "[calibrate] refusing main-model restart: %v\n", optimizerErr)
+			return nil, strategy, serverArgs, nil
+		}
 	}
 	if optimized {
 		for _, measured := range measurements {
@@ -383,20 +857,83 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		return nil, best.Strategy, best.Args, nil
 	}
 
-	pending := &placement.CalibrationDecision{
-		ScopeKey: scopeKey, Winner: best.Name,
-		ModelBasename:    filepath.Base(model.Path),
-		DefaultTPS:       defaultResult.GenTPS,
-		DefaultPromptTPS: defaultResult.PromptTPS,
-		DefaultScore:     1,
-		WinnerTPS:        best.Result.GenTPS,
-		WinnerPromptTPS:  best.Result.PromptTPS,
-		WinnerScore:      best.Score,
-		Improvement:      (best.Score - 1) * 100,
+	pending := newCalibrationDecision(scopeKey, model, defaultResult, best)
+	annotateOptimizationDecision(pending, candidates, measurements)
+	if best.Name != "default" && mode == calibrateOn {
+		req.CalibrationScreened = true
 	}
-	fmt.Printf("[calibrate] provisional winner %s (decode %.1f, prefill %.1f, score %.3f); awaiting lifecycle verification\n",
-		best.Name, best.Result.GenTPS, best.Result.PromptTPS, best.Score)
+	if mode == calibrateOn {
+		fmt.Printf("[calibrate] screened winner %s (turn %.2fs, relative %.3f); explicit run only, awaiting lifecycle canaries and not eligible for automatic default\n",
+			best.Name, calibrationTurnTime(best.Result), best.Score)
+	} else {
+		fmt.Printf("[optimize] candidate winner %s (turn %.2fs, relative %.3f); awaiting launch/cache/workload validation\n",
+			best.Name, calibrationTurnTime(best.Result), best.Score)
+	}
 	return curP, best.Strategy, best.Args, pending
+}
+
+func newCalibrationDecision(scopeKey string, model *placement.ModelProfile, defaultResult *benchmark.Result, best calibrationMeasurement) *placement.CalibrationDecision {
+	if defaultResult == nil || best.Result == nil {
+		return nil
+	}
+	modelBasename := ""
+	if model != nil {
+		modelBasename = placement.CalibrationModelBasename(model.Path)
+	}
+	return &placement.CalibrationDecision{
+		ScopeKey: scopeKey, Winner: best.Name,
+		ModelBasename:          modelBasename,
+		ValidationLevel:        placement.CalibrationValidationScreened,
+		DefaultTPS:             defaultResult.GenTPS,
+		DefaultPromptTPS:       defaultResult.PromptTPS,
+		DefaultMixedTPS:        defaultResult.MixedGenTPS,
+		DefaultTurnTimeS:       calibrationTurnTime(defaultResult),
+		DefaultTurnMaxS:        calibrationWorstWorkloadTime(defaultResult),
+		DefaultAgentSamples:    defaultResult.AgentSamples,
+		DefaultWorkloadLanes:   defaultResult.AgentWorkloadLanes,
+		DefaultCachedTokens:    defaultResult.AgentCachedTokens,
+		DefaultNewPromptTokens: defaultResult.AgentNewPromptTokens,
+		AgentPromptBytes:       defaultResult.AgentPromptBytes,
+		DefaultScore:           1,
+		WinnerTPS:              best.Result.GenTPS,
+		WinnerPromptTPS:        best.Result.PromptTPS,
+		WinnerMixedTPS:         best.Result.MixedGenTPS,
+		WinnerTurnTimeS:        calibrationTurnTime(best.Result),
+		WinnerTurnMaxS:         calibrationWorstWorkloadTime(best.Result),
+		WinnerAgentSamples:     best.Result.AgentSamples,
+		WinnerWorkloadLanes:    best.Result.AgentWorkloadLanes,
+		WinnerCachedTokens:     best.Result.AgentCachedTokens,
+		WinnerNewPromptTokens:  best.Result.AgentNewPromptTokens,
+		WinnerScore:            best.Score,
+		Improvement:            (best.Score - 1) * 100,
+	}
+}
+
+func annotateOptimizationDecision(decision *placement.CalibrationDecision, candidates []placement.CalibrationCandidate, measurements []calibrationMeasurement) {
+	if decision == nil || len(candidates) < 2 || candidates[0].Strategy == nil {
+		return
+	}
+	baseline := candidates[0].Strategy
+	decision.BaselineResidency = baseline.Residency
+	decision.BaselineBottleneck = baseline.OptimizationBottleneck
+	decision.ExploredBoundary = baseline.OptimizationBoundary
+
+	finalist := candidates[1]
+	decision.Finalist = finalist.Name
+	decision.FinalistEstimatedCost = finalist.Estimate.AgentCost
+	decision.FinalistConfidence = finalist.Estimate.Confidence
+	decision.FinalistOutcome = "unavailable"
+	for _, measured := range measurements {
+		if measured.Name != finalist.Name {
+			continue
+		}
+		if decision.Winner == finalist.Name {
+			decision.FinalistOutcome = "promoted"
+		} else {
+			decision.FinalistOutcome = "baseline-won"
+		}
+		return
+	}
 }
 
 func stopCalibrationProcess(process *server.Process, label string) bool {
@@ -435,6 +972,160 @@ func stopCalibrationProcessAndWait(process *server.Process, label string, baseli
 			return false
 		}
 		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func sampleLaunchGPUUtilization(caps *detect.Capabilities) []benchmark.GPUUtilization {
+	if caps == nil {
+		return nil
+	}
+	mapped := detect.MapUtilizationToIndexes(caps.GPUs, detect.SampleGPUUtilization())
+	if len(mapped) == 0 {
+		return nil
+	}
+	out := make([]benchmark.GPUUtilization, 0, len(mapped))
+	for _, sample := range mapped {
+		out = append(out, benchmark.GPUUtilization{
+			GPU: sample.Index, SMPercent: sample.SMPercent, MemPercent: sample.MemPercent,
+		})
+	}
+	return out
+}
+
+func deviceBalanceBottleneckFromResult(strategy *placement.Strategy, result *benchmark.Result) string {
+	return placement.DeviceBalanceBottleneck(strategy, gpuUtilSamplesFromResult(result))
+}
+
+func deviceBalanceSignalFromResult(strategy *placement.Strategy, result *benchmark.Result) placement.DeviceBalanceSignal {
+	return placement.AnalyzeDeviceBalance(strategy, gpuUtilSamplesFromResult(result))
+}
+
+func gpuUtilSamplesFromResult(result *benchmark.Result) []placement.GPUUtilSample {
+	if result == nil || len(result.GPUUtilization) == 0 {
+		return nil
+	}
+	samples := make([]placement.GPUUtilSample, 0, len(result.GPUUtilization))
+	for _, sample := range result.GPUUtilization {
+		samples = append(samples, placement.GPUUtilSample{
+			GPU: sample.GPU, SMPercent: sample.SMPercent, MemPercent: sample.MemPercent,
+		})
+	}
+	return samples
+}
+
+func telemetryDirectedCalibrationFinalist(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, signal placement.DeviceBalanceSignal, memoryRecovery *launchMemoryRecovery) (placement.CalibrationCandidate, bool) {
+	// Utilization can prove a performance defect but cannot prove memory
+	// headroom. Exact resource accounting must have admitted the launch to the
+	// roomy lane before telemetry may authorize a topology reshuffle.
+	if strategy == nil || strategy.Residency != placement.ResidencyRoomy {
+		return placement.CalibrationCandidate{}, false
+	}
+	frontier := calibrationCandidates(req, cfg, model, be, caps, strategy)
+	if memoryRecovery != nil && memoryRecovery.hasRejections() {
+		frontier = filterCalibrationCandidates(frontier, func(candidate *placement.Strategy) bool {
+			args := buildLaunchServerArgs(req, cfg, be, caps, model, candidate)
+			return memoryRecovery.isRejected(args)
+		})
+	}
+	cacheDir := ""
+	if cfg != nil {
+		cacheDir = cfg.CacheDir
+	}
+	opts := placementOptionsFromRequest(req, model, be, cacheDir)
+	frontier = placement.AnalyzeCandidateFrontier(caps, model, opts, frontier)
+	return placement.SelectDeviceBalanceFinalist(frontier, signal)
+}
+
+func cmdStatus(args []string) {
+	cfg := loadConfigOrExit()
+	jsonOut := hasArg(args, "--json")
+	modelArg := ""
+	for _, arg := range args {
+		if arg == "--json" {
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			fmt.Fprintf(os.Stderr, "unknown status option %q\n", arg)
+			os.Exit(2)
+		}
+		if modelArg == "" {
+			modelArg = arg
+		}
+	}
+
+	type statusRecord struct {
+		Model     string                          `json:"model,omitempty"`
+		Status    string                          `json:"status"`
+		Decision  *placement.CalibrationDecision  `json:"decision,omitempty"`
+		Decisions []placement.CalibrationDecision `json:"decisions,omitempty"`
+	}
+
+	if modelArg != "" {
+		decision, err := placement.LatestCalibrationDecisionForModel(cfg.CacheDir, filepath.Base(modelArg))
+		if err != nil {
+			if jsonOut {
+				_ = json.NewEncoder(os.Stdout).Encode(statusRecord{
+					Model: filepath.Base(modelArg), Status: placement.FormatCalibrationStatus(nil),
+				})
+				return
+			}
+			fmt.Printf("ggrun launch optimizer: %s\n", placement.FormatCalibrationStatus(nil))
+			fmt.Printf("  model: %s\n", filepath.Base(modelArg))
+			fmt.Printf("  detail: %v\n", err)
+			return
+		}
+		if jsonOut {
+			_ = json.NewEncoder(os.Stdout).Encode(statusRecord{
+				Model: decision.ModelBasename, Status: placement.FormatCalibrationStatus(decision), Decision: decision,
+			})
+			return
+		}
+		printLaunchOptimizerStatus(decision)
+		return
+	}
+
+	decisions := placement.ListCalibrationDecisions(cfg.CacheDir, 8)
+	if jsonOut {
+		status := "no measured winner yet (cold estimate on launch)"
+		if len(decisions) > 0 {
+			status = placement.FormatCalibrationStatus(&decisions[0])
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(statusRecord{Status: status, Decisions: decisions})
+		return
+	}
+	if len(decisions) == 0 {
+		fmt.Println("ggrun launch optimizer: no measured winner yet (cold estimate on launch)")
+		fmt.Println("  inspect a model with: ggrun status <model.gguf>")
+		fmt.Println("  dry-run prints the same residency/boundary payload")
+		return
+	}
+	fmt.Println("ggrun launch optimizer")
+	for i, decision := range decisions {
+		if i == 0 {
+			printLaunchOptimizerStatus(&decision)
+			continue
+		}
+		fmt.Printf("  also %s: %s\n", decision.ModelBasename, placement.FormatCalibrationStatus(&decision))
+	}
+}
+
+func printLaunchOptimizerStatus(decision *placement.CalibrationDecision) {
+	if decision == nil {
+		fmt.Println("ggrun launch optimizer: no measured winner yet (cold estimate on launch)")
+		return
+	}
+	fmt.Printf("ggrun launch optimizer: %s\n", placement.FormatCalibrationStatus(decision))
+	if decision.ModelBasename != "" {
+		fmt.Printf("  model:     %s\n", decision.ModelBasename)
+	}
+	fmt.Printf("  winner:    %s (%s)\n", decision.Winner, decision.ValidationLevel)
+	if decision.Finalist != "" {
+		fmt.Printf("  finalist:  %s (%s)\n", decision.Finalist, decision.FinalistOutcome)
+	}
+	if decision.ExploredBoundary != nil {
+		b := decision.ExploredBoundary
+		fmt.Printf("  explored:  %d candidates (%d feasible), batch %d..%d, ubatch %d..%d, parallel %d..%d\n",
+			b.CandidateCount, b.FeasibleCount, b.MinBatch, b.MaxBatch, b.MinUBatch, b.MaxUBatch, b.MinParallel, b.MaxParallel)
 	}
 }
 
@@ -524,17 +1215,21 @@ func calibrationAdvisorIncident(req *launchRequest, model *placement.ModelProfil
 			properties["main_gpu"] = strconv.Itoa(measured.Strategy.MainGPU)
 			properties["mmap"] = strconv.FormatBool(measured.Strategy.MMap)
 		}
+		properties["agent_prompt_bytes"] = strconv.Itoa(measured.Result.AgentPromptBytes)
 		candidates = append(candidates, advisor.Candidate{
 			ID: measured.Name, Verified: true, Properties: properties,
 			Metrics: map[string]float64{
 				"decode_tps": measured.Result.GenTPS, "prefill_tps": measured.Result.PromptTPS,
 				"decode_seconds": measured.Result.GenTimeS, "prefill_seconds": measured.Result.PromptTimeS,
-				"balanced_score": measured.Score,
+				"agent_workflow_seconds": calibrationTurnTime(measured.Result),
+				"agent_append_seconds":   measured.Result.AgentTurnTimeS,
+				"cache_reused_tokens":    float64(measured.Result.AgentCachedTokens),
+				"relative_turn_score":    measured.Score,
 			},
 		})
 		observations = append(observations, advisor.Observation{
 			Code: fmt.Sprintf("candidate_%d_measured", index), Component: "calibration",
-			Value: measured.Score, Unit: "relative_score", Source: "ggrun_benchmark", Confidence: "measured",
+			Value: calibrationTurnTime(measured.Result), Unit: "seconds", Source: "ggrun_agent_turn_screen", Confidence: "measured",
 			Attributes: map[string]string{"candidate_id": measured.Name},
 		})
 	}

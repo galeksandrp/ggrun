@@ -57,10 +57,18 @@ func setScopeMemoryMaxMB(string, int) error {
 	return fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
 }
 
+func setScopeMemoryHighMB(string, int) error {
+	return fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
+}
+
 func (p *Process) ScopeNonReclaimableMB() (int, error) {
 	return 0, fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
 }
 
 func (p *Process) SetMemoryMaxMB(int) error {
+	return fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
+}
+
+func (p *Process) SetMemoryHighMB(int) error {
 	return fmt.Errorf("backend memory scopes are only implemented on Linux/systemd")
 }

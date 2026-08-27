@@ -1125,7 +1125,7 @@ func retryStartWithAdvisor(req *launchRequest, cfg *config.Config, model *placem
 		return nil, strategy, nil, nil, fmt.Errorf("advisor-approved re-plan failed: %w", err)
 	}
 	next = applyCalibrationDecision(req, cfg, model, be, caps, next)
-	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	if err := validateHostMemoryContainment(req, caps, next); err != nil {
 		return nil, strategy, nil, nil, fmt.Errorf("advisor-approved re-plan violates host containment: %w", err)
 	}

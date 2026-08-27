@@ -34,6 +34,11 @@ func TestRouterSeparatesClassifierAndMainTraffic(t *testing.T) {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			w.Header().Set("X-Backend", name)
+			if name == "reviewer" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"<block>no</block>"}]}`))
+				return
+			}
 			fmt.Fprintf(w, "%s:%s", name, body)
 		}))
 	}
@@ -61,8 +66,14 @@ func TestRouterSeparatesClassifierAndMainTraffic(t *testing.T) {
 		}
 		got, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.Header.Get("X-Backend") != tc.want || !strings.HasPrefix(string(got), tc.want+":") {
+		if resp.Header.Get("X-Backend") != tc.want {
 			t.Fatalf("%s routed to %q body=%q, want %q", tc.path, resp.Header.Get("X-Backend"), got, tc.want)
+		}
+		if tc.want == "main" && !strings.HasPrefix(string(got), tc.want+":") {
+			t.Fatalf("%s body=%q, want main backend echo", tc.path, got)
+		}
+		if tc.want == "reviewer" && !strings.Contains(string(got), "<block>no</block>") {
+			t.Fatalf("%s body=%q, want reviewer verdict", tc.path, got)
 		}
 	}
 }

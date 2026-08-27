@@ -378,6 +378,9 @@ func TestClaudeCompanionExplicitModelOverrideWinsNano(t *testing.T) {
 	if profile.NanoBeige || profile.ModelPath != custom || profile.Name != claudeReviewerCompanionName {
 		t.Fatalf("explicit reviewer override lost to automatic Nano selection: %+v", profile)
 	}
+	if profile.ServesWorkers {
+		t.Fatal("an arbitrary reviewer model override advertised unverified worker capability")
+	}
 }
 
 func TestClaudeCompanionExplicitBackendOverrideWinsNano(t *testing.T) {
@@ -391,6 +394,9 @@ func TestClaudeCompanionExplicitBackendOverrideWinsNano(t *testing.T) {
 	profile := resolveClaudeCompanionProfile(&launchRequest{AppHome: t.TempDir()}, t.TempDir())
 	if profile.NanoBeige || profile.Name != claudeReviewerCompanionName {
 		t.Fatalf("explicit reviewer backend lost to automatic Nano selection: %+v", profile)
+	}
+	if !profile.ServesWorkers {
+		t.Fatal("a backend-only override disabled the pinned 4B model's worker capability")
 	}
 }
 
@@ -647,6 +653,9 @@ func TestClaudeReviewerFlagAutoResolvesQwen4B(t *testing.T) {
 	if profile.DisplayName != "Qwen3.5-4B" {
 		t.Fatalf("auto reviewer display name = %q, want Qwen3.5-4B", profile.DisplayName)
 	}
+	if !profile.ServesWorkers {
+		t.Fatal("auto Qwen3.5-4B profile lost its cheap-tier worker capability")
+	}
 	// Empty override (the historical default) picks the same profile.
 	emptyReq := &launchRequest{AppHome: t.TempDir()}
 	if again := resolveClaudeCompanionProfile(emptyReq, t.TempDir()); again.Name != profile.Name {
@@ -682,5 +691,28 @@ func TestClaudeReviewerFlagQwen2BResolvesSmallReviewer(t *testing.T) {
 	wantPath := filepath.Join(req.AppHome, ".cache", "claude-reviewer", claudeauto.DefaultSmallReviewerFile)
 	if profile.ModelPath != wantPath {
 		t.Fatalf("small reviewer path = %q, want %q", profile.ModelPath, wantPath)
+	}
+	if profile.ServesWorkers {
+		t.Fatal("Qwen3.5-2B review-only profile advertised cheap-tier worker capability")
+	}
+	if (&claudeAutoRuntime{reviewerPort: 1, companion: profile}).workerRouteEnabled() {
+		t.Fatal("a seated Qwen3.5-2B reviewer enabled the local-fast worker route")
+	}
+}
+
+func TestClaudeWorkerRouteRequiresAWorkerCapableSeatedCompanion(t *testing.T) {
+	worker := &claudeCompanionProfile{ServesWorkers: true}
+	for name, runtime := range map[string]*claudeAutoRuntime{
+		"no runtime":          nil,
+		"no backend":          {reviewerPort: 0, companion: worker},
+		"no profile":          {reviewerPort: 1},
+		"review-only profile": {reviewerPort: 1, companion: &claudeCompanionProfile{}},
+	} {
+		if runtime.workerRouteEnabled() {
+			t.Errorf("%s enabled the worker route", name)
+		}
+	}
+	if !(&claudeAutoRuntime{reviewerPort: 1, companion: worker}).workerRouteEnabled() {
+		t.Fatal("seated worker-capable companion did not enable the worker route")
 	}
 }

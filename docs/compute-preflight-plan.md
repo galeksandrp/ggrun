@@ -2,7 +2,10 @@
 
 # Compute preflight: fastest stable placement without paying for failed loads
 
-Status: backend-neutral contained allocation measurement implemented 2026-07-21.
+Status: allocation preflight, promotion canaries, measured runtime-growth
+accounting, and post-health CUDA-OOM recovery implemented. Documentation
+reconciled 2026-08-24; the release-matrix long-context validation remains
+pending on idle hardware.
 
 ## Why
 
@@ -64,33 +67,81 @@ measured values (plus the separately-probed ~680 MB CUDA context overhead per GP
   success branch, recovery.handleHealthy), and overwritten on success after a derate.
   Previously OOM re-plans persisted never-loaded plans, which poisoned later launches.
 
-## Stage 2 — runtime-shape canary (planned)
+## Stage 2 — functional and workload promotion canaries (implemented)
 
-The +1000 MiB runtime growth is invisible to the startup reserve. Plan:
+HTTP health is no longer treated as proof that a placement is reusable.
+`verifyAndActivateLaunch` creates a lifecycle profile and advances it through
+allocation, load, functional, cache, performance, and active states:
 
-- After health check, before declaring a placement stable (and before `.place` is
-  trusted for max-fill), send one synthetic long prompt sized to the real per-slot
-  budget (crossing at least one 8192-token checkpoint boundary), sampling per-GPU
-  `nvidia-smi memory.used` peaks.
-- Cache `runtime_extra_mb_by_gpu = peak - post_load_baseline` in the model probe
-  (keyed like compute-buffer probes: model+ctx+ubatch+kv+backend).
-- Placement then reserves the *measured* runtime delta per GPU on subsequent packs —
-  a measured value, not a guessed margin. First-launch (no probe yet) keeps stage-1
-  behavior; the canary runs once and upgrades the cache.
-- 2026-07-07 measurement (mainline, V4, 30k-token canary): see
-  `.benchmarks`/session notes — used to validate whether current mainline exhibits
-  the same runtime growth.
+- The first real workload is a bounded cold/append/older-branch/replay cache
+  canary. It requires a non-empty bounded answer from every call, deterministic
+  replay, and measured prefix restoration. Its generated prefix crosses at
+  least two 512-token checkpoint boundaries on ordinary tokenizers, exercising
+  graph creation and checkpoint state rather than merely listing the model.
+- A functional failure rejects the profile and stops the launch. A backend that
+  answers but cannot prove deterministic cache restoration may remain available
+  in a visibly degraded state, but its placement and full launch config are not
+  promoted.
+- Claude Code profiles additionally exercise the real Anthropic gateway. When a
+  separate worker/reviewer is seated, its `local-fast` route receives its own
+  canary.
+- Only an active profile persists the MoE `.place` entry, verified launch
+  configuration, and explicitly screened calibration result. A later explicit
+  screen can reuse only the exact model/backend/hardware/policy identity that
+  passed. Automatic optimizer replay additionally requires the versioned agent
+  screen plus branch/replay, functional/gateway, lifecycle, and clean-relaunch
+  validation level.
+- On Linux, after the functional canary has forced the first real allocations,
+  the server cgroup is resized from the pre-launch ceiling to measured
+  non-reclaimable host memory plus configured headroom, while preserving the
+  planned host-footprint floor.
 
-## Stage 3 — runtime OOM recovery (planned)
+The original design proposed running a full per-slot long-context sweep and
+deriving GPU growth from `nvidia-smi` deltas during every promotion. The
+implemented promotion canary is deliberately bounded; it does not claim to
+cover the largest checkpoint, vision, speculation, or maximum fan-out shape.
+Those cases belong to the release hardware matrix. Runtime VRAM growth is
+instead learned from backend allocation evidence after the model is known to
+be serving, as described below, so model/KV bytes are not accidentally recorded
+twice as generic growth.
 
-Startup OOM recovery exists; post-health crashes currently just kill the server.
+## Stage 3 — runtime OOM recording and recovery (implemented)
 
-- `recovery.Launcher` already restarts crashed servers; teach its failure parser that
-  a post-health `cudaMalloc failed` (log contains a served request before the crash)
-  is a placement error, not a transient: feed the failed alloc size + device into
-  `ReplanAfterOOM` (measured penalty), invalidate the `.place` cache, relaunch once.
-- This is the safety net for shapes the canary didn't exercise (bigger parallel
-  fan-out, vision, speculative decoding).
+Post-health crashes are now distinguished from load failures by a serving
+boundary in the backend log (`model loaded` or ggrun's passed-health marker).
+An allocation failure before that boundary remains startup placement evidence;
+only a failure after it can become runtime-growth evidence.
+
+- A parseable post-health `cudaMalloc` failure records the device and failed
+  allocation for the exact model, context, ubatch, KV, backend, GPU-set, and
+  parallel signature. CUDA VMM failures that omit the allocation size use one
+  GGUF-derived routed-expert layer as the smallest placement-changing reserve.
+  When no expert ledger exists, the fallback is explicitly tagged estimated
+  and contained to that runtime key so a later measurement can replace it.
+- Preflight consumes the recorded per-device growth in addition to the
+  backend's model/context/compute rows and measured CUDA overhead. A cold
+  context/ubatch key may carry only the largest non-estimated observation for
+  the same model, backend, GPU set, and parallel count; estimated or
+  cross-parallel evidence is rejected.
+- The failed lifecycle profile, `.place` entry, calibration decisions, and
+  verified full config are revoked before re-planning. Re-planning skips the
+  stale placement cache, shares the launch-wide rejected-argv set, and refuses
+  to restart an argv identical to one that already crashed.
+- A normal serving launch retries at most two recognized runtime CUDA OOMs.
+  Every replacement server must pass health and all promotion canaries again
+  before it becomes active. An unrecognized crash or exhausted recovery budget
+  fails visibly instead of entering a restart loop.
+- In Claude Code mode the terminal belongs to the Claude client, so ggrun does
+  not replace its backend invisibly during the session. A health monitor and
+  the client-exit path record a matching post-health OOM for the next launch,
+  guarded by a log fingerprint so the same crash is not counted twice.
+- `ggrun probe-reset <model> ...` removes learned runtime growth for one exact
+  signature when an operator intentionally wants a clean measurement.
+
+This recovery is the safety net for runtime shapes the bounded promotion canary
+does not cover. The pending real-hardware release matrix still has to prove a
+long prompt crossing a context-checkpoint boundary followed by concurrent
+decode; implementation is not a substitute for that release evidence.
 
 ## Backend-neutral allocation firewall — implemented
 

@@ -255,10 +255,9 @@ func TestWaitReadyTimeout(t *testing.T) {
 }
 
 // TestScopeSetMemoryMaxMBAndNonReclaimable guards Fix B's server-side methods:
-// a real scoped launch can be re-sized by direct cgroup write (SetMemoryMaxMB)
-// and its measured non-reclaimable footprint (ScopeNonReclaimableMB) reads
-// anon+shmem+slab from the scope's own memory.stat. Both are what the launcher
-// uses to set the ceiling to measured+headroom after the canary.
+// a real scoped launch can update both its hard ceiling and mmap reclaim
+// threshold by direct cgroup writes, and its measured non-reclaimable footprint
+// reads anon+shmem+slab from the scope's own memory.stat.
 func TestScopeSetMemoryMaxMBAndNonReclaimable(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("systemd-run memory scopes are Linux-only")
@@ -323,6 +322,16 @@ func TestScopeSetMemoryMaxMBAndNonReclaimable(t *testing.T) {
 	}
 	if got := strings.TrimSpace(string(data)); got != "2147483648" {
 		t.Fatalf("scope memory.max = %s, want 2147483648 (2048 MiB)", got)
+	}
+	if err := p.SetMemoryHighMB(1536); err != nil {
+		t.Fatalf("SetMemoryHighMB: %v", err)
+	}
+	highData, readHighErr := os.ReadFile("/sys/fs/cgroup" + cgroup + "/memory.high")
+	if readHighErr != nil {
+		t.Fatalf("read memory.high: %v", readHighErr)
+	}
+	if got := strings.TrimSpace(string(highData)); got != "1610612736" {
+		t.Fatalf("scope memory.high = %s, want 1610612736 (1536 MiB)", got)
 	}
 
 	// The non-reclaimable footprint must be readable and sane for a live scope.

@@ -77,7 +77,10 @@ func (r RequestRecord) PrefillMS() int64 {
 
 // DecodeMS is the streaming tail after the first byte.
 func (r RequestRecord) DecodeMS() int64 {
-	if r.TotalMS <= r.TTFBMS {
+	// A request cancelled while it is queued has no response writer and therefore
+	// no first-byte timestamp. Treating total_ms - 0 as decode time made queue
+	// cancellations look like slow generation even though they produced no token.
+	if r.TTFBMS <= 0 || r.TotalMS <= r.TTFBMS {
 		return 0
 	}
 	return r.TotalMS - r.TTFBMS
@@ -88,14 +91,19 @@ type metricsSink struct {
 	out    io.Writer
 	closer io.Closer
 
-	count        int64
-	aborted      int64
-	queueMS      int64
-	prefillMS    int64
-	decodeMS     int64
-	maxQueueMS   int64
-	maxPrefillMS int64
-	usage        Usage
+	count            int64
+	successful       int64
+	failed           int64
+	aborted          int64
+	abortedMS        int64
+	abortedQueueMS   int64
+	abortedServiceMS int64
+	queueMS          int64
+	prefillMS        int64
+	decodeMS         int64
+	maxQueueMS       int64
+	maxPrefillMS     int64
+	usage            Usage
 }
 
 func (m *metricsSink) record(rec RequestRecord) {
@@ -105,22 +113,31 @@ func (m *metricsSink) record(rec RequestRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.count++
+	m.queueMS += rec.QueueMS
 	if rec.Aborted {
 		m.aborted++
+		m.abortedMS += rec.TotalMS
+		m.abortedQueueMS += rec.QueueMS
+		if rec.TotalMS > rec.QueueMS {
+			m.abortedServiceMS += rec.TotalMS - rec.QueueMS
+		}
+	} else if rec.Status >= 200 && rec.Status < 300 {
+		m.successful++
+		m.prefillMS += rec.PrefillMS()
+		m.decodeMS += rec.DecodeMS()
+		if p := rec.PrefillMS(); p > m.maxPrefillMS {
+			m.maxPrefillMS = p
+		}
+		m.usage.InputTokens += rec.Usage.InputTokens
+		m.usage.CacheReadTokens += rec.Usage.CacheReadTokens
+		m.usage.CacheCreationTokens += rec.Usage.CacheCreationTokens
+		m.usage.OutputTokens += rec.Usage.OutputTokens
+	} else {
+		m.failed++
 	}
-	m.queueMS += rec.QueueMS
-	m.prefillMS += rec.PrefillMS()
-	m.decodeMS += rec.DecodeMS()
 	if rec.QueueMS > m.maxQueueMS {
 		m.maxQueueMS = rec.QueueMS
 	}
-	if p := rec.PrefillMS(); p > m.maxPrefillMS {
-		m.maxPrefillMS = p
-	}
-	m.usage.InputTokens += rec.Usage.InputTokens
-	m.usage.CacheReadTokens += rec.Usage.CacheReadTokens
-	m.usage.CacheCreationTokens += rec.Usage.CacheCreationTokens
-	m.usage.OutputTokens += rec.Usage.OutputTokens
 	if m.out == nil {
 		return
 	}
@@ -139,18 +156,23 @@ func (m *metricsSink) summary() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := map[string]any{
-		"requests":             m.count,
-		"aborted":              m.aborted,
-		"queue_ms_total":       m.queueMS,
-		"prefill_ms_total":     m.prefillMS,
-		"decode_ms_total":      m.decodeMS,
-		"queue_ms_max":         m.maxQueueMS,
-		"prefill_ms_max":       m.maxPrefillMS,
-		"prompt_tokens":        m.usage.PromptTokens(),
-		"cache_read_tokens":    m.usage.CacheReadTokens,
-		"output_tokens":        m.usage.OutputTokens,
-		"prefill_tokens_per_s": ratePerSecond(m.usage.PromptTokens(), m.prefillMS),
-		"decode_tokens_per_s":  ratePerSecond(m.usage.OutputTokens, m.decodeMS),
+		"requests":                 m.count,
+		"successful":               m.successful,
+		"failed":                   m.failed,
+		"aborted":                  m.aborted,
+		"aborted_ms_total":         m.abortedMS,
+		"aborted_queue_ms_total":   m.abortedQueueMS,
+		"aborted_service_ms_total": m.abortedServiceMS,
+		"queue_ms_total":           m.queueMS,
+		"prefill_ms_total":         m.prefillMS,
+		"decode_ms_total":          m.decodeMS,
+		"queue_ms_max":             m.maxQueueMS,
+		"prefill_ms_max":           m.maxPrefillMS,
+		"prompt_tokens":            m.usage.PromptTokens(),
+		"cache_read_tokens":        m.usage.CacheReadTokens,
+		"output_tokens":            m.usage.OutputTokens,
+		"prefill_tokens_per_s":     ratePerSecond(m.usage.PromptTokens(), m.prefillMS),
+		"decode_tokens_per_s":      ratePerSecond(m.usage.OutputTokens, m.decodeMS),
 	}
 	if m.count > 0 {
 		s["queue_ms_mean"] = m.queueMS / m.count

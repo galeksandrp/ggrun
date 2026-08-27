@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/raketenkater/ggrun/pkg/claudeauto"
 )
 
 func TestClaudeRouterCanaryExercisesAnthropicEndpointAndTools(t *testing.T) {
@@ -62,6 +64,54 @@ func TestClaudeRouterCanaryRejectsEmptyOrUnboundedOutput(t *testing.T) {
 			defer server.Close()
 			if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeRouterCanary(); err == nil {
 				t.Fatalf("%s Anthropic completion activated Claude workload profile", tc.name)
+			}
+		})
+	}
+}
+
+func TestClaudeReviewerCanaryExercisesClassifierRouteWithoutTools(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			System []struct {
+				Text string `json:"text"`
+			} `json:"system"`
+			Tools json.RawMessage `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.System) == 0 || !strings.Contains(body.System[0].Text, claudeauto.ClassifierMarker) {
+			t.Fatal("reviewer canary omitted Claude Code's classifier marker")
+		}
+		if len(body.Tools) != 0 {
+			t.Fatal("reviewer canary presented a synthetic tool to the safety model")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"content": []map[string]string{{"type": "text", "text": "<block>no</block>"}},
+		})
+	}))
+	defer server.Close()
+	if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeReviewerCanary(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClaudeReviewerCanaryRejectsToolOnlyOrMalformedVerdict(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content []map[string]interface{}
+	}{
+		{"tool-only", []map[string]interface{}{{"type": "tool_use", "name": "ggrun_canary_noop", "input": map[string]interface{}{}}}},
+		{"prose", []map[string]interface{}{{"type": "text", "text": "This action looks safe."}}},
+		{"wrong-verdict", []map[string]interface{}{{"type": "text", "text": "<block>yes</block>"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"content": tc.content})
+			}))
+			defer server.Close()
+			if err := (&Runner{BaseURL: server.URL, Model: "local"}).RunClaudeReviewerCanary(); err == nil {
+				t.Fatal("unusable reviewer verdict activated Claude workload profile")
 			}
 		})
 	}

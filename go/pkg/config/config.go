@@ -38,17 +38,22 @@ type Config struct {
 	KVQuality        string `json:"kv_quality"`
 	SWAFull          bool   `json:"swa_full"`
 	AssumeYes        bool   `json:"assume_yes"`
-	Backend          string `json:"backend"`
-	LlamaServer      string `json:"llama_server"`
-	AppHome          string `json:"app_home"`
-	TuneRounds       int    `json:"tune_rounds"`
-	Vision           bool   `json:"vision"`
-	Parallel         int    `json:"parallel"`
-	Host             string `json:"host"`
-	Spec             string `json:"spec"`           // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
-	SupportExpert    string `json:"support_expert"` // off, auto (installed-only), on
-	SupportOnline    bool   `json:"support_online"` // official llama.cpp research only
-	SupportModel     string `json:"support_model"`  // optional verified local artifact override
+	// AllowLiveMemoryProbe remembers the user's approval for ggrun to run a
+	// contained full model load when a backend cannot report complete allocation
+	// evidence without one. The guarded result is still cached per launch shape;
+	// this setting only removes the repeated consent prompt.
+	AllowLiveMemoryProbe bool   `json:"allow_live_memory_probe"`
+	Backend              string `json:"backend"`
+	LlamaServer          string `json:"llama_server"`
+	AppHome              string `json:"app_home"`
+	TuneRounds           int    `json:"tune_rounds"`
+	Vision               bool   `json:"vision"`
+	Parallel             int    `json:"parallel"`
+	Host                 string `json:"host"`
+	Spec                 string `json:"spec"`           // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
+	SupportExpert        string `json:"support_expert"` // off, auto (installed-only), on
+	SupportOnline        bool   `json:"support_online"` // official llama.cpp research only
+	SupportModel         string `json:"support_model"`  // optional verified local artifact override
 
 	// sources is populated by Load and intentionally not serialized. Keeping
 	// provenance next to the merged value lets `config show` report the source
@@ -61,7 +66,7 @@ var DefaultKeys = []string{
 	"PORT", "CTX_SIZE", "MAX_RESTARTS", "KEEP_ALIVE", "HEALTH_TIMEOUT",
 	"MODEL_DIR", "CACHE_DIR", "LOG_DIR",
 	"RAM_BUDGET", "RAM_LIMIT_PERCENT", "VRAM_HEADROOM", "RAM_HEADROOM", "CGROUP_HEADROOM_MB", "KV_PLACEMENT", "KV_QUALITY", "SWA_FULL",
-	"ASSUME_YES",
+	"ASSUME_YES", "ALLOW_LIVE_MEMORY_PROBE",
 	"BACKEND", "LLAMA_SERVER", "APP_HOME",
 	"TUNE_ROUNDS", "VISION", "PARALLEL", "HOST", "SPEC",
 	"SUPPORT_EXPERT", "SUPPORT_ONLINE", "SUPPORT_MODEL",
@@ -88,23 +93,24 @@ func Defaults() *Config {
 		// checkpoint growth, and host staging without being so large that a
 		// genuinely oversized plan sneaks under the whole-host clamp. 0 disables
 		// the auto re-size (see --cgroup-headroom).
-		CgroupHeadroomMB: 4096,
-		KVPlacement:      "auto",
-		KVQuality:        "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
-		SWAFull:          false,
-		AssumeYes:        false,
-		Backend:          "",
-		LlamaServer:      "",
-		AppHome:          "",
-		TuneRounds:       8,
-		Vision:           false,
-		Parallel:         1,
-		Host:             "127.0.0.1",
-		Spec:             "off",
-		SupportExpert:    "auto",
-		SupportOnline:    false,
-		SupportModel:     "",
-		sources:          defaultSources(),
+		CgroupHeadroomMB:     4096,
+		KVPlacement:          "auto",
+		KVQuality:            "auto", // model-aware default: generic models use q8_0; stricter architectures may require f16
+		SWAFull:              false,
+		AssumeYes:            false,
+		AllowLiveMemoryProbe: false,
+		Backend:              "",
+		LlamaServer:          "",
+		AppHome:              "",
+		TuneRounds:           8,
+		Vision:               false,
+		Parallel:             1,
+		Host:                 "127.0.0.1",
+		Spec:                 "off",
+		SupportExpert:        "auto",
+		SupportOnline:        false,
+		SupportModel:         "",
+		sources:              defaultSources(),
 	}
 }
 
@@ -257,7 +263,7 @@ func snapshotEnv() map[string]string {
 	for _, k := range []string{
 		"LLM_PORT", "LLM_CTX_SIZE", "LLM_MAX_RESTARTS", "LLM_KEEP_ALIVE",
 		"LLM_HEALTH_TIMEOUT", "LLM_MODEL_DIR", "LLM_CACHE_DIR", "LLM_LOG_DIR",
-		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_CGROUP_HEADROOM_MB", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_SWA_FULL", "LLM_ASSUME_YES",
+		"LLM_RAM_BUDGET", "LLM_RAM_LIMIT_PERCENT", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_CGROUP_HEADROOM_MB", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_SWA_FULL", "LLM_ASSUME_YES", "LLM_ALLOW_LIVE_MEMORY_PROBE",
 		"LLM_BACKEND", "LLAMA_SERVER", "LLM_APP_HOME", "LLM_TUNE_ROUNDS",
 		"LLM_VISION", "LLM_PARALLEL", "LLM_HOST", "LLM_SPEC",
 		"LLM_SUPPORT_EXPERT", "LLM_SUPPORT_ONLINE", "LLM_SUPPORT_MODEL",
@@ -380,6 +386,8 @@ func setConfigValue(cfg *Config, key, raw, source string) error {
 		cfg.SWAFull = parseBool(val)
 	case "ASSUME_YES":
 		cfg.AssumeYes = parseBool(val)
+	case "ALLOW_LIVE_MEMORY_PROBE":
+		cfg.AllowLiveMemoryProbe = parseBool(val)
 	case "BACKEND":
 		cfg.Backend = val
 	case "LLAMA_SERVER":
@@ -575,6 +583,7 @@ func (c *Config) Save() error {
 	fmt.Fprintf(f, "LLM_KV_QUALITY=%q\n", c.KVQuality)
 	fmt.Fprintf(f, "LLM_SWA_FULL=%v\n", c.SWAFull)
 	fmt.Fprintf(f, "LLM_ASSUME_YES=%v\n", c.AssumeYes)
+	fmt.Fprintf(f, "LLM_ALLOW_LIVE_MEMORY_PROBE=%v\n", c.AllowLiveMemoryProbe)
 	fmt.Fprintf(f, "LLM_BACKEND=%q\n", c.Backend)
 	fmt.Fprintf(f, "LLAMA_SERVER=%q\n", c.LlamaServer)
 	fmt.Fprintf(f, "LLM_APP_HOME=%q\n", c.AppHome)
@@ -631,6 +640,8 @@ func (c *Config) Show() string {
 			val = strconv.FormatBool(c.SWAFull)
 		case "ASSUME_YES":
 			val = strconv.FormatBool(c.AssumeYes)
+		case "ALLOW_LIVE_MEMORY_PROBE":
+			val = strconv.FormatBool(c.AllowLiveMemoryProbe)
 		case "BACKEND":
 			val = c.Backend
 		case "LLAMA_SERVER":

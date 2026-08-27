@@ -556,8 +556,9 @@ func TestAllocationProbeScopeSharesProductionReclaimBand(t *testing.T) {
 	mmapArgs := []string{"-m", "m3.gguf", "--n-cpu-moe", "44", "-ot", "exps=CPU"}
 	probeArgs := append(append([]string{}, mmapArgs...), "--port", "8080", "--host", "127.0.0.1", "--dry-run")
 	budget := backendMemoryMaxMB(req, caps)
+	mainline := &backendInfo{CPUExpertMMapCapability: placement.CPUExpertMMapFileBacked}
 
-	probeScope := backendStartOptions(req, caps, []string{"GGML_CUDA_NO_PINNED=1"}, probeArgs)
+	probeScope := backendStartOptions(req, caps, mainline, []string{"GGML_CUDA_NO_PINNED=1"}, probeArgs)
 
 	// Regression assertion (this is what the old probe violated): the probe must
 	// carry a reclaim band, not a hard cap at the budget.
@@ -572,21 +573,21 @@ func TestAllocationProbeScopeSharesProductionReclaimBand(t *testing.T) {
 	}
 
 	// Probe must run under exactly the regime the launch will run in.
-	prodScope := backendStartOptions(req, caps, nil, mmapArgs)
+	prodScope := backendStartOptions(req, caps, mainline, nil, mmapArgs)
 	if probeScope.MemoryHighMB != prodScope.MemoryHighMB || probeScope.MemoryMaxMB != prodScope.MemoryMaxMB {
 		t.Errorf("probe scope (%d/%d) must match production scope (%d/%d)",
 			probeScope.MemoryHighMB, probeScope.MemoryMaxMB, prodScope.MemoryHighMB, prodScope.MemoryMaxMB)
 	}
 
 	// A named --ram-budget stays a hard cap in the probe too (policy preserved).
-	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000}, caps, nil, probeArgs)
+	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000}, caps, mainline, nil, probeArgs)
 	if named.MemoryHighMB != named.MemoryMaxMB {
 		t.Errorf("a named --ram-budget must stay a hard cap in the probe, got high=%d max=%d", named.MemoryHighMB, named.MemoryMaxMB)
 	}
 
 	// Resident plans still get a hard cap at the budget (nothing to reclaim).
 	residentArgs := append(append([]string{}, mmapArgs...), "--no-mmap")
-	resident := backendStartOptions(req, caps, nil, residentArgs)
+	resident := backendStartOptions(req, caps, mainline, nil, residentArgs)
 	if resident.MemoryHighMB != resident.MemoryMaxMB || resident.MemoryMaxMB != budget {
 		t.Errorf("resident probe must keep a hard cap at the budget, got high=%d max=%d budget=%d", resident.MemoryHighMB, resident.MemoryMaxMB, budget)
 	}

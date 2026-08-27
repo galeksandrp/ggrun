@@ -1,5 +1,126 @@
 # Changelog
 
+## Unreleased
+
+- **Roomy MoE optimization now distinguishes compute ownership from storage.**
+  The bounded frontier fully recomputes every feasible GPU as a sole
+  ordinary-layer/KV/output owner while the remaining cards store complete
+  routed-expert layers. PCI-keyed SM sampling spans the complete agent trial;
+  sustained imbalance can redirect the one finalist toward a topology that
+  removes the serial backbone from the saturated card, even when that card
+  still stores sparse expert bytes. Exact allocation admission and the normal
+  live workload/lifecycle gates remain promotion authority. Recovery to a safe
+  argv no longer suppresses roomy performance measurement, while exact-ledger
+  tight launches retain their proven-shape filter.
+- **The automatic agent screen now fits its own time budget and scores cold
+  work.** A short uncached prefill pilot selects one rounded per-lane prompt
+  geometry for both baseline and finalist; slow CPU-expert MoEs no longer time
+  out trying to run the fixed two-lane ~8k-token prompt inside a 20-minute
+  controller, while fast models retain the full screen and explicit maintenance
+  remains full-length. Promotion now minimizes the repeated cold-ingest plus
+  cache-backed-append scenario instead of ignoring cold prefill in the score.
+  Prompt bytes are persisted, mismatched geometry fails closed, and workload
+  profile/calibration schemas invalidate older append-only decisions.
+- **Automatic core optimization now measures one finalist, not every idea.**
+  Standard TUI/CLI launch calculates the complete safe candidate set, selects
+  one highest-confidence neighbor (preferring exact allocation evidence), and
+  benchmarks only it against the stable baseline. A failed finalist or baseline
+  win becomes a reusable scoped decision after normal canaries; explicit `--calibrate on`
+  retains the wider maintenance sweep. Tuned batch/ubatch survives every
+  backend-measured placement recompute. Exact allocator evidence can no longer
+  authorize a changed argv: denser MoE replans are contained again and lateral
+  tensor-split churn retains the proven placement. Very large models now print
+  a long-load warning before the first backend or reviewer start.
+- **Parallel-agent batch and microbatch are now measured together.** Claude
+  hybrid/recurrent serving starts from a valid `128/128` fairness baseline
+  instead of emitting `128/512` and relying on llama.cpp's silent clamp.
+  Candidate generation covers a bounded `256/128` through `512/512` ladder;
+  automatic launch screens one calculated finalist and maintenance mode can
+  traverse more. The workload uses two repeated cold-ingest-plus-cache-append
+  scenarios, aggregate decode, and foreground decode under competing prefill.
+  End-to-end workflow wall time—not a weighted tok/s score—is authoritative.
+  Every batch pair is recomputed through the coupled
+  placement ledger, and an exact/explicit ubatch can no longer be silently
+  derated into another configuration. Recovered or runtime-OOM shapes never
+  become screened winners. Screened decisions are reusable only with explicit
+  `--calibrate on`. Ordinary `auto` launch now owns a bounded candidate search
+  and promotes its exact winner only after the repeated agent screen, cache
+  branch/replay, functional/gateway, lifecycle, and clean-relaunch gates.
+  Workload and calibration schema versions retire the old evidence, explicit batch intent
+  is preserved, and tune overlays enforce `ubatch <= batch`. AI Tune cannot
+  mutate batch/ubatch in any workload, including through old cached/community
+  overlays, because it does not own placement recomputation; parallel-agent
+  Tune uses the same direct turn-time objective for its remaining safe flags.
+  Full verified-config replay now preserves hybrid/MoE runtime semantics, and
+  its schema plus planner scope are advanced so an older direct-start record
+  cannot bypass the recurrent fairness or context-shift policy.
+- **Hardware bandwidth can be measured and bound to the exact machine.**
+  `ggrun detect --bandwidth` measures host memory and pinned CUDA transfer
+  paths, persists only a complete CPU/RAM/GPU/PCI fingerprint, and feeds valid
+  observations into MoE placement and recommendation speed estimates. Stale,
+  corrupt, partial, or mismatched profiles fail closed to derived topology.
+  (`8da0520`)
+- **Dense multi-GPU placement uses the fastest VRAM first.** When every device
+  has known memory bandwidth, fully resident layer splits fill the fastest
+  usable VRAM before adding slower cards, account for combined weights and KV,
+  and leave unnecessary GPUs available. Degenerate zero-capacity and
+  all-zero-tensor-split cases now fall back safely instead of emitting invalid
+  backend arguments. (`695ed42`, `1509bcb`, `10ba58f`)
+- **Automatic context fit now spends VRAM deliberately.** `--ctx fit` sizes
+  against available VRAM, keeps KV resident where possible, rounds only to
+  1024-token granularity rather than discarding up to half the proven window,
+  and weighs a larger multi-GPU context against its predicted dense decode
+  slowdown. Explicit oversized contexts remain user-owned but receive a
+  warning derived from the planner's actual answer. Verified configs are
+  versioned so plans from older placement logic are retired. (`3e537d3`,
+  `70098f2`, `e74cd05`, `964c6f1`, `7d29692`)
+- **Offloaded MoE calibration measures larger microbatches.** Explicit
+  `--calibrate on` can challenge the default with bounded 1024/2048
+  ubatch candidates, subjects each exact argv to allocation and lifecycle
+  checks, and refuses to cache a candidate that needed memory recovery into a
+  different shape. Runtime OOM invalidation removes every calibration decision
+  for the affected model. (`9c7156d`)
+- **Launch safety and diagnostics are fail-closed.** Unknown commands no longer
+  become accidental model launches; model errors are reported before waiting
+  on an old server; `benchmark` validates its model, flags, port, and running
+  server; contained-probe failures retain their evidence path and bounded
+  recovery guidance; and KV presets promote to f16 when a model's K/V head
+  dimensions cannot represent block-quantized cache types. Exact incompatible
+  KV requests fail clearly. (`a9cc4b3`)
+- **`--gpus` cannot silently broaden or narrow its hardware scope.** A
+  selection naming a missing device is rejected with the detected device list
+  instead of dropping indices—or falling back to every GPU when none remain.
+  (`8767514`)
+- **Claude's local reviewer/worker path is more reliable and explicit.** A
+  seated reviewer that crashes, rejects a request, or returns an unusable
+  response is buffered and visibly retried on the admitted main route. The
+  auto-installer uses the pinned artifact that matches its VRAM reservation and
+  supports slow/resumable downloads. Help, TUI labels, dry-run output, and flag
+  validation now agree on worker/reviewer roles and the `off` behavior;
+  the Qwen3.5-2B review-only profile cannot receive ordinary `local-fast`
+  worker traffic; arbitrary reviewer-model overrides also default to that
+  review-only capability. Launch verification now exercises the actual XML
+  safety-verdict route, and runtime fallback rejects non-2xx, empty, thinking-
+  only, tool-only, ambiguous, or malformed reviewer responses before Claude
+  sees them. Non-interactive TUI/config commands fail early with actionable
+  guidance.
+  (`44f99a0`, `e1a95d4`, `7b70ed8`)
+- **Claude request telemetry separates work from cancellation.** Requests
+  cancelled before their first response byte no longer inflate streamed decode
+  time or depress reported decode throughput. Router summaries now distinguish
+  successful, failed, and aborted requests and retain aborted queue/service
+  totals for capacity diagnosis.
+- **Source-checkout updates no longer assume `~/ggrun`.** Update and backend
+  maintenance resolve the active checkout, preserve install state, and work
+  when the repository lives elsewhere. (`971e196`)
+- **The model recommendation catalog was refreshed.** Generated catalog data
+  and its recommendation fixtures reflect the latest reproducible snapshot.
+  (`88f6f81`)
+- **Experimental FreeToken adapter.** An explicitly experimental command can
+  launch a FreeToken-compatible sidecar with health checks, bounded request
+  handling, and process cleanup. It remains a separate optional development
+  lane and is not part of the GGUF placement or release gate. (`eb19f46`)
+
 ## v3.2.8 — 2026-08-20
 
 - **An Auto review that cannot reach a separate reviewer goes to the main model.**

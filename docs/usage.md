@@ -26,10 +26,10 @@ ggrun model.gguf --kv-quality auto
 ggrun model.gguf --kv-quality q5_1
 ggrun model.gguf --kv-placement gpu
 
-# First-launch placement calibration
-ggrun model.gguf --calibrate auto   # default: measure alternatives once for small models
-ggrun model.gguf --calibrate on     # force calibration even on a large MoE
-ggrun model.gguf --calibrate off    # never calibrate; always serve the estimated placement
+# Core launch optimization
+ggrun model.gguf --calibrate auto   # default: bounded search on a cold scope, direct reuse afterward
+ggrun model.gguf --calibrate on     # wider explicit screen; its result stays explicit-only
+ggrun model.gguf --calibrate off    # serve the stable planner estimate without performance search
 
 # Vision
 ggrun model.gguf --vision
@@ -105,29 +105,74 @@ ggrun model.gguf --cache-type-k q5_1 --cache-type-v q5_1
 K and V must currently use the same type. ggrun rejects a mixed pair instead
 of producing a placement plan with the wrong KV-memory estimate.
 
-## First-launch placement calibration
+## Core standard-launch optimization
 
-ggrun's placement planner computes where a model's weights, experts, and KV
-cache live from the GGUF and real measured VRAM — but on a multi-GPU host more
-than one placement usually *fits*, and the estimate can only guess which is
-*fastest* on your exact topology. First-launch calibration closes that gap:
-on the first launch of a model + hardware + workload shape, ggrun measures the
-real decode throughput of each alternative placement (for a MoE, KV-on-GPU vs
-KV-on-CPU with the freed VRAM going to more GPU experts; for multi-GPU dense,
-the inverted split), keeps the fastest, and caches the decision.
+ggrun's placement planner computes where a model's weights, experts, KV cache,
+and runtime graph live from the GGUF and measured memory — but more than one
+placement or scheduler shape can usually *fit*, and an estimate can only guess
+which is fastest on your exact topology and workload. The default `auto` mode
+therefore computes the complete bounded neighbor set but live-compares only the
+stable baseline and one selected finalist. It prefers a finalist already
+covered by the exact allocation signature (for example, a larger logical batch
+at the same physical ubatch); otherwise it admits the nearest completely
+recomputed neighbor. `--calibrate on` widens the live search for an explicit
+maintenance experiment; its screening-only result is never consumed by the
+no-flag path.
 
-Later launches with the same scope apply the cached winner directly — no
-re-measurement, no restart. Change the model, backend build, GPU set, context,
-slot count, or workload profile and the scope key changes, so a decision is
-never applied to a launch it didn't measure.
+For parallel Claude/Ultracode on a hybrid or recurrent model, candidate
+generation jointly covers valid `batch/ubatch` pairs: `128/128`, `256/128`,
+`256/256`, `512/256`, and `512/512`. Automatic launch screens one calculated
+finalist; explicit maintenance mode can traverse more of the ladder. It does
+not use the generic short serial benchmark. Every pair is recomputed through
+placement because ubatch changes graph VRAM and can move experts. Each live
+candidate receives two distinct cache-backed append turns, concurrent cold
+prefill, concurrent decode, and a mixed phase where a foreground decoder must
+keep moving while the other slots ingest prompts. Automatic launch first runs a
+small uncached prefill pilot, then chooses one per-lane prompt length that fits
+two repeated baseline/finalist scenarios inside the finite budget; both
+placements receive exactly the same bytes, and fast models retain the full
+~8k-token screen. Explicit maintenance mode always uses the full prompt.
+Lowest end-to-end cold-ingest plus cache-backed-append workflow wall time wins;
+append-only latency, prefill/decode throughput, mixed foreground progress,
+reused tokens, and the slowest confirmation sample remain visible diagnostics
+and stability gates. A pair with no reported prefix reuse or mismatched prompt
+geometry is invalid.
 
-Calibration restarts the server once per candidate, so `auto` (the default)
-only runs it for models small enough to restart cheaply (under ~40 GB). Force
-it on a large MoE with `--calibrate on`, or disable it entirely with
-`--calibrate off`. A candidate that fails to start or OOMs is skipped; if no
-alternative beats the estimated default by a meaningful margin, the default
-stands — calibration can never leave you on a slower placement than the one
-the planner chose.
+An `auto` winner is not reusable merely because its benchmark was faster. The
+restarted exact argv must also pass the shared functional, append-cache,
+older-branch/replay, workload-gateway, lifecycle, and clean-relaunch gates.
+Only then are its decision, verified configuration, and eligible placement
+cache promoted together. A failed cache write cannot strand a tuned-looking
+verified config. Change the model, backend build/capabilities, GPU set, context,
+slot count, batch pair, sampling/workload policy, companions, or explicit-intent
+bits and the scope changes. A later runtime OOM revokes the scoped evidence.
+
+Automatic optimization benchmarks at most two configurations: the stable
+baseline and one finalist, with one failed challenger and a 20-minute search
+budget. A failed finalist or a baseline win is recorded after the ordinary
+launch gates, so the same scope does not repeat the experiment forever.
+`--calibrate on` widens the maintenance sweep to nine candidates, two failures,
+and 60 minutes. The calculated candidate set can include general batch/ubatch
+neighbors, automatic 1/2/4 slot shapes, the parallel-agent recurrent ladder,
+larger 1024/2048 MoE ubatches, a separately computed MoE KV placement, or an
+inverted dense split where applicable. Roomy MoE candidates also include every
+feasible sole-backbone owner while other cards remain complete-expert storage;
+sustained per-device imbalance may redirect the one finalist to that computed
+topology. `off` ignores optimizer decisions.
+
+Exact allocation evidence authorizes only the exact argv that produced it. If
+measured data yields a genuinely denser placement, ggrun subjects that new argv
+to another contained admission pass; it retains an already-proven MoE placement
+instead of changing only its tensor split without evidence. A candidate that
+fails, OOMs, or reaches a different argv through recovery is not cached under
+the requested name. The winner must still pass functional/cache/lifecycle and
+clean-relaunch canaries, and a later runtime OOM invalidates it. If no
+alternative wins beyond the 3% noise floor, the conservative default stands.
+
+Models of 64 GiB or larger receive a warning before the first backend/reviewer
+start. It is informational rather than another consent prompt and explains
+that exact allocation measurement or bounded recovery may require more than
+one long load.
 
 ## Model storage
 
@@ -137,6 +182,13 @@ hardware-aware download list as `ggrun recommend`. `ggrun models path` prints th
 Use `ggrun models rm <model.gguf>` to remove a listed model; it asks before
 deleting and only operates inside the configured model directory. Add `--yes`
 for scripts or set `LLM_ASSUME_YES=true` in a non-interactive environment.
+
+When a backend cannot report complete allocation evidence without loading the
+model, ggrun asks before running one contained live memory probe. An interactive
+approval is remembered as `LLM_ALLOW_LIVE_MEMORY_PROBE=true`, so later model
+launches do not repeat that consent question. Set it to `false` in the config to
+restore per-launch prompting; `--allow-live-memory-probe` remains a one-launch
+override.
 
 ## AI Tune
 
@@ -149,10 +201,26 @@ them against backend help, memory headroom, crash behavior, and benchmark result
 cache entry is reused. A 1% noise floor guards against replacing a good baseline with
 single-run noise.
 
-AI Tune only changes performance knobs (batch, microbatch, threads, flash attention,
-mmap/mlock, defrag, speculative decoding). It never changes anything that affects output
-quality — KV-cache quantization, context size, and `--parallel` are user-owned and left
-exactly as you set them, including in cached and community-shared tunes.
+AI Tune changes safe performance knobs such as threads, flash attention,
+mmap/mlock, defrag, and speculative decoding. It never changes batch or
+microbatch: both require coupled placement recomputation and belong to the core
+placement optimizer for every workload. It also never changes anything
+that affects output quality — KV-cache quantization and context remain
+constraints, and an explicit `--parallel` is left exactly as set. The core
+standard-launch optimizer may compare automatic slot counts, but AI Tune and
+cached/community tune overlays may not.
+
+Parallel Claude launches use the placement-owned core optimizer above for
+batch/ubatch experiments. Generic/community tune files are not
+automatically applied to Claude mode because they do not encode slot scheduling
+or mixed prefill/decode behavior. When `--ai-tune` is explicitly combined with
+parallel Claude on a hybrid/recurrent model, it uses repeated cache-backed agent
+turn time for the remaining safe flags and refuses all batch/ubatch proposals.
+Those results are stored separately by slots, context, KV layout, and
+placement; they cannot overwrite or auto-select as a generic serial tune. Tune
+overlays protect the existing batch pair, with `ubatch <= batch` normalization
+retained as defense in depth; explicit `--batch-size` and `--ubatch-size` remain
+user-owned.
 
 See [launch-performance.md](launch-performance.md) for the benchmark tables and method.
 
@@ -186,8 +254,8 @@ env to run it yourself in another terminal:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8081 ANTHROPIC_AUTH_TOKEN=ggrun
-export ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=local ANTHROPIC_DEFAULT_SONNET_MODEL=local ANTHROPIC_DEFAULT_OPUS_MODEL=local
+export ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local-fast
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=local-fast ANTHROPIC_DEFAULT_SONNET_MODEL=local ANTHROPIC_DEFAULT_OPUS_MODEL=local
 export CLAUDE_CODE_EFFORT_LEVEL=xhigh       # agentic default; use max for one demanding session
 export API_TIMEOUT_MS=2147483647            # maximum safe timer; no practical inference deadline
 export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=2147483647
@@ -196,8 +264,11 @@ export CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=75
 claude --permission-mode auto --disallowedTools WebSearch
 ```
 
-All five inference tiers point at `local` on purpose, so foreground and background
-model calls cannot leave for `api.anthropic.com`.
+Foreground tiers point at `local`; Claude's cheap/Haiku tiers address the
+router-only `local-fast` alias. With a worker-capable companion, that alias
+uses it; with `qwen2b`, `off`, or no seated worker it is rewritten to the
+main `local` model. Both aliases stay inside ggrun, so no inference call can
+leave for `api.anthropic.com`.
 
 ### Resuming a session and its workflow
 
@@ -262,9 +333,11 @@ Two deliberate restrictions:
 
 - **Anti-loop sampling.** The Anthropic API has no repetition-penalty fields and the
   client only sends temperature, so ggrun sets server-side defaults in claude-code
-  mode (`--presence-penalty 1.0 --repeat-penalty 1.05 --repeat-last-n 512 --top-k 40
-  --top-p 0.95 --min-p 0.05`) — quantized thinking models loop endlessly without them.
-  Pass any of these flags yourself (after `--`) and your value wins.
+  mode (`--presence-penalty 1.0 --repeat-penalty 1.05 --repeat-last-n 512
+  --top-k 20 --top-p 0.95 --min-p 0.0`) — quantized thinking models loop
+  endlessly without them. DeepSeek V4 uses its separately validated
+  `top-k 40` / `min-p 0.05` recipe and closes the reasoning budget. Pass any
+  of these flags yourself (after `--`) and your value wins.
 
 ### Prompt caching and hybrid models
 
@@ -280,10 +353,13 @@ Two deliberate restrictions:
   it instead keeps one rolling context checkpoint per slot when at least 512 MiB of
   host headroom per slot remains. This lets llama.cpp restore append-only agent turns
   without exposing the unsafe 32-checkpoint backend default.
-- **Hybrid slot fairness.** Claude mode caps the logical prompt batch at 128 tokens on
-  hybrid/recurrent models. Physical ubatch remains placement-derived. This prevents a
-  long prefill batch from withholding decode work from the other active slot for more
-  than a minute; explicit backend arguments still win.
+- **Hybrid slot fairness and optimization.** Claude mode starts parallel
+  hybrid/recurrent models at a valid `batch=128, ubatch=128` baseline. This
+  prevents a long prefill batch from withholding decode work from the other
+  active slot for more than a minute. The standard-launch optimizer can measure
+  the bounded batch pair and automatic-slot ladders; a winner becomes reusable
+  only after its cache/workload/lifecycle gates pass. Explicit batch, ubatch,
+  and parallel arguments win.
 
 ### Permissions and Auto mode
 
@@ -294,18 +370,27 @@ Two deliberate restrictions:
   permission prompt — `--claude-code` does this for you. Prefer another provider? Add it with
   `claude mcp add …` (it runs alongside `ddg-search`), or launch `claude` yourself
   from the printed recipe and drop/replace the `--mcp-config` line.
-- **Auto works locally and remains fail-closed.** Claude Code sends hidden permission
-  reviews to the same model ID as coding turns. ggrun detects those exact
-  security-monitor requests and routes them to a pinned Qwen3.5-4B reviewer running
-  locally; all other traffic stays on the selected coding model. The reviewer starts
-  before placement, so its measured VRAM use is included when ggrun places the main
-  model. This is Auto, not `bypassPermissions`. The first launch downloads and verifies
-  the pinned ~2.6 GiB Q4_K_M GGUF and serves it with one independent 64k slot and Q8
-  KV cache. GPU visibility
-  is isolated to its selected physical device; if it does not fit any selected GPU,
-  ggrun falls back to CPU. Override it with `GGRUN_CLAUDE_REVIEWER_MODEL=/path/model.gguf`,
-  choose another permission mode with `GGRUN_CLAUDE_PERMISSION_MODE=acceptEdits`, or
-  use `inherit` to preserve your global Claude setting. See Claude Code's
+- **Auto works locally and remains fail-closed.** ggrun detects Claude Code's
+  exact security-monitor requests and routes them to a pinned local companion.
+  The default `auto` profile is Qwen3.5-4B and also handles explicit
+  `local-fast` cheap-tier work. `--claude-reviewer qwen2b` selects the smaller
+  review-only Qwen3.5-2B; its presence does not authorize worker traffic, so
+  `local-fast` falls back to the admitted main model. `nanbeige` is an
+  explicit larger worker/reviewer choice, and `off` seats no companion and
+  visibly self-reviews on the main model. The companion's reservation is part
+  of main placement, and its measured VRAM replaces the conservative initial
+  reservation. This is Auto, not `bypassPermissions`. The first launch
+  downloads and verifies the selected pinned GGUF and serves one independent
+  64k slot. GPU visibility is isolated to its selected physical device; an
+  unplanned fallback may try CPU when no GPU seat succeeds. Override the
+  artifact with `GGRUN_CLAUDE_REVIEWER_MODEL=/path/model.gguf`; custom artifacts
+  are fail-closed to the review-only lane because ggrun has not verified their
+  general worker capability. Each launch verifies both the Anthropic gateway and
+  the actual XML safety-verdict route before activating the profile. A reviewer
+  4xx/5xx, empty 200, thinking-only answer, tool call, or malformed verdict is
+  withheld and retried through the admitted main route. Choose another
+  permission mode with `GGRUN_CLAUDE_PERMISSION_MODE=acceptEdits`, or use
+  `inherit` to preserve your global Claude setting. See Claude Code's
   [permission-mode requirements](https://code.claude.com/docs/en/permission-modes#eliminate-prompts-with-auto-mode).
 
 ### Progress display
@@ -321,6 +406,6 @@ Two deliberate restrictions:
   with progress shown in the terminal title instead. Set `GGRUN_CLAUDE_PROGRESS=off`
   to disable the display.
 
-Quality depends on the local model: pick a tool-capable coder, and keep one
-llama-server in mind for wide agent fan-out (it serializes). Best for single-agent,
-scoped, or offline/private work.
+Quality depends on the local model: pick a tool-capable coder. Main-model
+fan-out is still bounded by its slots and ggrun's admission policy; a separate
+worker/reviewer only accelerates requests explicitly addressed to its lane.

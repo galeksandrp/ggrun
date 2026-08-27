@@ -12,9 +12,10 @@ import (
 
 // ConfigEntry represents a cached tuned config for display/picking.
 type ConfigEntry struct {
-	Path   string
-	Label  string
-	GenTPS float64
+	Path     string
+	Label    string
+	GenTPS   float64
+	Workload string
 }
 
 // ListTunedConfigs returns tuned configs matching the model, backend, and vision flag,
@@ -42,6 +43,7 @@ func ListTunedConfigs(cacheDir, modelName, backendTag string, wantVision bool) [
 		var doc struct {
 			Model          string  `json:"model"`
 			BaselineGenTPS float64 `json:"baseline_gen_tps"`
+			Workload       string  `json:"workload"`
 			BestConfig     struct {
 				GenTPS float64                `json:"gen_tps"`
 				Flags  map[string]interface{} `json:"flags"`
@@ -77,9 +79,10 @@ func ListTunedConfigs(cacheDir, modelName, backendTag string, wantVision bool) [
 		label := fmt.Sprintf("%.2f tok/s (%+.1f%%) | %s | %s | %s | %d rounds | %s",
 			gen, gain, mode, backendTag, kv, doc.Rounds, age)
 		entries = append(entries, ConfigEntry{
-			Path:   path,
-			Label:  label,
-			GenTPS: gen,
+			Path:     path,
+			Label:    label,
+			GenTPS:   gen,
+			Workload: doc.Workload,
 		})
 	}
 

@@ -19,27 +19,35 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 	}.String()
 
 	s := &Strategy{
-		Type:           MoEOffload,
-		ContextSize:    131072,
-		KVPlacement:    "cpu",
-		KVType:         "q8_0",
-		NCPUMoE:        40,
-		OTString:       "blk.0-9.ffn_up,ffn_gate,ffn_down=GPU0,exps=CPU",
-		MainGPU:        0,
-		TensorSplit:    []float64{0.6, 0.4},
-		SplitMode:      "layer",
-		BatchSize:      2048,
-		UBatchSize:     512,
-		Parallel:       4,
-		Threads:        8,
-		ThreadsBatch:   8,
-		MMap:           true,
-		FlashAttention: true,
-		SWAFull:        true,
-		CRAM:           4096,
-		MaxCheckpoints: 8,
-		BackendTag:     "llama",
-		ModelBasename:  "V4.gguf",
+		Type:                     MoEOffload,
+		HasSSM:                   true,
+		IsMoE:                    true,
+		ContextSize:              131072,
+		KVPlacement:              "cpu",
+		KVType:                   "q8_0",
+		NCPUMoE:                  40,
+		OTString:                 "blk.0-9.ffn_up,ffn_gate,ffn_down=GPU0,exps=CPU",
+		MainGPU:                  0,
+		TensorSplit:              []float64{0.6, 0.4},
+		SplitMode:                "layer",
+		BatchSize:                2048,
+		UBatchSize:               512,
+		Parallel:                 4,
+		Threads:                  8,
+		ThreadsBatch:             8,
+		MMap:                     true,
+		MMapRequired:             true,
+		CPUExpertMMapCapability:  CPUExpertMMapFileBacked,
+		CPUExpertMMapEvidence:    "live exact-build proof",
+		ReclaimableHostWeightsMB: 81920,
+		BatchTuned:               true,
+		PerformanceTuned:         true,
+		FlashAttention:           true,
+		SWAFull:                  true,
+		CRAM:                     4096,
+		MaxCheckpoints:           8,
+		BackendTag:               "llama",
+		ModelBasename:            "V4.gguf",
 	}
 	vc := VerifiedConfigToRecord(key, "V4.gguf", s, "be-ident", "/path/to/llama", "qwen", "qwen3.5")
 	if _, err := SaveVerifiedConfig(dir, vc); err != nil {
@@ -57,6 +65,14 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 	}
 	if loaded.BackendIdentity != "be-ident" || loaded.BackendPath != "/path/to/llama" {
 		t.Fatalf("provenance lost: %+v", loaded)
+	}
+	if !loaded.HasSSM || !loaded.IsMoE {
+		t.Fatalf("model semantics lost: %+v", loaded)
+	}
+	if !loaded.MMapRequired || loaded.CPUExpertMMapCapability != CPUExpertMMapFileBacked ||
+		loaded.CPUExpertMMapEvidence != "live exact-build proof" || loaded.ReclaimableHostWeightsMB != 81920 ||
+		!loaded.BatchTuned || !loaded.PerformanceTuned {
+		t.Fatalf("optimizer/mmap evidence lost: %+v", loaded)
 	}
 	// The file lives under the verified-configs namespace with a hashed name.
 	p := VerifiedConfigPath(dir, key)
@@ -354,6 +370,8 @@ func TestComputeVerifiedConfigRespectsNoCachedConfig(t *testing.T) {
 func TestVerifiedConfigToStrategyRestoresRequestOwnedKnobs(t *testing.T) {
 	vc := &VerifiedConfig{
 		StrategyType:   MoEOffload,
+		HasSSM:         true,
+		IsMoE:          true,
 		ContextSize:    8192,
 		KVPlacement:    "gpu",
 		KVType:         "q8_0",
@@ -385,6 +403,9 @@ func TestVerifiedConfigToStrategyRestoresRequestOwnedKnobs(t *testing.T) {
 	}
 	if s.NCPUMoE != 30 || s.OTString != "exps=CPU" || s.Type != MoEOffload {
 		t.Fatalf("placement identity must restore verbatim: %+v", s)
+	}
+	if !s.HasSSM || !s.IsMoE {
+		t.Fatalf("model semantics must restore verbatim: %+v", s)
 	}
 	// The saved values are used when the caller did not request overrides.
 	opts2 := Options{}

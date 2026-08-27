@@ -282,7 +282,7 @@ func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.C
 	if err != nil {
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, nil, err
 	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	if ceiling > 0 && (strategy.Draft == nil || strategy.Draft.Type != mode.Draft) {
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, strategy, fmt.Errorf("no compatible %s path for selected backend", mode.Label)
 	}

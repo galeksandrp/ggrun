@@ -1719,6 +1719,14 @@ func (m Model) viewModelConfig() string {
 	line("chattemplate", "[n] Chat template", m.chatTemplateLabel(model))
 	line("benchmark", "[b] Benchmark mode", boolLabel(m.benchmark))
 
+	section("Launch optimizer")
+	optLabel := placement.FormatCalibrationStatus(nil)
+	if d, err := placement.LatestCalibrationDecisionForModel(m.cacheDir, model.Name); err == nil {
+		optLabel = placement.FormatCalibrationStatus(d)
+	}
+	statline("Measured config", optLabel)
+	statline("Inspect", "ggrun status "+model.Name)
+
 	section("Cache & launch")
 	nocacheLabel := "off (reuse cached placement/probes)"
 	if m.noCachedConfig {
@@ -3121,6 +3129,9 @@ func settingRows() []settingRow {
 		{label: "Full SWA cache", kind: "bool",
 			get: func(c *config.Config) string { return boolLabel(c.SWAFull) },
 			set: func(c *config.Config, v string) { c.SWAFull = v == "on" }},
+		{label: "Remember live probes", kind: "bool",
+			get: func(c *config.Config) string { return boolLabel(c.AllowLiveMemoryProbe) },
+			set: func(c *config.Config, v string) { c.AllowLiveMemoryProbe = v == "on" }},
 		{label: "Support expert / optimizer", kind: "enum", options: []string{"auto", "on", "off"},
 			get: func(c *config.Config) string { return c.SupportExpert },
 			set: func(c *config.Config, v string) { c.SupportExpert = v }},

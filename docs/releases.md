@@ -4,7 +4,7 @@ Each tag publishes platform archives, `install.sh`, `install.ps1`, and
 `SHA256SUMS`. The installer checks the checksum before unpacking. `ggrun --update`
 refuses an installer that is not listed in `SHA256SUMS`.
 
-The current latest tag (`v3.2.1`) includes Linux CPU, Linux Vulkan, Linux
+The current latest tag (`v3.2.8`) includes Linux CPU, Linux Vulkan, Linux
 CUDA (ik_llama.cpp), macOS Metal, and Windows CPU. Setup downloads the CUDA
 bundle when it is on the release; it only compiles if that file is missing.
 

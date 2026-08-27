@@ -2331,6 +2331,61 @@ func TestComputeMoEMultiGPU(t *testing.T) {
 	}
 }
 
+func TestComputeMoEForcedSplitOwnerRecomputesCompletePlacement(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 4070", VRAMTotalMB: 12288, BandwidthMBps: 4000},
+			{Index: 1, Name: "RTX 3090 Ti", VRAMTotalMB: 24576, BandwidthMBps: 16000},
+			{Index: 2, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 1000},
+		},
+		RAM: detect.RAMInfo{TotalMB: 217088, FreeMB: 200000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path: "roomy-moe.gguf", TotalSizeMB: 68 * 1024,
+		SizeBytes: 68 * 1024 * 1024 * 1024,
+		NumLayers: 32, LeadingDense: 2, IsMoE: true,
+		NumExperts: 64, ExpertUsedCount: 4,
+		ExpertBytes:    60 * 1024 * 1024 * 1024,
+		NonExpertBytes: 8 * 1024 * 1024 * 1024,
+		ContextSize:    32768, CTXTrain: 32768, HiddenSize: 4096,
+		EmbeddingLength: 4096, HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
+	}
+	owner := 1
+	strategy, err := Compute(caps, model, Options{
+		ContextSize: 32768, KVPlacement: "gpu", KVQuality: "low",
+		Parallel: 2, NoMMap: true, CacheDir: t.TempDir(), MoESplitOwnerGPU: &owner,
+	})
+	if err != nil {
+		t.Fatalf("forced-owner placement failed: %v", err)
+	}
+	if strategy.Type != MoEOffload {
+		t.Fatalf("type=%s, want MoE offload", strategy.Type)
+	}
+	if strategy.MainGPU != owner || strategy.PlacementPolicy != "owner-1" {
+		t.Fatalf("owner provenance lost: main=%d policy=%q", strategy.MainGPU, strategy.PlacementPolicy)
+	}
+	if len(strategy.TensorSplit) != 3 || strategy.TensorSplit[0] != 0 ||
+		strategy.TensorSplit[1] != 1 || strategy.TensorSplit[2] != 0 {
+		t.Fatalf("split=%v, want sole CUDA1 backbone owner", strategy.TensorSplit)
+	}
+	for _, entry := range strategy.VRAMLedger {
+		if entry.GPU == owner && entry.ExpertOnly {
+			t.Fatalf("owner GPU was marked expert-only: %+v", entry)
+		}
+		if entry.GPU != owner && !entry.ExpertOnly {
+			t.Fatalf("non-owner GPU retained ordinary layers: %+v", entry)
+		}
+	}
+	missing := 99
+	if _, err := Compute(caps, model, Options{
+		ContextSize: 32768, KVPlacement: "gpu", KVQuality: "low",
+		NoMMap: true, CacheDir: t.TempDir(), MoESplitOwnerGPU: &missing,
+	}); err == nil || !strings.Contains(err.Error(), "is not selected") {
+		t.Fatalf("missing forced owner did not fail closed: %v", err)
+	}
+}
+
 func TestComputeMoEHeterogeneousMultiGPUExactLedger(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{
@@ -3928,7 +3983,7 @@ func TestIKLlamaCPUExpertsCannotUseMMapAsRAMCapacity(t *testing.T) {
 	}
 	opts := Options{ContextSize: 65536, KVPlacement: "cpu", KVQuality: "high", UBatchSize: 512, BackendTag: "ik_llama", CacheDir: t.TempDir()}
 	_, err := Compute(caps, model, opts)
-	if err == nil || !strings.Contains(err.Error(), "anonymous CUDA-host memory") {
+	if err == nil || !strings.Contains(err.Error(), "anonymous host memory") {
 		t.Fatalf("ik_llama mmap must not bypass resident RAM: %v", err)
 	}
 
@@ -4581,14 +4636,40 @@ func TestPromptCacheIsSizedAgainstHostWeightsNotInstalledVRAM(t *testing.T) {
 func TestPromptCacheChargesOnlyTheAnonymousWorkingSetUnderMmap(t *testing.T) {
 	const residentMB, workingSetMB = 88793, 4200
 
-	if got := hostFootprintForCache(residentMB, workingSetMB, false, "llama"); got != residentMB {
+	mainline := Options{CPUExpertMMapCapability: CPUExpertMMapFileBacked}
+	if got := hostFootprintForCache(residentMB, workingSetMB, false, mainline); got != residentMB {
 		t.Errorf("resident plan should charge the whole footprint, got %d want %d", got, residentMB)
 	}
-	if got := hostFootprintForCache(residentMB, workingSetMB, true, "llama"); got != workingSetMB {
+	if got := hostFootprintForCache(residentMB, workingSetMB, true, mainline); got != workingSetMB {
 		t.Errorf("mmap plan should charge only the working set, got %d want %d", got, workingSetMB)
 	}
-	if got := hostFootprintForCache(-1, -1, false, "llama"); got != 0 {
+	if got := hostFootprintForCache(-1, -1, false, mainline); got != 0 {
 		t.Errorf("a negative footprint must clamp to 0 so it reads as 'not derived', got %d", got)
+	}
+}
+
+func TestCachedMMapWorkingSetIncludesEmbeddingsAndCheckpoints(t *testing.T) {
+	caps := &detect.Capabilities{
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 100000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		IsMoE: true, NumLayers: 2, TotalSizeMB: 4096,
+		ExpertBytes: 2 * 1024 * 1024 * 1024, TokenEmbdBytes: 512 * 1024 * 1024,
+		SlidingWindow: 512,
+	}
+	strategy := &Strategy{ContextSize: 8192, Parallel: 2, KVPlacement: "gpu"}
+	cache := &CacheEntry{NCPUMoE: 1, UBatchSize: 128, Parallel: 2, KVUnified: true, MMap: true}
+	opts := Options{ForceMMap: true, CPUExpertMMapCapability: CPUExpertMMapFileBacked}
+	const kvTotalMB = 8192
+	fits, mmap, _, footprint := cachedMoEHostMemoryFits(caps, model, strategy, cache, model.TotalSizeMB, kvTotalMB, opts)
+	if !fits || !mmap {
+		t.Fatalf("fixture did not produce an mmap-backed cached plan: fits=%v mmap=%v", fits, mmap)
+	}
+	want := plannedRAMRuntimeOverheadMB(caps, model, cache.UBatchSize, model.TotalSizeMB, opts) +
+		bytesToMiBCeil(model.TokenEmbdBytes) + checkpointFootprintMB(model, 0, strategy.Parallel, kvTotalMB, strategy.ContextSize)
+	if footprint != want {
+		t.Fatalf("mmap working set = %d MiB, want exact fixed host state %d MiB", footprint, want)
 	}
 }
 
@@ -4852,7 +4933,52 @@ func TestHostBufferParsingTakesMaximaNotSums(t *testing.T) {
 	}
 }
 
+func TestLoadSystemProbeDropsCurrentSchemaOutliers(t *testing.T) {
+	dir := t.TempDir()
+	gpus := []detect.GPU{
+		{Index: 0, Name: "RTX 4070", VRAMTotalMB: 12282},
+		{Index: 1, Name: "RTX 3090 Ti", VRAMTotalMB: 24564},
+		{Index: 2, Name: "RTX 3060", VRAMTotalMB: 12288},
+	}
+	path := filepath.Join(dir, fmt.Sprintf("system_%s.cache", gpuSignatureHash(gpus)))
+	// Schema 2 still latched a 4230 MiB "overhead" on CUDA1 after a DeepSeek
+	// load. That is graph/KV, not CUDA context; charging it on the next launch
+	// moved four expert layers onto the CPU.
+	body := "SYS_PROBE_SCHEMA=2\nSYS_CUDA_OVERHEAD_MB_CUDA0=1614\n" +
+		"SYS_CUDA_OVERHEAD_MB_CUDA1=4230\nSYS_CUDA_OVERHEAD_MB_CUDA2=568\nSYS_CUDA_OVERHEAD_MB=4230\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sp := loadSystemProbe(dir, gpus)
+	if sp == nil {
+		t.Fatal("system probe missing")
+	}
+	if _, ok := sp.CUDAOverheadByGPU[1]; ok {
+		t.Fatalf("CUDA1 outlier %d was trusted as CUDA overhead", sp.CUDAOverheadByGPU[1])
+	}
+	if sp.CUDAOverheadByGPU[0] != 1614 || sp.CUDAOverheadByGPU[2] != 568 {
+		t.Fatalf("peer overheads were discarded: %+v", sp.CUDAOverheadByGPU)
+	}
+}
+
+func TestStableAutoContextDoesNotInflateClaudeBatchGraph(t *testing.T) {
+	opts := Options{
+		RuntimePolicy: func(s *Strategy) {
+			s.BatchSize = 128
+			s.UBatchSize = 64
+		},
+	}
+	got := stableAutoContextOptions(opts)
+	if got.BatchSize != 0 || got.UBatchSize != 0 {
+		t.Fatalf("auto-fit search overrode the serving graph with %d/%d", got.BatchSize, got.UBatchSize)
+	}
+	if got.RuntimePolicy == nil {
+		t.Fatal("runtime policy was stripped from auto-fit search")
+	}
+}
+
 // The host term is measured on its own schedule, but needing it must not cause
+
 // the cards to be measured again. A whole-device delta charges everything it
 // cannot attribute to "CUDA overhead", and what it cannot attribute depends on
 // the launch: a single-GPU Qwen3.6-27B at -b 8192 -ub 1024 wrote CUDA0=3850 MiB
@@ -4898,29 +5024,25 @@ func TestHostFootprintChargesFullResidentWhenBackendDoesNotMap(t *testing.T) {
 	const resident = 111130 // MiniMax-M3's CPU experts plus overhead
 	const workingSet = 458  // what mmap would appear to cost
 
-	if got := hostFootprintForCache(resident, workingSet, true, "ik_llama"); got != resident {
+	anonymous := Options{CPUExpertMMapCapability: CPUExpertMMapAnonymous}
+	fileBacked := Options{CPUExpertMMapCapability: CPUExpertMMapFileBacked}
+	if got := hostFootprintForCache(resident, workingSet, true, anonymous); got != resident {
 		t.Fatalf("ik_llama does not map CPU experts, so the plan must charge the full %d MB, got %d", resident, got)
 	}
-	// Case is not meaningful for a backend tag.
-	if got := hostFootprintForCache(resident, workingSet, true, "IK_Llama"); got != resident {
-		t.Fatalf("backend tag must match case-insensitively, got %d", got)
-	}
-
 	// Mainline does map them (DeepSeek-V4: anon 1.9 GB, file 113 GB), so the
 	// reclaimable bytes must not be charged or the prompt cache is disabled on
 	// exactly the hosts that page happily.
-	if got := hostFootprintForCache(resident, workingSet, true, "llama"); got != workingSet {
+	if got := hostFootprintForCache(resident, workingSet, true, fileBacked); got != workingSet {
 		t.Fatalf("mainline maps CPU experts, so only the working set is charged: want %d, got %d", workingSet, got)
 	}
-	// An unknown or empty tag must not silently become the conservative case
-	// either -- mainline is the default backend.
-	if got := hostFootprintForCache(resident, workingSet, true, ""); got != workingSet {
-		t.Fatalf("default backend must keep mmap accounting, got %d", got)
+	// An explicitly unknown exact backend is never granted reclaimable capacity.
+	if got := hostFootprintForCache(resident, workingSet, true, Options{CPUExpertMMapCapability: CPUExpertMMapUnknown}); got != resident {
+		t.Fatalf("unknown backend capability must fail closed, got %d", got)
 	}
 
 	// Without mmap the backend is irrelevant: the bytes are resident either way.
 	for _, tag := range []string{"llama", "ik_llama", ""} {
-		if got := hostFootprintForCache(resident, workingSet, false, tag); got != resident {
+		if got := hostFootprintForCache(resident, workingSet, false, Options{BackendTag: tag}); got != resident {
 			t.Fatalf("resident plan on %q must charge %d, got %d", tag, resident, got)
 		}
 	}
@@ -4934,13 +5056,13 @@ func TestHostFootprintChargesFullResidentForIKDerivedForkTags(t *testing.T) {
 	const resident = 111130 // MiniMax-M3 CPU experts plus overhead
 	const workingSet = 458  // what mmap would appear to cost
 	for _, tag := range []string{"hy3", "ik", "ik_llama-fork"} {
-		if got := hostFootprintForCache(resident, workingSet, true, tag); got != resident {
+		if got := hostFootprintForCache(resident, workingSet, true, Options{BackendTag: tag}); got != resident {
 			t.Errorf("%q is an ik-derived loader: mmap must charge the full %d MB, got %d", tag, resident, got)
 		}
 	}
 	// Mainline still maps (DeepSeek-V4 measured anon 1.9GB / file 113GB): the
 	// reclaimable bytes must not be charged or the cache is disabled there.
-	if got := hostFootprintForCache(resident, workingSet, true, "llama"); got != workingSet {
+	if got := hostFootprintForCache(resident, workingSet, true, Options{CPUExpertMMapCapability: CPUExpertMMapFileBacked}); got != workingSet {
 		t.Errorf("mainline maps CPU experts: want working set %d, got %d", workingSet, got)
 	}
 }
@@ -4952,6 +5074,9 @@ func TestMMapBandDeniedForIKDerivedFork(t *testing.T) {
 	}
 	if !mmapCanPageCPUExperts(Options{BackendTag: "llama"}) {
 		t.Error("mainline maps CPU experts: mmap reclaimability must be kept")
+	}
+	if mmapCanPageCPUExperts(Options{BackendTag: "llama", CPUExpertMMapCapability: CPUExpertMMapUnknown}) {
+		t.Error("an explicit unknown exact-backend capability must override a friendly tag")
 	}
 }
 

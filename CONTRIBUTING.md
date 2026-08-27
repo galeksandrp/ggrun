@@ -5,6 +5,10 @@ Thanks for looking at ggrun. This file covers what we expect from a change.
 ggrun is Go-first. Changes should preserve the public product layout and
 include tests that match the risk of the change.
 
+The [core development roadmap](docs/development-roadmap.md) is the active
+engineering sequence. External-engine experiments, including FreeToken, stay
+in their own parked lanes and are not core release dependencies.
+
 ## Building locally
 
 ```bash

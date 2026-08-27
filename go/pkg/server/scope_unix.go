@@ -236,6 +236,18 @@ func (p *Process) SetMemoryMaxMB(memoryMaxMB int) error {
 	return setScopeMemoryMaxMB(p.scopeUnit, memoryMaxMB)
 }
 
+// SetMemoryHighMB updates the running backend scope's reclaim/throttle
+// boundary without lowering its hard ceiling. Mmap-backed launches use this
+// after the first real canary: measured anonymous state belongs below
+// memory.high, while clean model pages still need the larger memory.max band in
+// which the kernel can evict and re-fault them.
+func (p *Process) SetMemoryHighMB(memoryHighMB int) error {
+	if p == nil || p.scopeUnit == "" {
+		return fmt.Errorf("backend has no memory scope")
+	}
+	return setScopeMemoryHighMB(p.scopeUnit, memoryHighMB)
+}
+
 func scopeMemoryOOMKillCountAt(cgroup string) (uint64, error) {
 	data, err := os.ReadFile("/sys/fs/cgroup" + cgroup + "/memory.events")
 	if err != nil {
@@ -287,26 +299,34 @@ func scopeNonReclaimableMB(cgroup string) (int, error) {
 // systemctl --user set-property fallback keeps DBus in the loop when the
 // direct write is not permitted.
 func setScopeMemoryMaxMB(unit string, memoryMaxMB int) error {
+	return setScopeMemoryLimitMB(unit, "memory.max", "MemoryMax", memoryMaxMB)
+}
+
+func setScopeMemoryHighMB(unit string, memoryHighMB int) error {
+	return setScopeMemoryLimitMB(unit, "memory.high", "MemoryHigh", memoryHighMB)
+}
+
+func setScopeMemoryLimitMB(unit, cgroupFile, systemdProperty string, limitMB int) error {
 	if unit == "" {
 		return fmt.Errorf("empty scope unit")
 	}
-	if memoryMaxMB <= 0 {
-		return fmt.Errorf("invalid memory max %d MiB", memoryMaxMB)
+	if limitMB <= 0 {
+		return fmt.Errorf("invalid %s %d MiB", cgroupFile, limitMB)
 	}
 	cgroup, err := scopeControlGroup(unit)
 	if err != nil {
 		return err
 	}
-	bytes := uint64(memoryMaxMB) * 1024 * 1024
-	path := "/sys/fs/cgroup" + cgroup + "/memory.max"
+	bytes := uint64(limitMB) * 1024 * 1024
+	path := "/sys/fs/cgroup" + cgroup + "/" + cgroupFile
 	if err := os.WriteFile(path, []byte(strconv.FormatUint(bytes, 10)), 0o644); err == nil {
 		return nil
 	}
 	// Fallback: systemctl set-property on the transient unit. This goes through
 	// DBus and may fail for a scope that was never fully registered, which the
 	// caller treats as a non-fatal signal.
-	if exec.Command("systemctl", "--user", "set-property", unit, "MemoryMax", fmt.Sprintf("%d", bytes)).Run() == nil {
+	if exec.Command("systemctl", "--user", "set-property", unit, systemdProperty, fmt.Sprintf("%d", bytes)).Run() == nil {
 		return nil
 	}
-	return fmt.Errorf("raise scope memory.max at %s", path)
+	return fmt.Errorf("set scope %s at %s", cgroupFile, path)
 }

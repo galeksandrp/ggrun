@@ -403,6 +403,38 @@ func TestConfirmLiveMemoryProbeRequiresExplicitNonInteractiveConsent(t *testing.
 	}
 }
 
+func TestRememberLiveMemoryProbeConsentPersistsPreference(t *testing.T) {
+	isolateConfig(t)
+	cfg := config.Defaults()
+	var output bytes.Buffer
+	rememberLiveMemoryProbeConsent(cfg, &output)
+	if !cfg.AllowLiveMemoryProbe {
+		t.Fatal("in-memory config did not retain live probe approval")
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.AllowLiveMemoryProbe {
+		t.Fatal("saved config did not retain live probe approval")
+	}
+	if !strings.Contains(output.String(), "future launches will not ask again") {
+		t.Fatalf("saved approval was not reported: %q", output.String())
+	}
+}
+
+func TestParseLaunchArgsLoadsRememberedLiveMemoryProbeConsent(t *testing.T) {
+	isolateConfig(t)
+	t.Setenv("LLM_ALLOW_LIVE_MEMORY_PROBE", "true")
+	req, err := parseLaunchArgs([]string{"model.gguf"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !req.AllowLiveMemoryProbe {
+		t.Fatal("remembered live probe approval did not reach the launch request")
+	}
+}
+
 func TestIsLlamaServerExecutableIgnoresArguments(t *testing.T) {
 	if !isLlamaServerExecutable("/opt/bin/llama-server-cuda") || !isLlamaServerExecutable("/opt/bin/ik_llama-server") {
 		t.Fatal("known server executable was not recognized")
@@ -450,8 +482,8 @@ func TestBackendStartOptionsArePlacementStrategyIndependent(t *testing.T) {
 	single := &placement.Strategy{Type: placement.SingleGPU}
 	multi := &placement.Strategy{Type: placement.MultiGPUDense}
 
-	singleOpts := backendStartOptions(req, caps, nil, nil)
-	multiOpts := backendStartOptions(req, caps, nil, nil)
+	singleOpts := backendStartOptions(req, caps, nil, nil, nil)
+	multiOpts := backendStartOptions(req, caps, nil, nil, nil)
 
 	if single.Type != placement.SingleGPU || multi.Type != placement.MultiGPUDense {
 		t.Fatalf("test setup broken: single=%s multi=%s", single.Type, multi.Type)
@@ -503,28 +535,30 @@ func TestClaudeCodeParallelIsFeaturePolicyForDeepseek4(t *testing.T) {
 	if opts.Parallel != 4 {
 		t.Fatalf("claude-code should request four slots over the shared mainline placement, got %d", opts.Parallel)
 	}
-	if opts.ContextSize != 1048576 {
-		t.Fatalf("claude-code auto context should use the 1M native window, got %d", opts.ContextSize)
+	if opts.ContextSize != 0 || opts.AutoContextMax != 1048576 {
+		t.Fatalf("claude-code fit should remain unresolved under a 1M cap, got ctx=%d cap=%d",
+			opts.ContextSize, opts.AutoContextMax)
+	}
+	if !opts.AutoParallel || opts.ParallelSlotTarget != claudeSlotTarget {
+		t.Fatalf("automatic Claude slots were not delegated to fit: auto=%t target=%d",
+			opts.AutoParallel, opts.ParallelSlotTarget)
 	}
 	explicit := &launchRequest{ClaudeCode: true, CtxFlag: "262144"}
 	if got := placementOptionsFromRequest(explicit, model, be, t.TempDir()).ContextSize; got != 262144 {
 		t.Fatalf("explicit Claude Code context must win, got %d", got)
 	}
 	be = &backendInfo{Tag: "ik_llama"}
-	// Placement must plan for the slot count the server will actually run.
-	// A 131072 context supports two ~65k slots, so the 4-slot request is clamped
-	// here rather than by claudeCodeSlotAdjust after the plan exists. When the
-	// two disagreed the disagreement was silent and total: every probe and
-	// placement key embeds the slot count, so a plan made at parallel=4 could
-	// never read evidence the preflight had recorded at parallel=2. Measured
-	// 2026-08-03 on DeepSeek-V4-Flash — a 9501 MiB compute-buffer measurement
-	// sat unread, placement charged 0 MiB for compute, and the load OOM'd.
+	// Unknown metadata gets a portable 131072 ceiling. The full fit search—not
+	// option construction—selects the two 65k slots it can support, so every
+	// candidate is accounted under its actual parallel key.
 	opts = placementOptionsFromRequest(req, &placement.ModelProfile{ModelArch: "qwen3moe"}, be, t.TempDir())
-	if opts.Parallel != 2 {
-		t.Fatalf("claude-code at a 131072 context plans the two slots it will run, got %d", opts.Parallel)
+	if opts.Parallel != 4 || !opts.AutoParallel {
+		t.Fatalf("claude-code should pass a four-slot automatic ceiling into fit, got parallel=%d auto=%t",
+			opts.Parallel, opts.AutoParallel)
 	}
-	if opts.ContextSize != 131072 {
-		t.Fatalf("unknown model context should use the portable 2x64k baseline, got %d", opts.ContextSize)
+	if opts.ContextSize != 0 || opts.AutoContextMax != 131072 {
+		t.Fatalf("unknown model fit should remain unresolved under the portable 131072 cap, got ctx=%d cap=%d",
+			opts.ContextSize, opts.AutoContextMax)
 	}
 }
 
@@ -563,6 +597,9 @@ func TestClaudeWorkloadProfileScopesCacheEvidence(t *testing.T) {
 	if parallelScope == "" {
 		t.Fatal("Claude Code default must have a non-empty workload cache scope")
 	}
+	if !strings.Contains(parallelScope, "agent-parallel-v4") {
+		t.Fatalf("parallel workload did not invalidate pre-batch-tuner evidence: %q", parallelScope)
+	}
 	if got := requestWorkloadProfile(parallelExplicit, model); got != parallelScope {
 		t.Fatalf("default and explicit agent-parallel should share behavior scope: got %q, want %q", got, parallelScope)
 	}
@@ -575,6 +612,27 @@ func TestClaudeWorkloadProfileScopesCacheEvidence(t *testing.T) {
 	}
 	if got := placementOptionsFromRequest(interactive, model, be, t.TempDir()).WorkloadProfile; got != interactiveScope {
 		t.Fatalf("placement workload scope=%q, want %q", got, interactiveScope)
+	}
+}
+
+func TestWorkloadConcurrencyFollowsAgentDemandNotOnlyServerSlots(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *launchRequest
+		want int
+	}{
+		{"interactive_default", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileInteractive, Parallel: 4}, 1},
+		{"interactive_explicit", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileInteractive, Parallel: 4, ParallelSet: true}, 4},
+		{"parallel_default", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel}, 2},
+		{"parallel_declared_demand", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, Parallel: 2, ClaudeMaxActive: 4}, 4},
+		{"bounded", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, ClaudeMaxActive: 32}, 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requestWorkloadConcurrency(tc.req); got != tc.want {
+				t.Fatalf("workload concurrency=%d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -640,7 +698,7 @@ func TestClaudeCodeInteractiveProfileKeepsSSMPrefillBatch(t *testing.T) {
 	}
 	opts := placementOptionsFromRequest(req, &placement.ModelProfile{ModelArch: "deepseek4", CTXTrain: 1048576}, &backendInfo{Tag: "llama"}, t.TempDir())
 	s := &placement.Strategy{ContextSize: opts.ContextSize, Parallel: opts.Parallel, BatchSize: 2048, HasSSM: true}
-	claudeCodeSlotAdjust(s, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(s, &placement.ModelProfile{ModelArch: "deepseek4"}, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	if s.Parallel != 1 || s.BatchSize != 2048 {
 		t.Fatalf("interactive Claude profile changed foreground prefill setup: parallel=%d batch=%d", s.Parallel, s.BatchSize)
 	}
@@ -1540,7 +1598,7 @@ func TestExplicitBatchFlagsFeedPlacementInsteadOfExtraArgs(t *testing.T) {
 		t.Fatalf("explicit placement flags must not remain late extra args: %v", req.ExtraArgs)
 	}
 	opts := placementOptionsFromRequest(req, &placement.ModelProfile{}, &backendInfo{Tag: "llama"}, t.TempDir())
-	if !opts.UBatchSizeExplicit || opts.UBatchSize != 256 {
+	if !opts.BatchSizeExplicit || !opts.UBatchSizeExplicit || opts.BatchSize != 512 || opts.UBatchSize != 256 {
 		t.Fatalf("explicit ubatch intent did not reach calibration scope: %#v", opts)
 	}
 	if _, err := parseLaunchArgs([]string{"model.gguf", "--batch-size", "128", "--ubatch-size", "256"}); err == nil {
@@ -1579,6 +1637,62 @@ func TestAutoStartupTimeoutDoublesBaseTimeout(t *testing.T) {
 	model := &placement.ModelProfile{SizeBytes: 1024 * 1024}
 	if got := autoStartupTimeout(model); got != 8*time.Minute {
 		t.Fatalf("base timeout mismatch: got %v", got)
+	}
+}
+
+func TestLongModelLoadWarningPrecedesHugeModelBoundary(t *testing.T) {
+	model := &placement.ModelProfile{
+		SizeBytes: 146 * 1024 * 1024 * 1024,
+		IsMoE:     true,
+	}
+	warning := longModelLoadWarning(model, 30*time.Minute)
+	for _, want := range []string{"Long first load ahead", "MoE model", "146.0 GiB", "more than once", "30m0s"} {
+		if !strings.Contains(warning, want) {
+			t.Fatalf("warning %q does not contain %q", warning, want)
+		}
+	}
+	if got := longModelLoadWarning(&placement.ModelProfile{SizeBytes: 4 * 1024 * 1024 * 1024}, 8*time.Minute); got != "" {
+		t.Fatalf("ordinary model received long-load warning: %q", got)
+	}
+}
+
+func TestTunedBatchSurvivesBackendMeasuredRecompute(t *testing.T) {
+	constraint := tunedBatchConstraintFor(&placement.Strategy{
+		BatchSize: 256, UBatchSize: 128, BatchTuned: true, PerformanceTuned: true,
+	})
+	opts := placement.Options{BatchSize: 4096, UBatchSize: 512, RuntimePolicy: func(*placement.Strategy) {}}
+	constraint.apply(&opts)
+	if opts.BatchSize != 256 || opts.UBatchSize != 128 || !opts.BatchSizeExplicit || !opts.UBatchSizeExplicit || opts.RuntimePolicy != nil {
+		t.Fatalf("tuned batch was not preserved as a recompute constraint: %+v", opts)
+	}
+	matching := constraint.retain(&placement.Strategy{BatchSize: 256, UBatchSize: 128})
+	if !matching.BatchTuned || !matching.PerformanceTuned {
+		t.Fatalf("matching recompute lost tuned identity: %+v", matching)
+	}
+	mismatch := constraint.retain(&placement.Strategy{BatchSize: 128, UBatchSize: 128})
+	if mismatch.BatchTuned || mismatch.PerformanceTuned {
+		t.Fatalf("altered recovery was mislabeled as the tuned candidate: %+v", mismatch)
+	}
+}
+
+func TestExactAllocationDoesNotAuthorizeLateralMoESplit(t *testing.T) {
+	current := &placement.Strategy{
+		Type: placement.MoEOffload, NCPUMoE: 34,
+		OTString:    "blk.(0|1).ffn_exps=CUDA0,exps=CPU",
+		TensorSplit: []float64{0.27, 0.65, 0.09},
+	}
+	lateral := *current
+	lateral.TensorSplit = []float64{0.26, 0.64, 0.10}
+	if backendMeasuredRecomputeWorthVerifying(memoryEvidenceAllocated, current, &lateral) {
+		t.Fatal("exact evidence for one argv must not trigger an unmeasured lateral split")
+	}
+	denser := lateral
+	denser.NCPUMoE = 33
+	if !backendMeasuredRecomputeWorthVerifying(memoryEvidenceAllocated, current, &denser) {
+		t.Fatal("a denser measured re-plan should receive its own contained verification")
+	}
+	if !backendMeasuredRecomputeWorthVerifying(memoryEvidenceOraclePlanned, current, &lateral) {
+		t.Fatal("planned evidence must continue through the recompute verification loop")
 	}
 }
 
@@ -2522,11 +2636,27 @@ func TestBestTuneCachePathFiltersHardwareHash(t *testing.T) {
 	if err := os.WriteFile(cachePath, []byte(doc), 0644); err != nil {
 		t.Fatalf("write tune cache: %v", err)
 	}
-	if got := bestTuneCachePath(cacheDir, "model.gguf", "vulkan", false, "badc0ffe"); got != "" {
+	agentPath := filepath.Join(cacheDir, "tune_model.gguf_4_hwdeadbeef_vulkan_agent-parallel-v1-p2.json")
+	agentDoc := `{
+		"model": "model.gguf",
+		"workload": "agent-parallel-v1-p2",
+		"baseline_gen_tps": 100.0,
+		"baseline_wins": false,
+		"best_config": {"name": "agent-batch", "flags": {"-b": "256", "-ub": "256"}, "gen_tps": 999.0, "pp_tps": 300.0},
+		"rounds": 4,
+		"tuned_at": "2026-05-29T00:00:00Z"
+	}`
+	if err := os.WriteFile(agentPath, []byte(agentDoc), 0644); err != nil {
+		t.Fatalf("write agent tune cache: %v", err)
+	}
+	if got := bestTuneCachePath(cacheDir, "model.gguf", "vulkan", false, "", "badc0ffe"); got != "" {
 		t.Fatalf("expected wrong-hardware cache to be ignored, got %s", got)
 	}
-	if got := bestTuneCachePath(cacheDir, "model.gguf", "vulkan", false, "deadbeef"); got != cachePath {
+	if got := bestTuneCachePath(cacheDir, "model.gguf", "vulkan", false, "", "deadbeef"); got != cachePath {
 		t.Fatalf("expected matching hardware cache, got %s", got)
+	}
+	if got := bestTuneCachePath(cacheDir, "model.gguf", "vulkan", false, "agent-parallel-v1-p2", "deadbeef"); got != agentPath {
+		t.Fatalf("expected matching agent workload cache, got %s", got)
 	}
 }
 
@@ -2782,20 +2912,20 @@ func TestRejectedMemoryArgvIdentityBlocksOnlyTheExactFailedPlan(t *testing.T) {
 	}
 }
 
-func TestRecoveredLaunchRetainsFirstSafeBaselineUnlessForced(t *testing.T) {
+func TestRecoveredLaunchRetainsFirstSafeAllocationBaselineUnlessForced(t *testing.T) {
 	recovery := newLaunchMemoryRecovery()
 	recovery.reject([]string{"llama-server", "--n-cpu-moe", "35"})
 
-	if !retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateAuto}, recovery) {
-		t.Fatal("automatic calibration was allowed to stop a recovered live server")
+	if !retainRecoveredBaselineForAllocationPromotion(&launchRequest{Calibrate: calibrateAuto}, recovery) {
+		t.Fatal("automatic allocation promotion was allowed after recovery")
 	}
-	if !retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateOff}, recovery) {
-		t.Fatal("disabled calibration was allowed to promote a recovered live server")
+	if !retainRecoveredBaselineForAllocationPromotion(&launchRequest{Calibrate: calibrateOff}, recovery) {
+		t.Fatal("disabled optimization was allowed to promote a recovered allocation")
 	}
-	if retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateOn}, recovery) {
+	if retainRecoveredBaselineForAllocationPromotion(&launchRequest{Calibrate: calibrateOn}, recovery) {
 		t.Fatal("explicit forced calibration was unexpectedly suppressed")
 	}
-	if retainProvenSafeAfterRecovery(&launchRequest{Calibrate: calibrateAuto}, newLaunchMemoryRecovery()) {
+	if retainRecoveredBaselineForAllocationPromotion(&launchRequest{Calibrate: calibrateAuto}, newLaunchMemoryRecovery()) {
 		t.Fatal("clean launch was treated as memory-recovered")
 	}
 }
@@ -3134,7 +3264,7 @@ func TestClaudeCodeSlotAdjust(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &placement.Strategy{ContextSize: tc.ctx, Parallel: tc.par}
-			claudeCodeSlotAdjust(s, tc.claudeCode, tc.explicit, false)
+			claudeCodeSlotAdjust(s, nil, tc.claudeCode, tc.explicit, false, false)
 			if s.Parallel != tc.wantParallel {
 				t.Fatalf("ctx=%d par=%d cc=%v: got parallel %d, want %d", tc.ctx, tc.par, tc.claudeCode, s.Parallel, tc.wantParallel)
 			}
@@ -3143,24 +3273,44 @@ func TestClaudeCodeSlotAdjust(t *testing.T) {
 }
 
 func TestClaudeCodeHybridUsesFairPromptBatch(t *testing.T) {
-	s := &placement.Strategy{ContextSize: 1048576, Parallel: 2, BatchSize: 2048, HasSSM: true}
-	claudeCodeSlotAdjust(s, true, false, false)
-	if s.BatchSize != claudeHybridBatch {
-		t.Fatalf("hybrid Claude batch=%d, want %d", s.BatchSize, claudeHybridBatch)
+	s := &placement.Strategy{ContextSize: 1048576, Parallel: 2, BatchSize: 2048, UBatchSize: 512, HasSSM: true}
+	claudeCodeSlotAdjust(s, &placement.ModelProfile{HasSSM: 1}, true, false, false, false)
+	if s.BatchSize != claudeHybridBatch || s.UBatchSize != claudeHybridBatch {
+		t.Fatalf("hybrid Claude batch/ubatch=%d/%d, want %d/%d", s.BatchSize, s.UBatchSize, claudeHybridBatch, claudeHybridBatch)
 	}
 
 	nonClaude := &placement.Strategy{ContextSize: 1048576, Parallel: 2, BatchSize: 2048, HasSSM: true}
-	claudeCodeSlotAdjust(nonClaude, false, false, false)
+	claudeCodeSlotAdjust(nonClaude, &placement.ModelProfile{HasSSM: 1}, false, false, false, false)
 	if nonClaude.BatchSize != 2048 {
 		t.Fatalf("non-Claude batch was changed: %d", nonClaude.BatchSize)
 	}
 }
 
+func TestClaudeCodeHybridRepairsMissingVerifiedConfigSemantics(t *testing.T) {
+	s := &placement.Strategy{ContextSize: 262144, Parallel: 2, BatchSize: 2048, UBatchSize: 128}
+	model := &placement.ModelProfile{ModelArch: "qwen35", HasSSM: 1}
+	claudeCodeSlotAdjust(s, model, true, true, false, false)
+	if !s.HasSSM {
+		t.Fatal("model-derived hybrid semantics were not restored")
+	}
+	if s.BatchSize != claudeHybridBatch || s.UBatchSize != claudeHybridBatch {
+		t.Fatalf("restored hybrid batch/ubatch=%d/%d, want %d/%d", s.BatchSize, s.UBatchSize, claudeHybridBatch, claudeHybridBatch)
+	}
+}
+
 func TestClaudeCodeHybridExplicitBatchOverridesFairnessCap(t *testing.T) {
-	s := &placement.Strategy{ContextSize: 65536, Parallel: 4, BatchSize: 512, HasSSM: true}
-	claudeCodeSlotAdjust(s, true, true, true)
+	s := &placement.Strategy{ContextSize: 65536, Parallel: 4, BatchSize: 512, UBatchSize: 512, HasSSM: true}
+	claudeCodeSlotAdjust(s, &placement.ModelProfile{HasSSM: 1}, true, true, true, false)
 	if s.BatchSize != 512 {
 		t.Fatalf("explicit hybrid Claude batch=%d, want 512", s.BatchSize)
+	}
+}
+
+func TestClaudeCodeHybridExplicitUBatchRaisesAutomaticFairBatch(t *testing.T) {
+	s := &placement.Strategy{ContextSize: 65536, Parallel: 2, BatchSize: 2048, UBatchSize: 512, HasSSM: true}
+	claudeCodeSlotAdjust(s, &placement.ModelProfile{HasSSM: 1}, true, true, false, true)
+	if s.BatchSize != 512 || s.UBatchSize != 512 {
+		t.Fatalf("explicit ubatch was silently clamped: batch/ubatch=%d/%d", s.BatchSize, s.UBatchSize)
 	}
 }
 
@@ -3177,7 +3327,7 @@ func TestClaudeCodeHybridSingleSlotKeepsPlacementBatch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &placement.Strategy{ContextSize: tc.ctx, Parallel: tc.parallel, BatchSize: 2048, HasSSM: true}
-			claudeCodeSlotAdjust(s, true, tc.explicit, false)
+			claudeCodeSlotAdjust(s, &placement.ModelProfile{HasSSM: 1}, true, tc.explicit, false, false)
 			if s.Parallel != 1 {
 				t.Fatalf("parallel=%d, want final single slot", s.Parallel)
 			}
@@ -3606,23 +3756,28 @@ func TestMMapBackedPlanGetsAReclaimBandBeforeTheKillThreshold(t *testing.T) {
 		CPU: detect.CPUInfo{Cores: 8},
 	}
 	req := &launchRequest{RAMLimitPercent: 95}
+	mainline := &backendInfo{CPUExpertMMapCapability: placement.CPUExpertMMapFileBacked}
+	anonymous := &backendInfo{CPUExpertMMapCapability: placement.CPUExpertMMapAnonymous}
 
 	mmapArgs := []string{"-m", "m3.gguf", "--n-cpu-moe", "44", "-ot", "exps=CPU"}
 	residentArgs := append(append([]string{}, mmapArgs...), "--no-mmap")
 
-	if !argsMMapBackedExperts(mmapArgs) {
+	if !argsMMapBackedExperts(mainline, mmapArgs) {
 		t.Fatal("CPU experts with no --no-mmap must count as mmap-backed")
 	}
-	if argsMMapBackedExperts(residentArgs) {
+	if argsMMapBackedExperts(mainline, residentArgs) {
 		t.Fatal("--no-mmap means the experts are resident, not file-backed")
 	}
-	if argsMMapBackedExperts([]string{"-m", "dense.gguf"}) {
+	if argsMMapBackedExperts(mainline, []string{"-m", "dense.gguf"}) {
 		t.Fatal("a plan with no CPU experts has no file-backed expert bytes")
+	}
+	if argsMMapBackedExperts(anonymous, mmapArgs) {
+		t.Fatal("an anonymous CPU-expert loader must never receive a reclaim band")
 	}
 
 	// Resident: the bytes are anonymous and cannot be reclaimed, so a hard cap
 	// at the plan's budget is exactly right and must not be loosened.
-	res := backendStartOptions(req, caps, nil, residentArgs)
+	res := backendStartOptions(req, caps, mainline, nil, residentArgs)
 	if res.MemoryHighMB != res.MemoryMaxMB {
 		t.Errorf("resident plan should keep a hard cap, got high=%d max=%d", res.MemoryHighMB, res.MemoryMaxMB)
 	}
@@ -3631,7 +3786,7 @@ func TestMMapBackedPlanGetsAReclaimBandBeforeTheKillThreshold(t *testing.T) {
 	}
 
 	// mmap: reclaim at the budget, kill only at the whole-host limit.
-	mm := backendStartOptions(req, caps, nil, mmapArgs)
+	mm := backendStartOptions(req, caps, mainline, nil, mmapArgs)
 	if mm.MemoryHighMB != backendMemoryMaxMB(req, caps) {
 		t.Errorf("reclaim threshold should stay at the plan budget, got %d", mm.MemoryHighMB)
 	}
@@ -3650,16 +3805,76 @@ func TestMMapBackedPlanGetsAReclaimBandBeforeTheKillThreshold(t *testing.T) {
 
 	// An explicitly named --ram-budget is a ceiling the user asked for by name
 	// and must stay hard, even under mmap.
-	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000, RAMLimitPercent: 95}, caps, nil, mmapArgs)
+	named := backendStartOptions(&launchRequest{RamBudgetMB: 90000, RAMLimitPercent: 95}, caps, mainline, nil, mmapArgs)
 	if named.MemoryHighMB != named.MemoryMaxMB {
 		t.Errorf("an explicit --ram-budget must stay a hard cap, got high=%d max=%d", named.MemoryHighMB, named.MemoryMaxMB)
 	}
 
 	// With no percent target there is nothing to reinterpret as pressure, so
 	// containment must be exactly as it was.
-	bare := backendStartOptions(&launchRequest{RamBudgetMB: 100000}, caps, nil, mmapArgs)
+	bare := backendStartOptions(&launchRequest{RamBudgetMB: 100000}, caps, mainline, nil, mmapArgs)
 	if bare.MemoryHighMB != bare.MemoryMaxMB {
 		t.Errorf("no ram-limit-percent must leave the cap unchanged, got high=%d max=%d", bare.MemoryHighMB, bare.MemoryMaxMB)
+	}
+}
+
+func TestMMapPageabilityContradictionUsesExactExpertScale(t *testing.T) {
+	strategy := &placement.Strategy{
+		Type:                     placement.MoEOffload,
+		MMap:                     true,
+		CPUExpertMMapCapability:  placement.CPUExpertMMapFileBacked,
+		ReclaimableHostWeightsMB: 80000,
+		PlannedHostFootprintMB:   4000,
+		CRAM:                     8000,
+	}
+	if contradicted, limit := mmapPageabilityContradicted(strategy, 18000); contradicted || limit != 22000 {
+		t.Fatalf("ordinary working set was treated as anonymous experts: contradicted=%v limit=%d", contradicted, limit)
+	}
+	if contradicted, _ := mmapPageabilityContradicted(strategy, 70000); !contradicted {
+		t.Fatal("large anonymous CPU-expert allocation did not contradict file-backed capability")
+	}
+	anonymous := *strategy
+	anonymous.CPUExpertMMapCapability = placement.CPUExpertMMapAnonymous
+	if contradicted, _ := mmapPageabilityContradicted(&anonymous, 70000); contradicted {
+		t.Fatal("known-anonymous plan was incorrectly treated as a new pageability contradiction")
+	}
+}
+
+func TestProbedMMapCapabilityCannotBeForgedByBackendTag(t *testing.T) {
+	ik := &backendInfo{Tag: "llama", Dialect: "llama", IsIK: true, Help: "ikawrakow --model", Identity: "ik-build"}
+	capability, _ := probedCPUExpertMMapCapability(ik)
+	if capability != placement.CPUExpertMMapAnonymous {
+		t.Fatalf("misleading friendly tag authorized ik anonymous experts: %q", capability)
+	}
+	mainline := &backendInfo{Tag: "custom-name", Dialect: "llama", Help: "--model FNAME --ctx-size N", Identity: "main-build"}
+	capability, _ = probedCPUExpertMMapCapability(mainline)
+	if capability != placement.CPUExpertMMapFileBacked {
+		t.Fatalf("probed mapped loader was not recognized: %q", capability)
+	}
+	unknown := &backendInfo{Tag: "llama", Dialect: "llama", Identity: "opaque-build"}
+	capability, _ = probedCPUExpertMMapCapability(unknown)
+	if capability != placement.CPUExpertMMapUnknown {
+		t.Fatalf("unprobed loader did not fail closed: %q", capability)
+	}
+}
+
+func TestDaemonMemoryScopeMatchesProductionCapabilityRules(t *testing.T) {
+	caps := &detect.Capabilities{RAM: detect.RAMInfo{TotalMB: 128512, FreeMB: 114844}}
+	req := &launchRequest{RAMLimitPercent: 95}
+	args := []string{"llama-server", "--n-cpu-moe", "44", "-ot", "exps=CPU"}
+	mainline := &backendInfo{CPUExpertMMapCapability: placement.CPUExpertMMapFileBacked}
+	high, max, err := daemonMemoryScope(req, caps, mainline, args, 0)
+	if err != nil || high != backendMemoryMaxMB(req, caps) || max <= high {
+		t.Fatalf("daemon did not inherit production mmap band: high=%d max=%d err=%v", high, max, err)
+	}
+	high, max, err = daemonMemoryScope(req, caps, mainline, args, 114000)
+	if err != nil || high != backendMemoryMaxMB(req, caps) || max != 114000 {
+		t.Fatalf("daemon hard override lost the production soft threshold: high=%d max=%d err=%v", high, max, err)
+	}
+	anonymous := &backendInfo{CPUExpertMMapCapability: placement.CPUExpertMMapAnonymous}
+	high, max, err = daemonMemoryScope(req, caps, anonymous, args, 0)
+	if err != nil || high != max {
+		t.Fatalf("anonymous loader received a daemon reclaim band: high=%d max=%d err=%v", high, max, err)
 	}
 }
 
@@ -3842,9 +4057,17 @@ func TestValidateHostMemoryContainmentFailClosed(t *testing.T) {
 	// An mmap-backed plan is NOT refused: page cache can be reclaimed, so the
 	// mmap reclaim band absorbs overshoot (backendStartOptions moves the hard
 	// ceiling up to the host reclaim ceiling).
-	mmap := &placement.Strategy{Type: placement.MoEOffload, MMap: true, PlannedHostFootprintMB: 111000}
+	mmap := &placement.Strategy{
+		Type: placement.MoEOffload, MMap: true, PlannedHostFootprintMB: 111000,
+		ReclaimableHostWeightsMB: 90000, CPUExpertMMapCapability: placement.CPUExpertMMapFileBacked,
+	}
 	if err := validateHostMemoryContainment(req, caps, mmap); err != nil {
 		t.Fatalf("mmap plan must not be fail-closed by footprint: %v", err)
+	}
+	anonymousMMap := *mmap
+	anonymousMMap.CPUExpertMMapCapability = placement.CPUExpertMMapAnonymous
+	if err := validateHostMemoryContainment(req, caps, &anonymousMMap); err == nil {
+		t.Fatal("anonymous CPU experts must not bypass resident containment just because mmap is enabled")
 	}
 	// Zero headroom disables the gate (auto re-size off).
 	noHeadroom := &launchRequest{RAMLimitPercent: 95, CgroupHeadroomMB: 0}
@@ -4038,6 +4261,7 @@ func TestComputeServerArgsAppliesCachedCalibrationWinner(t *testing.T) {
 	scopeKey := calibrationScopeKey(req, model, be, caps, base)
 	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, placement.CalibrationDecision{
 		ScopeKey: scopeKey, Winner: "kv-alternate", DefaultTPS: 20, WinnerTPS: 24,
+		ValidationLevel: placement.CalibrationValidationWorkflow,
 	}); err != nil {
 		t.Fatalf("seed decision: %v", err)
 	}
@@ -4111,6 +4335,13 @@ func TestClaudeReviewerHelpEnumeratesOffAndDescribesEachValue(t *testing.T) {
 func TestHelpAdvertisesMeasuredBandwidthDetection(t *testing.T) {
 	if help := usageText(); !strings.Contains(help, "detect --bandwidth") {
 		t.Fatalf("help does not advertise the hardware bandwidth profiler")
+	}
+}
+
+func TestHelpAdvertisesLaunchOptimizerStatus(t *testing.T) {
+	help := usageText()
+	if !strings.Contains(help, "status [model.gguf]") {
+		t.Fatalf("help does not advertise ggrun status: %s", help)
 	}
 }
 

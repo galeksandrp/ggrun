@@ -71,7 +71,7 @@ func cmdMemoryProbe(args []string) {
 		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
 		os.Exit(1)
 	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	runtimeCaps, visibleToPhysical := runtimeGPUCapabilities(caps, req)
 	oomPenalty := map[int]int{}
 
@@ -87,6 +87,7 @@ func cmdMemoryProbe(args []string) {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
+			rememberLiveMemoryProbeConsent(cfg, os.Stderr)
 			continue
 		}
 		if outcome.Err != nil {
@@ -129,7 +130,7 @@ func cmdMemoryProbe(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: measured placement recompute failed: %v\n", replanErr)
 			os.Exit(1)
 		}
-		claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+		claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 		nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 		if formatCommand(nextArgs) != formatCommand(serverArgs) {
 			strategy = next

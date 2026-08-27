@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -27,8 +28,12 @@ type Engine struct {
 	MinImprovementPct float64
 	BenchmarkTimeout  time.Duration
 	BackendHelp       string
-	OnProgress        func(msg string)
-	StartServer       func(flags []string) (cleanup func(), err error)
+	// AgentParallel selects the concurrent cache-backed turn benchmark used by
+	// parallel coding-agent workloads. Batch and ubatch are always placement-owned.
+	AgentParallel int
+	Workload      string
+	OnProgress    func(msg string)
+	StartServer   func(flags []string) (cleanup func(), err error)
 
 	// benchmarkFn, when set, replaces the live HTTP benchmark. Test seam only.
 	benchmarkFn func() (*benchmark.Result, error)
@@ -118,11 +123,18 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	best.Name = "baseline"
 	best.Status = "ok"
 	best.Best = true
+	if e.agentWorkload() {
+		best.Result.Score = 100
+	}
 	e.addCache(best)
 	entries := []Entry{*best}
 	e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
 	protected := QualityProtectedFlags()
-	plan := deterministicPlan(initialFlags, e.Backend, e.Caps, e.BackendHelp)
+	// Batch dimensions are placement inputs: ubatch changes graph VRAM and can
+	// move experts. This engine restarts raw flag sets but cannot recompute the
+	// placement ledger, so batch-pair search belongs exclusively to contained
+	// placement calibration for every workload.
+	plan := placementSafeTunePlan(deterministicPlan(initialFlags, e.Backend, e.Caps, e.BackendHelp))
 	triedCandidates := map[string]bool{}
 
 	for round := 1; round <= e.Rounds; round++ {
@@ -187,6 +199,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				HardwareHash:  e.hardwareHash(),
 				Backend:       e.Backend,
 				Vision:        e.Vision,
+				Workload:      e.workloadName(),
 				Round:         round,
 				Name:          suggestion.Name,
 				Flags:         flagMap(candidateFlags),
@@ -204,8 +217,16 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			candidate.Status = "ok"
 			candidate.Backend = e.Backend
 			candidate.Vision = e.Vision
-			candidate.Best = meaningfulImprovement(candidate.Result.GenTPS, best.Result.GenTPS, minImprovementPct)
-			e.addCache(candidate)
+			if e.agentWorkload() {
+				candidate.Result.Score = 100 * agentWorkloadScore(candidate.Result, baseline.Result)
+			}
+			candidate.Best = e.meaningfulImprovement(candidate.Result, best.Result, minImprovementPct)
+			// Candidate wins remain provisional until the back-to-back confirmation
+			// pass. Persist the measurement now, but do not replace the cache's
+			// baseline best with a one-sample noise winner.
+			cachedCandidate := *candidate
+			cachedCandidate.Best = false
+			e.addCache(&cachedCandidate)
 			entries = append(entries, *candidate)
 			if candidate.Best {
 				best = candidate
@@ -240,7 +261,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			best.Best = false
 			baseline.Best = true
 			best = baseline
-		case meaningfulImprovement(confBest.Result.GenTPS, confBase.Result.GenTPS, minImprovementPct):
+		case e.confirmedImprovement(confBest, confBase, minImprovementPct):
 			// Reproduced under equal conditions: trust the confirmed numbers.
 			baseline.Result = confBase.Result
 			best.Result = confBest.Result
@@ -261,6 +282,8 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 		e.OnProgress(fmt.Sprintf("AI-tune: done. Best result: %.1f tok/s", best.Result.GenTPS))
 	}
 	if e.Cache != nil {
+		// Promote only the confirmed winner (or retain the original baseline).
+		e.addCache(best)
 		path, err := e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, true)
 		if err != nil && e.OnProgress != nil {
 			e.OnProgress(fmt.Sprintf("AI-tune: failed to save tune cache: %v", err))
@@ -327,10 +350,20 @@ func (e *Engine) roundRunning(round int, modelPath string, flags []string) (*Ent
 			Model:   e.Model,
 			Timeout: e.benchmarkTimeout(),
 		}
-		res, err = runner.Run()
+		if e.agentWorkload() {
+			res, err = runner.RunAgentParallel(e.AgentParallel)
+		} else {
+			res, err = runner.Run()
+		}
 	}
 	if err != nil {
 		return nil, err
+	}
+	if res == nil {
+		return nil, fmt.Errorf("benchmark returned no result")
+	}
+	if e.agentWorkload() && !validAgentBenchmarkResult(res) {
+		return nil, fmt.Errorf("agent benchmark returned incomplete concurrent metrics")
 	}
 
 	entry := &Entry{
@@ -340,22 +373,84 @@ func (e *Engine) roundRunning(round int, modelPath string, flags []string) (*Ent
 		HardwareHash: e.hardwareHash(),
 		Backend:      e.Backend,
 		Vision:       e.Vision,
+		Workload:     e.workloadName(),
 		Round:        round,
 		Flags:        flagMap(flags),
 		Result: BenchmarkResult{
-			PromptTokens:    res.PromptTokens,
-			PromptTPS:       res.PromptTPS,
-			GenTokens:       res.GenTokens,
-			GenTPS:          res.GenTPS,
-			PeakVRAMMB:      res.PeakVRAMMB,
-			DraftTokens:     res.DraftTokens,
-			DraftAccepted:   res.DraftAccepted,
-			DraftAcceptRate: res.DraftAcceptRate,
+			PromptTokens:         res.PromptTokens,
+			PromptTPS:            res.PromptTPS,
+			GenTokens:            res.GenTokens,
+			GenTPS:               res.GenTPS,
+			Parallel:             res.Parallel,
+			MixedGenTokens:       res.MixedGenTokens,
+			MixedGenTPS:          res.MixedGenTPS,
+			AgentTurnTimeS:       res.AgentTurnTimeS,
+			AgentTurnMaxS:        res.AgentTurnMaxS,
+			AgentSamples:         res.AgentSamples,
+			AgentCachedTokens:    res.AgentCachedTokens,
+			AgentNewPromptTokens: res.AgentNewPromptTokens,
+			PeakVRAMMB:           res.PeakVRAMMB,
+			DraftTokens:          res.DraftTokens,
+			DraftAccepted:        res.DraftAccepted,
+			DraftAcceptRate:      res.DraftAcceptRate,
 		},
 		Best: false,
 	}
 
 	return entry, nil
+}
+
+func validAgentBenchmarkResult(result *benchmark.Result) bool {
+	valid := func(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
+	return result != nil && result.Parallel > 1 &&
+		result.PromptTokens > 0 && result.GenTokens > 0 && result.MixedGenTokens > 0 &&
+		result.AgentSamples >= 2 && result.AgentCachedTokens > 0 && result.AgentNewPromptTokens > 0 &&
+		valid(result.PromptTPS) && valid(result.GenTPS) && valid(result.MixedGenTPS) &&
+		valid(result.AgentTurnTimeS) && valid(result.AgentTurnMaxS)
+}
+
+func (e *Engine) agentWorkload() bool {
+	return e != nil && e.AgentParallel > 1
+}
+
+func (e *Engine) workloadName() string {
+	if e.agentWorkload() {
+		if strings.TrimSpace(e.Workload) != "" {
+			return strings.TrimSpace(e.Workload)
+		}
+		return fmt.Sprintf("%s-p%d", AgentParallelWorkloadPrefix, e.AgentParallel)
+	}
+	return ""
+}
+
+// agentWorkloadScore mirrors first-launch calibration: the only primary
+// objective is cache-backed end-to-end agent turn time. Throughput metrics stay
+// diagnostic and cannot compensate for a slower user-visible turn.
+func agentWorkloadScore(result, baseline BenchmarkResult) float64 {
+	valid := func(v float64) bool { return v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) }
+	if !valid(result.AgentTurnTimeS) || !valid(baseline.AgentTurnTimeS) {
+		return 0
+	}
+	return baseline.AgentTurnTimeS / result.AgentTurnTimeS
+}
+
+func (e *Engine) meaningfulImprovement(candidate, current BenchmarkResult, minImprovementPct float64) bool {
+	if e.agentWorkload() {
+		return meaningfulImprovement(candidate.Score, current.Score, minImprovementPct) &&
+			candidate.AgentTurnMaxS <= current.AgentTurnMaxS
+	}
+	return meaningfulImprovement(candidate.GenTPS, current.GenTPS, minImprovementPct)
+}
+
+func (e *Engine) confirmedImprovement(candidate, baseline *Entry, minImprovementPct float64) bool {
+	if candidate == nil || baseline == nil {
+		return false
+	}
+	if e.agentWorkload() {
+		baseline.Result.Score = 100
+		candidate.Result.Score = 100 * agentWorkloadScore(candidate.Result, baseline.Result)
+	}
+	return e.meaningfulImprovement(candidate.Result, baseline.Result, minImprovementPct)
 }
 
 func (e *Engine) benchmarkTimeout() time.Duration {
@@ -512,15 +607,18 @@ func DefaultProtectedFlags() map[string]bool {
 }
 
 // QualityProtectedFlags extends the placement-protected set with flags that
-// change the model's OUTPUT QUALITY or effective context — knobs AI-tune must
-// never set on the user's behalf, in any path: the autonomous loop, a cached
-// tune file, or a community-shared config. KV cache quantization
+// change model placement, OUTPUT QUALITY, or effective context — knobs AI-tune
+// must never set on the user's behalf, in any path: the autonomous loop, a
+// cached tune file, or a community-shared config. Batch dimensions require a
+// fresh placement computation; KV cache quantization
 // (--cache-type-k/-v) is a user-owned quality/memory tradeoff, and --parallel
 // divides --ctx-size across sequence slots, shrinking the usable per-request
 // context. The user can still set any of these directly on the command line;
 // the tune machinery just never overrides them.
 func QualityProtectedFlags() map[string]bool {
 	protected := DefaultProtectedFlags()
+	protected[canonicalFlagName("-b")] = true
+	protected[canonicalFlagName("-ub")] = true
 	protected[canonicalFlagName("--cache-type-k")] = true
 	protected[canonicalFlagName("--cache-type-v")] = true
 	protected[canonicalFlagName("--parallel")] = true
@@ -552,7 +650,22 @@ func ApplyOverrides(baseFlags []string, overrides map[string]interface{}, protec
 		}
 		result = applySuggestionWithProtection(result, flagValuesToArgs(map[string]interface{}{key: val}), protected)
 	}
-	return result
+	return NormalizeBatchArgs(result)
+}
+
+// NormalizeBatchArgs keeps persisted, community, and LLM-suggested tune
+// overlays from emitting an n_ubatch larger than n_batch. llama.cpp silently
+// clamps such a pair; doing it here makes the cached config, memory guard, and
+// effective runtime describe the same workload. Lowering ubatch is fail-closed:
+// it never increases graph allocation.
+func NormalizeBatchArgs(flags []string) []string {
+	values := flagMap(flags)
+	batch, batchErr := strconv.Atoi(strings.TrimSpace(values["-b"]))
+	ubatch, ubatchErr := strconv.Atoi(strings.TrimSpace(values["-ub"]))
+	if batchErr != nil || ubatchErr != nil || batch <= 0 || ubatch <= batch {
+		return flags
+	}
+	return applySuggestionWithProtection(flags, []string{"-ub", strconv.Itoa(batch)}, nil)
 }
 
 func sanitizeFlagValues(values map[string]interface{}, protected map[string]bool) map[string]interface{} {
@@ -855,6 +968,27 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 	}
 
 	return candidates
+}
+
+// placementSafeTunePlan removes every generic batch mutation. The contained
+// placement calibrator is the only component allowed to search that coupled
+// dimension because it recomputes memory placement for every pair.
+func placementSafeTunePlan(generic []Suggestion) []Suggestion {
+	plan := make([]Suggestion, 0, len(generic))
+	for _, candidate := range generic {
+		changesBatch := false
+		for key := range candidate.FlagValues {
+			canon := canonicalFlagName(key)
+			if canon == "-b" || canon == "-ub" {
+				changesBatch = true
+				break
+			}
+		}
+		if !changesBatch {
+			plan = append(plan, candidate)
+		}
+	}
+	return plan
 }
 
 func guardRiskyMoEOverrides(overrides map[string]interface{}, baseFlags []string) map[string]interface{} {

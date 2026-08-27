@@ -3,10 +3,12 @@ package claudeauto
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"time"
 )
 
@@ -32,13 +34,13 @@ func reviewerAttemptFrom(ctx context.Context) *reviewerAttempt {
 }
 
 // installReviewerFallbackHooks makes the reviewer proxy report transport errors
-// and 5xx responses as failed attempts instead of writing them to the client. A
+// and non-2xx responses as failed attempts instead of writing them to the client. A
 // reviewer that crashed, never came up, or rejected the prompt (a context that
 // will not hold it, a template it cannot apply) must not take the review down
 // with it -- the main model can still answer.
 func installReviewerFallbackHooks(proxy *httputil.ReverseProxy) {
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		if resp == nil || resp.StatusCode < 500 {
+		if resp == nil || (resp.StatusCode >= 200 && resp.StatusCode < 300) {
 			return nil
 		}
 		if attempt := reviewerAttemptFrom(resp.Request.Context()); attempt != nil {
@@ -54,6 +56,90 @@ func installReviewerFallbackHooks(proxy *httputil.ReverseProxy) {
 		}
 		proxyError(w, r, err)
 	}
+}
+
+// validReviewerVerdict mirrors the response contract in Claude Code's
+// security-monitor prompt. A thinking block, tool call, empty 200, or prose-only
+// answer is not a permission decision and must be retried on the main model.
+func validReviewerVerdict(text string) bool {
+	text = strings.TrimSpace(text)
+	no := strings.Count(text, "<block>no</block>")
+	yes := strings.Count(text, "<block>yes</block>")
+	return no+yes == 1
+}
+
+func reviewerJSONText(body []byte) string {
+	var decoded struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+		Completion string `json:"completion"`
+	}
+	if json.Unmarshal(body, &decoded) != nil {
+		return ""
+	}
+	texts := make([]string, 0, len(decoded.Content)+1)
+	for _, block := range decoded.Content {
+		if block.Type == "text" || block.Type == "" {
+			texts = append(texts, block.Text)
+		}
+	}
+	if decoded.Completion != "" {
+		texts = append(texts, decoded.Completion)
+	}
+	return strings.Join(texts, "")
+}
+
+// reviewerSSEText joins only user-visible text deltas. Thinking and tool-use
+// events are intentionally ignored: neither can satisfy Claude's verdict parser.
+func reviewerSSEText(body []byte) string {
+	var texts []string
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := bytes.TrimSpace(rawLine)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+			continue
+		}
+		var event struct {
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+			ContentBlock struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content_block"`
+			Completion string `json:"completion"`
+		}
+		if json.Unmarshal(payload, &event) != nil {
+			continue
+		}
+		if event.Delta.Type == "text_delta" || (event.Delta.Type == "" && event.Delta.Text != "") {
+			texts = append(texts, event.Delta.Text)
+		}
+		if event.ContentBlock.Type == "text" || (event.ContentBlock.Type == "" && event.ContentBlock.Text != "") {
+			texts = append(texts, event.ContentBlock.Text)
+		}
+		if event.Completion != "" {
+			texts = append(texts, event.Completion)
+		}
+	}
+	return strings.Join(texts, "")
+}
+
+func reviewerResponseUsable(status int, header http.Header, body []byte) bool {
+	if status < 200 || status >= 300 || len(bytes.TrimSpace(body)) == 0 {
+		return false
+	}
+	contentType := strings.ToLower(header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/event-stream") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("event:")) || bytes.HasPrefix(bytes.TrimSpace(body), []byte("data:")) {
+		return validReviewerVerdict(reviewerSSEText(body))
+	}
+	return validReviewerVerdict(reviewerJSONText(body))
 }
 
 // deferredWriter withholds a response until the router decides whether to keep
@@ -122,7 +208,7 @@ func (r *Router) tryReviewer(w http.ResponseWriter, req *http.Request, proxy *ht
 	deferred := newDeferredWriter(w)
 	metered := &meteredWriter{ResponseWriter: deferred, start: start}
 	proxy.ServeHTTP(metered, req)
-	if attempt.failed {
+	if attempt.failed || !reviewerResponseUsable(deferred.status, deferred.hdr, deferred.buf.Bytes()) {
 		return false
 	}
 	deferred.flush()

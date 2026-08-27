@@ -75,6 +75,16 @@ when the profile is absent, stale, incomplete, or corrupt.
   offload configurations.
 - Measures a bounded set of safe performance options with `--ai-tune` and
   preserves the winning configuration for the same setup.
+- Makes the ordinary TUI/direct launch converge from a stable placement estimate
+  toward a faster measured whole configuration for its agent workload. The
+  automatic path computes the complete safe neighbor set, then live-compares
+  only the baseline and one highest-confidence finalist; the wider sweep stays
+  an explicit maintenance operation. It measures repeated cache-backed turns
+  plus mixed prefill/decode and promotes only after contained admission,
+  branch/replay, lifecycle, and clean-relaunch gates. Exact evidence—including
+  a measured result where the stable baseline won—is reused on the next launch.
+- Prints an informational warning before the first load of a very large model,
+  including the startup bound and the possibility of a bounded measured retry.
 - Keeps model downloads, recommendations, launches, and the generated command
   in one inspectable TUI flow.
 - Exposes llama.cpp's OpenAI-compatible `/v1` API (chat completions and
@@ -189,6 +199,7 @@ ggrun does not own are forwarded unchanged.
 [Troubleshooting](docs/troubleshooting.md) ·
 [Usage](docs/usage.md) ·
 [Architecture](docs/architecture.md) ·
+[Development roadmap](docs/development-roadmap.md) ·
 [Fitting the hardware](docs/fitting-the-hardware.md) ·
 [Benchmarks](docs/launch-performance.md) ·
 [Speculative decoding](docs/speculative-decoding.md) ·

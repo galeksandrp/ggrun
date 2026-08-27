@@ -46,6 +46,33 @@ func TestBackendCapabilityCacheIsExactAndProtectsExplicitFlags(t *testing.T) {
 	}
 }
 
+func TestBackendCapabilityCachePersistsExactMMapContradiction(t *testing.T) {
+	dir := t.TempDir()
+	model := &placement.ModelProfile{Path: "/models/m3.gguf", SizeBytes: 4321, ModelArch: "minimax-m3", NumLayers: 62}
+	backend := &backendInfo{Path: "/bin/llama-server", Identity: "mapped-build", Tag: "llama"}
+	if err := persistBackendCapability(dir, model, backend, "--metrics", "parser rejected it", false); err != nil {
+		t.Fatal(err)
+	}
+	evidence := "live cgroup showed CPU experts in anonymous memory"
+	if err := persistBackendCPUExpertMMapCapability(dir, model, backend, placement.CPUExpertMMapAnonymous, evidence); err != nil {
+		t.Fatal(err)
+	}
+	replay := &backendInfo{Path: backend.Path, Identity: backend.Identity, Tag: backend.Tag}
+	req := &launchRequest{}
+	applyCachedBackendCapabilities(req, dir, model, replay)
+	if replay.CPUExpertMMapCapability != placement.CPUExpertMMapAnonymous || replay.CPUExpertMMapEvidence != evidence {
+		t.Fatalf("mmap contradiction was not restored: %+v", replay)
+	}
+	if req.DisabledBackendFlags["--metrics"] == "" {
+		t.Fatal("persisting mmap evidence erased existing parser capabilities")
+	}
+	differentBuild := &backendInfo{Path: backend.Path, Identity: "new-build", Tag: backend.Tag}
+	applyCachedBackendCapabilities(&launchRequest{}, dir, model, differentBuild)
+	if differentBuild.CPUExpertMMapCapability != "" {
+		t.Fatalf("mmap evidence leaked across exact backend builds: %+v", differentBuild)
+	}
+}
+
 func TestValidateAndRepairBackendArgsRemovesGeneratedOptionalFlag(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "llama-server")

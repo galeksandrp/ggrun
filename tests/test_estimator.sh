@@ -80,7 +80,8 @@ build_gguf --out "$TMP/dense.gguf" --arch llama --name 'Test-Llama-7B' \
     --layers 32 --hkv 8 --kl 128 --vl 128 --embd 4096 --ff 14336 --ctx-train 8192
 out=$(run_dry "$TMP/dense.gguf")
 assert_contains "$out" "$TMP/dense.gguf" "dense_llama: model path included"
-assert_contains "$out" "--ctx-size 32768" "dense_llama: context selected from metadata"
+# Automatic fit must not silently exceed the GGUF's native/training context.
+assert_contains "$out" "--ctx-size 8192" "dense_llama: native context cap preserved"
 assert_contains "$out" "--cache-type-k q4_0" "dense_llama: KV cache type emitted"
 
 # ── Test 2: MoE ──────────────────────────────────────────────────────────

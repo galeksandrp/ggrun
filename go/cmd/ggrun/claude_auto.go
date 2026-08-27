@@ -30,7 +30,16 @@ type claudeAutoRuntime struct {
 	reviewerLog  io.Closer
 	reviewerPort int
 	reviewerGPU  int
+	companion    *claudeCompanionProfile
 	router       *claudeauto.Router
+}
+
+// workerRouteEnabled is deliberately separate from reviewer availability.
+// Qwen3.5-2B is a review-only profile: its process is a valid classifier
+// destination, but advertising it as local-fast would send ordinary cheap-tier
+// background work into a model the user selected only for security reviews.
+func (r *claudeAutoRuntime) workerRouteEnabled() bool {
+	return r != nil && r.reviewerPort > 0 && r.companion != nil && r.companion.ServesWorkers
 }
 
 func claudeAutoReviewerNeeded(extraArgs []string) bool {
@@ -82,6 +91,10 @@ type claudeCompanionProfile struct {
 	KVType            string
 	ReservationVRAMMB int
 	NanoBeige         bool
+	// ServesWorkers authorizes ordinary local-fast traffic in addition to
+	// classifier/security reviews. It is false for the Qwen3.5-2B review-only
+	// profile; review availability alone must never imply worker capability.
+	ServesWorkers bool
 	// Artifact is the pinned model this profile runs. The launcher installs
 	// exactly this one: ReservationVRAMMB describes THIS model, so installing
 	// another artifact under it under-reserves the companion.
@@ -155,10 +168,15 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 
 	var profile *claudeCompanionProfile
 	// An explicit reviewer model/backend override (env) retains its historical
-	// behavior and always outranks both ggrun's automatic choice and the
-	// --claude-reviewer flag.
-	envOverride := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != "" ||
-		strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) != ""
+	// precedence and always outranks both ggrun's automatic choice and the
+	// --claude-reviewer flag. Model capability is a separate question: an
+	// arbitrary GGUF is safe to use for the narrow classifier lane only. Never
+	// advertise it as the local-fast worker merely because it was supplied in an
+	// environment variable. A backend-only override still runs ggrun's pinned,
+	// worker-verified 4B artifact and keeps that artifact's worker capability.
+	modelOverride := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_MODEL")) != ""
+	backendOverride := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_REVIEWER_BIN")) != ""
+	envOverride := modelOverride || backendOverride
 	override := ""
 	if req != nil {
 		override = strings.TrimSpace(req.ClaudeReviewerOverride)
@@ -186,6 +204,7 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 				MeasurementKey:    claudeNanoCompanionName + "-ctx65536-kv-q4_0",
 				KVType:            "q4_0",
 				ReservationVRAMMB: claudeNanoReservationVRAMMB, NanoBeige: true,
+				ServesWorkers: true,
 			}
 		}
 	}
@@ -199,12 +218,14 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			MeasurementKey:    "claude-reviewer-qwen35-2b-q4-k-m",
 			KVType:            "q8_0",
 			ReservationVRAMMB: claudeSmallReviewerReservationVRAMMB,
+			ServesWorkers:     false,
 			Artifact:          claudeauto.SmallReviewerSpec(),
 		}
 	}
 	// Fallback (env override, degraded NanoBeige, or any unmapped value): the
-	// Qwen3.5-4B worker/reviewer. An env override carries its own model path and
-	// backend through the helper functions, so the placeholder profile is enough.
+	// Qwen3.5-4B worker/reviewer profile. A model env override carries its own
+	// model path through the helper functions, but remains review-only because
+	// ggrun has not verified the arbitrary artifact as a general worker.
 	if profile == nil {
 		modelPath := claudeauto.ReviewerModelPath(appHome)
 		profile = &claudeCompanionProfile{
@@ -215,6 +236,7 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			MeasurementKey:    "claude-reviewer-qwen35-4b-q4-k-m",
 			KVType:            "q8_0",
 			ReservationVRAMMB: claudeReviewerReservationVRAMMB,
+			ServesWorkers:     !modelOverride,
 			Artifact:          claudeauto.DefaultReviewerSpec(),
 		}
 	}
@@ -427,7 +449,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		if err == nil {
 			fmt.Printf("[claude-code] Auto worker/reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, profile.DisplayName)
 			recordReviewerVRAM(cfg, p, profile)
-			return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: gpu}, nil
+			return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: gpu, companion: profile}, nil
 		}
 		lastErr = err
 		if planned {
@@ -456,7 +478,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		return nil, fmt.Errorf("start local Auto reviewer: %w", err)
 	}
 	fmt.Printf("[claude-code] Auto worker/reviewer ready on CPU (PID %d, %s, ctx 64k)\n", p.Cmd.Process.Pid, profile.DisplayName)
-	return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: -1}, nil
+	return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: -1, companion: profile}, nil
 }
 
 func claudeReviewerArgs(binary, modelPath string, port int, device, help string) []string {
@@ -785,11 +807,11 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 		return err
 	}
 	r.router = router
-	// Point Claude Code's cheap tiers at the companion backend when one is
-	// actually running. With no separate companion the alias must stay unset,
-	// so cheap-tier work continues to the main model rather than into a lane
-	// that loops back to the same server.
-	router.SetCompanion("local", r.reviewerPort > 0)
+	// Point Claude Code's cheap tiers at the companion only when the selected
+	// profile explicitly serves worker traffic. A seated Qwen3.5-2B remains a
+	// perfectly valid separate safety reviewer, but local-fast falls through to
+	// the main model because that profile is review-only.
+	router.SetCompanion("local", r.workerRouteEnabled())
 	// The separate reviewer always runs with claudeReviewerContextTokens of
 	// context (see claudeReviewerArgsWithKV). Tell the router that window so a
 	// classifier prompt too large for the reviewer falls back to the main model
@@ -810,8 +832,10 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	} else {
 		fmt.Printf("[claude-code] per-request metrics -> %s\n", metricsPath)
 	}
-	if r.reviewerPort > 0 {
-		fmt.Printf("[claude-code] Auto router ready on %s (coding -> main model, safety -> local reviewer)\n", router.URL())
+	if r.reviewerPort > 0 && r.workerRouteEnabled() {
+		fmt.Printf("[claude-code] Auto router ready on %s (coding -> main model, cheap work + safety -> local companion)\n", router.URL())
+	} else if r.reviewerPort > 0 {
+		fmt.Printf("[claude-code] Auto router ready on %s (coding + cheap work -> main model, safety -> local reviewer)\n", router.URL())
 	} else {
 		fmt.Printf("[claude-code] agent gateway ready on %s\n", router.URL())
 	}

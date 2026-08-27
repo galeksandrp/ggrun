@@ -62,17 +62,53 @@ const (
 	MoEOffload      StrategyType = "moe_offload"
 )
 
+// CPUExpertMMapCapability describes the selected loader's CPU-expert memory
+// behavior. It is deliberately tri-state: an unknown fork is not entitled to
+// the RAM-capacity benefit of mmap until its exact loader family is classified
+// or observed. The empty value exists only for legacy package callers and is
+// normalized separately from an explicit unknown core-launch capability.
+type CPUExpertMMapCapability string
+
+const (
+	CPUExpertMMapUnknown    CPUExpertMMapCapability = "unknown"
+	CPUExpertMMapFileBacked CPUExpertMMapCapability = "file-backed"
+	CPUExpertMMapAnonymous  CPUExpertMMapCapability = "anonymous"
+)
+
+// NormalizeCPUExpertMMapCapability validates an external capability value.
+func NormalizeCPUExpertMMapCapability(value string) CPUExpertMMapCapability {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case string(CPUExpertMMapFileBacked):
+		return CPUExpertMMapFileBacked
+	case string(CPUExpertMMapAnonymous):
+		return CPUExpertMMapAnonymous
+	default:
+		return CPUExpertMMapUnknown
+	}
+}
+
 // Strategy represents the computed placement for a model on this hardware.
 type Strategy struct {
 	Type        StrategyType `json:"type"`
 	ContextSize int          `json:"context_size"`
-	GPULayers   int          `json:"gpu_layers"` // always 999; llama-server decides
-	TensorSplit []float64    `json:"tensor_split,omitempty"`
-	SplitMode   string       `json:"split_mode,omitempty"` // graph, layer, row
-	MainGPU     int          `json:"main_gpu,omitempty"`
-	KVPlacement string       `json:"kv_placement"` // gpu, cpu, auto
-	KVQuality   string       `json:"kv_quality"`   // high, mid, low
-	KVType      string       `json:"kv_type"`      // f16, q8_0, q4_0
+	// ContextFit* records the automatic-context admission boundary. A zero
+	// ContextFitRejected means ContextSize reached the model/policy cap; otherwise
+	// it is the immediately adjacent context granule that either failed admission
+	// or crossed into a slower residency class.
+	ContextAuto        bool      `json:"context_auto,omitempty"`
+	ContextFitTier     string    `json:"context_fit_tier,omitempty"`
+	ContextFitRejected int       `json:"context_fit_rejected,omitempty"`
+	ContextFitEvidence string    `json:"context_fit_evidence,omitempty"`
+	GPULayers          int       `json:"gpu_layers"` // always 999; llama-server decides
+	TensorSplit        []float64 `json:"tensor_split,omitempty"`
+	SplitMode          string    `json:"split_mode,omitempty"` // graph, layer, row
+	MainGPU            int       `json:"main_gpu,omitempty"`
+	// PlacementPolicy records which internal topology hypothesis produced the
+	// complete split. It is diagnostic provenance, not a backend flag.
+	PlacementPolicy string `json:"placement_policy,omitempty"`
+	KVPlacement     string `json:"kv_placement"` // gpu, cpu, auto
+	KVQuality       string `json:"kv_quality"`   // high, mid, low
+	KVType          string `json:"kv_type"`      // f16, q8_0, q4_0
 	// KVTypeV, when non-empty, overrides the V-cache leg emitted by Args. It
 	// carries a mixed K/V pair that placement sized under the unified estimate:
 	// the context fit is computed as if both legs used KVType, and only the
@@ -116,11 +152,34 @@ type Strategy struct {
 	MMap                         bool   `json:"mmap"`
 	MMapRequired                 bool   `json:"mmap_required,omitempty"`
 	MLock                        bool   `json:"mlock"`
-	FlashAttention               bool   `json:"flash_attention"`
-	Threads                      int    `json:"threads"`
-	BatchSize                    int    `json:"batch_size"`
-	UBatchSize                   int    `json:"ubatch_size"`
-	BackendTag                   string `json:"backend_tag,omitempty"` // "llama" or "ik_llama"
+	// CPUExpertMMapCapability records whether the exact selected backend loader
+	// keeps CPU-offloaded expert tensors file-backed. MMapRequired is safe only
+	// with the file-backed capability; an anonymous/unknown loader must satisfy
+	// the full resident host ledger instead. The evidence string explains where
+	// the capability came from (loader probe, reviewed family, or a live
+	// contradiction) and is persisted with verified configs for diagnostics.
+	CPUExpertMMapCapability CPUExpertMMapCapability `json:"cpu_expert_mmap_capability,omitempty"`
+	CPUExpertMMapEvidence   string                  `json:"cpu_expert_mmap_evidence,omitempty"`
+	// ReclaimableHostWeightsMB is the exact routed-expert weight footprint that
+	// may be evicted when the capability above is file-backed. It is zero for
+	// resident/non-MoE plans and gives the live pageability gate a scale against
+	// which to detect a loader that actually copied those bytes into anonymous
+	// host memory.
+	ReclaimableHostWeightsMB int  `json:"reclaimable_host_weights_mb,omitempty"`
+	FlashAttention           bool `json:"flash_attention"`
+	Threads                  int  `json:"threads"`
+	BatchSize                int  `json:"batch_size"`
+	UBatchSize               int  `json:"ubatch_size"`
+	// BatchTuned marks a live, profile-scoped calibration winner. It is runtime
+	// state only: cached decisions re-derive the named candidate, while verified
+	// configs still require the matching calibration decision before bypassing
+	// the conservative parallel-agent fairness baseline.
+	BatchTuned bool `json:"-"`
+	// PerformanceTuned marks a full standard-launch optimizer decision
+	// (including "the stable default won"). Verified configs persist it so a
+	// direct-start winner does not immediately re-enter candidate search.
+	PerformanceTuned bool   `json:"-"`
+	BackendTag       string `json:"backend_tag,omitempty"` // "llama" or "ik_llama"
 	// ModelBasename is the basename of the model this placement was computed for
 	// (filepath.Base of the primary shard). Persisted alongside the placement
 	// cache so a "clear caches" action can match every .place file a model
@@ -133,6 +192,20 @@ type Strategy struct {
 	ThreadsBatch  int    `json:"threads_batch"`      // batch threads (logical cores)
 	Parallel      int    `json:"parallel,omitempty"`
 	CRAM          int    `json:"cram,omitempty"` // prompt cache MB
+	// ResourceLedger is the complete, per-device memory account used by the
+	// standard-launch optimizer. VRAMLedger below remains the detailed MoE
+	// expert-packing explanation; ResourceLedger covers every strategy type.
+	ResourceLedger *ResourceLedger `json:"resource_ledger,omitempty"`
+	// Residency is a derived controller state, not a model-size class or a
+	// user-selected mode.
+	Residency ResidencyClass `json:"residency,omitempty"`
+	// These diagnostics explain why the bounded optimizer chose a finalist. A
+	// predicted cost can select a candidate for measurement but is never itself
+	// sufficient evidence for promotion.
+	OptimizationBottleneck string                `json:"optimization_bottleneck,omitempty"`
+	EstimatedAgentCost     float64               `json:"estimated_agent_cost,omitempty"`
+	EstimateConfidence     string                `json:"estimate_confidence,omitempty"`
+	OptimizationBoundary   *OptimizationBoundary `json:"optimization_boundary,omitempty"`
 	// VRAMLedger explains, per GPU, how the expert placement was arrived at.
 	// Every question of the form "why is that card not full?" has been answered
 	// by reverse-engineering this arithmetic from the emitted -ot string and
@@ -345,6 +418,34 @@ func checkpointMinStep(model *ModelProfile, ubatch int) int {
 	return 0
 }
 
+// NormalizeBatchSizes enforces llama.cpp's n_ubatch <= n_batch invariant on a
+// fully resolved strategy. Placement, verified-config restore, Claude workload
+// policy, and tune-cache overlays can all change one side independently. The
+// backend silently clamps an inverted pair, which makes the displayed argv,
+// memory estimate, calibration scope, and effective runtime disagree.
+//
+// User intent decides the safe direction: an explicit ubatch raises an
+// automatic batch to match; otherwise the physical ubatch is lowered to the
+// logical batch. Lowering ubatch is the fail-closed choice for stale automatic
+// or cached state because it cannot increase graph allocation.
+func NormalizeBatchSizes(s *Strategy, model *ModelProfile, batchExplicit, ubatchExplicit bool) bool {
+	if s == nil {
+		return false
+	}
+	oldBatch, oldUBatch := s.BatchSize, s.UBatchSize
+	if s.BatchSize > 0 && s.UBatchSize > s.BatchSize {
+		if ubatchExplicit && !batchExplicit {
+			s.BatchSize = s.UBatchSize
+		} else {
+			s.UBatchSize = s.BatchSize
+		}
+	}
+	if s.UBatchSize != oldUBatch {
+		s.CheckpointMinStep = checkpointMinStep(model, s.UBatchSize)
+	}
+	return s.BatchSize != oldBatch || s.UBatchSize != oldUBatch
+}
+
 // isRecurrentOrHybrid reports whether the model carries recurrent state that a
 // context checkpoint must preserve and restore. This is the same set that
 // requiresScopedContextEvidence prices separately: DeepSeek4's GGUFs do not
@@ -433,13 +534,30 @@ type DenseCPUOffloadPromptFunc func(totalSizeMB, freeGPUVRAMMB int) bool
 // Options allows user overrides.
 type Options struct {
 	ContextSize int
-	KVPlacement string // auto, gpu, cpu
-	KVQuality   string // high, mid, low
+	// AutoContextMax caps an automatic/fit context without turning it into an
+	// explicit user request. Zero uses the model's native context (or the
+	// planner's bounded unknown-metadata ceiling). This is how workload profiles
+	// such as Claude Code impose a portable ceiling while still using the same
+	// placement-backed fit resolver as every other launch path.
+	AutoContextMax int
+	KVPlacement    string // auto, gpu, cpu
+	KVQuality      string // high, mid, low
 	// KVQualityV forces the V-cache leg (--cache-type-v) to a specific type
 	// while KVQuality still sizes the unified plan. Used when a backend rejects
 	// a quantized V cache for an architecture whose K leg may still compress.
 	KVQualityV string
 	GPUs       []int // restrict to specific GPUs
+	// PlacementPolicy is an internal candidate-generation hint. Empty/"link"
+	// keeps the stable fit-first policy; "memory" and "capacity" are bounded
+	// topology challengers which still pass the full ledger and live gates.
+	PlacementPolicy string
+	// MoESplitOwnerGPU is an internal calibration-only topology hypothesis. When
+	// set, the named physical GPU is the sole owner of ordinary transformer
+	// layers, KV, and the output head; every other selected GPU may still carry
+	// complete routed-expert layers. The allocator still recomputes the entire
+	// placement and may reject it. A pointer is used because CUDA0 is a valid
+	// owner and nil must remain the unchanged fit-first default.
+	MoESplitOwnerGPU *int
 	// Companions reserves VRAM for co-launched helper models before the main
 	// model's split is computed, so the main plan packs around real helper
 	// footprints instead of discovering them after launch.
@@ -456,12 +574,22 @@ type Options struct {
 	BackendTag             string // "llama" or "ik_llama"
 	BackendCacheTag        string // backend identity for probe/cache isolation; defaults to BackendTag
 	BackendIdentity        string // exact backend build/commit identity for speculative performance profiles
-	SamplingProfile        string // default, greedy, recommended, or a hash of explicit sampling overrides
+	// CPUExpertMMapCapability is an explicit loader capability supplied by the
+	// command layer after probing the exact backend binary. Core launches always
+	// set it. Empty retains the historical tag-derived behavior only for legacy
+	// package callers; an explicit "unknown" fails closed.
+	CPUExpertMMapCapability CPUExpertMMapCapability
+	CPUExpertMMapEvidence   string
+	SamplingProfile         string // default, greedy, recommended, or a hash of explicit sampling overrides
 	// WorkloadProfile scopes placement and probe evidence to scheduler semantics
 	// that can change the effective slot, batch, or cache behavior. An empty
 	// value preserves the legacy generic-serving cache namespace; callers that
 	// select an agent/workflow profile must provide a stable non-empty value.
 	WorkloadProfile string
+	// WorkloadConcurrency is the number of independent agent turns whose
+	// makespan the standard optimizer minimizes. It is not necessarily the
+	// server slot count: a one-slot candidate may need several serial waves.
+	WorkloadConcurrency int
 	// ChatTemplate is the chat-template catalog entry Name (pkg/chattemplate)
 	// forced for this launch. It scopes placement/cache keys: a forced template
 	// is a different serving contract, so a verified config measured under one
@@ -476,6 +604,16 @@ type Options struct {
 	NoMMap                 bool
 	ForceMMap              bool
 	Parallel               int
+	// AutoParallel lets automatic context fit lower an automatically-selected
+	// slot count when the requested count cannot retain ParallelSlotTarget tokens
+	// per slot in the selected residency class. Explicit --parallel leaves this
+	// false and is therefore preserved exactly.
+	AutoParallel       bool
+	ParallelSlotTarget int
+	// ParallelExplicit protects a user-owned slot count from performance
+	// candidate generation. AutoParallel describes fit-time slot selection;
+	// this bit separately records whether --parallel itself was explicit.
+	ParallelExplicit bool
 	// Threads overrides the CPU thread count, which otherwise follows physical
 	// cores. Physical cores is the right default -- MoE experts on CPU are
 	// bandwidth-bound, and SMT siblings share the ports that bound them -- but
@@ -507,13 +645,23 @@ type Options struct {
 	// planner default. First-live calibration may challenge an automatic MoE
 	// default with larger measured values, but must never override this intent.
 	UBatchSizeExplicit bool
-	CacheFile          string // path to placement cache for MoE recovery
-	CacheDir           string // path to ggrun cache dir (for probes)
-	Host               string // listen address (default 127.0.0.1)
-	VisionAuto         bool   // auto-detect mmproj for vision
-	MMProjPath         string // explicit vision projector GGUF
-	SpecMode           string // off, auto, draft, eagle3, dflash, ngram, ngram-mod, ngram-k4v, mtp
-	BackendHelp        string // llama-server --help output for dialect-specific flags
+	// BatchSizeExplicit carries the matching intent for the logical prompt
+	// batch. Parallel-agent calibration may jointly challenge automatic batch
+	// and ubatch values, but neither side may override a user-owned value.
+	BatchSizeExplicit bool
+	// RuntimePolicy finalizes workload-owned runtime knobs after context,
+	// parallel, and the conservative batch pair are known, but before draft,
+	// companion, allocation, cache-key, or placement accounting. It may adjust
+	// BatchSize/UBatchSize and other workload metadata; it must not change the
+	// model, devices, context, KV policy, or selected parallel count.
+	RuntimePolicy func(*Strategy)
+	CacheFile     string // path to placement cache for MoE recovery
+	CacheDir      string // path to ggrun cache dir (for probes)
+	Host          string // listen address (default 127.0.0.1)
+	VisionAuto    bool   // auto-detect mmproj for vision
+	MMProjPath    string // explicit vision projector GGUF
+	SpecMode      string // off, auto, draft, eagle3, dflash, ngram, ngram-mod, ngram-k4v, mtp
+	BackendHelp   string // llama-server --help output for dialect-specific flags
 	// SpecCandidateValidator asks the selected backend to load a proposed
 	// companion without allocating model buffers. GGUF metadata establishes
 	// target compatibility; this hook establishes runtime compatibility for
@@ -745,8 +893,436 @@ func applyRAMPolicy(caps *detect.Capabilities, opts Options) *detect.Capabilitie
 	return detect.ApplyRAMLimitPercent(caps, opts.RAMLimitPercent)
 }
 
+const unknownAutoContextCap = 4 * 1024 * 1024
+
+type autoContextTier struct {
+	name    string
+	accepts func(*Strategy) bool
+}
+
+type autoContextParallelShape struct {
+	value      int
+	slots      int
+	minContext int
+}
+
+type autoContextSearchResult struct {
+	strategy          *Strategy
+	rejectedContext   int
+	rejectionEvidence string
+}
+
 // Compute builds a Strategy from hardware capabilities and model profile.
+//
+// Automatic context is deliberately resolved outside computeResolvedStrategy:
+// every candidate enters that function as an exact context and therefore pays
+// for the complete launch shape (batch graph, slots, draft, companions, scoped
+// allocation evidence, tensor/expert placement, and current per-device free
+// memory). This keeps "fit" from becoming an aggregate-memory estimate that a
+// later placement overlay can invalidate.
 func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Strategy, error) {
+	if opts.ContextSize > 0 {
+		return computeResolvedStrategy(caps, model, opts)
+	}
+	if caps == nil {
+		return nil, fmt.Errorf("automatic context fit requires hardware capabilities")
+	}
+	if model == nil {
+		return nil, fmt.Errorf("automatic context fit requires a model profile")
+	}
+
+	// A verified config is full launch evidence for this strategy-free auto-fit
+	// scope. Give it one direct-start lookup before doing a fresh boundary search.
+	// The seed context is irrelevant to a hit (the record restores the whole
+	// strategy), but keeps all pre-lookup accounting bounded on a miss.
+	if !opts.SkipCachedConfig && opts.VerifiedConfigScopeKey != "" {
+		probe := opts
+		probe.ContextSize = autoContextFloor(model, autoContextCap(model, opts))
+		probe.DenseCPUOffloadPrompt = nil
+		if verified, err := computeResolvedStrategy(caps, model, probe); err == nil &&
+			verified != nil && verified.VerifiedConfigReused {
+			verified.ContextAuto = true
+			if verified.ContextFitTier == "" {
+				verified.ContextFitTier = "verified"
+			}
+			if verified.ContextFitEvidence == "" {
+				verified.ContextFitEvidence = "reused a launch-validated automatic-context plan"
+			}
+			return verified, nil
+		}
+	}
+
+	return computeAutomaticContextStrategy(caps, model, opts)
+}
+
+func computeAutomaticContextStrategy(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Strategy, error) {
+	capContext := autoContextCap(model, opts)
+	floorContext := autoContextFloor(model, capContext)
+	if capContext <= 0 || floorContext <= 0 {
+		return nil, fmt.Errorf("automatic context fit has no legal context range")
+	}
+
+	qualities, err := autoContextQualityCandidates(model, opts)
+	if err != nil {
+		return nil, err
+	}
+	placements := autoContextPlacementCandidates(caps, opts)
+	shapes := autoContextParallelShapes(opts, floorContext, capContext)
+	tiers := autoContextTiers(caps, opts)
+
+	var firstAdmissionErr error
+	for _, tier := range tiers {
+		for _, quality := range qualities {
+			for _, shape := range shapes {
+				for _, kvPlacement := range placements {
+					if tier.name == "gpu-resident" && kvPlacement != "gpu" {
+						continue
+					}
+					result, searchErr := searchAutomaticContextBoundary(
+						caps, model, opts, quality, kvPlacement, shape, tier, capContext,
+					)
+					if searchErr != nil {
+						if firstAdmissionErr == nil {
+							firstAdmissionErr = searchErr
+						}
+						continue
+					}
+					if result == nil || result.strategy == nil {
+						continue
+					}
+
+					// Re-enter the exact winning point with normal placement-cache
+					// policy. A cache hit is accepted only if it remains in the same
+					// residency tier; otherwise the fresh boundary candidate wins.
+					finalOpts := automaticContextCandidateOptions(
+						opts, result.strategy.ContextSize, quality, kvPlacement, shape.value,
+					)
+					finalOpts.SkipPlacementCache = opts.SkipPlacementCache
+					finalOpts.DenseCPUOffloadPrompt = nil
+					final, finalErr := computeResolvedStrategy(caps, model, finalOpts)
+					if finalErr != nil || final == nil || !tier.accepts(final) {
+						final = result.strategy
+					}
+
+					if final.Type == DenseCPUOffload && opts.DenseCPUOffloadPrompt != nil {
+						freeGPUVRAM := 0
+						for _, free := range final.PlanFreeVRAM {
+							freeGPUVRAM += free
+						}
+						totalSizeMB := model.TotalSizeMB
+						if totalSizeMB <= 0 {
+							totalSizeMB = int(model.SizeBytes / 1024 / 1024)
+						}
+						if !opts.DenseCPUOffloadPrompt(totalSizeMB, freeGPUVRAM) {
+							name := model.Name
+							if name == "" {
+								name = filepath.Base(model.Path)
+							}
+							return nil, fmt.Errorf(
+								"model %s has no automatic GPU-resident context; refusing system-RAM offload", name,
+							)
+						}
+					}
+
+					final.ContextAuto = true
+					final.ContextFitTier = tier.name
+					final.ContextFitRejected = result.rejectedContext
+					final.ContextFitEvidence = result.rejectionEvidence
+					fmt.Fprintf(os.Stderr,
+						"[placement] context fit: %d tokens, %d slot(s), KV %s on %s (%s; %s)\n",
+						final.ContextSize, strategySlots(final), final.KVType,
+						final.KVPlacement, final.ContextFitTier, final.ContextFitEvidence,
+					)
+					return final, nil
+				}
+			}
+		}
+	}
+
+	if firstAdmissionErr != nil {
+		return nil, fmt.Errorf("automatic context fit found no admissible plan: %w", firstAdmissionErr)
+	}
+	return nil, fmt.Errorf("automatic context fit found no admissible plan between %d and %d tokens", floorContext, capContext)
+}
+
+func autoContextCap(model *ModelProfile, opts Options) int {
+	native := 0
+	if model != nil {
+		native = model.CTXTrain
+		if native <= 0 {
+			native = model.ContextSize
+		}
+	}
+	capContext := opts.AutoContextMax
+	if capContext <= 0 {
+		capContext = native
+	}
+	if capContext <= 0 {
+		capContext = unknownAutoContextCap
+	}
+	if native > 0 && native < capContext {
+		capContext = native
+	}
+	if capContext >= contextGranularity {
+		capContext = capContext / contextGranularity * contextGranularity
+	}
+	return capContext
+}
+
+func autoContextFloor(model *ModelProfile, capContext int) int {
+	floor := contextMinimum
+	native := 0
+	if model != nil {
+		native = model.CTXTrain
+		if native <= 0 {
+			native = model.ContextSize
+		}
+	}
+	if native > 0 && native < floor {
+		floor = native
+	}
+	if capContext > 0 && capContext < floor {
+		floor = capContext
+	}
+	if floor >= contextGranularity {
+		floor = (floor + contextGranularity - 1) / contextGranularity * contextGranularity
+	}
+	return floor
+}
+
+func autoContextParallelShapes(opts Options, floorContext, capContext int) []autoContextParallelShape {
+	value := opts.Parallel
+	slots := value
+	if slots <= 0 {
+		slots = 1
+	}
+	if !opts.AutoParallel || slots <= 1 {
+		return []autoContextParallelShape{{value: value, slots: slots, minContext: floorContext}}
+	}
+
+	target := opts.ParallelSlotTarget
+	if target <= 0 {
+		target = contextMinimum
+	}
+	out := make([]autoContextParallelShape, 0, slots+1)
+	for n := slots; n >= 1; n-- {
+		minContext := n * target
+		if minContext < floorContext {
+			minContext = floorContext
+		}
+		if minContext <= capContext {
+			out = append(out, autoContextParallelShape{value: n, slots: n, minContext: minContext})
+		}
+	}
+	// If even one target-sized slot cannot fit, retain a final useful-context
+	// attempt at one slot. The caller's existing warning reports a sub-target
+	// result; silently creating several unusably small slots is never attempted.
+	if len(out) == 0 || out[len(out)-1].minContext != floorContext {
+		out = append(out, autoContextParallelShape{value: 1, slots: 1, minContext: floorContext})
+	}
+	return out
+}
+
+func autoContextQualityCandidates(model *ModelProfile, opts Options) ([]string, error) {
+	resolved, err := resolveKVQuality(model, opts.KVQuality, opts.BackendTag)
+	if err != nil {
+		return nil, err
+	}
+	requested := strings.ToLower(strings.TrimSpace(opts.KVQuality))
+	if requested != "" && requested != "auto" {
+		return []string{resolved}, nil
+	}
+	preferred, err := NormalizeKVType(resolved)
+	if err != nil {
+		return nil, err
+	}
+	values := kvTypesForAutoContext(model, preferred, "auto")
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, candidateErr := resolveKVQuality(model, value, opts.BackendTag); candidateErr == nil {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no legal KV type exists for automatic context fit")
+	}
+	return out, nil
+}
+
+func autoContextPlacementCandidates(caps *detect.Capabilities, opts Options) []string {
+	if opts.CPUMode || caps == nil || len(caps.GPUs) == 0 {
+		return []string{"cpu"}
+	}
+	requested := strings.ToLower(strings.TrimSpace(opts.KVPlacement))
+	switch requested {
+	case "", "auto":
+		return []string{"gpu", "cpu"}
+	default:
+		return []string{requested}
+	}
+}
+
+func autoContextTiers(caps *detect.Capabilities, opts Options) []autoContextTier {
+	resident := autoContextTier{
+		name: "memory-resident",
+		accepts: func(s *Strategy) bool {
+			return s != nil && !s.MMapRequired
+		},
+	}
+	lastResort := autoContextTier{
+		name: "mmap-last-resort",
+		accepts: func(s *Strategy) bool {
+			return s != nil
+		},
+	}
+	if opts.CPUMode || caps == nil || len(caps.GPUs) == 0 {
+		return []autoContextTier{resident, lastResort}
+	}
+	gpuResident := autoContextTier{
+		name: "gpu-resident",
+		accepts: func(s *Strategy) bool {
+			return s != nil && s.KVPlacement == "gpu" && !s.MMapRequired &&
+				s.Type != DenseCPUOffload && s.Type != CPUOnly
+		},
+	}
+	return []autoContextTier{gpuResident, resident, lastResort}
+}
+
+func stableAutoContextOptions(opts Options) Options {
+	stable := opts
+	// A cold automatic boundary still needs a conservative graph reserve.
+	// RequireMeasuredBuffers= true is appropriate for the final contained
+	// allocation preflight, but treating every unmeasured granular candidate as
+	// a zero-byte graph makes the search optimistic between cached probe points.
+	// Measured buffers and runtime growth remain authoritative when present;
+	// this only restores the model-aware fallback when they are absent.
+	stable.RequireMeasuredBuffers = false
+	// When a workload policy will set the serving batch graph (Claude Code
+	// 128/64), do not search the automatic-context boundary as if it were a
+	// 2048/512 first-token estimate. That inflated graph made a proven 1M
+	// DeepSeek context look inadmissible and packed extra experts onto the CPU.
+	if stable.RuntimePolicy == nil {
+		if !stable.BatchSizeExplicit {
+			stable.BatchSize = 2048
+		}
+		if !stable.UBatchSizeExplicit {
+			stable.UBatchSize = 512
+		}
+	}
+	return stable
+}
+
+func automaticContextCandidateOptions(opts Options, context int, quality, kvPlacement string, parallel int) Options {
+	candidate := stableAutoContextOptions(opts)
+	candidate.ContextSize = context
+	candidate.AutoContextMax = 0
+	candidate.KVQuality = quality
+	candidate.KVPlacement = kvPlacement
+	candidate.Parallel = parallel
+	candidate.AutoParallel = false
+	candidate.VerifiedConfigScopeKey = ""
+	candidate.SkipPlacementCache = true
+	candidate.DenseCPUOffloadPrompt = nil
+	return candidate
+}
+
+func searchAutomaticContextBoundary(
+	caps *detect.Capabilities,
+	model *ModelProfile,
+	opts Options,
+	quality string,
+	kvPlacement string,
+	shape autoContextParallelShape,
+	tier autoContextTier,
+	capContext int,
+) (*autoContextSearchResult, error) {
+	minContext := shape.minContext
+	if minContext >= contextGranularity {
+		minContext = (minContext + contextGranularity - 1) / contextGranularity * contextGranularity
+	}
+	if minContext > capContext {
+		return nil, nil
+	}
+
+	// Models with a native window below one granule have exactly one legal
+	// candidate. Every normal agent context uses the 1024-token grid below.
+	if capContext < contextGranularity {
+		candidateOpts := automaticContextCandidateOptions(opts, capContext, quality, kvPlacement, shape.value)
+		candidate, err := computeResolvedStrategy(caps, model, candidateOpts)
+		if err != nil {
+			return nil, err
+		}
+		if !tier.accepts(candidate) {
+			return nil, nil
+		}
+		return &autoContextSearchResult{
+			strategy:          candidate,
+			rejectionEvidence: "model/policy context cap reached",
+		}, nil
+	}
+
+	low := minContext / contextGranularity
+	high := capContext / contextGranularity
+	var best *Strategy
+	var firstErr error
+	for low <= high {
+		mid := low + (high-low)/2
+		context := mid * contextGranularity
+		candidateOpts := automaticContextCandidateOptions(opts, context, quality, kvPlacement, shape.value)
+		candidate, err := computeResolvedStrategy(caps, model, candidateOpts)
+		if err == nil && tier.accepts(candidate) {
+			best = candidate
+			low = mid + 1
+			continue
+		}
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		high = mid - 1
+	}
+	if best == nil {
+		return nil, firstErr
+	}
+
+	result := &autoContextSearchResult{strategy: best}
+	next := best.ContextSize + contextGranularity
+	if next > capContext {
+		result.rejectionEvidence = "model/policy context cap reached"
+		return result, nil
+	}
+
+	// Prove the immediately adjacent granule as well as the accepted boundary.
+	// Fixed parallel and a fixed conservative batch pair make memory admission
+	// monotonic. Refuse to claim a boundary if scoped evidence violates that
+	// invariant; a sparse/non-normalizable measurement must not become proof.
+	nextOpts := automaticContextCandidateOptions(opts, next, quality, kvPlacement, shape.value)
+	nextStrategy, nextErr := computeResolvedStrategy(caps, model, nextOpts)
+	if nextErr == nil && tier.accepts(nextStrategy) {
+		return nil, fmt.Errorf(
+			"non-monotonic context admission: %d and adjacent %d both fit after boundary search",
+			best.ContextSize, next,
+		)
+	}
+	result.rejectedContext = next
+	if nextErr != nil {
+		result.rejectionEvidence = fmt.Sprintf("next granule %d rejected: %v", next, nextErr)
+	} else {
+		result.rejectionEvidence = fmt.Sprintf("next granule %d crosses the %s residency boundary", next, tier.name)
+	}
+	return result, nil
+}
+
+func strategySlots(s *Strategy) int {
+	if s == nil || s.Parallel <= 0 {
+		return 1
+	}
+	return s.Parallel
+}
+
+// computeResolvedStrategy computes one exact-context candidate. Automatic
+// callers must go through Compute so they receive the placement-backed boundary
+// search above.
+func computeResolvedStrategy(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Strategy, error) {
 	var err error
 	caps, err = restrictGPUs(caps, opts.GPUs)
 	if err != nil {
@@ -756,6 +1332,17 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	caps = applyRAMPolicy(caps, opts)
 	caps = detect.ApplyVRAMHeadroom(caps, opts.VRAMHeadroomMB)
 	caps = detect.ApplyRAMHeadroom(caps, opts.RAMHeadroomMB)
+	// Fixed companions (reviewer/worker helpers) are occupied hardware, not a
+	// late annotation. Seat them before KV placement, batch selection, draft
+	// selection, plan-free snapshots, caches, or weight packing so every one of
+	// those decisions sees the same effective inventory.
+	var companionPlacements []CompanionPlacement
+	if len(opts.Companions) > 0 {
+		caps, companionPlacements, err = applyCompanionReservations(caps, opts.Companions)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Load any KV cache size llama.cpp measured for this model on a prior launch,
 	// so context sizing uses measured truth (exact for compressed attention).
@@ -780,23 +1367,26 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	}
 
 	s := &Strategy{
-		ContextSize:    opts.ContextSize,
-		SWAFull:        opts.SWAFull,
-		PlanFreeVRAM:   snapshotPlanFreeVRAM(caps),
-		KVPlacement:    opts.KVPlacement,
-		KVQuality:      resolvedKVQuality,
-		MMap:           opts.ForceMMap || !opts.NoMMap,
-		MLock:          false,
-		Threads:        caps.CPU.Cores, // physical cores
-		ThreadsBatch:   caps.CPU.Cores, // physical cores
-		BackendTag:     opts.BackendTag,
-		ModelBasename:  filepath.Base(model.Path),
-		IsMoE:          model.IsMoE,
-		GPULayers:      999,
-		FlashAttention: true, // finalized against the resolved KV placement before each return
+		ContextSize:             opts.ContextSize,
+		SWAFull:                 opts.SWAFull,
+		PlanFreeVRAM:            snapshotPlanFreeVRAM(caps),
+		KVPlacement:             opts.KVPlacement,
+		KVQuality:               resolvedKVQuality,
+		MMap:                    opts.ForceMMap || !opts.NoMMap,
+		MLock:                   false,
+		CPUExpertMMapCapability: opts.CPUExpertMMapCapability,
+		CPUExpertMMapEvidence:   opts.CPUExpertMMapEvidence,
+		Threads:                 caps.CPU.Cores, // physical cores
+		ThreadsBatch:            caps.CPU.Cores, // physical cores
+		BackendTag:              opts.BackendTag,
+		ModelBasename:           filepath.Base(model.Path),
+		IsMoE:                   model.IsMoE,
+		GPULayers:               999,
+		FlashAttention:          true, // finalized against the resolved KV placement before each return
 		// Thinking stays ON for normal serving (backend default `--reasoning auto`);
 		// only benchmark/tune opt in to `--reasoning off` for clean, fast measurement.
-		ReasoningOff: opts.ReasoningOff,
+		ReasoningOff:        opts.ReasoningOff,
+		CompanionPlacements: companionPlacements,
 		// NoJinja is legacy placement metadata (kept for cached-strategy JSON
 		// stability). The current fix for models whose embedded template carries a
 		// raise_exception guard (nanbeige, Qwen3.5/3.8) is the data-driven
@@ -1004,6 +1594,14 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	if opts.UBatchSize > 0 {
 		s.UBatchSize = opts.UBatchSize
 	}
+	NormalizeBatchSizes(s, model, opts.BatchSizeExplicit, opts.UBatchSizeExplicit)
+	if opts.RuntimePolicy != nil {
+		opts.RuntimePolicy(s)
+		// A workload policy is allowed to change either automatic side of the
+		// pair, but the backend invariant and every later memory key must observe
+		// the final legal pair.
+		NormalizeBatchSizes(s, model, opts.BatchSizeExplicit, opts.UBatchSizeExplicit)
+	}
 
 	// Resolve external speculation before target placement. Its metadata-derived
 	// weights and KV footprint become occupied VRAM in the same ledger, so the
@@ -1020,17 +1618,18 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 	// not necessarily scale with either context or K/V quantization. Exact
 	// evidence is consumed only under the key it was measured with.
 	kvTotalMB = scopedContextAllocationMB(kvTotalMB, model, s, caps, opts)
-	companions := append([]CompanionReservation(nil), opts.Companions...)
 	if draftReservation, ok := speculativeCompanionReservation(s.Draft); ok {
-		companions = append([]CompanionReservation{draftReservation}, companions...)
-	}
-	if len(companions) > 0 {
+		var draftPlacements []CompanionPlacement
 		var compErr error
-		caps, s.CompanionPlacements, compErr = applyCompanionReservations(caps, companions)
+		caps, draftPlacements, compErr = applyCompanionReservations(caps, []CompanionReservation{draftReservation})
 		if compErr != nil {
 			return nil, compErr
 		}
+		s.CompanionPlacements = append(s.CompanionPlacements, draftPlacements...)
 	}
+	// The stale-plan guard and support output describe the exact post-companion
+	// inventory the target placement is about to consume.
+	s.PlanFreeVRAM = snapshotPlanFreeVRAM(caps)
 
 	// Persist/reuse this exact placement under a key that includes kv placement,
 	// ctx, ubatch, backend, and the GPU set — computed from the now-resolved
@@ -1061,6 +1660,9 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			if _, stale := verifiedConfigFreeVRAMStale(vc, caps); !stale {
 				restored := VerifiedToStrategy(vc, opts, caps)
 				if restored != nil {
+					restored.CompanionPlacements = append(
+						[]CompanionPlacement(nil), s.CompanionPlacements...,
+					)
 					// Re-validate the fit against the same duress machinery the
 					// placement cache uses: the recorded free-VRAM ledger must still
 					// fit, else the config was verified under transiently tighter
@@ -1073,6 +1675,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 						}
 					}
 					s = restored
+					NormalizeBatchSizes(s, model, opts.BatchSizeExplicit, opts.UBatchSizeExplicit)
 					s.PlacementCacheHit = true
 					s.VerifiedConfigReused = true
 					// The saved config is the complete serving decision, including
@@ -1138,6 +1741,7 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			if opts.UBatchSize > 0 {
 				s.UBatchSize = opts.UBatchSize
 			}
+			NormalizeBatchSizes(s, model, opts.BatchSizeExplicit, opts.UBatchSizeExplicit)
 			s.NCPUMoE = cache.NCPUMoE
 			// Restore the cached mmap decision, don't reset it: the entry was
 			// saved from a load that landed right, and CACHED_MMAP=0 means it
@@ -1596,7 +2200,9 @@ func buildCPUOnly(s *Strategy, caps *detect.Capabilities, model *ModelProfile, o
 }
 
 func buildSingleGPU(s *Strategy, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, error) {
-	gpuOrder := orderGPUsByBandwidth(caps.GPUs)
+	policy := normalizePlacementPolicy(opts.PlacementPolicy)
+	gpuOrder := orderGPUsForPlacement(caps.GPUs, policy)
+	s.PlacementPolicy = policy
 	if len(gpuOrder) == 0 {
 		return nil, fmt.Errorf("single-GPU strategy requires a GPU")
 	}
@@ -1903,8 +2509,43 @@ func BackendUsesAnonymousCPUExperts(backendTag string) bool {
 	return backendUsesAnonymousCPUExperts(backendTag)
 }
 
+func effectiveCPUExpertMMapCapability(opts Options) CPUExpertMMapCapability {
+	if opts.CPUExpertMMapCapability != "" {
+		return NormalizeCPUExpertMMapCapability(string(opts.CPUExpertMMapCapability))
+	}
+	// Compatibility for callers outside the standard cmd path which predate the
+	// explicit capability. Production always supplies a non-empty tri-state
+	// value, so an unclassified exact backend fails closed there.
+	if backendUsesAnonymousCPUExperts(opts.BackendTag) {
+		return CPUExpertMMapAnonymous
+	}
+	return CPUExpertMMapFileBacked
+}
+
 func mmapCanPageCPUExperts(opts Options) bool {
-	return !backendUsesAnonymousCPUExperts(opts.BackendTag)
+	return effectiveCPUExpertMMapCapability(opts) == CPUExpertMMapFileBacked
+}
+
+func mmapCPUExpertIneligibility(opts Options) string {
+	identity := strings.TrimSpace(opts.BackendIdentity)
+	if identity == "" {
+		identity = strings.TrimSpace(opts.BackendTag)
+	}
+	if identity == "" {
+		identity = "selected backend"
+	}
+	switch effectiveCPUExpertMMapCapability(opts) {
+	case CPUExpertMMapAnonymous:
+		return fmt.Sprintf("%s allocates CPU experts in anonymous host memory", identity)
+	case CPUExpertMMapUnknown:
+		reason := strings.TrimSpace(opts.CPUExpertMMapEvidence)
+		if reason == "" {
+			reason = "the exact loader has no proven file-backed CPU-expert capability"
+		}
+		return fmt.Sprintf("%s has unknown CPU-expert pageability (%s)", identity, reason)
+	default:
+		return "CPU experts are not eligible for file-backed reclaim"
+	}
 }
 
 type moeLayerMemoryMB struct {
@@ -1988,8 +2629,8 @@ func sumRoutedLayerMB(costs []moeLayerMemoryMB, start int) int {
 // and fall through to an ordinary allocation. Mainline llama.cpp maps them and
 // reports CPU_Mapped buffers instead, which is why DeepSeek-V4 under the same
 // flags shows anon 1.9 GB against file 113 GB.
-func mmapFreesCPUExperts(backendTag string) bool {
-	return !backendUsesAnonymousCPUExperts(backendTag)
+func mmapFreesCPUExperts(opts Options) bool {
+	return mmapCanPageCPUExperts(opts)
 }
 
 // hostFootprintForCache reports how much host RAM a plan denies the prompt
@@ -2003,9 +2644,9 @@ func mmapFreesCPUExperts(backendTag string) bool {
 // bytes. Where it does not, charging only the working set understates the plan
 // by the entire expert set: for MiniMax-M3 it predicted 458 MB against a real
 // 113 GB, a 250x error that the memory preflight then had to catch at launch.
-func hostFootprintForCache(residentMB, workingSetMB int, mmap bool, backendTag string) int {
+func hostFootprintForCache(residentMB, workingSetMB int, mmap bool, opts Options) int {
 	footprint := residentMB
-	if mmap && mmapFreesCPUExperts(backendTag) {
+	if mmap && mmapFreesCPUExperts(opts) {
 		footprint = workingSetMB
 	}
 	if footprint < 0 {
@@ -2056,8 +2697,10 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	}
 	runtimeMB := plannedRAMRuntimeOverheadMB(caps, model, cache.UBatchSize, totalSizeMB, opts)
 	tokenEmbdMB := bytesToMiBCeil(model.TokenEmbdBytes)
-	residentMB := cpuExpertMB + cpuKVMB + runtimeMB + tokenEmbdMB
+	checkpointReserveMB := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
+	residentMB := cpuExpertMB + cpuKVMB + runtimeMB + tokenEmbdMB + checkpointReserveMB
 	residentFits := residentMB <= caps.RAM.FreeMB
+	s.ReclaimableHostWeightsMB = cpuExpertMB
 
 	mmap = cache.MMap
 	if opts.NoMMap {
@@ -2065,9 +2708,9 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	} else if opts.ForceMMap {
 		mmap = true
 	}
-	workingSetFloor := runtimeMB + cpuKVMB
+	workingSetFloor := runtimeMB + cpuKVMB + tokenEmbdMB + checkpointReserveMB
 	if residentFits {
-		return true, mmap, false, hostFootprintForCache(residentMB, workingSetFloor, mmap, opts.BackendTag)
+		return true, mmap, false, hostFootprintForCache(residentMB, workingSetFloor, mmap, opts)
 	}
 	if !mmap || !mmapCanPageCPUExperts(opts) {
 		return false, mmap, false, 0
@@ -2075,7 +2718,7 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	if workingSetFloor > caps.RAM.FreeMB {
 		return false, mmap, false, 0
 	}
-	return true, true, true, hostFootprintForCache(residentMB, workingSetFloor, true, opts.BackendTag)
+	return true, true, true, hostFootprintForCache(residentMB, workingSetFloor, true, opts)
 }
 
 func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, error) {
@@ -2087,8 +2730,19 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		return nil, fmt.Errorf("MoE placement requires model layer count")
 	}
 
-	gpuOrder := orderGPUsByBandwidth(caps.GPUs)
+	policy := normalizePlacementPolicy(opts.PlacementPolicy)
+	gpuOrder := orderGPUsForPlacement(caps.GPUs, policy)
+	s.PlacementPolicy = policy
 	s.MainGPU = caps.GPUs[gpuOrder[0]].Index
+	forcedOwnerOrdinal := -1
+	if opts.MoESplitOwnerGPU != nil {
+		forcedOwnerOrdinal = gpuOrdinal(caps.GPUs, *opts.MoESplitOwnerGPU)
+		if forcedOwnerOrdinal < 0 {
+			return nil, fmt.Errorf("MoE split owner GPU %d is not selected", *opts.MoESplitOwnerGPU)
+		}
+		s.MainGPU = *opts.MoESplitOwnerGPU
+		s.PlacementPolicy = fmt.Sprintf("owner-%d", *opts.MoESplitOwnerGPU)
+	}
 	if numGPUs > 1 {
 		s.SplitMode = "layer"
 	}
@@ -2281,6 +2935,15 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		}
 	}
 	expertOnlyGPU := expertOnlySlowGPUs(caps.GPUs, fixedPerGPU, expertOnlyFixedPerGPU, expertPerLayerMB, nonExpertPerLayerMB)
+	if forcedOwnerOrdinal >= 0 {
+		// This is a complete alternative placement, not a mutation of the emitted
+		// split. buildMoEOffload's normal room, exact-layer, host, mmap, and
+		// does-not-fit checks below remain authoritative. Non-owners that cannot
+		// hold a complete expert layer simply remain unused.
+		for i := range expertOnlyGPU {
+			expertOnlyGPU[i] = i != forcedOwnerOrdinal
+		}
+	}
 
 	// Use only GPUs that can carry CUDA/compute overhead plus their emitted
 	// tensor-split share of all non-expert weights and KV. The split is
@@ -2390,7 +3053,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 				// reserve, not raw free VRAM, so high-overhead GPUs are not
 				// over-allocated.
 				avail := float64(g.VRAMFreeMB() - fixedPerGPU[i])
-				totalWeighted += avail * gpuSplitWeight(g)
+				totalWeighted += avail * gpuPlacementWeight(g, policy)
 			}
 		}
 		if totalWeighted <= 0 {
@@ -2399,7 +3062,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		for i, g := range caps.GPUs {
 			if used[i] {
 				avail := float64(g.VRAMFreeMB() - fixedPerGPU[i])
-				rawSplit[i] = avail * gpuSplitWeight(g) / totalWeighted
+				rawSplit[i] = avail * gpuPlacementWeight(g, policy) / totalWeighted
 			}
 		}
 		split = normalizeSplit(rawSplit)
@@ -2577,7 +3240,11 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// working set vastly exceeds even non-reclaimable RAM through) and the
 	// "full footprint must fit" floor (too strict — defeated the entire point
 	// of mmap, which is to hold LESS than the full footprint resident).
-	preWorkingSetFloor := ramOverheadPreMB + cpuKVRAMMB
+	// Checkpoint snapshots and token embeddings are anonymous/fixed host state,
+	// just like CPU KV and runtime buffers. Omitting them from this floor let an
+	// mmap plan pass only to OOM when a long agent session populated checkpoints.
+	checkpointReserve := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
+	preWorkingSetFloor := ramOverheadPreMB + cpuKVRAMMB + tokenEmbdMB + checkpointReserve
 	mmapReclaimable := mmapCanPageCPUExperts(opts)
 	maxCPULayersMMap := 0
 	if mmapReclaimable && caps.RAM.FreeMB >= preWorkingSetFloor {
@@ -2589,7 +3256,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	if opts.NoMMap {
 		ceilCPULabel = "strict --no-mmap"
 	} else if !mmapReclaimable {
-		ceilCPULabel = fmt.Sprintf("resident RAM (%s CPU experts are anonymous)", opts.BackendTag)
+		ceilCPULabel = "resident RAM (" + mmapCPUExpertIneligibility(opts) + ")"
 	}
 	if maxCPULayersStrict < moeLayerCount-maxGPULayers &&
 		!opts.NoMMap &&
@@ -2609,7 +3276,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		}
 		mmapAdvice := "Drop --no-mmap so kernel can page experts on demand"
 		if !mmapReclaimable {
-			mmapAdvice = fmt.Sprintf("Selected %s backend allocates CPU experts in anonymous CUDA-host memory; mmap cannot reduce this RAM requirement", opts.BackendTag)
+			mmapAdvice = mmapCPUExpertIneligibility(opts) + "; mmap cannot reduce this RAM requirement"
 		}
 		exactCPUExpertMB := sumRoutedLayerMB(layerCosts, maxGPULayers)
 		return nil, fmt.Errorf(
@@ -2670,6 +3337,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	if cpuExpertMB < 0 {
 		cpuExpertMB = 0
 	}
+	s.ReclaimableHostWeightsMB = cpuExpertMB
 
 	// Non-weight RAM overhead, derived per-component (see ramRuntimeOverheadMB):
 	// CUDA host staging + graph scratch + mmap page table + CPU activation.
@@ -2686,7 +3354,6 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// 41-layer V4 crash (plan ~116 GB vs 111 GB ceiling, --ctx-checkpoints 16).
 	// The reserve is an estimate; Fix B's measured re-size then clamps to the
 	// real footprint once the canary has grown the graph.
-	checkpointReserve := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
 	ramNeeded := cpuExpertMB + cpuKVMB + ramOverheadMB + tokenEmbdMB + checkpointReserve
 	ramAvailMB := caps.RAM.FreeMB
 
@@ -2714,12 +3381,12 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		// actually fit is the runtime's non-reclaimable anonymous memory: KV
 		// cache (continuously read/written) plus compute/activation overhead.
 		// (Same reasoning as preWorkingSetFloor above; keep both in sync.)
-		workingSetFloor := ramOverheadMB + cpuKVMB
+		workingSetFloor := ramOverheadMB + cpuKVMB + tokenEmbdMB + checkpointReserve
 		if mmapReclaimable && ramAvailMB >= workingSetFloor {
 			s.MMap = true
 			s.MMapRequired = true
 		} else if !mmapReclaimable {
-			return nil, fmt.Errorf("Model does not fit on this system: %s CPU expert offload needs %dMB resident RAM but the configured limit is %dMB; mmap cannot reclaim anonymous CUDA-host buffers", opts.BackendTag, ramNeeded, ramAvailMB)
+			return nil, fmt.Errorf("Model does not fit on this system: CPU expert offload needs %dMB resident RAM but the configured limit is %dMB; %s", ramNeeded, ramAvailMB, mmapCPUExpertIneligibility(opts))
 		}
 	} else if opts.ForceMMap {
 		s.MMap = true
@@ -2730,7 +3397,12 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// Hand the same footprint to the prompt cache that the mmap decision was
 	// just made against, so the cache is sized against RAM that will really be
 	// free rather than against RAM the weights are about to take.
-	s.PlannedHostFootprintMB = hostFootprintForCache(ramNeeded, ramOverheadMB+cpuKVMB, s.MMap, opts.BackendTag)
+	s.PlannedHostFootprintMB = hostFootprintForCache(
+		ramNeeded,
+		ramOverheadMB+cpuKVMB+tokenEmbdMB+checkpointReserve,
+		s.MMap,
+		opts,
+	)
 	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
 		fmt.Fprintf(os.Stderr, "[trace] host footprint=%d (cpuExperts=%d tokenEmbd=%d cpuKV=%d overhead=%d mmap=%v) freeRAM=%d\n",
 			s.PlannedHostFootprintMB, cpuExpertMB, tokenEmbdMB, cpuKVMB, ramOverheadMB, s.MMap, ramAvailMB)
@@ -2862,6 +3534,14 @@ func numGPUsExcluded(s *Strategy, gpus []detect.GPU, numLayers int) int {
 // placement, preserving as much prefill batching as the VRAM allows.
 func maximizeMoEGPUFitByUBatch(base, s *Strategy, err error, caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB int, opts Options) (*Strategy, error) {
 	if base == nil || model == nil {
+		return s, err
+	}
+	// A user-owned ubatch and a calibration candidate are exact configurations,
+	// not hints. Silently descending the ladder here would make the displayed
+	// argv, allocation evidence, and cached candidate identity describe different
+	// runs. Let an unfit exact value fail admission; only an automatic planner
+	// default may trade microbatch size for a usable placement.
+	if opts.UBatchSizeExplicit {
 		return s, err
 	}
 	_, moeCount := moeLayerRange(model)
@@ -3788,7 +4468,11 @@ func exactKVTypeRequested(quality string) bool {
 
 func kvTypesForAutoContext(model *ModelProfile, preferred, quality string) []string {
 	values := []string{preferred}
-	if !exactKVTypeRequested(quality) {
+	// Only the explicit "auto" policy grants permission to trade KV quality for
+	// fit. high/mid/low are quality constraints just like exact llama.cpp cache
+	// types; silently walking a preset down to q4_0 violates user intent.
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "", "auto":
 		values = append(values, "q8_0", "q4_0")
 	}
 	seen := make(map[string]bool, len(values))
@@ -3806,7 +4490,10 @@ func kvTypesForAutoContext(model *ModelProfile, preferred, quality string) []str
 }
 
 func fallbackKVType(model *ModelProfile, preferred, quality string) string {
-	if exactKVTypeRequested(quality) {
+	switch strings.ToLower(strings.TrimSpace(quality)) {
+	case "", "auto":
+		// The auto policy may use its compact fallback below.
+	default:
 		return preferred
 	}
 	if kvTypeFitsHeadDim(model, "q4_0") {
@@ -3939,6 +4626,41 @@ func gpuSplitWeight(g detect.GPU) float64 {
 		return 1.0
 	}
 	return float64(g.BandwidthMBps)
+}
+
+func normalizePlacementPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "memory":
+		return "memory"
+	case "capacity":
+		return "capacity"
+	default:
+		return "link"
+	}
+}
+
+func gpuPlacementWeight(g detect.GPU, policy string) float64 {
+	switch normalizePlacementPolicy(policy) {
+	case "memory":
+		if g.MemBandwidthMBps > 0 {
+			return float64(g.MemBandwidthMBps)
+		}
+	case "capacity":
+		return 1
+	}
+	return gpuSplitWeight(g)
+}
+
+func orderGPUsForPlacement(gpus []detect.GPU, policy string) []int {
+	switch normalizePlacementPolicy(policy) {
+	case "memory":
+		if denseMemBandwidthKnown(gpus) {
+			return orderGPUsByMemoryBandwidth(gpus)
+		}
+	case "capacity":
+		return orderGPUsByFreeVRAM(gpus)
+	}
+	return orderGPUsByBandwidth(gpus)
 }
 
 // expertOnlySlowGPUs classifies GPUs as expert-only devices: they must not own
@@ -5114,9 +5836,9 @@ const systemProbeSchema = 2
 
 // systemProbeOutlierRatio is how far above its peers a stored per-GPU overhead
 // must sit before it is treated as contaminated rather than measured. Real
-// variation between a 24 GB and a 12 GB card is well under 2x; the contaminated
-// reading on this project was 9x.
-const systemProbeOutlierRatio = 4
+// variation between a 24 GB and a 12 GB card is a few times; the contaminated
+// DeepSeek reading was CUDA1=4230 against a 568 MiB peer (~7x).
+const systemProbeOutlierRatio = 5
 
 // loadSystemProbe tries to load measured CUDA overhead from cache.
 // Keys the probe cache by a GPU-signature hash.
@@ -5184,7 +5906,6 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 		return nil
 	}
 	sp := &systemProbe{CUDAOverheadByGPU: map[int]int{}}
-	sysSchema := 1
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -5203,9 +5924,7 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 				sp.CUDAOverheadMB = v
 			}
 		case key == "SYS_PROBE_SCHEMA":
-			if v, err := strconv.Atoi(val); err == nil {
-				sysSchema = v
-			}
+			_ = val
 		case key == "SYS_HOST_OVERHEAD_MB":
 			if v, err := strconv.Atoi(val); err == nil && v >= 0 {
 				sp.HostOverheadMB = v
@@ -5230,11 +5949,16 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 	// every later placement on top of the reviewer's own reservation, costing
 	// the smallest GPU a full expert layer.
 	//
-	// Only an outlier is discarded, not every legacy value: CUDA context
-	// overhead is broadly similar across devices sharing a driver, so a card
-	// several times its peers is measuring something else. A single-GPU record
-	// has no peer to compare against and is kept.
-	if sysSchema < systemProbeSchema && len(sp.CUDAOverheadByGPU) > 1 {
+	// Only an outlier is discarded, not every value: CUDA context overhead is
+	// broadly similar across devices sharing a driver, so a card several times
+	// its peers is measuring something else (graph, KV, or a companion). A
+	// single-GPU record has no peer to compare against and is kept.
+	//
+	// This filter is not schema-gated. Schema 2 was supposed to be the clean
+	// measurement, but a DeepSeek load still latched CUDA1=4230 against 568/1614
+	// peers. The next launch then packed 4 extra expert layers onto the CPU and
+	// could no longer admit the proven 1M context.
+	if len(sp.CUDAOverheadByGPU) > 1 {
 		lo := 0
 		for _, v := range sp.CUDAOverheadByGPU {
 			if v > 0 && (lo == 0 || v < lo) {

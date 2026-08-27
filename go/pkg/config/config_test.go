@@ -27,6 +27,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.CgroupHeadroomMB != 4096 {
 		t.Fatalf("expected default cgroup headroom 4096 MiB, got %d", cfg.CgroupHeadroomMB)
 	}
+	if cfg.AllowLiveMemoryProbe {
+		t.Fatal("live memory probe approval must default off")
+	}
 }
 
 func TestLoadFile(t *testing.T) {
@@ -38,6 +41,7 @@ MODEL_DIR="/models"
 BACKEND=ik_llama
 KV_PLACEMENT=gpu
 SWA_FULL=true
+ALLOW_LIVE_MEMORY_PROBE=true
 VISION=true
 `
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -67,6 +71,9 @@ VISION=true
 	if !cfg.SWAFull {
 		t.Fatal("expected full SWA cache true")
 	}
+	if !cfg.AllowLiveMemoryProbe {
+		t.Fatal("expected remembered live memory probe approval")
+	}
 	if !cfg.Vision {
 		t.Fatalf("expected vision true")
 	}
@@ -79,22 +86,23 @@ func TestSaveAndLoad(t *testing.T) {
 	defer os.Setenv("HOME", origHome)
 
 	cfg := &Config{
-		Port:             9090,
-		Ctx:              "4096",
-		ModelDir:         "/test/models",
-		CacheDir:         "/test/cache",
-		Backend:          "llama",
-		KVPlacement:      "cpu",
-		KVQuality:        "high",
-		SWAFull:          true,
-		TuneRounds:       3,
-		Vision:           true,
-		Parallel:         2,
-		KeepAlive:        30,
-		Host:             "0.0.0.0",
-		Spec:             "ngram",
-		RAMLimitPercent:  87,
-		CgroupHeadroomMB: 2048,
+		Port:                 9090,
+		Ctx:                  "4096",
+		ModelDir:             "/test/models",
+		CacheDir:             "/test/cache",
+		Backend:              "llama",
+		KVPlacement:          "cpu",
+		KVQuality:            "high",
+		SWAFull:              true,
+		AllowLiveMemoryProbe: true,
+		TuneRounds:           3,
+		Vision:               true,
+		Parallel:             2,
+		KeepAlive:            30,
+		Host:                 "0.0.0.0",
+		Spec:                 "ngram",
+		RAMLimitPercent:      87,
+		CgroupHeadroomMB:     2048,
 	}
 
 	if err := cfg.Save(); err != nil {
@@ -130,12 +138,15 @@ func TestSaveAndLoad(t *testing.T) {
 	if !loaded.SWAFull {
 		t.Fatal("full SWA cache mismatch")
 	}
+	if !loaded.AllowLiveMemoryProbe {
+		t.Fatal("live memory probe approval mismatch")
+	}
 
 	data, err := os.ReadFile(Path())
 	if err != nil {
 		t.Fatalf("read saved config: %v", err)
 	}
-	for _, want := range []string{"LLM_PORT=", "LLM_CTX_SIZE=", "LLM_KV_QUALITY=", "LLM_SWA_FULL=true", "LLM_RAM_LIMIT_PERCENT=87", "LLM_SPEC="} {
+	for _, want := range []string{"LLM_PORT=", "LLM_CTX_SIZE=", "LLM_KV_QUALITY=", "LLM_SWA_FULL=true", "LLM_ALLOW_LIVE_MEMORY_PROBE=true", "LLM_RAM_LIMIT_PERCENT=87", "LLM_SPEC="} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("saved config missing %s:\n%s", want, string(data))
 		}

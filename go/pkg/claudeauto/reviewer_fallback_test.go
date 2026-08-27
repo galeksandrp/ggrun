@@ -17,7 +17,8 @@ func countingBackend(t *testing.T, hits *atomic.Int64) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
-		_, _ = w.Write([]byte(`{"usage":{"input_tokens":11,"output_tokens":2}}`))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"<block>no</block>"}],"usage":{"input_tokens":11,"output_tokens":2}}`))
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -210,6 +211,100 @@ func TestUnreachableReviewerFallsBackToMainModel(t *testing.T) {
 	}
 	if mainHits.Load() != 1 {
 		t.Errorf("main hits = %d, want 1", mainHits.Load())
+	}
+}
+
+func TestReviewerClientErrorFallsBackToMainModel(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		http.Error(w, "template rejected prompt", http.StatusBadRequest)
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, _ := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(payload), "<block>no</block>") {
+		t.Fatalf("client got status %d body %q, want main-model verdict", resp.StatusCode, string(payload))
+	}
+	if reviewerHits.Load() != 1 || mainHits.Load() != 1 {
+		t.Fatalf("reviewer=%d main=%d; want one rejected attempt and one fallback", reviewerHits.Load(), mainHits.Load())
+	}
+}
+
+func TestReviewerUnusableHTTP200FallsBackToMainModel(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"empty-json", "application/json", `{}`},
+		{"thinking-only", "application/json", `{"content":[{"type":"thinking","thinking":"looks safe"}]}`},
+		{"tool-only", "application/json", `{"content":[{"type":"tool_use","name":"ggrun_canary_noop","input":{}}]}`},
+		{"prose-only", "application/json", `{"content":[{"type":"text","text":"This looks safe."}]}`},
+		{"ambiguous", "application/json", `{"content":[{"type":"text","text":"<block>no</block><block>yes</block>"}]}`},
+		{"tool-only-stream", "text/event-stream", "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"noop\"}}\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mainHits, reviewerHits atomic.Int64
+			mainBackend := countingBackend(t, &mainHits)
+			reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				reviewerHits.Add(1)
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(reviewerBackend.Close)
+
+			router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+			resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(classifierBody(16)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			payload, _ := io.ReadAll(resp.Body)
+			if !strings.Contains(string(payload), "<block>no</block>") {
+				t.Fatalf("client got %q, want the main-model verdict", string(payload))
+			}
+			if reviewerHits.Load() != 1 || mainHits.Load() != 1 {
+				t.Fatalf("reviewer=%d main=%d; want one unusable attempt and one fallback", reviewerHits.Load(), mainHits.Load())
+			}
+			records := waitForRecords(t, path, 1)
+			if records[0].Route != routeMain {
+				t.Fatalf("route = %q, want %q after fallback", records[0].Route, routeMain)
+			}
+		})
+	}
+}
+
+func TestReviewerValidStreamingVerdictAnswersItself(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"<block>no\"}}\n\n"))
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"</block>\"}}\n\n"))
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+	if reviewerHits.Load() != 1 || mainHits.Load() != 0 {
+		t.Fatalf("reviewer=%d main=%d; want reviewer-only streaming verdict", reviewerHits.Load(), mainHits.Load())
+	}
+	if records := waitForRecords(t, path, 1); records[0].Route != routeReviewer {
+		t.Fatalf("route = %q, want %q", records[0].Route, routeReviewer)
 	}
 }
 

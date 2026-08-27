@@ -96,6 +96,8 @@ func main() {
 		cmdFreeToken(args[1:])
 	case "daemon":
 		cmdDaemon(args[1:])
+	case "status":
+		cmdStatus(args[1:])
 	case "claude-status":
 		cmdClaudeStatus(args[1:])
 	case "claude-workflow-hook":
@@ -159,6 +161,8 @@ Commands:
   daemon               Start persistent daemon
   dry-run <model.gguf> Print computed flags without launching
                        (--emit-server-argv-json supported)
+  status [model.gguf]  Show the cached launch-optimizer winner/boundary
+                       (--json supported)
   download <repo/name> Download from HuggingFace
                        (--dir <path> to use another disk, --quant <name> to
                        preselect instead of the interactive picker)
@@ -211,7 +215,8 @@ Launch flags:
   --ram-limit-percent int  Maximum whole-host RAM utilisation (default 95)
   --vram-headroom str  Reserve VRAM the recommender/placement won't use, e.g. 2G
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
-  --allow-live-memory-probe  Approve a contained full-load probe when no complete dry-run is available
+  --allow-live-memory-probe  Approve a contained full-load probe for this launch when no complete dry-run is available
+                       Set LLM_ALLOW_LIVE_MEMORY_PROBE=true to remember approval
   --vision, -vision    Enable vision (auto-detect mmproj)
   --claude-code        Serve locally and launch Claude Code with workflows/research
   --claude-profile str Claude Code scheduling (requires --claude-code): agent-interactive|agent-parallel
@@ -228,8 +233,8 @@ Launch flags:
   --claude-resume str  Reopen a recorded Claude Code session (id or "latest") and resume
                        its interrupted workflow from the cached journal
   --claude-resume-force  Resume even though the backend shape changed (unsafe)
-  --calibrate str      First-launch placement calibration: auto|on|off (default auto;
-                       measures alternative placements once per model/hardware/workload)
+  --calibrate str      Core launch optimization: auto|on|off (default auto; auto runs/replays
+                       a bounded agent-workload search, on widens an explicit screen)
   --worker-benchmark   Load once, measure throughput plus typed support/reviewer decisions,
                        print JSON, and stop
   --support-expert str Optional native expert/optimizer: off|auto|on (default auto)
@@ -240,7 +245,7 @@ Launch flags:
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "freetoken", "daemon", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "download", "tune", "spec-test", "recommend", "support", "advisor", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
+	case "help", "--help", "-h", "version", "--version", "-v", "detect", "launch", "benchmark", "freetoken", "daemon", "status", "claude-status", "claude-workflow-hook", "dry-run", "probe", "probe-reset", "memory-probe", "kv-probe", "download", "tune", "spec-test", "recommend", "support", "advisor", "models", "gui", "tui", "config", "backend", "backends", "claude", "update", "--update":
 		return true
 	default:
 		return false
@@ -337,6 +342,33 @@ func autoStartupTimeout(model *placement.ModelProfile) time.Duration {
 		timeoutSec = 900
 	}
 	return time.Duration(timeoutSec*2) * time.Second
+}
+
+const longModelLoadWarningThresholdBytes int64 = 64 * 1024 * 1024 * 1024
+
+// longModelLoadWarning is deliberately informational, not another consent
+// prompt. Large resident/offloaded checkpoints can spend minutes in a contained
+// allocation probe and may need one corrected retry; say that before the first
+// backend load so an otherwise quiet terminal is not mistaken for a hang.
+func longModelLoadWarning(model *placement.ModelProfile, timeout time.Duration) string {
+	if model == nil {
+		return ""
+	}
+	sizeBytes := model.SizeBytes
+	if sizeBytes <= 0 && model.TotalSizeMB > 0 {
+		sizeBytes = int64(model.TotalSizeMB) * 1024 * 1024
+	}
+	if sizeBytes < longModelLoadWarningThresholdBytes {
+		return ""
+	}
+	kind := "model"
+	if model.IsMoE {
+		kind = "MoE model"
+	}
+	return fmt.Sprintf(
+		"[launch] Long first load ahead: this %s is %s. Allocation measurement and a bounded recovery may load it more than once; each attempt can take several minutes (startup limit %s). Progress will continue below.",
+		kind, formatModelBytes(sizeBytes), timeout,
+	)
 }
 
 func shellQuote(arg string) string {
@@ -678,10 +710,22 @@ type launchRequest struct {
 	ClaudeResume           string   // session id or "latest": reopen a recorded Claude session
 	ClaudeResumeForce      bool     // accept a resume whose backend shape no longer matches
 	OriginalArgs           []string // launch argv as given, so a resume can reproduce it exactly
-	Calibrate              string   // "auto" (default: calibrate unproven small models), "on" (force), "off"
-	NoCachedConfig         bool     // --no-cached-config: derive placement fresh, ignoring cached measurements
-	SupportExpert          string   // off, auto (installed-only), on
-	SupportOnline          bool     // typed official llama.cpp research only
+	Calibrate              string   // "auto" (workflow-validated replay only), "on" (explicit bounded screen), "off"
+	// CalibrationScreened marks a non-default configuration selected only by the
+	// bounded screen. It may serve this explicit run, but must not leak into the
+	// automatic verified-config or MoE placement caches.
+	CalibrationScreened bool
+	// CalibrationPending prevents verifyAndActivateLaunch from persisting a
+	// tuned-looking verified config before the pending optimizer decision has
+	// itself passed promotion and been written. Runtime-only.
+	CalibrationPending bool
+	// AppliedCalibration is the reusable cached decision that this launch or
+	// dry-run actually replayed. It is inspect-only: argv still comes from the
+	// re-derived winner strategy, never from deserialized flags.
+	AppliedCalibration *placement.CalibrationDecision
+	NoCachedConfig     bool   // --no-cached-config: derive placement fresh, ignoring cached measurements
+	SupportExpert      string // off, auto (installed-only), on
+	SupportOnline      bool   // typed official llama.cpp research only
 	// SupportOnlineSet is true when the user named --support-online or
 	// --no-support-online on the command line. The default (and the config) leave
 	// it false, which lets an escalated launch force online research — the advisor
@@ -750,26 +794,27 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 	backendExplicit := configuredBackendExplicit(cfg.Backend)
 	originalArgs := append([]string(nil), args...)
 	req := &launchRequest{
-		Port:             cfg.Port,
-		CtxFlag:          cfg.CtxValue(),
-		KVPlacement:      cfg.KVPlacement,
-		KVQuality:        cfg.KVQuality,
-		Host:             cfg.Host,
-		VisionAuto:       cfg.Vision,
-		ServerBin:        cfg.LlamaServer,
-		AppHome:          cfg.AppHome,
-		Backend:          cfg.Backend,
-		BackendExplicit:  backendExplicit,
-		SpecMode:         cfg.Spec,
-		Parallel:         cfg.Parallel,
-		RamBudgetMB:      parseBudgetMB(cfg.RamBudget),
-		RAMLimitPercent:  cfg.RAMLimitPercent,
-		VRAMHeadroomMB:   parseBudgetMB(cfg.VRAMHeadroom),
-		RAMHeadroomMB:    parseBudgetMB(cfg.RAMHeadroom),
-		CgroupHeadroomMB: cfg.CgroupHeadroomMB,
-		OriginalArgs:     originalArgs,
-		SupportExpert:    cfg.SupportExpert,
-		SupportOnline:    cfg.SupportOnline,
+		Port:                 cfg.Port,
+		CtxFlag:              cfg.CtxValue(),
+		KVPlacement:          cfg.KVPlacement,
+		KVQuality:            cfg.KVQuality,
+		Host:                 cfg.Host,
+		VisionAuto:           cfg.Vision,
+		ServerBin:            cfg.LlamaServer,
+		AppHome:              cfg.AppHome,
+		Backend:              cfg.Backend,
+		BackendExplicit:      backendExplicit,
+		SpecMode:             cfg.Spec,
+		Parallel:             cfg.Parallel,
+		RamBudgetMB:          parseBudgetMB(cfg.RamBudget),
+		RAMLimitPercent:      cfg.RAMLimitPercent,
+		VRAMHeadroomMB:       parseBudgetMB(cfg.VRAMHeadroom),
+		RAMHeadroomMB:        parseBudgetMB(cfg.RAMHeadroom),
+		CgroupHeadroomMB:     cfg.CgroupHeadroomMB,
+		AllowLiveMemoryProbe: cfg.AllowLiveMemoryProbe,
+		OriginalArgs:         originalArgs,
+		SupportExpert:        cfg.SupportExpert,
+		SupportOnline:        cfg.SupportOnline,
 	}
 	if cfg.SWAFull {
 		req.ExtraArgs = append(req.ExtraArgs, "--swa-full")
@@ -1430,7 +1475,32 @@ func requestWorkloadProfile(req *launchRequest, model *placement.ModelProfile) s
 	if profile == "" {
 		profile = "explicit-batch"
 	}
-	return fmt.Sprintf("claude-%s-v1:%s", profile, requestSamplingProfile(req, model))
+	return fmt.Sprintf("claude-%s-v4:%s", profile, requestSamplingProfile(req, model))
+}
+
+func requestWorkloadConcurrency(req *launchRequest) int {
+	if req == nil {
+		return 1
+	}
+	if req.ClaudeCode && effectiveClaudeProfile(req) == claudeProfileInteractive {
+		if req.ParallelSet && req.Parallel > 0 {
+			return min(8, req.Parallel)
+		}
+		return 1
+	}
+	if req.ClaudeCode && effectiveClaudeProfile(req) == claudeProfileParallel {
+		if req.ClaudeMaxActive > 0 {
+			return min(8, req.ClaudeMaxActive)
+		}
+		if req.Parallel > 0 {
+			return min(8, req.Parallel)
+		}
+		return 2
+	}
+	if req.Parallel > 0 {
+		return min(8, req.Parallel)
+	}
+	return 1
 }
 
 // evidenceBackendCacheTag gives placement/probe evidence an exact backend-build
@@ -1984,15 +2054,27 @@ type backendArchProbe func(binaryPath, arch string) (supported, probed bool)
 // file-backed allocation does not decide survival under the cgroup.
 const autoBackendLargeMoEMinMB = 48 * 1024 // 48 GiB
 
+// backendCPUExpertMMapCapability returns the explicit capability attached to
+// the exact probed backend. The fallback exists for old synthetic callers and
+// tests; detectBackend always populates the tri-state field, including an
+// explicit unknown, so production never authorizes reclaim from a tag alone.
+func backendCPUExpertMMapCapability(be *backendInfo) placement.CPUExpertMMapCapability {
+	if be == nil {
+		return placement.CPUExpertMMapUnknown
+	}
+	if be.CPUExpertMMapCapability != "" {
+		return placement.NormalizeCPUExpertMMapCapability(string(be.CPUExpertMMapCapability))
+	}
+	if placement.BackendUsesAnonymousCPUExperts(backendDialect(be)) || be.IsIK {
+		return placement.CPUExpertMMapAnonymous
+	}
+	return placement.CPUExpertMMapFileBacked
+}
+
 // cpuExpertsFileBacked reports whether a backend leaves CPU-offloaded expert
 // tensors file-backed (reclaimable) rather than in anonymous CUDA-host memory.
-// It mirrors placement.mmapCanPageCPUExperts, which makes the same distinction
-// through the loader-family predicate.
 func cpuExpertsFileBacked(be *backendInfo) bool {
-	if be == nil {
-		return false
-	}
-	return !placement.BackendUsesAnonymousCPUExperts(backendDialect(be))
+	return backendCPUExpertMMapCapability(be) == placement.CPUExpertMMapFileBacked
 }
 
 // largeCPUMoEPrefersFileBacked reports whether this model is a large-CPU-expert
@@ -2455,74 +2537,54 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 	// A resolved size here means the user named one (a number, or "max"); "fit"
 	// and the empty default both resolve to 0.
 	userSetCtx := ctxSize > 0
+	autoContextMax := 0
 	if req.ClaudeCode && ctxSize <= 0 {
-		// Claude Code needs a large shared window for its main conversation plus
-		// background work. In auto/fit mode use the model's native window, capped
-		// at 1M so the four default slots each retain about 256k tokens. Explicit
-		// numeric/max context choices are resolved above and remain user overrides.
-		ctxSize = model.CTXTrain
-		if ctxSize > 1048576 {
-			ctxSize = 1048576
-		} else if ctxSize <= 0 {
-			// Unknown metadata must not make a small/old model allocate a speculative
-			// 1M KV cache. Two 64k slots are a portable Claude Code baseline; models
-			// that advertise a larger native window still get it automatically.
-			ctxSize = 131072
-		}
-		// ...but a large window is not worth buying with an offloaded KV cache.
-		// Taking the native window unconditionally made "fit" mean "max" in Claude
-		// Code mode, and a KV that does not fit in VRAM lands on the host, which
-		// costs far more speed than the extra window is worth. Bound the default
-		// by what actually fits; an explicit numeric/max context is a user override
-		// and is resolved above, so it is never lowered here.
-		if fitCtx, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, req.KVQuality, placement.Options{
-			KVQuality: req.KVQuality, KVQualityV: req.KVQualityV, CacheDir: cacheDir,
-			// Must match the options the real plan is computed with, or the answer
-			// is a different question: RequireMeasuredBuffers in particular drops
-			// the plan-wide headroom, and without it this reported 76800 where the
-			// planner went on to fit 102400 -- a threshold that warns correctly but
-			// names a needlessly small context to fall back to.
-			RequireMeasuredBuffers: true,
-			SWAFull:                hasArg(req.ExtraArgs, "--swa-full"),
-		}); fitCtx > 0 && fitCtx < ctxSize {
-			native := ctxSize
-			ctxOffloadWarning.Do(func() {
-				fmt.Fprintf(os.Stderr, "[launch] context sized to %d to keep the KV cache in VRAM (native %d would offload it)\n", fitCtx, native)
-			})
-			ctxSize = fitCtx
+		// This is a workload ceiling, not a pre-resolved context. The placement
+		// package still searches the exact full-plan boundary below it, so Claude,
+		// ordinary CLI, TUI, recovery, and dry-run all use one fit resolver.
+		autoContextMax = model.CTXTrain
+		if autoContextMax > 1048576 {
+			autoContextMax = 1048576
+		} else if autoContextMax <= 0 {
+			autoContextMax = 131072
 		}
 	}
 	samplingProfile := requestSamplingProfile(req, model)
 	opts := placement.Options{
-		ContextSize:            ctxSize,
-		KVPlacement:            req.KVPlacement,
-		KVQuality:              req.KVQuality,
-		KVQualityV:             req.KVQualityV,
-		CPUMode:                req.CPUMode,
-		RamBudgetMB:            req.RamBudgetMB,
-		RAMLimitPercent:        req.RAMLimitPercent,
-		VRAMHeadroomMB:         req.VRAMHeadroomMB,
-		RAMHeadroomMB:          req.RAMHeadroomMB,
-		RequireMeasuredBuffers: true,
-		NoMMap:                 req.NoMMap,
-		ForceMMap:              req.ForceMMap,
-		CacheDir:               cacheDir,
-		Host:                   req.Host,
-		BackendTag:             backendDialect(be),
-		BackendCacheTag:        evidenceBackendCacheTag(be),
-		BackendIdentity:        be.Identity,
-		SamplingProfile:        samplingProfile,
-		WorkloadProfile:        requestWorkloadProfile(req, model),
-		VisionAuto:             req.VisionAuto,
-		MMProjPath:             req.MMProjPath,
-		SpecMode:               req.SpecMode,
-		ForceSpecMoE:           req.ForceSpecMoE,
-		BackendHelp:            be.Help,
-		SpecCandidateValidator: backendSpecCandidateValidator(be, model.ModelArch),
-		CacheFile:              req.TuneCache,
-		Parallel:               req.Parallel,
-		Threads:                req.Threads,
-		CacheRAMMB:             req.CacheRAMMB,
+		ContextSize:             ctxSize,
+		AutoContextMax:          autoContextMax,
+		KVPlacement:             req.KVPlacement,
+		KVQuality:               req.KVQuality,
+		KVQualityV:              req.KVQualityV,
+		CPUMode:                 req.CPUMode,
+		RamBudgetMB:             req.RamBudgetMB,
+		RAMLimitPercent:         req.RAMLimitPercent,
+		VRAMHeadroomMB:          req.VRAMHeadroomMB,
+		RAMHeadroomMB:           req.RAMHeadroomMB,
+		RequireMeasuredBuffers:  true,
+		NoMMap:                  req.NoMMap,
+		ForceMMap:               req.ForceMMap,
+		CacheDir:                cacheDir,
+		Host:                    req.Host,
+		BackendTag:              backendDialect(be),
+		BackendCacheTag:         evidenceBackendCacheTag(be),
+		BackendIdentity:         be.Identity,
+		CPUExpertMMapCapability: backendCPUExpertMMapCapability(be),
+		CPUExpertMMapEvidence:   be.CPUExpertMMapEvidence,
+		SamplingProfile:         samplingProfile,
+		WorkloadProfile:         requestWorkloadProfile(req, model),
+		WorkloadConcurrency:     requestWorkloadConcurrency(req),
+		VisionAuto:              req.VisionAuto,
+		MMProjPath:              req.MMProjPath,
+		SpecMode:                req.SpecMode,
+		ForceSpecMoE:            req.ForceSpecMoE,
+		BackendHelp:             be.Help,
+		SpecCandidateValidator:  backendSpecCandidateValidator(be, model.ModelArch),
+		CacheFile:               req.TuneCache,
+		Parallel:                req.Parallel,
+		ParallelExplicit:        req.ParallelSet,
+		Threads:                 req.Threads,
+		CacheRAMMB:              req.CacheRAMMB,
 		// --swa-full is a passthrough flag, but placement cannot treat it as
 		// one: it decides whether sliding-window layers hold the whole context,
 		// which on Laguna is the difference between 13.8 GB and 54.0 GB of KV
@@ -2530,6 +2592,7 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 		SWAFull:            hasArg(req.ExtraArgs, "--swa-full"),
 		BatchSize:          req.BatchSize,
 		UBatchSize:         req.UBatchSize,
+		BatchSizeExplicit:  req.BatchSizeSet,
 		UBatchSizeExplicit: req.UBatchSizeSet,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
 		// normal launch keeps reasoning on so tools like Claude Code can think.
@@ -2557,16 +2620,26 @@ func placementOptionsFromRequestCaps(req *launchRequest, model *placement.ModelP
 	// could still land on DenseCPUOffload asks the user instead of silently
 	// spilling the model into system RAM.
 	opts.DenseCPUOffloadPrompt = req.DenseOffloadPrompt
+	requestedParallel := claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile)
 	opts.Parallel = claudeCodeSlotsForPlacement(
-		claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet, req.ClaudeProfile),
+		requestedParallel,
 		opts.ContextSize, req.ClaudeCode, req.ParallelSet,
 	)
+	opts.AutoParallel = req.ClaudeCode && !req.ParallelSet && opts.ContextSize <= 0 && requestedParallel > 1
+	if opts.AutoParallel {
+		opts.ParallelSlotTarget = claudeSlotTarget
+	}
+	if req.ClaudeCode {
+		opts.RuntimePolicy = func(strategy *placement.Strategy) {
+			applyClaudeCodeRuntimePolicy(strategy, model, req.BatchSizeSet, req.UBatchSizeSet, false)
+		}
+	}
 	warnIfContextForcesOffload(caps, model, req, opts, userSetCtx)
 	// Derive the strategy-free verified-config scope key from the finalized opts.
 	// It is what the reuse lookup in placement.Compute hashes against, and the
 	// save path uses the same computation, so save and load can never disagree.
 	if caps != nil && !req.NoCachedConfig {
-		opts.VerifiedConfigScopeKey = placement.NewCalibrationScopeKey(model, caps, opts, nil).String()
+		opts.VerifiedConfigScopeKey = placement.NewCalibrationScopeKey(model, caps, opts, nil).String() + "-plan" + planLogicVersion
 	}
 	return opts
 }
@@ -2679,7 +2752,7 @@ const (
 // wait) and may re-process the prompt on interleave — slow, but functional.
 // Runs after placement.Compute and before Strategy.Args, so the emitted
 // --parallel and the derived CLAUDE_AUTOCOMPACT_PCT_OVERRIDE stay consistent.
-func claudeCodeSlotAdjust(strategy *placement.Strategy, claudeCode, parallelExplicit, batchExplicit bool) {
+func claudeCodeSlotAdjust(strategy *placement.Strategy, model *placement.ModelProfile, claudeCode, parallelExplicit, batchExplicit, ubatchExplicit bool) {
 	if !claudeCode || strategy == nil {
 		return
 	}
@@ -2700,20 +2773,54 @@ func claudeCodeSlotAdjust(strategy *placement.Strategy, claudeCode, parallelExpl
 			fmt.Printf("[claude-code] warning: only ~%dk context per slot — Claude Code needs ~24k+ just for its system prompt. Use a larger --ctx-size or a smaller model.\n", slot/1000)
 		}
 	}
+	applyClaudeCodeRuntimePolicy(strategy, model, batchExplicit, ubatchExplicit, true)
+}
+
+// applyClaudeCodeRuntimePolicy resolves the batch graph that placement must
+// account for after automatic context fit chooses a fixed slot count. The quiet
+// form runs inside placement.Compute before draft/companion/cache/placement
+// ledgers; the announcing form runs at finalization as a no-op safety check.
+func applyClaudeCodeRuntimePolicy(strategy *placement.Strategy, model *placement.ModelProfile, batchExplicit, ubatchExplicit, announce bool) {
+	if strategy == nil {
+		return
+	}
+	// A full verified-config replay is allowed to bypass placement.Compute. Keep
+	// the final serving policy model-derived as well as strategy-derived so a
+	// cached record can never erase recurrent semantics, context-shift safety, or
+	// the parallel-agent fairness baseline.
+	modelHasSSM := model != nil && (model.HasSSM != 0 || strings.EqualFold(model.ModelArch, "deepseek4"))
+	if modelHasSSM {
+		strategy.HasSSM = true
+	}
 	// Normalize the slot count before applying the fairness policy: an automatic
 	// 4-slot request can legitimately become one slot at a smaller context size.
 	// Capping that final single foreground slot to 128 would sacrifice long-prompt
 	// MoE efficiency without protecting any competing decode.
-	if strategy.HasSSM && strategy.Parallel > 1 && strategy.BatchSize > claudeHybridBatch && !batchExplicit {
-		fmt.Printf("[claude-code] hybrid recurrent model: lowering --batch-size from %d to %d so prompt prefill does not starve another active slot\n",
-			strategy.BatchSize, claudeHybridBatch)
-		strategy.BatchSize = claudeHybridBatch
+	if strategy.HasSSM && strategy.Parallel > 1 && strategy.BatchSize > claudeHybridBatch && !batchExplicit && !strategy.BatchTuned {
+		target := claudeHybridBatch
+		if ubatchExplicit && strategy.UBatchSize > target {
+			// An explicit physical microbatch is user-owned. Keep the logical
+			// batch large enough to make it real instead of advertising a value
+			// llama.cpp will silently clamp.
+			target = strategy.UBatchSize
+		}
+		if announce {
+			fmt.Printf("[claude-code] hybrid recurrent model: lowering --batch-size from %d to %d so prompt prefill does not starve another active slot\n",
+				strategy.BatchSize, target)
+		}
+		strategy.BatchSize = target
 	}
+	placement.NormalizeBatchSizes(strategy, model, batchExplicit, ubatchExplicit)
 }
 
 func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, strategy *placement.Strategy) []string {
 	if req.SpecDraftMax > 0 && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
 		strategy.Draft.DraftMax = req.SpecDraftMax
+	}
+	oldBatch, oldUBatch := strategy.BatchSize, strategy.UBatchSize
+	if placement.NormalizeBatchSizes(strategy, model, req.BatchSizeSet, req.UBatchSizeSet) {
+		fmt.Printf("[launch] normalized batch/ubatch %d/%d -> %d/%d (llama.cpp requires ubatch <= batch)\n",
+			oldBatch, oldUBatch, strategy.BatchSize, strategy.UBatchSize)
 	}
 	serverArgs := append([]string{be.Path}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, hy3CompatibilityArgs(req.ExtraArgs, model, be)...)
@@ -3197,7 +3304,7 @@ func validateHostMemoryContainment(req *launchRequest, caps *detect.Capabilities
 	// Scoped to --no-mmap (anonymous) plans: file-backed expert pages are
 	// reclaimable page cache that can legitimately overshoot the resident
 	// footprint, so the mmap reclaim band absorbs it (see backendStartOptions).
-	if req.CgroupHeadroomMB > 0 && strategy.PlannedHostFootprintMB > 0 && !strategy.MMap {
+	if req.CgroupHeadroomMB > 0 && strategy.PlannedHostFootprintMB > 0 && !strategyUsesReclaimableMMap(strategy) {
 		ceiling := backendMemoryMaxMB(req, caps)
 		plannedReserve := req.CgroupHeadroomMB
 		if strategy.CRAM > plannedReserve {
@@ -3421,6 +3528,22 @@ func confirmLiveMemoryProbe(req *launchRequest, reason string, input io.Reader, 
 	}
 }
 
+// rememberLiveMemoryProbeConsent persists an approval made at the interactive
+// prompt. A command-line --allow-live-memory-probe remains a one-launch
+// override because this helper is called only after the prompt path. Failure to
+// remember the preference must not invalidate consent for the current launch.
+func rememberLiveMemoryProbeConsent(cfg *config.Config, output io.Writer) {
+	if cfg == nil || cfg.AllowLiveMemoryProbe {
+		return
+	}
+	cfg.AllowLiveMemoryProbe = true
+	if err := cfg.Save(); err != nil {
+		fmt.Fprintf(output, "[config] warning: live memory probe approved for this launch, but the preference could not be saved: %v\n", err)
+		return
+	}
+	fmt.Fprintln(output, "[config] live memory probe approval saved; future launches will not ask again")
+}
+
 func stdinIsTerminal() bool {
 	info, err := os.Stdin.Stat()
 	return err == nil && info.Mode()&os.ModeCharDevice != 0
@@ -3478,7 +3601,10 @@ func argsOffloadExpertsToCPU(serverArgs []string) bool {
 // expert tensors file-backed rather than copied into host buffers. Keyed off
 // argv for the same reason as argsOffloadExpertsToCPU: it cannot drift from
 // what the backend is actually told.
-func argsMMapBackedExperts(serverArgs []string) bool {
+func argsMMapBackedExperts(be *backendInfo, serverArgs []string) bool {
+	if !cpuExpertsFileBacked(be) {
+		return false
+	}
 	if !argsOffloadExpertsToCPU(serverArgs) {
 		return false
 	}
@@ -3488,6 +3614,64 @@ func argsMMapBackedExperts(serverArgs []string) bool {
 		}
 	}
 	return true
+}
+
+func strategyUsesReclaimableMMap(strategy *placement.Strategy) bool {
+	if strategy == nil || !strategy.MMap || strategy.ReclaimableHostWeightsMB <= 0 {
+		return false
+	}
+	capability := strategy.CPUExpertMMapCapability
+	if capability == "" {
+		// Compatibility for old in-memory strategies. Standard launches always
+		// carry the explicit exact-backend capability.
+		return !placement.BackendUsesAnonymousCPUExperts(strategy.BackendTag)
+	}
+	return placement.NormalizeCPUExpertMMapCapability(string(capability)) == placement.CPUExpertMMapFileBacked
+}
+
+func mmapPageabilityContradicted(strategy *placement.Strategy, nonReclaimableMB int) (bool, int) {
+	if !strategyUsesReclaimableMMap(strategy) || nonReclaimableMB <= 0 {
+		return false, 0
+	}
+	expected := strategy.ReclaimableHostWeightsMB
+	if expected <= 0 {
+		return false, 0
+	}
+	// CRAM is future anonymous capacity and the planner's host footprint is the
+	// non-reclaimable working-set estimate. Permit allocator noise equal to the
+	// larger of 1 GiB or one eighth of the expected mapped expert bytes. A real
+	// anonymous-copy loader exceeds both the working-set envelope and half the
+	// exact expert footprint (the observed ik case was ~113 GiB vs <1 GiB).
+	limit := strategy.PlannedHostFootprintMB + strategy.CRAM + maxInt(1024, expected/8)
+	return nonReclaimableMB > limit && nonReclaimableMB > expected/2, limit
+}
+
+func validateObservedMMapPageability(cfg *config.Config, model *placement.ModelProfile, be *backendInfo, strategy *placement.Strategy, process *server.Process) error {
+	if cfg == nil || model == nil || be == nil || process == nil || !strategyUsesReclaimableMMap(strategy) {
+		return nil
+	}
+	measuredMB, err := process.ScopeNonReclaimableMB()
+	if err != nil || measuredMB <= 0 {
+		// The audited exact-backend capability remains the admission fact when the
+		// host cannot expose cgroup memory.stat (non-Linux or non-systemd).
+		return nil
+	}
+	contradicted, limitMB := mmapPageabilityContradicted(strategy, measuredMB)
+	if !contradicted {
+		fmt.Fprintf(os.Stderr, "[mmap] live pageability check: %d MiB non-reclaimable for %d MiB mapped CPU experts\n",
+			measuredMB, strategy.ReclaimableHostWeightsMB)
+		return nil
+	}
+	evidence := fmt.Sprintf(
+		"live cgroup contradiction: %d MiB non-reclaimable exceeds %d MiB envelope with %d MiB CPU experts expected file-backed",
+		measuredMB, limitMB, strategy.ReclaimableHostWeightsMB,
+	)
+	be.CPUExpertMMapCapability = placement.CPUExpertMMapAnonymous
+	be.CPUExpertMMapEvidence = evidence
+	if persistErr := persistBackendCPUExpertMMapCapability(cfg.CacheDir, model, be, placement.CPUExpertMMapAnonymous, evidence); persistErr != nil {
+		fmt.Fprintf(os.Stderr, "[mmap] warning: could not persist pageability contradiction: %v\n", persistErr)
+	}
+	return fmt.Errorf("backend copied CPU experts into anonymous host memory despite mmap (%s)", evidence)
 }
 
 // backendStartOptions builds the memory scope for the backend.
@@ -3511,10 +3695,10 @@ func argsMMapBackedExperts(serverArgs []string) bool {
 // the user already configures with --ram-limit-percent. Containment is kept --
 // there is still a hard ceiling, and MemorySwapMax=0 still holds -- but the
 // kernel is allowed to evict page cache before it kills the process.
-func backendStartOptions(req *launchRequest, caps *detect.Capabilities, envOverrides []string, serverArgs []string) server.StartOptions {
+func backendStartOptions(req *launchRequest, caps *detect.Capabilities, be *backendInfo, envOverrides []string, serverArgs []string) server.StartOptions {
 	budgetMB := backendMemoryMaxMB(req, caps)
 	highMB, maxMB := budgetMB, budgetMB
-	if budgetMB > 0 && argsMMapBackedExperts(serverArgs) {
+	if budgetMB > 0 && argsMMapBackedExperts(be, serverArgs) {
 		if hostCeiling := hostReclaimCeilingMB(req, caps); hostCeiling > budgetMB {
 			maxMB = hostCeiling
 		}
@@ -3553,6 +3737,18 @@ func resizeScopeToMeasuredFootprint(req *launchRequest, caps *detect.Capabilitie
 	}
 	plannedFloor := measuredFootprintPlannedFloor(strategy, measured, ceiling)
 	newMax := measuredFootprintCgroupMaxMB(measured, req.CgroupHeadroomMB, plannedFloor, ceiling)
+	if strategyUsesReclaimableMMap(strategy) {
+		// Never collapse a file-backed plan's hard ceiling to its anonymous
+		// working set. memory.max must retain the reclaim band for clean expert
+		// pages; only memory.high is tightened to measured state + headroom.
+		if err := p.SetMemoryHighMB(newMax); err != nil {
+			fmt.Fprintf(os.Stderr, "[launch] measured-footprint mmap reclaim threshold re-size to %d MiB failed: %v\n", newMax, err)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "[launch] mmap reclaim threshold re-sized to %d MiB (measured %d MiB + headroom, planned floor %d MiB, hard ceiling preserved)\n",
+			newMax, measured, plannedFloor)
+		return
+	}
 	if err := p.SetMemoryMaxMB(newMax); err != nil {
 		fmt.Fprintf(os.Stderr, "[launch] measured-footprint cgroup re-size to %d MiB failed: %v\n", newMax, err)
 		return
@@ -3647,7 +3843,7 @@ func hostReclaimCeilingMB(req *launchRequest, caps *detect.Capabilities) int {
 }
 
 func startLaunchProcess(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration) (*server.Process, error) {
-	startOpts := backendStartOptions(req, caps, hostExpertPinningEnv(be, serverArgs), serverArgs)
+	startOpts := backendStartOptions(req, caps, be, hostExpertPinningEnv(be, serverArgs), serverArgs)
 	if req.ClaudeCode {
 		// In Claude Code mode ggrun hands the terminal to the `claude` client, so
 		// the backend's ongoing per-request logs must go to a file instead of
@@ -3722,6 +3918,59 @@ func printVRAMLedger(strategy *placement.Strategy) {
 		fmt.Printf("[launch] CUDA%d %-11s free %6d - fixed %6d = room %6d MiB -> %2d expert layers, %5d MiB stranded\n",
 			e.GPU, role, e.FreeMB, e.FixedMB, e.RoomMB, e.ExpertLayers, e.StrandedMB)
 	}
+}
+
+func printOptimizationSummary(label string, strategy *placement.Strategy, detailed bool) {
+	for _, line := range optimizationSummaryLines(label, strategy, detailed) {
+		fmt.Println(line)
+	}
+}
+
+func optimizationSummaryLines(label string, strategy *placement.Strategy, detailed bool) []string {
+	if strategy == nil || strategy.Residency == "" || strategy.ResourceLedger == nil {
+		return nil
+	}
+	if label == "" {
+		label = "optimize"
+	}
+	ledger := strategy.ResourceLedger
+	evidence := ledger.Evidence
+	if evidence == "" {
+		evidence = "estimate"
+	}
+	slots := max(1, strategy.Parallel)
+	kv := strategy.KVPlacement
+	if strategy.KVType != "" {
+		if kv == "" {
+			kv = strategy.KVType
+		} else {
+			kv += "/" + strategy.KVType
+		}
+	}
+	if kv == "" {
+		kv = "unspecified"
+	}
+	lines := []string{fmt.Sprintf("[%s] %s, ctx %d total / %d per agent, kv %s, batch %d/%d, parallel %d, bottleneck %s (%s)",
+		label, strategy.Residency, strategy.ContextSize, strategy.ContextSize/slots, kv,
+		strategy.BatchSize, strategy.UBatchSize, slots, strategy.OptimizationBottleneck, evidence)}
+	if boundary := strategy.OptimizationBoundary; boundary != nil {
+		lines = append(lines, fmt.Sprintf("[%s] calculated %d candidates (%d feasible, %d exact): batch %d..%d, ubatch %d..%d, parallel %d..%d, %d topology shape(s)",
+			label, boundary.CandidateCount, boundary.FeasibleCount, boundary.ExactCount,
+			boundary.MinBatch, boundary.MaxBatch, boundary.MinUBatch, boundary.MaxUBatch,
+			boundary.MinParallel, boundary.MaxParallel, len(boundary.Topologies)))
+	}
+	if !detailed {
+		return lines
+	}
+	for _, device := range ledger.Devices {
+		lines = append(lines, fmt.Sprintf("[%s] CUDA%d %-11s free %6d - model %6d - KV %5d - graph/runtime %5d = slack %6d MiB [%s]",
+			label, device.GPU, device.Role, device.FreeMB, device.ModelMB, device.ContextMB,
+			device.GraphMB+device.RuntimeMB, device.SlackMB, device.Evidence))
+	}
+	lines = append(lines, fmt.Sprintf("[%s] host free %d - required %d = slack %d MiB (reclaimable weights %d MiB) [%s]",
+		label, ledger.Host.FreeMB, ledger.Host.RequiredMB, ledger.Host.SlackMB,
+		ledger.Host.Reclaimable, ledger.Host.Evidence))
+	return lines
 }
 
 // serverProcessPID is the backend's PID, or 0 when it is not running.
@@ -3934,7 +4183,7 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 		fmt.Fprintf(os.Stderr, "[launch] calibration: measured placement recompute failed: %v\n", err)
 		return nil, nil, false
 	}
-	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	if !shouldPromoteMoEPlacement(current, next) {
 		return nil, nil, false
 	}
@@ -3949,12 +4198,12 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 	return next, nextArgs, true
 }
 
-// retainProvenSafeAfterRecovery keeps automatic optimization monotonic. Once
-// this lifecycle has needed memory recovery, the first server that actually
-// reaches health is the baseline to serve and verify. Measurements remain on
-// disk for the next launch; only an explicit --calibrate on may stop the good
-// server and challenge it immediately.
-func retainProvenSafeAfterRecovery(req *launchRequest, memoryRecovery *launchMemoryRecovery) bool {
+// retainRecoveredBaselineForAllocationPromotion keeps the allocator's denser
+// recompute monotonic. Once this lifecycle needed memory recovery, it must not
+// immediately promote another allocation-only guess. The workload optimizer is
+// separate: it may measure the recovered server in place and challenge one
+// non-rejected finalist when the resolved launch has performance headroom.
+func retainRecoveredBaselineForAllocationPromotion(req *launchRequest, memoryRecovery *launchMemoryRecovery) bool {
 	if memoryRecovery == nil || !memoryRecovery.hasRejections() {
 		return false
 	}
@@ -3986,6 +4235,60 @@ func restoreLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Confi
 	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, true)
 }
 
+type tunedBatchConstraint struct {
+	enabled          bool
+	batch            int
+	ubatch           int
+	performanceTuned bool
+}
+
+func tunedBatchConstraintFor(strategy *placement.Strategy) tunedBatchConstraint {
+	if strategy == nil || !strategy.BatchTuned || strategy.BatchSize <= 0 || strategy.UBatchSize <= 0 {
+		return tunedBatchConstraint{}
+	}
+	return tunedBatchConstraint{
+		enabled:          true,
+		batch:            strategy.BatchSize,
+		ubatch:           strategy.UBatchSize,
+		performanceTuned: strategy.PerformanceTuned,
+	}
+}
+
+func (constraint tunedBatchConstraint) apply(opts *placement.Options) {
+	if !constraint.enabled || opts == nil {
+		return
+	}
+	opts.BatchSize = constraint.batch
+	opts.UBatchSize = constraint.ubatch
+	opts.BatchSizeExplicit = true
+	opts.UBatchSizeExplicit = true
+	opts.RuntimePolicy = nil
+}
+
+func (constraint tunedBatchConstraint) retain(strategy *placement.Strategy) *placement.Strategy {
+	if strategy != nil && constraint.enabled && strategy.BatchSize == constraint.batch && strategy.UBatchSize == constraint.ubatch {
+		strategy.BatchTuned = true
+		strategy.PerformanceTuned = constraint.performanceTuned
+	}
+	return strategy
+}
+
+// backendMeasuredRecomputeWorthVerifying keeps exact allocator evidence tied
+// to the argv that produced it. A newly denser MoE placement is worth another
+// contained admission pass; lateral split churn at the same expert residency
+// is not. In the latter case the already-proven placement is both safer and no
+// less substantiated as a performance choice. Planned/no-allocation evidence
+// still has to converge through the ordinary recompute loop.
+func backendMeasuredRecomputeWorthVerifying(level memoryEvidenceLevel, current, next *placement.Strategy) bool {
+	if level != memoryEvidenceAllocated || current == nil || next == nil {
+		return true
+	}
+	if current.Type == placement.MoEOffload && next.Type == placement.MoEOffload {
+		return shouldPromoteMoEPlacement(current, next)
+	}
+	return true
+}
+
 func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool) (launchProcess *server.Process, launchStrategy *placement.Strategy, launchArgs []string, launchErr error) {
 	const maxRetries = 2
 	const maxPreflightReplans = 5
@@ -3997,9 +4300,19 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 	}
 	specDisabled := false
 	measuredProductionArgs := ""
+	// A calibration winner/candidate owns an exact batch pair even when the user
+	// did not spell that pair on the command line. Backend allocation evidence
+	// can force a fresh Compute pass before the real server starts; preserve the
+	// measured candidate as a placement input through that pass instead of
+	// letting the ordinary Claude cold-start policy collapse it back to 128/128.
+	tunedBatch := tunedBatchConstraintFor(strategy)
+	retainTunedBatch := func(next *placement.Strategy) *placement.Strategy {
+		return tunedBatch.retain(next)
+	}
 	runtimeCaps, visibleToPhysical := runtimeGPUCapabilitiesForLaunch(caps, req, strategy)
 	placementOpts := func() placement.Options {
 		opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+		tunedBatch.apply(&opts)
 		if specDisabled {
 			opts.SpecMode = "off"
 		}
@@ -4040,6 +4353,7 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 					}
 					return nil, strategy, serverArgs, fmt.Errorf("speculative profile mismatch and target-only re-plan returned no strategy")
 				}
+				next = retainTunedBatch(next)
 				strategy = next
 				serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, next)
 				continue
@@ -4095,7 +4409,8 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 							}
 							return nil, strategy, serverArgs, fmt.Errorf("backend feature re-plan returned no strategy")
 						}
-						claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+						next = retainTunedBatch(next)
+						claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 						nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 						if formatCommand(nextArgs) == formatCommand(serverArgs) {
 							return nil, strategy, serverArgs, fmt.Errorf("backend feature re-plan for %s produced no argument change", adjustment.RemoveFlag)
@@ -4158,7 +4473,8 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 						}
 						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible V-cache re-plan returned no strategy")
 					}
-					claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+					next = retainTunedBatch(next)
+					claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 					nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 					if formatCommand(nextArgs) == formatCommand(serverArgs) {
 						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible V-cache re-plan produced no argument change")
@@ -4191,7 +4507,8 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 						}
 						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible KV re-plan returned no strategy")
 					}
-					claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+					next = retainTunedBatch(next)
+					claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 					nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 					if formatCommand(nextArgs) == formatCommand(serverArgs) {
 						return nil, strategy, serverArgs, fmt.Errorf("backend-compatible KV re-plan produced no argument change")
@@ -4215,6 +4532,7 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 					if err := confirmLiveMemoryProbe(req, consent.Reason, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
 						return nil, strategy, serverArgs, err
 					}
+					rememberLiveMemoryProbeConsent(cfg, os.Stderr)
 					continue
 				}
 				// A backend/model error that no ggrun rule classified (no OOM, no
@@ -4242,6 +4560,7 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 					}
 					return nil, strategy, serverArgs, fmt.Errorf("selected backend rejected speculative companion and target-only re-plan returned no strategy")
 				}
+				next = retainTunedBatch(next)
 				strategy = next
 				serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, next)
 				fmt.Fprintln(os.Stderr, "[launch] continuing with stable target-only serving")
@@ -4278,32 +4597,41 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 					return nil, strategy, serverArgs, fmt.Errorf("backend-measured placement recompute returned no strategy")
 				}
 				next = recomputeAndApplyCalibration(req, cfg, model, be, caps, next)
-				claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+				next = retainTunedBatch(next)
+				claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 				nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
 				if changed, rejected := memoryRecovery.recomputeDecision(serverArgs, nextArgs); changed {
 					if rejected {
 						fmt.Fprintln(os.Stderr, "[launch] backend-measured recompute reproduced an argv rejected by this launch's memory checks; retaining the verified-safe placement")
-					} else {
-						strategy = next
-						serverArgs = nextArgs
 						if preflight.Evidence.Level == memoryEvidenceAllocated {
-							// The disposable live probe has already been stopped. Its
-							// complete allocator evidence is enough to choose the measured
-							// plan; start that plan once as the contained production server
-							// instead of paying for another disposable full model load.
-							fmt.Fprintln(os.Stderr, "[launch] allocation probe complete; starting a fresh server with the backend-measured configuration")
 							measuredProductionArgs = formatCommand(serverArgs)
-						} else {
-							if preflightReplans >= maxPreflightReplans {
+						}
+					} else if !backendMeasuredRecomputeWorthVerifying(preflight.Evidence.Level, strategy, next) {
+						// The exact probe covered serverArgs, not nextArgs. Do not trade
+						// a proven placement for an unmeasured lateral tensor split.
+						fmt.Fprintln(os.Stderr, "[launch] exact allocation already proves this expert residency; retaining it instead of testing an unmeasured lateral split")
+						measuredProductionArgs = formatCommand(serverArgs)
+					} else {
+						if preflightReplans >= maxPreflightReplans {
+							if preflight.Evidence.Level == memoryEvidenceAllocated {
+								fmt.Fprintln(os.Stderr, "[launch] measured re-plan budget reached; retaining the exact allocation-proven placement")
+								measuredProductionArgs = formatCommand(serverArgs)
+							} else {
 								return nil, strategy, serverArgs, fmt.Errorf("backend memory plan did not reach a fixed point after %d re-plans; refusing a real model load", maxPreflightReplans)
 							}
+						} else {
+							strategy = next
+							serverArgs = nextArgs
 							preflightReplans++
-							fmt.Fprintf(os.Stderr, "[launch] backend-measured memory re-plan %d/%d; verifying the new placement\n", preflightReplans, maxPreflightReplans)
+							fmt.Fprintf(os.Stderr, "[launch] backend-measured memory re-plan %d/%d changed the exact argv; verifying the new placement before production\n", preflightReplans, maxPreflightReplans)
 							continue
 						}
 					}
 				} else {
 					fmt.Fprintf(os.Stderr, "[launch] memory plan stable at %s evidence\n", preflight.Evidence.Level)
+					if preflight.Evidence.Level == memoryEvidenceAllocated {
+						measuredProductionArgs = formatCommand(serverArgs)
+					}
 				}
 			}
 		}
@@ -4318,6 +4646,29 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		}
 		p, err := startLaunchProcess(req, cfg, model, be, caps, serverArgs, timeout)
 		if err == nil {
+			if mmapErr := validateObservedMMapPageability(cfg, model, be, strategy, p); mmapErr != nil {
+				memoryRecovery.reject(serverArgs)
+				_ = p.Stop()
+				if preflightReplans >= maxPreflightReplans {
+					return nil, strategy, serverArgs, fmt.Errorf("mmap pageability correction did not converge: %w", mmapErr)
+				}
+				preflightReplans++
+				opts := placementOpts()
+				opts.SkipPlacementCache = true
+				next, replanErr := placement.Compute(caps, model, opts)
+				if replanErr != nil || next == nil {
+					if replanErr != nil {
+						return nil, strategy, serverArgs, fmt.Errorf("%w; resident re-plan failed: %v", mmapErr, replanErr)
+					}
+					return nil, strategy, serverArgs, fmt.Errorf("%w; resident re-plan returned no strategy", mmapErr)
+				}
+				strategy = recomputeAndApplyCalibration(req, cfg, model, be, caps, next)
+				strategy = retainTunedBatch(strategy)
+				claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
+				serverArgs = buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
+				fmt.Fprintln(os.Stderr, "[mmap] exact backend contradicted file-backed loading; recomputing under resident anonymous-memory accounting")
+				continue
+			}
 			if measuredProductionArgs != "" && measuredProductionArgs == formatCommand(serverArgs) {
 				fmt.Fprintln(os.Stderr, "[launch] backend-measured configuration loaded and passed health check")
 			}
@@ -4376,10 +4727,12 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 			s, rerr = placement.Compute(caps, model, opts)
 			if rerr == nil && s != nil {
 				s = recomputeAndApplyCalibration(req, cfg, model, be, caps, s)
+				s = retainTunedBatch(s)
 			}
 		} else {
 			oomPenalty[physicalDevice] += oomOvershoot(caps, physicalDevice, allocMB)
 			s, rerr = placement.ReplanAfterOOM(caps, model, placementOpts(), oomPenalty)
+			s = retainTunedBatch(s)
 		}
 		if rerr != nil || s == nil || s.OTString == "" {
 			s = nil
@@ -4701,7 +5054,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 			return nil, err
 		}
 		next = applyCalibrationDecision(req, cfg, model, be, caps, next)
-		claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+		claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 		fmt.Printf("[launch] prompt cache: re-planned -cram %d -> %d MiB from the measured entry size\n", strategy.CRAM, next.CRAM)
 		return next, nil
 	}
@@ -4717,7 +5070,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 		return nil, err
 	}
 	next = applyCalibrationDecision(req, cfg, model, be, caps, next)
-	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(next, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	return next, nil
 }
 
@@ -4879,7 +5232,7 @@ func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *plac
 	scope := launchProfileScope(req, model, be, caps)
 	store := controller.Store{CacheDir: cfg.CacheDir}
 	if store.IsActive(scope, argsHash) {
-		if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+		if !req.CalibrationScreened && !req.CalibrationPending && strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
 			_ = placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy))
 		}
 		// The already-active fast path is a re-validation of the same profile: the
@@ -4982,7 +5335,21 @@ func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *plac
 			_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "claude-router-canary")
 			return errors.New(reason)
 		}
-		if req.ReviewerProfile != nil && !req.ClaudeReviewerDisabled && claudeCompanionNeeded(nil) {
+		reviewerEnabled := req.ReviewerProfile != nil &&
+			!req.ClaudeReviewerDisabled && claudeCompanionNeeded(nil)
+		if reviewerEnabled {
+			reviewerRunner := &benchmark.Runner{
+				BaseURL: claudeRouterURL,
+				Model:   "local",
+				Timeout: 20 * time.Minute,
+			}
+			if reviewerErr := reviewerRunner.RunClaudeReviewerCanary(); reviewerErr != nil {
+				reason := "Claude reviewer-route canary failed: " + reviewerErr.Error()
+				_, _ = store.Transition(scope, profile.ID, controller.StateRejected, reason, "claude-reviewer-canary")
+				return errors.New(reason)
+			}
+		}
+		if reviewerEnabled && req.ReviewerProfile.ServesWorkers {
 			workerRunner := &benchmark.Runner{
 				BaseURL: claudeRouterURL,
 				Model:   claudeauto.UtilityAlias,
@@ -5003,7 +5370,7 @@ func verifyAndActivateLaunch(req *launchRequest, cfg *config.Config, model *plac
 		"all required launch checks passed", "profile-controller"); err != nil {
 		return err
 	}
-	if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+	if !req.CalibrationScreened && !req.CalibrationPending && strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
 		if err := placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy)); err != nil {
 			return fmt.Errorf("persist verified placement: %w", err)
 		}
@@ -5031,7 +5398,7 @@ func saveVerifiedConfigForLaunch(cfg *config.Config, req *launchRequest, model *
 	}
 	// --no-cached-config is the escape hatch: do not write a verified config for
 	// a launch that explicitly asked to derive fresh.
-	if req.NoCachedConfig {
+	if req.NoCachedConfig || req.CalibrationScreened || req.CalibrationPending {
 		return
 	}
 	reviewer := ""
@@ -5071,7 +5438,7 @@ func saveVerifiedConfigForLaunch(cfg *config.Config, req *launchRequest, model *
 // bandwidth-aware dense splits, VRAM-budgeted context fit, and granular context
 // maximisation all changed what a good plan looks like, and records written
 // before them would otherwise replay the old answer indefinitely.
-const planLogicVersion = "2"
+const planLogicVersion = "4"
 
 func verifiedConfigScopeKey(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) string {
 	if req == nil || model == nil || be == nil {
@@ -5354,7 +5721,7 @@ func cmdLaunch(args []string) {
 	// companion or model process. A ggrun-generated dialect mismatch must be a
 	// cheap, explicit pre-launch error, never a reviewer load followed by a giant
 	// backend help dump from the contained memory probe.
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	var preRecoveryStrategy *placement.Strategy
 	var serverArgs []string
 	if req.ClaudeCode {
@@ -5376,6 +5743,9 @@ func cmdLaunch(args []string) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
+	}
+	if warning := longModelLoadWarning(model, autoStartupTimeout(model)); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
 	}
 
 	// Start the reviewer on the GPU the final plan chose (CPU when it placed -1).
@@ -5462,7 +5832,7 @@ func cmdLaunch(args []string) {
 	// promoting it after calibration would replace the measured winner with an
 	// unbenchmarked strategy and could undo a faster KV alternate.
 	if p.LogBuf != nil {
-		if retainProvenSafeAfterRecovery(req, launchRecovery) {
+		if retainRecoveredBaselineForAllocationPromotion(req, launchRecovery) {
 			fmt.Printf("[launch] retaining the first proven-safe placement after %d rejected memory configuration(s); measurements will seed the next launch\n", launchRecovery.rejectionCount())
 		} else if nextStrategy, nextArgs, ok := maybePromoteMeasuredPlacement(req, cfg, be, caps, model, strategy, serverArgs, launchRecovery); ok {
 			fmt.Printf("[launch] allocation measurement fits more GPU experts (%d CPU MoE -> %d); establishing the calibrated baseline\n", strategy.NCPUMoE, nextStrategy.NCPUMoE)
@@ -5509,19 +5879,27 @@ func cmdLaunch(args []string) {
 			}
 		}
 	}
-	// First-launch calibration now measures alternatives against the final
+	// First-launch optimization now measures alternatives against the final
 	// allocation-informed baseline. Its returned decision remains provisional
 	// until the winner passes lifecycle and cache verification below.
 	var pendingCalibration *placement.CalibrationDecision
-	if !retainProvenSafeAfterRecovery(req, launchRecovery) && len(calibrationPlan(req, cfg, model, be, caps, strategy)) >= 2 {
-		p, strategy, serverArgs, pendingCalibration = runCalibration(req, cfg, model, be, caps, strategy, serverArgs, timeout, p, launchRecovery, resourceBaseline)
+	plannedCandidates := calibrationPlan(req, cfg, model, be, caps, strategy, func(candidate *placement.Strategy) bool {
+		candidateArgs := buildLaunchServerArgs(req, cfg, be, caps, model, candidate)
+		return launchRecovery.isRejected(candidateArgs)
+	})
+	if len(plannedCandidates) >= 2 {
+		p, strategy, serverArgs, pendingCalibration = runCalibration(req, cfg, model, be, caps, strategy, serverArgs, timeout, p, launchRecovery, resourceBaseline, plannedCandidates)
 		if p == nil {
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error: calibration left no running server\n")
 			os.Exit(1)
 		}
 		fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
+	} else {
+		strategy = explainServingOptimization(req, cfg, model, be, caps, strategy, false)
+		printOptimizationSummary("optimize", strategy, false)
 	}
+	req.CalibrationPending = pendingCalibration != nil
 	// A Claude profile is not verified by llama's OpenAI endpoint alone. Bring
 	// up the actual Anthropic gateway first, including admission and chat-role
 	// delimiter transforms, so lifecycle activation can canary /v1/messages.
@@ -5558,13 +5936,39 @@ func cmdLaunch(args []string) {
 	if pendingCalibration != nil {
 		scope := launchProfileScope(req, model, be, runtimeCaps)
 		active := controller.Store{CacheDir: cfg.CacheDir}.IsActive(scope, controller.HashArgs(serverArgs))
+		mode := effectiveCalibrationMode(req)
 		if !active {
-			fmt.Fprintf(os.Stderr, "[calibrate] provisional winner was not promoted to an active profile; decision not cached\n")
-		} else if path, saveErr := placement.SaveCalibrationDecision(cfg.CacheDir, *pendingCalibration); saveErr != nil {
-			fmt.Fprintf(os.Stderr, "[calibrate] active winner verified but decision cache failed: %v\n", saveErr)
+			fmt.Fprintf(os.Stderr, "[calibrate] screened winner did not reach an active profile; decision not cached\n")
+		} else if mode == calibrateAuto && !automaticCalibrationEvidenceValid(pendingCalibration) {
+			fmt.Fprintf(os.Stderr, "[optimize] winner reached active state but agent-workflow evidence was incomplete; decision not promoted\n")
 		} else {
-			fmt.Printf("[calibrate] active winner %s verified and cached %s\n", pendingCalibration.Winner, path)
+			if mode == calibrateAuto {
+				pendingCalibration.ValidationLevel = placement.CalibrationValidationWorkflow
+			}
+			path, saveErr := placement.SaveCalibrationDecision(cfg.CacheDir, *pendingCalibration)
+			if saveErr != nil {
+				fmt.Fprintf(os.Stderr, "[optimize] active winner cache failed: %v\n", saveErr)
+			} else if mode == calibrateAuto {
+				// Only now does the winner become reusable core state. The earlier
+				// StateActive transition deliberately skipped verified/place writes
+				// while this decision was pending, so a decision-cache failure can
+				// never strand a falsely tuned verified config.
+				strategy.PerformanceTuned = true
+				req.CalibrationPending = false
+				saveVerifiedConfigForLaunch(cfg, req, model, be, runtimeCaps, strategy)
+				if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+					if placeErr := placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy)); placeErr != nil {
+						fmt.Fprintf(os.Stderr, "[optimize] verified placement cache write failed (launch unaffected): %v\n", placeErr)
+					}
+				}
+				fmt.Printf("[optimize] workflow winner %s passed clean relaunch, agent, cache, and lifecycle gates; cached at %s\n",
+					pendingCalibration.Winner, path)
+			} else {
+				fmt.Printf("[calibrate] screened winner %s passed launch canaries and was cached for explicit reuse at %s; it is not automatic-eligible without the full workflow gate\n",
+					pendingCalibration.Winner, path)
+			}
 		}
+		req.CalibrationPending = false
 	}
 	// A benchmarked Claude profile measures the exact Claude placement policy
 	// (reviewer reservation, slots, batch, sampling) without opening the
@@ -5820,6 +6224,18 @@ func invalidateRuntimeOOMLaunch(req *launchRequest, cfg *config.Config, model *p
 	// key the decision was saved under is removed — otherwise the OOM'd
 	// placement is re-declared the winner on the next launch.
 	keys := []string{calibrationScopeKey(req, model, be, caps, strategy)}
+	// The serving winner is not guaranteed to contain enough of the cold
+	// baseline to reverse-generate its scope (a KV alternate, for example, does
+	// not carry the default KV placement). Recompute the deterministic baseline
+	// with full-config and placement replay disabled, then delete the exact key
+	// under which runCalibration originally saved the decision.
+	defaultOpts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+	defaultOpts.VerifiedConfigScopeKey = ""
+	defaultOpts.SkipPlacementCache = true
+	defaultOpts.CacheFile = ""
+	if defaultStrategy, computeErr := placement.Compute(caps, model, defaultOpts); computeErr == nil && defaultStrategy != nil {
+		keys = append(keys, calibrationScopeKey(req, model, be, caps, defaultStrategy))
+	}
 	for _, cand := range calibrationCandidates(req, cfg, model, be, caps, strategy) {
 		if cand.Strategy == nil || cand.Strategy == strategy {
 			continue
@@ -5874,7 +6290,7 @@ func replanAfterRuntimeOOM(req *launchRequest, cfg *config.Config, model *placem
 	if err != nil {
 		return nil, nil, err
 	}
-	claudeCodeSlotAdjust(nextStrategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(nextStrategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 	nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, nextStrategy)
 	if formatCommand(nextArgs) == formatCommand(serverArgs) {
 		return nil, nil, fmt.Errorf("runtime OOM re-plan reproduced the exact failed argv; refusing an identical relaunch")
@@ -5917,7 +6333,7 @@ func applyTuneCache(req *launchRequest, serverArgs []string, cacheDir, backendTa
 		fmt.Println("[tune] Skipping automatic generic/community tune for Claude Code; use an explicit --tune-cache after workload validation.")
 		return serverArgs
 	}
-	path := bestTuneCachePath(cacheDir, filepath.Base(req.ModelPath), backendTag, vision, tuneHardwareHash(caps))
+	path := bestTuneCachePath(cacheDir, filepath.Base(req.ModelPath), backendTag, vision, "", tuneHardwareHash(caps))
 	if path == "" {
 		// No local tune for this model+hardware+backend: try the community
 		// pool. Downloads are sanitized to the tune-flag allow-list and both
@@ -5946,12 +6362,15 @@ func gpuNamesFromCaps(caps *detect.Capabilities) []string {
 	return names
 }
 
-func bestTuneCachePath(cacheDir, modelName, backendTag string, vision bool, hardwareHash string) string {
+func bestTuneCachePath(cacheDir, modelName, backendTag string, vision bool, workload, hardwareHash string) string {
 	if cacheDir == "" || modelName == "" {
 		return ""
 	}
 	rows := tune.ListTunedConfigs(cacheDir, modelName, tuneCacheBackendTag(backendTag), vision)
 	for _, row := range rows {
+		if row.Workload != workload {
+			continue
+		}
 		if hardwareHash == "" || strings.Contains(filepath.Base(row.Path), "_hw"+hardwareHash+"_") {
 			return row.Path
 		}
@@ -6281,7 +6700,8 @@ func cmdKVProbe(args []string) {
 		be = &backendInfo{Path: binPath, Tag: "llama"}
 	}
 	applyCachedBackendCapabilities(req, cfg.CacheDir, model, be)
-	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	placementOpts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+	strategy, err := placement.Compute(caps, model, placementOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
 		os.Exit(1)
@@ -6435,12 +6855,15 @@ func cmdDryRun(args []string) {
 	// additional expert layer fits and disagree with the real launch.
 	req.ReviewerReservation = claudeReviewerReservation(req, caps, cfg.CacheDir)
 
-	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
+	placementOpts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+	strategy, err := placement.Compute(caps, model, placementOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error computing placement: %s\n", placementErrorMessage(err))
 		os.Exit(1)
 	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
+	strategy = applyCalibrationDecision(req, cfg, model, be, caps, strategy)
+	strategy = explainServingOptimization(req, cfg, model, be, caps, strategy, true)
 
 	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
 		printVRAMLedger(strategy)
@@ -6451,15 +6874,20 @@ func cmdDryRun(args []string) {
 	envPrefix := applyGPUVisibility(req, backendDialect(be))
 	if req.EmitServerArgvJSON {
 		plan := struct {
-			Schema        string            `json:"schema"`
-			ModelPath     string            `json:"model_path"`
-			BackendTag    string            `json:"backend_tag"`
-			BackendID     string            `json:"backend_identity"`
-			ClaudeProfile string            `json:"claude_profile,omitempty"`
-			LaunchScope   string            `json:"launch_scope,omitempty"`
-			MemoryMaxMB   int               `json:"memory_max_mb,omitempty"`
-			Environment   map[string]string `json:"environment"`
-			ServerArgv    []string          `json:"server_argv"`
+			Schema               string                          `json:"schema"`
+			ModelPath            string                          `json:"model_path"`
+			BackendTag           string                          `json:"backend_tag"`
+			BackendID            string                          `json:"backend_identity"`
+			ClaudeProfile        string                          `json:"claude_profile,omitempty"`
+			LaunchScope          string                          `json:"launch_scope,omitempty"`
+			MemoryMaxMB          int                             `json:"memory_max_mb,omitempty"`
+			Environment          map[string]string               `json:"environment"`
+			ServerArgv           []string                        `json:"server_argv"`
+			Residency            placement.ResidencyClass        `json:"residency,omitempty"`
+			Bottleneck           string                          `json:"optimization_bottleneck,omitempty"`
+			ResourceLedger       *placement.ResourceLedger       `json:"resource_ledger,omitempty"`
+			OptimizationBoundary *placement.OptimizationBoundary `json:"optimization_boundary,omitempty"`
+			CachedOptimization   *placement.CalibrationDecision  `json:"cached_optimization,omitempty"`
 		}{
 			Schema:        "ggrun-server-plan-v1",
 			ModelPath:     req.ModelPath,
@@ -6469,10 +6897,15 @@ func cmdDryRun(args []string) {
 			// The name a crash log would be filed under. Exposed because it is a
 			// hash: when recovery silently fails to find a previous OOM, the only
 			// way to see why is to compare this between two runs.
-			LaunchScope: claudeLaunchLogScope(req, model, be, serverArgs),
-			MemoryMaxMB: backendMemoryMaxMB(req, caps),
-			Environment: launchPlanEnvironment(serverArgs, envPrefix, be.Path),
-			ServerArgv:  serverArgs,
+			LaunchScope:          claudeLaunchLogScope(req, model, be, serverArgs),
+			MemoryMaxMB:          backendMemoryMaxMB(req, caps),
+			Environment:          launchPlanEnvironment(serverArgs, envPrefix, be.Path),
+			ServerArgv:           serverArgs,
+			Residency:            strategy.Residency,
+			Bottleneck:           strategy.OptimizationBottleneck,
+			ResourceLedger:       strategy.ResourceLedger,
+			OptimizationBoundary: strategy.OptimizationBoundary,
+			CachedOptimization:   req.AppliedCalibration,
 		}
 		if err := json.NewEncoder(os.Stdout).Encode(plan); err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing launch plan: %v\n", err)
@@ -6480,6 +6913,7 @@ func cmdDryRun(args []string) {
 		}
 		return
 	}
+	printOptimizationSummary("dry-run", strategy, true)
 	if envPrefix != "" {
 		fmt.Print(envPrefix + " ")
 	}
@@ -7348,15 +7782,34 @@ func cmdTune(args []string) {
 	// Tune the same slot/batch policy that a real Claude launch uses. Without
 	// this, an agent-parallel tune can benchmark an uncapped hybrid prefill and
 	// later override the fairness policy it was meant to improve.
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+	claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
+	agentParallel := 0
+	agentWorkload := ""
+	minTuneImprovement := 0.0
+	if req.ClaudeCode && model.HasSSM > 0 && strategy.Parallel > 1 {
+		agentParallel = strategy.Parallel
+		minTuneImprovement = calibrationMinImprovementPct
+		kvTypeV := strategy.KVTypeV
+		if kvTypeV == "" {
+			kvTypeV = strategy.KVType
+		}
+		agentWorkload = fmt.Sprintf("%s-p%d-c%d-k%s-v%s-%s-%s",
+			tune.AgentParallelWorkloadPrefix, strategy.Parallel, strategy.ContextSize,
+			strategy.KVType, kvTypeV, strategy.KVPlacement, strategy.Type)
+		fmt.Printf("[tune] parallel agent workload: %d slots; ranking safe flags by repeated cache-backed turn time (batch/ubatch remain placement-owned; use --calibrate on to screen pairs)\n", strategy.Parallel)
+	}
 
 	// A completed tune for this model/hardware/backend is reused unless the
 	// user explicitly asks for a fresh run with --retune.
 	if !hasArg(args, "--retune") {
-		cachePath := tune.TuneCachePath(cfg.CacheDir, req.ModelPath, gpuNamesFromCaps(caps), strategy.MMProjPath != "", be.Tag)
+		cachePath := tune.TuneCachePathForWorkload(cfg.CacheDir, req.ModelPath, gpuNamesFromCaps(caps), strategy.MMProjPath != "", be.Tag, agentWorkload)
 		if cachePath != "" && tune.TuneFileComplete(cachePath) {
 			fmt.Printf("[tune] Completed tune cache found: %s\n", cachePath)
-			fmt.Println("[tune] It is applied automatically on launch. Re-run with --retune to tune again.")
+			if agentWorkload != "" {
+				fmt.Println("[tune] Select it with --tune-cache for this exact workload, or use --retune to measure again.")
+			} else {
+				fmt.Println("[tune] It is applied automatically on launch. Re-run with --retune to tune again.")
+			}
 			return
 		}
 	}
@@ -7390,20 +7843,23 @@ func cmdTune(args []string) {
 
 	cache := tune.NewCache(cfg.CacheDir)
 	engine := &tune.Engine{
-		BaseURL:          fmt.Sprintf("http://localhost:%d", req.Port),
-		Model:            filepath.Base(req.ModelPath),
-		Rounds:           rounds,
-		Cache:            cache,
-		Caps:             caps,
-		Backend:          be.Tag,
-		Vision:           strategy.MMProjPath != "",
-		BenchmarkTimeout: benchTimeout,
-		BackendHelp:      be.Help,
+		BaseURL:           fmt.Sprintf("http://localhost:%d", req.Port),
+		Model:             filepath.Base(req.ModelPath),
+		Rounds:            rounds,
+		Cache:             cache,
+		Caps:              caps,
+		Backend:           be.Tag,
+		Vision:            strategy.MMProjPath != "",
+		MinImprovementPct: minTuneImprovement,
+		BenchmarkTimeout:  benchTimeout,
+		BackendHelp:       be.Help,
+		AgentParallel:     agentParallel,
+		Workload:          agentWorkload,
 		OnProgress: func(msg string) {
 			fmt.Println("[tune]", msg)
 		},
 		StartServer: func(flags []string) (func(), error) {
-			p, err := server.StartWithTimeoutToOptions(flags, req.Port, timeout, os.Stdout, os.Stderr, backendStartOptions(req, caps, nil, flags))
+			p, err := server.StartWithTimeoutToOptions(flags, req.Port, timeout, os.Stdout, os.Stderr, backendStartOptions(req, caps, be, nil, flags))
 			if err != nil {
 				return nil, err
 			}
@@ -7418,7 +7874,7 @@ func cmdTune(args []string) {
 	}
 
 	fmt.Printf("[tune] Best config: %.1f tok/s\n", entry.Result.GenTPS)
-	tunePath := tune.TuneCachePath(cfg.CacheDir, req.ModelPath, gpuNamesFromCaps(caps), strategy.MMProjPath != "", be.Tag)
+	tunePath := tune.TuneCachePathForWorkload(cfg.CacheDir, req.ModelPath, gpuNamesFromCaps(caps), strategy.MMProjPath != "", be.Tag, agentWorkload)
 	if hint := tune.ShareHint(tunePath); hint != "" {
 		fmt.Println(hint)
 	}
@@ -7615,22 +8071,24 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 	applyBackendFeatureCompatibility(backendReq, model, be)
 	applyCachedBackendCapabilities(backendReq, cfg.CacheDir, model, be)
 	opts := placement.Options{
-		ContextSize:     resolveCtxFlag(cfg.CtxValue(), model.CTXTrain),
-		KVPlacement:     cfg.KVPlacement,
-		KVQuality:       cfg.KVQuality,
-		SWAFull:         hasArg(backendReq.ExtraArgs, "--swa-full"),
-		RamBudgetMB:     parseBudgetMB(cfg.RamBudget),
-		RAMLimitPercent: cfg.RAMLimitPercent,
-		VRAMHeadroomMB:  parseBudgetMB(cfg.VRAMHeadroom),
-		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
-		CacheDir:        cfg.CacheDir,
-		Host:            cfg.Host,
-		BackendTag:      backendDialect(be),
-		BackendCacheTag: evidenceBackendCacheTag(be),
-		BackendIdentity: be.Identity,
-		BackendHelp:     be.Help,
-		VisionAuto:      cfg.Vision,
-		SpecMode:        cfg.Spec,
+		ContextSize:             resolveCtxFlag(cfg.CtxValue(), model.CTXTrain),
+		KVPlacement:             cfg.KVPlacement,
+		KVQuality:               cfg.KVQuality,
+		SWAFull:                 hasArg(backendReq.ExtraArgs, "--swa-full"),
+		RamBudgetMB:             parseBudgetMB(cfg.RamBudget),
+		RAMLimitPercent:         cfg.RAMLimitPercent,
+		VRAMHeadroomMB:          parseBudgetMB(cfg.VRAMHeadroom),
+		RAMHeadroomMB:           parseBudgetMB(cfg.RAMHeadroom),
+		CacheDir:                cfg.CacheDir,
+		Host:                    cfg.Host,
+		BackendTag:              backendDialect(be),
+		BackendCacheTag:         evidenceBackendCacheTag(be),
+		BackendIdentity:         be.Identity,
+		CPUExpertMMapCapability: backendCPUExpertMMapCapability(be),
+		CPUExpertMMapEvidence:   be.CPUExpertMMapEvidence,
+		BackendHelp:             be.Help,
+		VisionAuto:              cfg.Vision,
+		SpecMode:                cfg.Spec,
 	}
 	strategy, err := placement.Compute(caps, model, opts)
 	if err != nil {
@@ -7648,6 +8106,25 @@ func computeServerArgs(modelPath string, port int) ([]string, error) {
 		serverArgs = append(serverArgs, "--swa-full")
 	}
 	return serverArgs, nil
+}
+
+func daemonMemoryScope(req *launchRequest, caps *detect.Capabilities, be *backendInfo, serverArgs []string, hardOverrideMB int) (highMB, maxMB int, err error) {
+	opts := backendStartOptions(req, caps, be, nil, serverArgs)
+	highMB, maxMB = opts.MemoryHighMB, opts.MemoryMaxMB
+	if hardOverrideMB > 0 {
+		maxMB = hardOverrideMB
+		highMB = hardOverrideMB
+		if argsMMapBackedExperts(be, serverArgs) && opts.MemoryHighMB > 0 && opts.MemoryHighMB < maxMB {
+			highMB = opts.MemoryHighMB
+		}
+	}
+	if maxMB <= 0 {
+		return 0, 0, fmt.Errorf("configured RAM policy leaves no positive daemon memory ceiling")
+	}
+	if highMB <= 0 || highMB > maxMB {
+		highMB = maxMB
+	}
+	return highMB, maxMB, nil
 }
 
 func cmdDaemon(args []string) {
@@ -7691,22 +8168,17 @@ func cmdDaemon(args []string) {
 		fmt.Fprintf(os.Stderr, "Error detecting hardware: %v\n", err)
 		os.Exit(1)
 	}
-	if *memoryMaxMB == 0 {
-		cfg := loadConfigOrExit()
-		percent := cfg.RAMLimitPercent
-		if *ramLimitPercent != 0 {
-			percent = *ramLimitPercent
-		}
-		*memoryMaxMB = backendMemoryMaxMB(&launchRequest{
-			RamBudgetMB:     parseBudgetMB(cfg.RamBudget),
-			RAMLimitPercent: percent,
-			RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
-		}, caps)
-		if *memoryMaxMB <= 0 {
-			fmt.Fprintln(os.Stderr, "Error: configured RAM limit leaves no memory for the daemon backend")
-			os.Exit(1)
-		}
+	cfgDaemon := loadConfigOrExit()
+	percent := cfgDaemon.RAMLimitPercent
+	if *ramLimitPercent != 0 {
+		percent = *ramLimitPercent
 	}
+	memoryReq := &launchRequest{
+		RamBudgetMB:     parseBudgetMB(cfgDaemon.RamBudget),
+		RAMLimitPercent: percent,
+		RAMHeadroomMB:   parseBudgetMB(cfgDaemon.RAMHeadroom),
+	}
+	hardOverrideMB := *memoryMaxMB
 
 	serverArgs, err := computeServerArgs(*modelPath, *port)
 	if err != nil {
@@ -7714,53 +8186,29 @@ func cmdDaemon(args []string) {
 		os.Exit(1)
 	}
 
-	// For an mmap-backed plan the daemon gets the same reclaim band the
-	// interactive launcher grants: the plan budget stays on the soft
-	// (reclaim) boundary and the hard ceiling is the configured max. Mirror
-	// backendStartOptions' argv-derived decision so the managed backend can
-	// evict clean page cache before the OOM killer. When --no-mmap is present
-	// the single hard cap is correct and high stays at the max (the daemon's
-	// memoryHighMaxMB preserves that as the default).
-	highMB := 0
-	if argsMMapBackedExperts(serverArgs) {
-		// Recompute the plan's budget the same way backendStartOptions does:
-		// the soft threshold is the derived budget; the hard ceiling remains
-		// the configured max. If no caps are reachable, fall back to the max
-		// so containment is never loosened.
-		highMB = *memoryMaxMB
-		if caps != nil {
-			cfgDaemon := loadConfigOrExit()
-			// The effective RAM limit is the configured percent with the
-			// --ram-limit-percent flag as an override — NOT the raw flag, which
-			// is 0 unless the operator passed it. Using the raw flag produced
-			// high==max (no band) for the documented --memory-max-mb-only
-			// invocation, re-creating the MiniMax-M3 OOM-kill the band exists
-			// to prevent.
-			percent := cfgDaemon.RAMLimitPercent
-			if *ramLimitPercent != 0 {
-				percent = *ramLimitPercent
-			}
-			budget := backendMemoryMaxMB(&launchRequest{
-				RamBudgetMB:     parseBudgetMB(cfgDaemon.RamBudget),
-				RAMLimitPercent: percent,
-				RAMHeadroomMB:   parseBudgetMB(cfgDaemon.RAMHeadroom),
-			}, caps)
-			if budget > 0 && budget < *memoryMaxMB {
-				highMB = budget
-			}
+	computeMemory := func(args []string) (int, int, error) {
+		if len(args) == 0 {
+			return 0, 0, fmt.Errorf("empty daemon backend argv")
 		}
+		return daemonMemoryScope(memoryReq, caps, detectUsableBackend(args[0]), args, hardOverrideMB)
+	}
+	highMB, effectiveMaxMB, err := computeMemory(serverArgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 	d := daemon.New(daemon.Config{
 		ModelPath:          *modelPath,
 		ServerArgs:         serverArgs,
 		Port:               *port,
 		ControlPort:        *controlPort,
-		MemoryMaxMB:        *memoryMaxMB,
+		MemoryMaxMB:        effectiveMaxMB,
 		MemoryHighMB:       highMB,
 		StartupTimeoutSecs: *startupTimeoutSecs,
 		// Let /reload recompute placement when handed a bare model path,
 		// so model swaps get the same auto-placement as the initial launch.
-		ComputeArgs: computeServerArgs,
+		ComputeArgs:   computeServerArgs,
+		ComputeMemory: computeMemory,
 	})
 	errCh := make(chan error, 1)
 	go func() { errCh <- d.Start() }()
@@ -8223,13 +8671,15 @@ func totalModelSize(path string) int64 {
 }
 
 type backendInfo struct {
-	Path              string
-	IsIK              bool
-	SupportsReasoning bool
-	Tag               string
-	Dialect           string // placement/flag family: llama, ik_llama, vulkan, metal
-	Help              string
-	Identity          string // version/build hash; invalidates speculative performance profiles
+	Path                    string
+	IsIK                    bool
+	SupportsReasoning       bool
+	Tag                     string
+	Dialect                 string // placement/flag family: llama, ik_llama, vulkan, metal
+	Help                    string
+	Identity                string // version/build hash; invalidates speculative performance profiles
+	CPUExpertMMapCapability placement.CPUExpertMMapCapability
+	CPUExpertMMapEvidence   string
 }
 
 // resolveCtxFlag converts --ctx flag to int: ""/"fit"=0, "max"=native, else number.
@@ -8386,7 +8836,31 @@ func detectBackend(path string) *backendInfo {
 	if strings.Contains(help, "--reasoning") {
 		info.SupportsReasoning = true
 	}
+	info.CPUExpertMMapCapability, info.CPUExpertMMapEvidence = probedCPUExpertMMapCapability(info)
 	return info
+}
+
+// probedCPUExpertMMapCapability classifies loader memory behavior from the
+// backend binary probe, not from the user-facing selection tag. ik-derived
+// loaders are known to copy CPU experts into anonymous CUDA-host buffers.
+// A successfully probed non-ik llama-server uses the reviewed mapped-CPU loader
+// family. Empty/broken help is deliberately unknown and therefore resident-only
+// until live evidence or an updated reviewed classifier says otherwise.
+func probedCPUExpertMMapCapability(info *backendInfo) (placement.CPUExpertMMapCapability, string) {
+	if info == nil {
+		return placement.CPUExpertMMapUnknown, "backend probe unavailable"
+	}
+	identity := strings.TrimSpace(info.Identity)
+	if identity == "" {
+		identity = filepath.Base(info.Path)
+	}
+	if info.IsIK || placement.BackendUsesAnonymousCPUExperts(backendDialect(info)) {
+		return placement.CPUExpertMMapAnonymous, "help-probed anonymous CPU-expert loader: " + identity
+	}
+	if strings.TrimSpace(info.Help) == "" || backendLoaderFailed(info.Help) {
+		return placement.CPUExpertMMapUnknown, "loader memory behavior not proven: " + identity
+	}
+	return placement.CPUExpertMMapFileBacked, "help-probed mapped CPU-expert loader: " + identity
 }
 
 func backendBuildIdentity(path string) string {

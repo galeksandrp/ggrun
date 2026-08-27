@@ -11,6 +11,11 @@ import (
 	"time"
 )
 
+// AgentParallelWorkloadPrefix identifies tune evidence measured with concurrent
+// long-prompt, decode, and mixed foreground traffic rather than a serial prompt.
+// Callers append the memory-relevant serving shape to keep evidence scoped.
+const AgentParallelWorkloadPrefix = "agent-parallel-v2"
+
 // Entry holds one tuning attempt result.
 type Entry struct {
 	Timestamp     int64                  `json:"timestamp"`
@@ -19,6 +24,7 @@ type Entry struct {
 	HardwareHash  string                 `json:"hardware_hash"`
 	Vision        bool                   `json:"vision"`
 	Backend       string                 `json:"backend"`
+	Workload      string                 `json:"workload,omitempty"`
 	Round         int                    `json:"round"`
 	Name          string                 `json:"name,omitempty"`
 	Flags         map[string]string      `json:"flags"`
@@ -30,14 +36,23 @@ type Entry struct {
 
 // BenchmarkResult mirrors benchmark.Result.
 type BenchmarkResult struct {
-	PromptTokens    int     `json:"prompt_tokens"`
-	PromptTPS       float64 `json:"prompt_tps"`
-	GenTokens       int     `json:"gen_tokens"`
-	GenTPS          float64 `json:"gen_tps"`
-	DraftTokens     int     `json:"draft_tokens,omitempty"`
-	DraftAccepted   int     `json:"draft_accepted,omitempty"`
-	DraftAcceptRate float64 `json:"draft_accept_rate,omitempty"`
-	PeakVRAMMB      int     `json:"peak_vram_mb"`
+	PromptTokens         int     `json:"prompt_tokens"`
+	PromptTPS            float64 `json:"prompt_tps"`
+	GenTokens            int     `json:"gen_tokens"`
+	GenTPS               float64 `json:"gen_tps"`
+	Parallel             int     `json:"parallel,omitempty"`
+	MixedGenTokens       int     `json:"mixed_gen_tokens,omitempty"`
+	MixedGenTPS          float64 `json:"mixed_gen_tps,omitempty"`
+	AgentTurnTimeS       float64 `json:"agent_turn_time_s,omitempty"`
+	AgentTurnMaxS        float64 `json:"agent_turn_max_s,omitempty"`
+	AgentSamples         int     `json:"agent_samples,omitempty"`
+	AgentCachedTokens    int     `json:"agent_cached_tokens,omitempty"`
+	AgentNewPromptTokens int     `json:"agent_new_prompt_tokens,omitempty"`
+	Score                float64 `json:"score,omitempty"`
+	DraftTokens          int     `json:"draft_tokens,omitempty"`
+	DraftAccepted        int     `json:"draft_accepted,omitempty"`
+	DraftAcceptRate      float64 `json:"draft_accept_rate,omitempty"`
+	PeakVRAMMB           int     `json:"peak_vram_mb"`
 }
 
 // Cache provides tune result persistence.
@@ -84,6 +99,12 @@ func (c *Cache) Save(entries []Entry) error {
 
 // FindBest returns the best entry for given model + hardware hash.
 func (c *Cache) FindBest(modelPath, hwHash string) (*Entry, error) {
+	return c.FindBestForWorkload(modelPath, hwHash, "")
+}
+
+// FindBestForWorkload returns the best entry in one measurement scope. Generic
+// callers use the empty workload; agent and serial scores are never compared.
+func (c *Cache) FindBestForWorkload(modelPath, hwHash, workload string) (*Entry, error) {
 	entries, err := c.Load()
 	if err != nil {
 		return nil, err
@@ -91,8 +112,8 @@ func (c *Cache) FindBest(modelPath, hwHash string) (*Entry, error) {
 	var best *Entry
 	for i := range entries {
 		e := &entries[i]
-		if e.ModelPath == modelPath && e.HardwareHash == hwHash && e.Best {
-			if best == nil || e.Result.GenTPS > best.Result.GenTPS {
+		if e.ModelPath == modelPath && e.HardwareHash == hwHash && e.Workload == workload && e.Best {
+			if best == nil || tunePerformance(*e) > tunePerformance(*best) {
 				best = e
 			}
 		}
@@ -108,11 +129,12 @@ func (c *Cache) Add(entry Entry) error {
 	}
 
 	// Mark previous best as non-best if this is better in the same model,
-	// hardware, backend, and vision scope. CUDA/IK and Vulkan tunes are not
-	// interchangeable even when they run on the same GPUs.
+	// hardware, backend, vision, and workload scope. CUDA/IK and Vulkan tunes are
+	// not interchangeable even when they run on the same GPUs; neither are serial
+	// and concurrent-agent measurements.
 	for i := range entries {
 		if sameTuneScope(entries[i], entry) && entries[i].Best {
-			if entry.Result.GenTPS > entries[i].Result.GenTPS {
+			if tunePerformance(entry) > tunePerformance(entries[i]) {
 				entries[i].Best = false
 			} else {
 				entry.Best = false
@@ -128,7 +150,15 @@ func sameTuneScope(a, b Entry) bool {
 	return a.ModelPath == b.ModelPath &&
 		a.HardwareHash == b.HardwareHash &&
 		a.Backend == b.Backend &&
-		a.Vision == b.Vision
+		a.Vision == b.Vision &&
+		a.Workload == b.Workload
+}
+
+func tunePerformance(entry Entry) float64 {
+	if entry.Workload != "" && entry.Result.Score > 0 {
+		return entry.Result.Score
+	}
+	return entry.Result.GenTPS
 }
 
 // TuneFileSummary is the loadable public tune artifact used by the CLI and GUI.
@@ -152,7 +182,7 @@ func (c *Cache) SaveTuneFile(modelPath string, baseline, best *Entry, rounds int
 	if best == nil {
 		best = baseline
 	}
-	path := TuneCachePath(filepath.Dir(c.path), modelPath, gpuNames, vision, backend)
+	path := TuneCachePathForWorkload(filepath.Dir(c.path), modelPath, gpuNames, vision, backend, baseline.Workload)
 	if path == "" {
 		return "", fmt.Errorf("could not build tune cache path")
 	}
@@ -163,7 +193,9 @@ func (c *Cache) SaveTuneFile(modelPath string, baseline, best *Entry, rounds int
 	if minImprovementPct <= 0 {
 		minImprovementPct = 1.0
 	}
-	baselineWins := best.Round == baseline.Round || !meaningfulImprovement(best.Result.GenTPS, baseline.Result.GenTPS, minImprovementPct) || len(best.OverrideFlags) == 0
+	baselineMetric := tunePerformance(*baseline)
+	bestMetric := tunePerformance(*best)
+	baselineWins := best.Round == baseline.Round || !meaningfulImprovement(bestMetric, baselineMetric, minImprovementPct) || len(best.OverrideFlags) == 0
 	bestName := best.Name
 	if bestName == "" {
 		bestName = "baseline"
@@ -189,12 +221,19 @@ func (c *Cache) SaveTuneFile(modelPath string, baseline, best *Entry, rounds int
 			name = "baseline"
 		}
 		allResults = append(allResults, map[string]interface{}{
-			"round":   e.Round,
-			"name":    name,
-			"gen_tps": e.Result.GenTPS,
-			"pp_tps":  e.Result.PromptTPS,
-			"flags":   flags,
-			"status":  status,
+			"round":                   e.Round,
+			"name":                    name,
+			"gen_tps":                 e.Result.GenTPS,
+			"pp_tps":                  e.Result.PromptTPS,
+			"mixed_gen_tps":           e.Result.MixedGenTPS,
+			"agent_turn_time_s":       e.Result.AgentTurnTimeS,
+			"agent_turn_max_s":        e.Result.AgentTurnMaxS,
+			"agent_samples":           e.Result.AgentSamples,
+			"agent_cached_tokens":     e.Result.AgentCachedTokens,
+			"agent_new_prompt_tokens": e.Result.AgentNewPromptTokens,
+			"score":                   e.Result.Score,
+			"flags":                   flags,
+			"status":                  status,
 		})
 	}
 
@@ -209,21 +248,30 @@ func (c *Cache) SaveTuneFile(modelPath string, baseline, best *Entry, rounds int
 	}
 
 	doc := map[string]interface{}{
-		"model":               filepath.Base(modelPath),
-		"tuned_at":            time.Now().UTC().Format(time.RFC3339),
-		"provider":            "v3-go",
-		"backend":             backendTagForFile(backend),
-		"baseline_gen_tps":    baseline.Result.GenTPS,
-		"baseline_pp_tps":     baseline.Result.PromptTPS,
-		"baseline_wins":       baselineWins,
-		"min_improvement_pct": minImprovementPct,
-		"completed_rounds":    completedRounds,
-		"complete":            complete,
+		"model":                      filepath.Base(modelPath),
+		"tuned_at":                   time.Now().UTC().Format(time.RFC3339),
+		"provider":                   "v3-go",
+		"backend":                    backendTagForFile(backend),
+		"workload":                   baseline.Workload,
+		"baseline_gen_tps":           baseline.Result.GenTPS,
+		"baseline_pp_tps":            baseline.Result.PromptTPS,
+		"baseline_agent_turn_time_s": baseline.Result.AgentTurnTimeS,
+		"baseline_wins":              baselineWins,
+		"min_improvement_pct":        minImprovementPct,
+		"completed_rounds":           completedRounds,
+		"complete":                   complete,
 		"best_config": map[string]interface{}{
-			"name":    bestName,
-			"flags":   bestFlags,
-			"gen_tps": best.Result.GenTPS,
-			"pp_tps":  best.Result.PromptTPS,
+			"name":                    bestName,
+			"flags":                   bestFlags,
+			"gen_tps":                 best.Result.GenTPS,
+			"pp_tps":                  best.Result.PromptTPS,
+			"mixed_gen_tps":           best.Result.MixedGenTPS,
+			"agent_turn_time_s":       best.Result.AgentTurnTimeS,
+			"agent_turn_max_s":        best.Result.AgentTurnMaxS,
+			"agent_samples":           best.Result.AgentSamples,
+			"agent_cached_tokens":     best.Result.AgentCachedTokens,
+			"agent_new_prompt_tokens": best.Result.AgentNewPromptTokens,
+			"score":                   best.Result.Score,
 		},
 		"rounds":      rounds,
 		"all_results": allResults,
@@ -253,6 +301,13 @@ func TuneFileComplete(path string) bool {
 
 // TuneCachePath builds the public tune artifact path.
 func TuneCachePath(dir, modelPath string, gpuNames []string, vision bool, backend string) string {
+	return TuneCachePathForWorkload(dir, modelPath, gpuNames, vision, backend, "")
+}
+
+// TuneCachePathForWorkload keeps generic throughput evidence separate from
+// agent-scheduler evidence. Otherwise the most recent tune can overwrite a
+// semantically different result for the same model and hardware.
+func TuneCachePathForWorkload(dir, modelPath string, gpuNames []string, vision bool, backend, workload string) string {
 	if dir == "" {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, ".cache", "ggrun")
@@ -265,8 +320,21 @@ func TuneCachePath(dir, modelPath string, gpuNames []string, vision bool, backen
 	if vision {
 		visionSuffix = "_v"
 	}
-	return filepath.Join(dir, fmt.Sprintf("tune_%s_%d_hw%s%s_%s.json",
-		filepath.Base(modelPath), size, BashHardwareHash(gpuNames), visionSuffix, backendTagForFile(backend)))
+	workloadSuffix := ""
+	if workload != "" {
+		workload = strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				return r
+			}
+			return '-'
+		}, strings.ToLower(strings.TrimSpace(workload)))
+		workload = strings.Trim(workload, "-")
+		if workload != "" {
+			workloadSuffix = "_" + workload
+		}
+	}
+	return filepath.Join(dir, fmt.Sprintf("tune_%s_%d_hw%s%s_%s%s.json",
+		filepath.Base(modelPath), size, BashHardwareHash(gpuNames), visionSuffix, backendTagForFile(backend), workloadSuffix))
 }
 
 func modelCacheSize(modelPath string) (int64, error) {

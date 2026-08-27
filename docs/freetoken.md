@@ -5,6 +5,10 @@ ggrun has a deliberately narrow adapter for
 MoE serving engine. It is an opt-in comparison path, not another llama.cpp
 flag dialect.
 
+Further integration work is deliberately parked in a
+[separate development lane](freetoken-development-lane.md). The active
+[ggrun core roadmap](development-roadmap.md) has no FreeToken dependency.
+
 Install FreeToken in its own Python environment first:
 
 ```bash
@@ -80,6 +84,10 @@ starting a server. `--ft-bin` selects an environment-specific `ft` executable;
   ```
 
 ## A/B measurement
+
+The reproducible real-agent protocol, live ggrun baseline, and hardware-window
+matrix are specified in the
+[runtime comparison plan](agentic-runtime-comparison-plan.md).
 
 Query the served model ID and use ggrun's HTTP one-shot benchmark against the
 FreeToken port:

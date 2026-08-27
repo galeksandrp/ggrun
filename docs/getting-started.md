@@ -86,7 +86,7 @@ ggrun <model.gguf> --claude-code
 
 This enables the local Claude Code/Ultracode workflow setup: local model aliases,
 parallel slots where the context supports them, request progress, local research
-tools, and a separate local permission reviewer. See
+tools, and—unless explicitly disabled—a separate local worker/reviewer. See
 [usage.md](usage.md#use-with-claude-code) for requirements and overrides.
 
 ## Need help?

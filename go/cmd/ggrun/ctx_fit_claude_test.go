@@ -42,23 +42,22 @@ func TestClaudeCodeDefaultContextIsBoundedByVRAM(t *testing.T) {
 	req := &launchRequest{ClaudeCode: true, CtxFlag: "fit"}
 
 	opts := placementOptionsFromRequestCaps(req, model, fitTestBackend(), t.TempDir(), caps)
-	if opts.ContextSize >= model.CTXTrain {
+	if opts.ContextSize != 0 {
+		t.Fatalf("fit was pre-resolved to %d before placement; want the shared automatic resolver", opts.ContextSize)
+	}
+	strategy, err := placement.Compute(caps, model, opts)
+	if err != nil {
+		t.Fatalf("compute fit: %v", err)
+	}
+	if strategy.ContextSize >= model.CTXTrain {
 		t.Errorf("Claude Code fit chose %d (native %d); it ignored the VRAM budget",
-			opts.ContextSize, model.CTXTrain)
+			strategy.ContextSize, model.CTXTrain)
 	}
-	if opts.ContextSize <= 0 {
-		t.Fatalf("no context chosen: %d", opts.ContextSize)
+	if strategy.ContextSize <= 0 {
+		t.Fatalf("no context chosen: %d", strategy.ContextSize)
 	}
-	// The exact size that fits is asserted in the placement package; here the
-	// contract is that the Claude Code default consults it at all. The query has
-	// to use the same options the launcher does -- RequireMeasuredBuffers in
-	// particular changes the answer, and comparing against a differently-computed
-	// fit is the very mismatch this pairing exists to prevent.
-	fit, _ := placement.AutoContextFitVRAM(caps, model, model.TotalSizeMB, "", placement.Options{
-		RequireMeasuredBuffers: true,
-	})
-	if fit > 0 && opts.ContextSize > fit {
-		t.Errorf("chose ctx=%d above the VRAM fit of %d", opts.ContextSize, fit)
+	if !strategy.ContextAuto || strategy.ContextFitTier != "gpu-resident" {
+		t.Fatalf("fit did not return a GPU-resident automatic boundary: %+v", strategy)
 	}
 }
 
@@ -70,8 +69,16 @@ func TestClaudeCodeDefaultContextKeepsNativeWhenVRAMAllows(t *testing.T) {
 	req := &launchRequest{ClaudeCode: true, CtxFlag: "fit"}
 
 	opts := placementOptionsFromRequestCaps(req, model, fitTestBackend(), t.TempDir(), caps)
-	if opts.ContextSize != model.CTXTrain {
-		t.Errorf("context = %d, want the native %d; VRAM was ample", opts.ContextSize, model.CTXTrain)
+	if opts.ContextSize != 0 || opts.AutoContextMax != model.CTXTrain {
+		t.Fatalf("fit options = ctx %d cap %d, want unresolved ctx and native cap %d",
+			opts.ContextSize, opts.AutoContextMax, model.CTXTrain)
+	}
+	strategy, err := placement.Compute(caps, model, opts)
+	if err != nil {
+		t.Fatalf("compute fit: %v", err)
+	}
+	if strategy.ContextSize != model.CTXTrain {
+		t.Errorf("context = %d, want the native %d; VRAM was ample", strategy.ContextSize, model.CTXTrain)
 	}
 }
 

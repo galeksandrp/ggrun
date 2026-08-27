@@ -31,6 +31,22 @@ func TestTuneCachePathUsesSplitGGUFTotalSize(t *testing.T) {
 	}
 }
 
+func TestTuneCachePathSeparatesAgentWorkload(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("gguf"), 0644); err != nil {
+		t.Fatalf("write model: %v", err)
+	}
+	generic := TuneCachePath(dir, modelPath, []string{"GPU"}, false, "vulkan")
+	agent := TuneCachePathForWorkload(dir, modelPath, []string{"GPU"}, false, "vulkan", "agent-parallel-v1-p2-c32768-kq4_0")
+	if generic == agent {
+		t.Fatalf("generic and agent tune paths collided: %s", generic)
+	}
+	if !strings.Contains(filepath.Base(agent), "_vulkan_agent-parallel-v1-p2-c32768-kq4-0.json") {
+		t.Fatalf("agent workload was not encoded safely in path: %s", agent)
+	}
+}
+
 func TestCache(t *testing.T) {
 	tmpDir := t.TempDir()
 	c := NewCache(tmpDir)
@@ -148,6 +164,53 @@ func TestCacheBestIsScopedByBackendAndVision(t *testing.T) {
 	}
 	if bestByScope["ik_llama/true"] != 1 {
 		t.Fatalf("expected vision IK best to survive, got %d", bestByScope["ik_llama/true"])
+	}
+}
+
+func TestCacheAgentBestUsesWorkloadScoreAndSeparateScope(t *testing.T) {
+	c := NewCache(t.TempDir())
+	base := Entry{
+		Timestamp: 1, ModelPath: "/models/test.gguf", HardwareHash: "abc123",
+		Backend: "vulkan", Workload: "agent-parallel-v1-p2", Best: true,
+		Result: BenchmarkResult{GenTPS: 100, Score: 100},
+	}
+	if err := c.Add(base); err != nil {
+		t.Fatalf("add baseline: %v", err)
+	}
+	winner := base
+	winner.Timestamp = 2
+	winner.Result = BenchmarkResult{GenTPS: 95, Score: 120}
+	if err := c.Add(winner); err != nil {
+		t.Fatalf("add agent winner: %v", err)
+	}
+	generic := base
+	generic.Timestamp = 3
+	generic.Workload = ""
+	generic.Result = BenchmarkResult{GenTPS: 110}
+	if err := c.Add(generic); err != nil {
+		t.Fatalf("add generic result: %v", err)
+	}
+	entries, err := c.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	agentBest := 0
+	genericBest := 0
+	for _, entry := range entries {
+		if !entry.Best {
+			continue
+		}
+		if entry.Workload == "agent-parallel-v1-p2" {
+			agentBest++
+			if entry.Result.Score != 120 {
+				t.Fatalf("agent cache chose decode TPS instead of workload score: %#v", entry)
+			}
+		} else {
+			genericBest++
+		}
+	}
+	if agentBest != 1 || genericBest != 1 {
+		t.Fatalf("workload cache scopes collided: agent=%d generic=%d", agentBest, genericBest)
 	}
 }
 

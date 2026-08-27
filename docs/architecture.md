@@ -11,7 +11,10 @@ GGUF metadata extraction, and downloading.
 - `go/pkg/detect`: CPU, RAM, CUDA, and Vulkan detection.
 - `go/pkg/gguf`: GGUF metadata parsing through the bundled parser helper.
 - `go/pkg/placement`: backend flag selection, KV planning, MoE placement,
-  speculative decoding, and vision projector lookup.
+  speculative decoding, batch-pair candidates, and vision projector lookup.
+- `go/pkg/benchmark`: serial throughput/correctness probes plus the parallel
+  agent benchmark (budget-scaled cold prefill, cached append, aggregate decode,
+  and mixed foreground progress).
 - `go/pkg/tune`: AI Tune benchmarking, candidate validation, and cache handling.
 - `go/pkg/update`: self-update, backend update, rollback, and startup update
   checks for interactive users.
@@ -42,3 +45,70 @@ Go-first.
 ggrun does not fork llama.cpp behavior. It selects flags, starts the
 backend, validates health, runs benchmarks, and records cache metadata. Unknown
 launcher flags are forwarded to the backend so upstream options remain usable.
+
+`n_ubatch <= n_batch` is a launcher invariant. Placement normalizes restored
+state before memory accounting, the Claude scheduler normalizes its conservative
+baseline, and tune overlays normalize again before emission. This avoids
+llama.cpp silently clamping a command whose displayed configuration and
+effective allocation disagree.
+
+Legacy AI Tune and the core placement optimizer are intentionally separate.
+Tune explores backend performance flags; for a parallel-agent workload it ranks
+them by repeated cache-backed agent turn time. AI Tune always protects batch
+and ubatch, including cached and community overlays. Only the core optimizer
+may change those coupled inputs, because it recomputes the complete
+memory/expert placement. The ordinary `auto` controller calculates all bounded
+neighbors, measures a short baseline prefill to bound one identical prompt
+geometry, then runs repeated cold-ingest-plus-cache-append scenarios for the
+stable baseline and one finalist. Explicit `--calibrate on` is the wider,
+screening-only maintenance sweep. Exact allocation evidence never transfers to
+a changed argv; a denser recompute is contained again, while a lateral MoE split
+cannot displace an already-proven placement. Promotion still requires the
+shared branch/replay, functional/gateway, lifecycle, and clean-relaunch gates.
+Generic, agent-screen, and automatically promoted artifacts are separately
+scoped by model, exact backend build, hardware, context, slots, effective batch
+pair, explicit-intent bits, and a versioned workload profile.
+
+Resident optimization has two distinct controller paths. A roomy launch has
+exactly measured residual headroom and actively searches a faster resident
+configuration—first avoiding unnecessary multi-GPU overhead, then spending
+graph headroom on batch/ubatch and workload-appropriate automatic slots. A
+tight launch stays anchored to its allocation-proven placement and admits only
+bounded monotonic experiments. These are launch classifications, not model-size
+classes: context, KV, companions, available devices, and current claims can move
+the same GGUF between them.
+
+For a roomy sparse MoE, resident bytes and compute ownership are deliberately
+separate signals. The frontier may fully recompute each feasible GPU as the sole
+ordinary-layer/KV/output owner while the other cards remain complete-expert
+storage. Sustained per-device SM imbalance can select one such topology as the
+single live finalist, but it still passes exact allocation admission and the
+same agent-workload/lifecycle gates before promotion. A recovered argv is only
+proof of a safe allocation; it is not evidence that a roomy host is tight.
+
+## Development lanes
+
+The active engineering sequence is the
+[ggrun core development roadmap](development-roadmap.md). It covers the
+GGUF/llama.cpp product and its next release independently.
+
+The accepted next core milestone is the
+[standard-launch optimizer](core-standard-launch-todos.md). It finishes KV fit
+and makes the shared TUI/direct-CLI path converge from a safe estimate to the
+fastest validated configuration for real agent work. Ordinary mmap remains the
+final generic fit fallback. Selective per-expert mmap/mlock pinning is a later,
+hardware-gated last resort for supported MoEs beyond usable RAM plus VRAM; it
+is not the backend's global `--mlock` mode.
+
+The evidence-driven [Workflow capacity planner](workflow-capacity-plan.md)
+follows that single-backend core milestone. It evaluates primary slots,
+same-model replicas, and smaller worker pools only on devices the user
+explicitly grants, while reserving the primary model for foreground work.
+
+The optional FreeToken experiment is recorded in a
+[separate parked lane](freetoken-development-lane.md). Work in that lane cannot
+change or block the core planner, installer, test matrix, or release gate.
+
+The [specialist model fabric](specialist-model-fabric-plan.md) is retained only
+as a parked exploratory idea. It is not an accepted architecture or an active
+roadmap item and cannot change the current core release sequence.

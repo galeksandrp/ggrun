@@ -60,6 +60,11 @@ type Config struct {
 	// server_args, so swaps get the same auto-placement as the initial
 	// launch. Not serialized — injected by the daemon's owner.
 	ComputeArgs func(modelPath string, port int) ([]string, error) `json:"-"`
+	// ComputeMemory recomputes the cgroup reclaim/hard limits for the exact
+	// argv returned by ComputeArgs. A reload can switch backend loader or move a
+	// model between resident and mmap placement, so retaining the old model's
+	// memory.high policy is unsafe. Not serialized — injected by the owner.
+	ComputeMemory func(serverArgs []string) (highMB, maxMB int, err error) `json:"-"`
 }
 
 // startupTimeout returns the configured wait or the daemon default.
@@ -162,7 +167,7 @@ func (d *Daemon) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"already running"}`, http.StatusConflict)
 		return
 	}
-	p, err := d.start(d.config.ServerArgs, d.config.Port, d.config.startupTimeout())
+	p, err := d.start(d.config, d.config.ServerArgs, d.config.Port, d.config.startupTimeout())
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -235,6 +240,14 @@ func (d *Daemon) handleReload(w http.ResponseWriter, r *http.Request) {
 		}
 		next.ServerArgs = args
 	}
+	if next.ComputeMemory != nil {
+		highMB, maxMB, err := next.ComputeMemory(next.ServerArgs)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"compute memory scope: %s"}`, err.Error()), http.StatusInternalServerError)
+			return
+		}
+		next.MemoryHighMB, next.MemoryMaxMB = highMB, maxMB
+	}
 
 	// A reload is an apply-and-run operation. When the daemon is idle this starts
 	// the newly selected model; when it is already serving, it replaces it.
@@ -248,7 +261,7 @@ func (d *Daemon) handleReload(w http.ResponseWriter, r *http.Request) {
 		// Small delay to free ports
 		time.Sleep(500 * time.Millisecond)
 	}
-	p, err := d.start(next.ServerArgs, next.Port, next.startupTimeout())
+	p, err := d.start(next, next.ServerArgs, next.Port, next.startupTimeout())
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -277,11 +290,11 @@ func (c Config) memoryHighMaxMB(args []string) (highMB, maxMB int) {
 	return highMB, maxMB
 }
 
-func (d *Daemon) start(args []string, port int, timeout time.Duration) (*server.Process, error) {
+func (d *Daemon) start(cfg Config, args []string, port int, timeout time.Duration) (*server.Process, error) {
 	if d.startServer != nil {
 		return d.startServer(args, port, timeout)
 	}
-	highMB, maxMB := d.config.memoryHighMaxMB(args)
+	highMB, maxMB := cfg.memoryHighMaxMB(args)
 	return server.StartWithTimeoutToOptions(
 		args,
 		port,

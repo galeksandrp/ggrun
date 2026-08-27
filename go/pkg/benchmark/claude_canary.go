@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/raketenkater/ggrun/pkg/claudeauto"
 )
 
 // RunClaudeRouterCanary verifies the actual Anthropic-compatible workload path
@@ -28,23 +30,63 @@ func (r *Runner) RunClaudeRouterCanary() error {
 			"input_schema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}},
 		}},
 	}
-	data, err := json.Marshal(body)
+	answer, err := r.runClaudeMessagesCanary(body, "Claude router")
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(r.BaseURL, "/")+"/v1/messages", bytes.NewReader(data))
+	if !validCanaryOutput(answer) {
+		return fmt.Errorf("Claude router functional canary returned %q instead of a bounded non-empty answer", strings.TrimSpace(answer))
+	}
+	return nil
+}
+
+// RunClaudeReviewerCanary exercises the classifier route Claude Code actually
+// uses in Auto permission mode. It deliberately carries no tool schema: a
+// security reviewer must return Claude's XML verdict as text, while presenting
+// a synthetic tool can tempt a small model to call it instead of classifying.
+func (r *Runner) RunClaudeReviewerCanary() error {
+	body := map[string]interface{}{
+		"model":       r.Model,
+		"max_tokens":  96,
+		"temperature": 0,
+		"stream":      false,
+		"system": []map[string]string{{
+			"type": "text",
+			"text": claudeauto.ClassifierMarker + " This is a deterministic health check. " +
+				"If the action is safe, output exactly <block>no</block>; otherwise output <block>yes</block>. Do not use tools.",
+		}},
+		"messages": []map[string]interface{}{{
+			"role": "user", "content": []map[string]string{{"type": "text", "text": "The action is a read-only health check."}},
+		}},
+	}
+	answer, err := r.runClaudeMessagesCanary(body, "Claude reviewer route")
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(answer) != "<block>no</block>" {
+		return fmt.Errorf("Claude reviewer functional canary returned %q instead of <block>no</block>", strings.TrimSpace(answer))
+	}
+	return nil
+}
+
+func (r *Runner) runClaudeMessagesCanary(body map[string]interface{}, lane string) (string, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return "", err
+	}
+	request, err := http.NewRequest(http.MethodPost, strings.TrimRight(r.BaseURL, "/")+"/v1/messages", bytes.NewReader(data))
+	if err != nil {
+		return "", err
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response, err := r.client().Do(request)
 	if err != nil {
-		return fmt.Errorf("Claude router request: %w", err)
+		return "", fmt.Errorf("%s request: %w", lane, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		detail, _ := io.ReadAll(io.LimitReader(response.Body, 2048))
-		return fmt.Errorf("Claude router HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(detail)))
+		return "", fmt.Errorf("%s HTTP %d: %s", lane, response.StatusCode, strings.TrimSpace(string(detail)))
 	}
 	var decoded struct {
 		Content []struct {
@@ -54,7 +96,7 @@ func (r *Runner) RunClaudeRouterCanary() error {
 		Completion string `json:"completion"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&decoded); err != nil {
-		return fmt.Errorf("decode Claude router response: %w", err)
+		return "", fmt.Errorf("decode %s response: %w", strings.ToLower(lane), err)
 	}
 	texts := make([]string, 0, len(decoded.Content)+1)
 	for _, block := range decoded.Content {
@@ -65,8 +107,5 @@ func (r *Runner) RunClaudeRouterCanary() error {
 	if decoded.Completion != "" {
 		texts = append(texts, decoded.Completion)
 	}
-	if !validCanaryOutput(strings.Join(texts, " ")) {
-		return fmt.Errorf("Claude router functional canary returned %q instead of a bounded non-empty answer", strings.TrimSpace(strings.Join(texts, " ")))
-	}
-	return nil
+	return strings.Join(texts, " "), nil
 }

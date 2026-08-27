@@ -74,6 +74,42 @@ func TestSaveVerifiedConfigSkipsNoCachedConfig(t *testing.T) {
 	}
 }
 
+func TestSaveVerifiedConfigSkipsScreenedCalibrationWinner(t *testing.T) {
+	cacheDir := t.TempDir()
+	cfg := &config.Config{CacheDir: cacheDir}
+	model := &placement.ModelProfile{Path: "/models/target.gguf", SizeBytes: 1 << 30, TotalSizeMB: 1024, ModelArch: "llama", NumLayers: 32}
+	backend := &backendInfo{Tag: "llama", Identity: "backend-build", Path: "/usr/bin/llama-server"}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "3090", VRAMTotalMB: 24576}}, RAM: detect.RAMInfo{TotalMB: 65536}, CPU: detect.CPUInfo{Cores: 8}}
+	strategy := &placement.Strategy{Type: placement.SingleGPU, ContextSize: 8192, MainGPU: 0, BatchSize: 256, UBatchSize: 256, Parallel: 2}
+	req := &launchRequest{CtxFlag: "8192", KVQuality: "mid", KVPlacement: "gpu", Parallel: 2, CalibrationScreened: true}
+
+	saveVerifiedConfigForLaunch(cfg, req, model, backend, caps, strategy)
+
+	if entries, _ := filepath.Glob(filepath.Join(cacheDir, "verified-configs", "verified-*.json")); len(entries) != 0 {
+		t.Fatalf("screened calibration winner leaked into automatic verified configs: %v", entries)
+	}
+}
+
+func TestSaveVerifiedConfigSkipsPendingOptimizerDecision(t *testing.T) {
+	cacheDir := t.TempDir()
+	cfg := &config.Config{CacheDir: cacheDir}
+	model := &placement.ModelProfile{Path: "/models/target.gguf", SizeBytes: 1 << 30, TotalSizeMB: 1024, ModelArch: "llama", NumLayers: 32}
+	backend := &backendInfo{Tag: "llama", Identity: "backend-build", Path: "/usr/bin/llama-server"}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "3090", VRAMTotalMB: 24576}}, RAM: detect.RAMInfo{TotalMB: 65536}, CPU: detect.CPUInfo{Cores: 8}}
+	strategy := &placement.Strategy{Type: placement.SingleGPU, ContextSize: 8192, MainGPU: 0, BatchSize: 256, UBatchSize: 256, Parallel: 2, PerformanceTuned: true}
+	req := &launchRequest{CtxFlag: "8192", KVQuality: "mid", KVPlacement: "gpu", Parallel: 2, CalibrationPending: true}
+
+	saveVerifiedConfigForLaunch(cfg, req, model, backend, caps, strategy)
+	if entries, _ := filepath.Glob(filepath.Join(cacheDir, "verified-configs", "verified-*.json")); len(entries) != 0 {
+		t.Fatalf("pending optimizer winner leaked into verified configs: %v", entries)
+	}
+	req.CalibrationPending = false
+	saveVerifiedConfigForLaunch(cfg, req, model, backend, caps, strategy)
+	if entries, _ := filepath.Glob(filepath.Join(cacheDir, "verified-configs", "verified-*.json")); len(entries) != 1 {
+		t.Fatalf("promoted optimizer winner was not persisted: %v", entries)
+	}
+}
+
 func TestInvalidateRuntimeOOMDeletesVerifiedConfig(t *testing.T) {
 	cacheDir := t.TempDir()
 	cfg := &config.Config{CacheDir: cacheDir}

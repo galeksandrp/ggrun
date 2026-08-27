@@ -18,7 +18,7 @@ import (
 	"github.com/raketenkater/ggrun/pkg/placement"
 )
 
-const backendCapabilitySchema = 1
+const backendCapabilitySchema = 2
 
 type backendFlagCapability struct {
 	Reason   string `json:"reason"`
@@ -26,13 +26,15 @@ type backendFlagCapability struct {
 }
 
 type backendCapabilityRecord struct {
-	SchemaVersion   int                              `json:"schema_version"`
-	Scope           string                           `json:"scope"`
-	BackendIdentity string                           `json:"backend_identity"`
-	ModelIdentity   string                           `json:"model_identity"`
-	Architecture    string                           `json:"architecture"`
-	Disabled        map[string]backendFlagCapability `json:"disabled"`
-	UpdatedAt       string                           `json:"updated_at"`
+	SchemaVersion           int                               `json:"schema_version"`
+	Scope                   string                            `json:"scope"`
+	BackendIdentity         string                            `json:"backend_identity"`
+	ModelIdentity           string                            `json:"model_identity"`
+	Architecture            string                            `json:"architecture"`
+	Disabled                map[string]backendFlagCapability  `json:"disabled"`
+	CPUExpertMMapCapability placement.CPUExpertMMapCapability `json:"cpu_expert_mmap_capability,omitempty"`
+	CPUExpertMMapEvidence   string                            `json:"cpu_expert_mmap_evidence,omitempty"`
+	UpdatedAt               string                            `json:"updated_at"`
 }
 
 func backendCapabilityScope(model *placement.ModelProfile, be *backendInfo) (scope, modelIdentity, backendIdentity string) {
@@ -73,10 +75,14 @@ func loadBackendCapabilityRecord(cacheDir string, model *placement.ModelProfile,
 }
 
 func applyCachedBackendCapabilities(req *launchRequest, cacheDir string, model *placement.ModelProfile, be *backendInfo) {
-	if req == nil {
+	if req == nil || be == nil {
 		return
 	}
 	record := loadBackendCapabilityRecord(cacheDir, model, be)
+	if record.CPUExpertMMapCapability != "" {
+		be.CPUExpertMMapCapability = placement.NormalizeCPUExpertMMapCapability(string(record.CPUExpertMMapCapability))
+		be.CPUExpertMMapEvidence = record.CPUExpertMMapEvidence
+	}
 	flags := make([]string, 0, len(record.Disabled))
 	for flag := range record.Disabled {
 		flags = append(flags, flag)
@@ -118,6 +124,40 @@ func persistBackendCapability(cacheDir string, model *placement.ModelProfile, be
 		record.Architecture = model.ModelArch
 	}
 	record.Disabled[flag] = backendFlagCapability{Reason: reason, HasValue: hasValue}
+	record.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicBackendCapabilityWrite(path, append(data, '\n'))
+}
+
+// persistBackendCPUExpertMMapCapability records live evidence for the exact
+// model/backend build. A contradiction is sticky: the next launch must price
+// CPU experts as resident instead of repeating a huge anonymous allocation
+// under an mmap plan that cannot actually reclaim it.
+func persistBackendCPUExpertMMapCapability(cacheDir string, model *placement.ModelProfile, be *backendInfo, capability placement.CPUExpertMMapCapability, evidence string) error {
+	path := backendCapabilityPath(cacheDir, model, be)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	release, err := acquireBackendCapabilityLock(path+".lock", 5*time.Second)
+	if err != nil {
+		return err
+	}
+	defer release()
+	record := loadBackendCapabilityRecord(cacheDir, model, be)
+	scope, modelIdentity, backendIdentity := backendCapabilityScope(model, be)
+	if record.Disabled == nil {
+		record.Disabled = make(map[string]backendFlagCapability)
+	}
+	record.SchemaVersion, record.Scope = backendCapabilitySchema, scope
+	record.ModelIdentity, record.BackendIdentity = modelIdentity, backendIdentity
+	if model != nil {
+		record.Architecture = model.ModelArch
+	}
+	record.CPUExpertMMapCapability = placement.NormalizeCPUExpertMMapCapability(string(capability))
+	record.CPUExpertMMapEvidence = strings.TrimSpace(evidence)
 	record.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -247,7 +287,7 @@ func validateAndRepairBackendArgs(req *launchRequest, cfg *config.Config, model 
 				return strategy, args, fmt.Errorf("backend flag repair re-plan failed: %w", computeErr)
 			}
 			strategy = applyCalibrationDecision(req, cfg, model, be, caps, next)
-			claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet)
+			claudeCodeSlotAdjust(strategy, model, req.ClaudeCode, req.ParallelSet, req.BatchSizeSet, req.UBatchSizeSet)
 		}
 		nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, strategy)
 		if formatCommand(nextArgs) == formatCommand(args) {

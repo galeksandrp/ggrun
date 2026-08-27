@@ -149,6 +149,35 @@ func TestReloadStartsWhenIdle(t *testing.T) {
 	}
 }
 
+func TestReloadRecomputesMemoryPolicyForNewArgv(t *testing.T) {
+	d := New(Config{
+		ModelPath:    "old.gguf",
+		ServerArgs:   []string{"old-server", "--no-mmap"},
+		Port:         8081,
+		ControlToken: "test-token",
+		ComputeArgs: func(string, int) ([]string, error) {
+			return []string{"new-server", "--n-cpu-moe", "40"}, nil
+		},
+		ComputeMemory: func(args []string) (int, int, error) {
+			if len(args) == 0 || args[0] != "new-server" {
+				t.Fatalf("memory policy saw stale argv: %v", args)
+			}
+			return 90000, 114000, nil
+		},
+	})
+	d.startServer = func([]string, int, time.Duration) (*server.Process, error) {
+		return &server.Process{}, nil
+	}
+	recorder := httptest.NewRecorder()
+	d.handleReload(recorder, authedRequest(http.MethodPost, "/reload", strings.NewReader(`{"model_path":"new.gguf"}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("reload status = %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if d.config.MemoryHighMB != 90000 || d.config.MemoryMaxMB != 114000 {
+		t.Fatalf("reload retained old-model memory policy: %#v", d.config)
+	}
+}
+
 func TestReloadRejectsExplicitServerArgsByDefault(t *testing.T) {
 	d := New(Config{ModelPath: "old.gguf", ServerArgs: []string{"old-server"}, Port: 8081, ControlToken: "test-token"})
 	d.startServer = func([]string, int, time.Duration) (*server.Process, error) {

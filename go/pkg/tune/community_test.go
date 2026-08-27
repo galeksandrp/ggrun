@@ -38,7 +38,8 @@ func TestFetchCommunityTuneHitSanitizesFlags(t *testing.T) {
 	model := communityTestModel(t)
 	cacheDir := t.TempDir()
 	payload := communityTuneDoc(filepath.Base(model), map[string]interface{}{
-		"-b":             "4096",       // allowed perf flag
+		"--threads":      "6",          // allowed placement-independent perf flag
+		"-b":             "4096",       // placement-owned: must be stripped
 		"-m":             "/evil.gguf", // protected: must be stripped
 		"--host":         "0.0.0.0",    // protected: must be stripped
 		"--made-up-fla":  "x",          // unknown: must be stripped
@@ -73,10 +74,10 @@ func TestFetchCommunityTuneHitSanitizesFlags(t *testing.T) {
 		t.Fatalf("expected community provenance, got %q", doc.Provenance)
 	}
 	flags := doc.BestConfig.Flags
-	if flags["-b"] != "4096" {
+	if flags["--threads"] != "6" {
 		t.Fatalf("allowed perf flag missing: %v", flags)
 	}
-	for _, banned := range []string{"-m", "--host", "--made-up-fla", "--cache-type-k", "--parallel"} {
+	for _, banned := range []string{"-b", "-m", "--host", "--made-up-fla", "--cache-type-k", "--parallel"} {
 		if _, ok := flags[banned]; ok {
 			t.Fatalf("flag %s must be stripped from community config: %v", banned, flags)
 		}
