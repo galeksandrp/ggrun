@@ -241,10 +241,20 @@ func cmdBackendAddRecipe(args []string, recipe *backends.Recipe) {
 	}
 
 	// Clone into .src/fork-<repo>-<branch> so it never clobbers the mainline checkout.
-	name := deriveBackendTag(url, branch)
-	srcDir := filepath.Join(backends.AppHome(), ".src", "fork-"+name)
+	srcDir := backends.IsolatedForkSourceDir(backends.AppHome(), url, branch, f["checkout-name"])
+	if !backends.IsIsolatedForkSourceDir(srcDir) {
+		fmt.Fprintf(os.Stderr, "refusing to install a fork into %s; that path is not an isolated .src/fork-* checkout\n", srcDir)
+		os.Exit(1)
+	}
+	if same, err := sameFilesystemPath(srcDir, backends.MainlineSourceDir("")); err != nil {
+		fmt.Fprintf(os.Stderr, "could not compare fork path with mainline llama.cpp: %v\n", err)
+		os.Exit(1)
+	} else if same {
+		fmt.Fprintf(os.Stderr, "refusing to install a PR/fork over the mainline llama.cpp checkout %s\n", srcDir)
+		os.Exit(1)
+	}
 	if _, err := os.Stat(filepath.Join(srcDir, ".git")); err != nil {
-		fmt.Printf("[backend] cloning %s%s → %s\n", url, branchNote(branch), srcDir)
+		fmt.Printf("[backend] cloning %s%s → %s (separate fork; mainline llama.cpp is not modified)\n", url, branchNote(branch), srcDir)
 		cloneArgs := []string{"clone", "--depth", "1"}
 		if branch != "" {
 			cloneArgs = append(cloneArgs, "-b", branch)
@@ -271,6 +281,9 @@ func cmdBackendAddRecipe(args []string, recipe *backends.Recipe) {
 	if err := validateBackendCandidate(bin, f["route-arch"], accel); err != nil {
 		fmt.Fprintf(os.Stderr, "backend conformance failed; refusing registration: %v\n", err)
 		os.Exit(1)
+	}
+	if arch := strings.TrimSpace(f["route-arch"]); arch != "" {
+		fmt.Printf("[backend] verified architecture %q in the new fork binary\n", arch)
 	}
 
 	actualCommit, _ := gitOutput(srcDir, "rev-parse", "HEAD")
@@ -397,6 +410,29 @@ func gitOutput(dir string, args ...string) (string, error) {
 }
 
 // deriveBackendTag builds a stable name from a git URL (+branch).
+func sameFilesystemPath(a, b string) (bool, error) {
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false, nil
+	}
+	absA, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	absB, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	if absA == absB {
+		return true, nil
+	}
+	realA, errA := filepath.EvalSymlinks(absA)
+	realB, errB := filepath.EvalSymlinks(absB)
+	if errA != nil || errB != nil {
+		return false, nil
+	}
+	return realA == realB, nil
+}
+
 func deriveBackendTag(url, branch string) string {
 	base := url
 	if i := strings.LastIndexByte(base, '/'); i >= 0 {

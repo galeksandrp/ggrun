@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -2347,8 +2348,8 @@ func TestBackendUnavailableReasonNovelArchNamesMainline(t *testing.T) {
 	if !strings.Contains(message, "newer llama.cpp mainline") {
 		t.Fatalf("novel-arch message does not name advancing the mainline: %q", message)
 	}
-	if !strings.Contains(message, "install a fork") {
-		t.Fatalf("novel-arch message does not offer the fork path: %q", message)
+	if !strings.Contains(message, "search open llama.cpp PRs") || !strings.Contains(message, "fork") {
+		t.Fatalf("novel-arch message does not offer a fork search: %q", message)
 	}
 }
 
@@ -2444,6 +2445,87 @@ func TestOfferMainlineBackendUpdate(t *testing.T) {
 	fail := func() error { ran++; return errors.New("build failed") }
 	if ok := offerMainlineBackendUpdateWith(novelReq(), novelModel, true, strings.NewReader(""), io.Discard, false, fail); ok || ran != 1 {
 		t.Fatalf("failed update: ok=%v ran=%d (want false,1)", ok, ran)
+	}
+}
+
+func TestOfferDiscoveredArchForkInstallsOpenPR(t *testing.T) {
+	if len(backends.RecipesForArch("muse-glimmer")) > 0 {
+		t.Skip("muse-glimmer unexpectedly has a reviewed recipe")
+	}
+	req := &launchRequest{BackendUnavailableReason: backendUnavailableReason("muse-glimmer", "/x/llama-server")}
+	model := &placement.ModelProfile{
+		ModelArch: "muse-glimmer",
+		Path:      "/models/Muse-Glimmer-30B-UD-Q8_K_XL.gguf",
+		Basename:  "Muse-Glimmer-30B-UD-Q8_K_XL.gguf",
+	}
+	pr := backends.ArchForkPR{
+		Arch: "muse-glimmer", Number: 99, Title: "add muse-glimmer",
+		URL:    "https://github.com/ggml-org/llama.cpp/pull/99",
+		GitURL: "https://github.com/example/llama.cpp.git",
+		Branch: "muse", Commit: "cccccccccccccccccccccccccccccccccccccccc",
+	}
+	search := func(context.Context, *placement.ModelProfile) ([]backends.ArchForkPR, error) {
+		return []backends.ArchForkPR{pr}, nil
+	}
+	var installed backends.Recipe
+	install := func(recipe backends.Recipe) error { installed = recipe; return nil }
+
+	var out bytes.Buffer
+	ok := offerDiscoveredArchForkWith(req, model, false, strings.NewReader("y\n"), &out, true, search, install)
+	if !ok || installed.GitURL != pr.GitURL || installed.RouteArch != "muse-glimmer" || installed.Commit != pr.Commit {
+		t.Fatalf("accepted fork: ok=%v recipe=%+v out=%q", ok, installed, out.String())
+	}
+	if installed.Tag != "muse-glimmer-30b" {
+		t.Fatalf("fork manager tag=%q, want model name muse-glimmer-30b", installed.Tag)
+	}
+	if !strings.Contains(out.String(), "PR #99") || !strings.Contains(out.String(), "separate fork") ||
+		!strings.Contains(out.String(), "muse-glimmer-30b") {
+		t.Fatalf("prompt did not name an isolated model-named fork: %q", out.String())
+	}
+
+	installed = backends.Recipe{}
+	out.Reset()
+	if ok := offerDiscoveredArchForkWith(req, model, false, strings.NewReader("n\n"), &out, true, search, install); ok || installed.GitURL != "" {
+		t.Fatalf("declined fork still installed: ok=%v recipe=%+v", ok, installed)
+	}
+
+	installed = backends.Recipe{}
+	out.Reset()
+	if ok := offerDiscoveredArchForkWith(req, model, false, strings.NewReader("y\n"), &out, false, search, install); ok || installed.GitURL != "" {
+		t.Fatalf("non-terminal installed a fork: ok=%v recipe=%+v", ok, installed)
+	}
+	if !strings.Contains(out.String(), "ggrun backend add") {
+		t.Fatalf("non-terminal did not print the add command: %q", out.String())
+	}
+
+	installed = backends.Recipe{}
+	if ok := offerDiscoveredArchForkWith(req, model, true, strings.NewReader(""), io.Discard, false, search, install); !ok || installed.GitURL != pr.GitURL {
+		t.Fatalf("assume-yes fork: ok=%v recipe=%+v", ok, installed)
+	}
+
+	if ok := offerDiscoveredArchForkWith(req, &placement.ModelProfile{ModelArch: "hy_v3"}, true, strings.NewReader(""), io.Discard, false, search, install); ok {
+		t.Fatal("recipe-backed arch searched GitHub instead of using the reviewed recipe")
+	}
+	if ok := offerDiscoveredArchForkWith(&launchRequest{}, model, true, strings.NewReader(""), io.Discard, false, search, install); ok {
+		t.Fatal("no FAIL-CLOSED reason still searched for a fork")
+	}
+	empty := func(context.Context, *placement.ModelProfile) ([]backends.ArchForkPR, error) { return nil, nil }
+	if ok := offerDiscoveredArchForkWith(req, model, true, strings.NewReader(""), io.Discard, false, empty, install); ok {
+		t.Fatal("empty search installed a fork")
+	}
+
+	cited := pr
+	cited.Cited = true
+	searchCited := func(context.Context, *placement.ModelProfile) ([]backends.ArchForkPR, error) {
+		return []backends.ArchForkPR{cited}, nil
+	}
+	out.Reset()
+	installed = backends.Recipe{}
+	if ok := offerDiscoveredArchForkWith(req, model, false, strings.NewReader("n\n"), &out, true, searchCited, install); ok {
+		t.Fatal("declined cited fork still installed")
+	}
+	if !strings.Contains(out.String(), "Hugging Face model card cites") {
+		t.Fatalf("cited PR prompt omitted Hugging Face: %q", out.String())
 	}
 }
 
@@ -2940,6 +3022,89 @@ func TestSharedLaunchRecoveryRefusesRejectedEntryArgv(t *testing.T) {
 	)
 	if err == nil || !strings.Contains(err.Error(), "rejected earlier in this launch lifecycle") {
 		t.Fatalf("rejected lifecycle entry returned %v", err)
+	}
+}
+
+func TestValidateExactAdmissionArgvRejectsAnyRewrite(t *testing.T) {
+	original := []string{
+		"llama-server", "-m", "model.gguf", "-b", "128", "-ub", "64",
+		"--tensor-split", "0,1",
+	}
+	expected := formatCommand(original)
+	if err := validateExactAdmissionArgv(true, expected, original); err != nil {
+		t.Fatalf("identical exact candidate was rejected: %v", err)
+	}
+
+	mutated := append([]string(nil), original...)
+	mutated[len(mutated)-1] = "1,0"
+	if err := validateExactAdmissionArgv(true, expected, mutated); err == nil ||
+		!strings.Contains(err.Error(), "argv changed during admission") {
+		t.Fatalf("changed exact candidate was accepted: %v", err)
+	}
+	if err := validateExactAdmissionArgv(false, expected, mutated); err != nil {
+		t.Fatalf("ordinary fit recovery was incorrectly constrained: %v", err)
+	}
+}
+
+func TestExactAdmissionErrorCoversEveryRewriteClass(t *testing.T) {
+	cause := errors.New("probe")
+	cases := []struct {
+		class   exactAdmissionClass
+		detail  string
+		cause   error
+		want    string
+		wantErr error
+	}{
+		{exactAdmissionSpec, "", nil, "speculation re-plan", nil},
+		{exactAdmissionCompat, "remove --swa-full", nil, "compatibility adjustment", nil},
+		{exactAdmissionCompanion, "", nil, "speculative companion was rejected", nil},
+		{exactAdmissionMemory, " on CUDA2 (617 MiB deficit)", nil, "memory admission on CUDA2", nil},
+		{exactAdmissionMMap, "", cause, "mmap pageability", cause},
+		{exactAdmissionCUDAOOM, " on device 0 allocating 9000 MiB", cause, "CUDA OOM on device 0", cause},
+	}
+	if len(cases) != 6 {
+		t.Fatalf("rewrite classes = %d, want speculation/compat/companion/memory/mmap/cuda-oom", len(cases))
+	}
+	for _, tc := range cases {
+		err := exactAdmissionError(tc.class, tc.detail, tc.cause)
+		if err == nil || !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "refusing") {
+			t.Fatalf("%s error = %v, want substring %q", tc.class, err, tc.want)
+		}
+		if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+			t.Fatalf("%s did not wrap cause: %v", tc.class, err)
+		}
+	}
+}
+
+func TestExactAdmissionRefusesRejectedLifecycleArgv(t *testing.T) {
+	args := []string{"llama-server", "--n-cpu-moe", "35", "-ub", "8192"}
+	recovery := newLaunchMemoryRecovery()
+	recovery.reject(args)
+	_, _, gotArgs, err := startLaunchExactAdmission(
+		&launchRequest{SpecMode: "off"}, nil, nil, nil, nil, nil, args, time.Second, recovery,
+	)
+	if err == nil || !strings.Contains(err.Error(), "rejected earlier in this launch lifecycle") {
+		t.Fatalf("rejected challenger returned %v", err)
+	}
+	if formatCommand(gotArgs) != formatCommand(args) {
+		t.Fatalf("rejected challenger mutated argv: %v", gotArgs)
+	}
+}
+
+func TestExactAdmissionRefusesSpeculationReplan(t *testing.T) {
+	args := []string{"llama-server", "-m", "model.gguf", "--draft", "draft.gguf"}
+	strategy := &placement.Strategy{
+		Draft: &placement.DraftConfig{Type: placement.DraftModel, VerifiedLaunchIdentity: "not-this-argv"},
+	}
+	_, _, gotArgs, err := startLaunchExactAdmission(
+		&launchRequest{SpecMode: "auto"}, &config.Config{}, &placement.ModelProfile{},
+		strategy, &backendInfo{}, &detect.Capabilities{}, args, time.Second, newLaunchMemoryRecovery(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "speculation re-plan") {
+		t.Fatalf("speculation rewrite was allowed: %v", err)
+	}
+	if formatCommand(gotArgs) != formatCommand(args) {
+		t.Fatalf("speculation refusal mutated argv: %v", gotArgs)
 	}
 }
 

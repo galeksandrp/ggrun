@@ -135,7 +135,13 @@ def test_corrupted_gguf():
         f.write(b'NOT A GGUF FILE')
         f.flush()
         r = parse(f.name)
-    assert r == {'fused': 0, 'expert_bytes': 0, 'non_expert_bytes': 0}, r
+    assert r == {
+        'tensor_accounting_schema': 2,
+        'has_per_layer_token_embd': 0,
+        'fused': 0,
+        'expert_bytes': 0,
+        'non_expert_bytes': 0,
+    }, r
     print('  ✓ corrupted_gguf')
 
 

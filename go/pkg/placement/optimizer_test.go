@@ -33,6 +33,88 @@ func TestMeasuredAllocationMustMatchTensorDistribution(t *testing.T) {
 	}
 }
 
+func TestMeasuredAllocationIdentityAcceptsUnlabelledGuardPeakOnlyForExactPlacement(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("model"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model := &ModelProfile{Path: modelPath, TotalSizeMB: 10000, SizeBytes: 10000 * 1024 * 1024}
+	gpus := optimizerTestGPUs()
+	caps := &detect.Capabilities{
+		GPUs: gpus,
+		RAM:  detect.RAMInfo{TotalMB: 65536, FreeMB: 60000},
+	}
+	strategy := &Strategy{
+		Type: MultiGPUDense, TensorSplit: []float64{0.8, 0.2}, SplitMode: "layer", MainGPU: 0,
+		ContextSize: 32768, Parallel: 1, BatchSize: 2048, UBatchSize: 512,
+		KVPlacement: "gpu", KVQuality: "high", KVType: "q8_0", FlashAttention: true,
+		PlanFreeVRAM: map[int]int{0: 32768, 1: 32768},
+	}
+	allocation := MeasuredAllocation{
+		Evidence:          "allocation-verified",
+		PlacementIdentity: AllocationPlacementIdentity(strategy),
+		ContextTotalMB:    768,
+		ContextByGPU:      map[int]int{0: 512, 1: 256},
+		// The guard observed exact peaks, but this backend did not label model
+		// buffers. The aggregate therefore lives in unaccounted rows.
+		UnaccountedByGPU:  map[int]int{0: 9000, 1: 3000},
+		UnaccountedHostMB: 2048,
+	}
+	if err := RecordMeasuredAllocation(dir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, "test", gpus, strategy.Parallel, allocation); err != nil {
+		t.Fatal(err)
+	}
+	loaded, ok := LoadMeasuredAllocation(dir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, "test", gpus, strategy.Parallel)
+	if !ok || loaded.PlacementIdentity != allocation.PlacementIdentity {
+		t.Fatalf("allocation identity did not round-trip: ok=%t loaded=%+v", ok, loaded)
+	}
+	ledger := BuildResourceLedger(caps, model, strategy, Options{CacheDir: dir, BackendCacheTag: "test"})
+	if !ledger.Exact || !ledger.Fits || ledger.Devices[0].RequiredMB != 9512 || ledger.Devices[1].RequiredMB != 3256 {
+		t.Fatalf("matching guarded allocation was not exact: %+v", ledger)
+	}
+
+	different := cloneStrategy(strategy)
+	different.TensorSplit = []float64{0.2, 0.8}
+	ledger = BuildResourceLedger(caps, model, different, Options{CacheDir: dir, BackendCacheTag: "test"})
+	if ledger.Exact {
+		t.Fatalf("different placement reused exact guarded allocation: %+v", ledger)
+	}
+}
+
+func TestPostLaunchContextObservationPreservesMatchingGuardedBreakdown(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+	if err := os.WriteFile(modelPath, []byte("model"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	model := &ModelProfile{Path: modelPath, TotalSizeMB: 10000, SizeBytes: 10000 * 1024 * 1024}
+	gpus := optimizerTestGPUs()
+	strategy := &Strategy{
+		Type: MultiGPUDense, TensorSplit: []float64{0.5, 0.5}, ContextSize: 32768,
+		Parallel: 1, BatchSize: 2048, UBatchSize: 512, KVPlacement: "gpu", KVQuality: "high", KVType: "q8_0",
+	}
+	identity := AllocationPlacementIdentity(strategy)
+	if err := RecordMeasuredAllocation(dir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, "test", gpus, strategy.Parallel, MeasuredAllocation{
+			Evidence: "allocation-verified", PlacementIdentity: identity, ContextTotalMB: 100,
+			ContextByGPU: map[int]int{0: 50, 1: 50}, ModelByGPU: map[int]int{0: 5000, 1: 5000},
+			UnaccountedByGPU: map[int]int{0: 200, 1: 200}, UnaccountedHostMB: 300,
+		}); err != nil {
+		t.Fatal(err)
+	}
+	logData := "llama_kv_cache_init: CUDA0 KV buffer size = 60.00 MiB\nllama_kv_cache_init: CUDA1 KV buffer size = 60.00 MiB\n"
+	if !RecordPostLaunchContextAllocation(dir, model, strategy, "test", gpus, logData) {
+		t.Fatal("post-launch context observation was not recorded")
+	}
+	loaded, ok := LoadMeasuredAllocation(dir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, "test", gpus, strategy.Parallel)
+	if !ok || loaded.ContextTotalMB != 120 || loaded.ModelByGPU[0] != 5000 || loaded.UnaccountedByGPU[1] != 200 || loaded.PlacementIdentity != identity {
+		t.Fatalf("sparse post-launch observation erased guarded breakdown: ok=%t loaded=%+v", ok, loaded)
+	}
+}
+
 func TestBatchAndParallelFrontiersRespectIntentWithoutFixedPairs(t *testing.T) {
 	base := &Strategy{ContextSize: 196608, Parallel: 2, BatchSize: 2048, UBatchSize: 512}
 	pairs := calibrationBatchNeighbors(base, Options{BatchSizeExplicit: true})
@@ -311,6 +393,59 @@ func TestDeviceBalanceBottleneckFlagsIdleComputeGPU(t *testing.T) {
 	}
 }
 
+func TestAnalyzeCandidateFrontierRanksMoEOwnerWhenCriticalPathIsCheaper(t *testing.T) {
+	base := &Strategy{
+		Type: MoEOffload, ContextSize: 32768, Parallel: 2,
+		BatchSize: 128, UBatchSize: 64, KVPlacement: "gpu", KVQuality: "high", KVType: "bf16",
+		NCPUMoE: 36, TensorSplit: []float64{0.27, 0.65, 0.08}, MainGPU: 0,
+		ResourceLedger: &ResourceLedger{Fits: true, Devices: []DeviceResourceLedger{
+			{GPU: 0, ModelMB: 3000, RequiredMB: 4000, Active: true, BandwidthMBps: 4000},
+			{GPU: 1, ModelMB: 9000, RequiredMB: 10000, Active: true, BandwidthMBps: 16000},
+			{GPU: 2, ModelMB: 1000, RequiredMB: 2000, Active: true, BandwidthMBps: 1000},
+		}},
+	}
+	giantUBatch := cloneStrategy(base)
+	giantUBatch.BatchSize = 8192
+	giantUBatch.UBatchSize = 8192
+	owner := cloneStrategy(base)
+	owner.TensorSplit = []float64{0, 1, 0}
+	owner.MainGPU = 1
+	owner.PlacementPolicy = "owner-1"
+	frontier := AnalyzeCandidateFrontier(&detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 12288, BandwidthMBps: 4000},
+			{Index: 1, VRAMTotalMB: 24576, BandwidthMBps: 16000},
+			{Index: 2, VRAMTotalMB: 12288, BandwidthMBps: 1000},
+		},
+		RAM:                     detect.RAMInfo{TotalMB: 217088, FreeMB: 200000},
+		HostMemoryBandwidthMBps: 50000,
+	}, &ModelProfile{
+		TotalSizeMB: 68000, SizeBytes: 68000 * 1024 * 1024,
+		NumLayers: 32, LeadingDense: 2, IsMoE: true,
+		ExpertBytes: 60 * 1024 * 1024 * 1024, NonExpertBytes: 8 * 1024 * 1024 * 1024,
+		NumExperts: 64, ExpertUsedCount: 4,
+	}, Options{}, []CalibrationCandidate{
+		{Name: "default", Strategy: base},
+		{Name: "batch-8192-ubatch-8192", Strategy: giantUBatch},
+		{Name: "moe-owner-1", Strategy: owner},
+	})
+	if len(frontier) < 3 || frontier[1].Name != "moe-owner-1" {
+		t.Fatalf("ranked %+v, want cheaper moe-owner-1 first", namesOf(frontier))
+	}
+	if !(frontier[1].Estimate.AgentCost < frontier[2].Estimate.AgentCost) {
+		t.Fatalf("owner was ordered by name rather than cost: owner=%g alternate=%g",
+			frontier[1].Estimate.AgentCost, frontier[2].Estimate.AgentCost)
+	}
+}
+
+func namesOf(candidates []CalibrationCandidate) []string {
+	out := make([]string, len(candidates))
+	for i, candidate := range candidates {
+		out[i] = candidate.Name
+	}
+	return out
+}
+
 func TestSelectDeviceBalanceFinalistRelievesMeasuredBusyGPU(t *testing.T) {
 	strategy := func(model0, model1, batch int) *Strategy {
 		return &Strategy{
@@ -336,7 +471,7 @@ func TestSelectDeviceBalanceFinalistRelievesMeasuredBusyGPU(t *testing.T) {
 	}
 }
 
-func TestSelectDeviceBalanceFinalistUsesMoEComputeRoleNotStoredBytes(t *testing.T) {
+func TestSelectDeviceBalanceFinalistChoosesCheapestRelievingMoETopology(t *testing.T) {
 	strategy := func(split []float64, modelMB []int) *Strategy {
 		return &Strategy{
 			Type: MoEOffload, ContextSize: 1048576, Parallel: 2,
@@ -364,8 +499,67 @@ func TestSelectDeviceBalanceFinalistUsesMoEComputeRoleNotStoredBytes(t *testing.
 		{GPU: 0, SMPercent: 98}, {GPU: 1, SMPercent: 1}, {GPU: 2, SMPercent: 2},
 	})
 	got, ok := SelectDeviceBalanceFinalist(frontier, signal)
-	if !ok || got.Name != "moe-owner-1" {
+	if !ok || got.Name != "moe-topology-memory" {
 		t.Fatalf("role-aware finalist=%+v ok=%t", got, ok)
+	}
+}
+
+func TestAnalyzeDeviceBalanceIgnoresIdleMoEExpertStorage(t *testing.T) {
+	s := &Strategy{
+		Type: MoEOffload, TensorSplit: []float64{0, 1}, MainGPU: 1,
+		ResourceLedger: &ResourceLedger{Fits: true, Devices: []DeviceResourceLedger{
+			{GPU: 0, ModelMB: 8000, Active: true},
+			{GPU: 1, ModelMB: 7000, Active: true},
+		}},
+		VRAMLedger: []GPULedgerEntry{
+			{GPU: 0, ExpertOnly: true, ExpertLayers: 4},
+			{GPU: 1, ExpertLayers: 2},
+		},
+	}
+	signal := AnalyzeDeviceBalance(s, []GPUUtilSample{
+		{GPU: 0, SMPercent: 1}, {GPU: 1, SMPercent: 96},
+	})
+	if signal.Observed || signal.Imbalanced {
+		t.Fatalf("idle expert storage was mistaken for a second serial compute stage: %+v", signal)
+	}
+}
+
+func TestEstimateMoECostPricesGPUExpertResidency(t *testing.T) {
+	const mib = int64(1024 * 1024)
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, VRAMTotalMB: 24576, BandwidthMBps: 16000, MemBandwidthMBps: 1_000_000},
+			{Index: 1, VRAMTotalMB: 24576, BandwidthMBps: 16000, MemBandwidthMBps: 100_000},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 120000}, HostMemoryBandwidthMBps: 50000,
+	}
+	model := &ModelProfile{
+		NumLayers: 10, IsMoE: true, NumExperts: 10, ExpertUsedCount: 1,
+		ExpertBytes: 10 * 1024 * mib, NonExpertBytes: 1024 * mib,
+		EmbeddingLength: 4096,
+	}
+	ledger := ResourceLedger{Fits: true, Devices: []DeviceResourceLedger{
+		{GPU: 0, ModelMB: 11024, RequiredMB: 12000, Active: true, BandwidthMBps: 1_000_000},
+		{GPU: 1, ModelMB: 10240, RequiredMB: 11000, Active: true, BandwidthMBps: 100_000},
+	}}
+	strategy := func(expertGPU int) *Strategy {
+		s := &Strategy{
+			Type: MoEOffload, ContextSize: 32768, Parallel: 1,
+			BatchSize: 128, UBatchSize: 64, KVPlacement: "gpu", KVType: "f16",
+			TensorSplit: []float64{1, 0}, MainGPU: 0,
+			VRAMLedger: []GPULedgerEntry{{GPU: expertGPU, ExpertLayers: 10, ExpertOnly: expertGPU != 0}},
+		}
+		copyLedger := ledger
+		s.ResourceLedger = &copyLedger
+		return s
+	}
+	fast := EstimateStrategyCost(caps, model, strategy(0), Options{WorkloadConcurrency: 1}, ledger)
+	slow := EstimateStrategyCost(caps, model, strategy(1), Options{WorkloadConcurrency: 1}, ledger)
+	if fast.GPUExpertCost <= 0 || slow.GPUExpertCost <= fast.GPUExpertCost*5 {
+		t.Fatalf("GPU expert service was not priced by its execution device: fast=%+v slow=%+v", fast, slow)
+	}
+	if slow.AgentCost <= fast.AgentCost {
+		t.Fatalf("slow expert GPU ranked ahead of fast residency: fast=%g slow=%g", fast.AgentCost, slow.AgentCost)
 	}
 }
 

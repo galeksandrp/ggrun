@@ -2386,6 +2386,69 @@ func TestComputeMoEForcedSplitOwnerRecomputesCompletePlacement(t *testing.T) {
 	}
 }
 
+func TestDefaultMoEPackDoesNotAdoptCalibrationOwnerPolicy(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "RTX 4070", VRAMTotalMB: 12288, BandwidthMBps: 4000},
+			{Index: 1, Name: "RTX 3090 Ti", VRAMTotalMB: 24576, BandwidthMBps: 16000},
+			{Index: 2, Name: "RTX 3060", VRAMTotalMB: 12288, BandwidthMBps: 1000},
+		},
+		RAM: detect.RAMInfo{TotalMB: 217088, FreeMB: 200000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path: "roomy-moe.gguf", TotalSizeMB: 68 * 1024,
+		SizeBytes: 68 * 1024 * 1024 * 1024,
+		NumLayers: 32, LeadingDense: 2, IsMoE: true,
+		NumExperts: 64, ExpertUsedCount: 4,
+		ExpertBytes:    60 * 1024 * 1024 * 1024,
+		NonExpertBytes: 8 * 1024 * 1024 * 1024,
+		ContextSize:    32768, CTXTrain: 32768, HiddenSize: 4096,
+		EmbeddingLength: 4096, HeadCountKV: 8, KeyLength: 128, ValueLength: 128,
+	}
+	strategy, err := Compute(caps, model, Options{
+		ContextSize: 32768, KVPlacement: "gpu", KVQuality: "low",
+		Parallel: 2, NoMMap: true, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("default pack failed: %v", err)
+	}
+	if strings.HasPrefix(strategy.PlacementPolicy, "owner-") {
+		t.Fatalf("fit-first default adopted an unmeasured performance topology: main=%d policy=%q", strategy.MainGPU, strategy.PlacementPolicy)
+	}
+}
+
+func TestDefaultMoEPackSpreadsBackboneWhenNoGPUHoldsKV(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{
+			{Index: 0, Name: "GPU A", VRAMTotalMB: 16384, BandwidthMBps: 16000},
+			{Index: 1, Name: "GPU B", VRAMTotalMB: 16384, BandwidthMBps: 16000},
+		},
+		RAM: detect.RAMInfo{TotalMB: 131072, FreeMB: 120000},
+		CPU: detect.CPUInfo{Cores: 16},
+	}
+	model := &ModelProfile{
+		Path: "kv-spread-moe.gguf", TotalSizeMB: 80 * 1024,
+		SizeBytes: 80 * 1024 * 1024 * 1024,
+		NumLayers: 32, IsMoE: true, NumExperts: 64, ExpertUsedCount: 4,
+		ExpertBytes:    60 * 1024 * 1024 * 1024,
+		NonExpertBytes: 12 * 1024 * 1024 * 1024,
+		ContextSize:    262144, CTXTrain: 262144, HiddenSize: 4096,
+		EmbeddingLength: 4096, HeadCountKV: 16, KeyLength: 256, ValueLength: 256,
+		MeasuredKVBytesPerTok: map[string]float64{"f16": 32768},
+	}
+	strategy, err := Compute(caps, model, Options{
+		ContextSize: 262144, KVPlacement: "gpu", KVQuality: "high",
+		NoMMap: true, CacheDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("spread pack failed: %v", err)
+	}
+	if len(strategy.TensorSplit) != 2 || strategy.TensorSplit[0] <= 0 || strategy.TensorSplit[1] <= 0 {
+		t.Fatalf("backbone+KV that does not fit on one GPU must keep a multi-owner split, got %v", strategy.TensorSplit)
+	}
+}
+
 func TestComputeMoEHeterogeneousMultiGPUExactLedger(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{

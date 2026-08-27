@@ -69,6 +69,9 @@ type CandidateEstimate struct {
 	AgentCost      float64 `json:"agent_cost"`
 	DecodeCost     float64 `json:"decode_cost"`
 	PrefillCost    float64 `json:"prefill_cost"`
+	BackboneCost   float64 `json:"backbone_cost,omitempty"`
+	GPUExpertCost  float64 `json:"gpu_expert_cost,omitempty"`
+	CPUExpertCost  float64 `json:"cpu_expert_cost,omitempty"`
 	TransferCost   float64 `json:"transfer_cost,omitempty"`
 	ActiveGPUs     int     `json:"active_gpus"`
 	Confidence     string  `json:"confidence"`
@@ -262,6 +265,9 @@ func BuildResourceLedger(caps *detect.Capabilities, model *ModelProfile, s *Stra
 // older keys do not encode tensor split. Distribution matching closes that gap
 // while preserving reuse for batch-only candidates.
 func measuredAllocationMatchesStrategy(allocation MeasuredAllocation, model *ModelProfile, s *Strategy, gpus []detect.GPU) bool {
+	if allocation.PlacementIdentity != "" {
+		return allocation.PlacementIdentity == AllocationPlacementIdentity(s)
+	}
 	totalSizeMB := 0
 	if model != nil {
 		totalSizeMB = model.TotalSizeMB
@@ -462,6 +468,129 @@ func effectiveMemoryBandwidth(gpu detect.GPU) int {
 	return gpu.BandwidthMBps
 }
 
+// moeExpertTouchFraction estimates how much of a routed-expert tensor is read
+// at least once by a batch. One token touches k/E experts; multiple tokens can
+// reuse an expert's weights, so multiplying k/E by token count would overprice
+// batching. The uniform-routing assumption is only an ordering prior. The live
+// agent workload remains authoritative for skewed routing and kernel effects.
+func moeExpertTouchFraction(model *ModelProfile, tokens int) float64 {
+	if model == nil || model.NumExperts <= 0 || model.ExpertUsedCount <= 0 {
+		return 1
+	}
+	used := min(model.ExpertUsedCount, model.NumExperts)
+	perToken := float64(used) / float64(model.NumExperts)
+	return 1 - math.Pow(1-perToken, float64(max(1, tokens)))
+}
+
+func moeRoutedExpertMBByGPU(model *ModelProfile, s *Strategy) (map[int]float64, bool) {
+	out := map[int]float64{}
+	if model == nil || s == nil || model.NumLayers <= 0 {
+		return out, false
+	}
+	moeLayers := max(1, model.NumLayers-max(0, model.LeadingDense))
+	routedMB := bytesToMiBCeil(model.ExpertBytes - model.ShexpBytes)
+	if routedMB <= 0 {
+		return out, false
+	}
+	perLayer := float64(routedMB) / float64(moeLayers)
+	known := false
+	for _, entry := range s.VRAMLedger {
+		if entry.ExpertLayers <= 0 {
+			continue
+		}
+		out[entry.GPU] += float64(entry.ExpertLayers) * perLayer
+		known = true
+	}
+	return out, known
+}
+
+func minLinkBandwidth(left, right detect.GPU) int {
+	l, r := left.BandwidthMBps, right.BandwidthMBps
+	if l <= 0 {
+		return r
+	}
+	if r <= 0 {
+		return l
+	}
+	return min(l, r)
+}
+
+// topologyActivationTransferCost prices only transfers created by placement:
+// layer-split boundaries, remote expert-only GPUs, and CPU expert execution.
+// Weight service is priced separately at VRAM/host-memory bandwidth. This term
+// is deliberately small on ordinary layer splits because activations, unlike
+// model weights, cross a boundary once rather than being streamed in full.
+func topologyActivationTransferCost(caps *detect.Capabilities, model *ModelProfile, s *Strategy, ledger ResourceLedger, tokens int) (float64, bool) {
+	if caps == nil || model == nil || s == nil || tokens <= 0 {
+		return 0, false
+	}
+	width := model.EmbeddingLength
+	if width <= 0 {
+		width = model.HiddenSize
+	}
+	if width <= 0 {
+		return 0, false
+	}
+	activationMB := float64(width*2*max(1, tokens)) / (1024 * 1024)
+	byGPU := make(map[int]detect.GPU, len(caps.GPUs))
+	for _, gpu := range caps.GPUs {
+		byGPU[gpu.Index] = gpu
+	}
+
+	split := normalizedStrategySplit(s, len(ledger.Devices))
+	owners := make([]int, 0, len(split))
+	primary := -1
+	primaryShare := -1.0
+	for i, share := range split {
+		if share <= 0 || i >= len(ledger.Devices) {
+			continue
+		}
+		gpu := ledger.Devices[i].GPU
+		owners = append(owners, gpu)
+		if share > primaryShare {
+			primary, primaryShare = gpu, share
+		}
+	}
+	if s.Type == SingleGPU {
+		primary = s.MainGPU
+		owners = []int{s.MainGPU}
+	}
+	if primary < 0 {
+		return 0, false
+	}
+
+	cost := 0.0
+	known := true
+	for i := 1; i < len(owners); i++ {
+		bw := minLinkBandwidth(byGPU[owners[i-1]], byGPU[owners[i]])
+		if bw <= 0 {
+			known = false
+			continue
+		}
+		cost += activationMB / float64(bw)
+	}
+	for _, entry := range s.VRAMLedger {
+		if !entry.ExpertOnly || entry.ExpertLayers <= 0 || entry.GPU == primary {
+			continue
+		}
+		bw := minLinkBandwidth(byGPU[primary], byGPU[entry.GPU])
+		if bw <= 0 {
+			known = false
+			continue
+		}
+		cost += 2 * activationMB * float64(entry.ExpertLayers) / float64(bw)
+	}
+	if s.Type == MoEOffload && s.NCPUMoE > 0 {
+		bw := byGPU[primary].BandwidthMBps
+		if bw <= 0 {
+			known = false
+		} else {
+			cost += 2 * activationMB * float64(s.NCPUMoE) / float64(bw)
+		}
+	}
+	return cost, known
+}
+
 // EstimateStrategyCost estimates the critical path from assigned bytes and the
 // measured hardware ceilings. It chooses a finalist only; the live agent
 // workload remains the sole performance authority.
@@ -477,6 +606,19 @@ func EstimateStrategyCost(caps *detect.Capabilities, model *ModelProfile, s *Str
 	for _, gpu := range caps.GPUs {
 		byGPU[gpu.Index] = gpu
 	}
+	targetConcurrency := max(1, opts.WorkloadConcurrency)
+	if strings.Contains(strings.ToLower(opts.WorkloadProfile), "parallel") && targetConcurrency < 2 {
+		targetConcurrency = max(2, opts.Parallel)
+	}
+	activeLanes := min(targetConcurrency, max(1, s.Parallel))
+	decodeExpertTouch := moeExpertTouchFraction(model, activeLanes)
+	prefillExpertTouch := moeExpertTouchFraction(model, max(1, s.UBatchSize))
+	gpuExpertMB, gpuExpertPlacementKnown := moeRoutedExpertMBByGPU(model, s)
+	backboneTotalMB := bytesToMiBCeil(model.NonExpertBytes - model.TokenEmbdBytes + model.ShexpBytes)
+	if backboneTotalMB < 0 {
+		backboneTotalMB = 0
+	}
+	prefillWeightCost := 0.0
 	maxDeviceCost := 0.0
 	for _, entry := range ledger.Devices {
 		if !entry.Active || entry.RequiredMB <= 0 {
@@ -491,8 +633,42 @@ func EstimateStrategyCost(caps *detect.Capabilities, model *ModelProfile, s *Str
 			bw = 1
 			est.Confidence = "low"
 		}
+		if gpu := byGPU[entry.GPU]; gpu.MemBandwidthMBps <= 0 {
+			// A PCIe rate is a useful last-resort ordering signal, not a measured
+			// VRAM roof. Keep the estimate visibly low-confidence.
+			est.Confidence = "low"
+		}
+		if s.Type == MoEOffload {
+			frac := deviceBackboneFraction(s, entry.GPU)
+			backboneMB := float64(backboneTotalMB) * frac
+			backboneCost := backboneMB / float64(bw)
+			expertMB := gpuExpertMB[entry.GPU]
+			if !gpuExpertPlacementKnown {
+				// Older/foreign strategies may lack the detailed MoE ledger. The
+				// residual measured model bytes are the safest available proxy.
+				expertMB = math.Max(0, float64(entry.ModelMB)-backboneMB)
+			}
+			decodeExpertCost := expertMB * decodeExpertTouch / float64(bw)
+			prefillExpertCost := expertMB * prefillExpertTouch / float64(bw)
+			deviceCost := backboneCost + decodeExpertCost
+			est.BackboneCost += backboneCost
+			est.GPUExpertCost += decodeExpertCost
+			prefillWeightCost += backboneCost + prefillExpertCost
+			est.DecodeCost += deviceCost
+			if deviceCost > maxDeviceCost {
+				maxDeviceCost = deviceCost
+				if decodeExpertCost > backboneCost {
+					est.Bottleneck = fmt.Sprintf("GPU %d routed-expert service", entry.GPU)
+				} else {
+					est.Bottleneck = fmt.Sprintf("GPU %d backbone service", entry.GPU)
+				}
+			}
+			continue
+		}
 		deviceCost := float64(max(1, entry.ModelMB)) / float64(bw)
 		est.DecodeCost += deviceCost
+		est.BackboneCost += deviceCost
+		prefillWeightCost += deviceCost
 		if deviceCost > maxDeviceCost {
 			maxDeviceCost = deviceCost
 			est.Bottleneck = fmt.Sprintf("GPU %d layer service", entry.GPU)
@@ -503,21 +679,27 @@ func EstimateStrategyCost(caps *detect.Capabilities, model *ModelProfile, s *Str
 		moeLayers := max(1, model.NumLayers-max(0, model.LeadingDense))
 		cpuExpertMB := float64(bytesToMiBCeil(model.ExpertBytes-model.ShexpBytes)) *
 			float64(min(s.NCPUMoE, moeLayers)) / float64(moeLayers)
-		activeFraction := 1.0
-		if model.NumExperts > 0 && model.ExpertUsedCount > 0 {
-			activeFraction = float64(model.ExpertUsedCount) / float64(model.NumExperts)
-		}
 		hostBW := caps.HostMemoryBandwidthMBps
 		if hostBW <= 0 {
 			hostBW = 1
 			est.Confidence = "low"
 		}
-		hostCost := cpuExpertMB * activeFraction / float64(hostBW)
-		est.TransferCost += hostCost
-		est.DecodeCost += hostCost
-		if hostCost > maxDeviceCost {
+		decodeHostCost := cpuExpertMB * decodeExpertTouch / float64(hostBW)
+		prefillHostCost := cpuExpertMB * prefillExpertTouch / float64(hostBW)
+		est.CPUExpertCost = decodeHostCost
+		est.DecodeCost += decodeHostCost
+		prefillWeightCost += prefillHostCost
+		if decodeHostCost > maxDeviceCost {
 			est.Bottleneck = "CPU expert bandwidth"
 		}
+	}
+
+	decodeTransfer, decodeTransferKnown := topologyActivationTransferCost(caps, model, s, ledger, activeLanes)
+	prefillTransfer, prefillTransferKnown := topologyActivationTransferCost(caps, model, s, ledger, 1)
+	est.TransferCost = decodeTransfer
+	est.DecodeCost += decodeTransfer
+	if !decodeTransferKnown || !prefillTransferKnown {
+		est.Confidence = "low"
 	}
 
 	if est.DecodeCost <= 0 {
@@ -532,13 +714,15 @@ func EstimateStrategyCost(caps *detect.Capabilities, model *ModelProfile, s *Str
 	if ubatchGain > 3.5 {
 		ubatchGain = 3.5
 	}
-	est.PrefillCost = est.DecodeCost / ubatchGain
-
-	targetConcurrency := max(1, opts.WorkloadConcurrency)
-	if strings.Contains(strings.ToLower(opts.WorkloadProfile), "parallel") && targetConcurrency < 2 {
-		targetConcurrency = max(2, opts.Parallel)
+	// Larger physical microbatches improve arithmetic intensity and amortize
+	// weight reads, but the actual knee depends on kernels, quantization, and
+	// model shape. This bounded prior orders one finalist; the identical live
+	// prefill/decode workload determines whether the predicted gain is real.
+	est.PrefillCost = prefillWeightCost/ubatchGain + prefillTransfer
+	if est.PrefillCost <= 0 {
+		est.PrefillCost = est.DecodeCost / ubatchGain
 	}
-	activeLanes := min(targetConcurrency, max(1, s.Parallel))
+
 	waves := (targetConcurrency + activeLanes - 1) / activeLanes
 	// Concurrent lanes share kernels and the weight stream, so they are not free;
 	// nevertheless, serving N requested agents in fewer scheduler waves is the
@@ -548,7 +732,7 @@ func EstimateStrategyCost(caps *detect.Capabilities, model *ModelProfile, s *Str
 	if waves > 1 {
 		est.Bottleneck = "agent admission queue"
 	}
-	if est.ActiveGPUs > 1 {
+	if est.ActiveGPUs > 1 && s.Type != MoEOffload {
 		est.AgentCost *= 1 + 0.015*float64(est.ActiveGPUs-1)
 	}
 	if ledger.Exact && est.Confidence != "low" {
@@ -652,8 +836,12 @@ func moeTopologyExperimentHeadroom(model *ModelProfile, base *Strategy, candidat
 	for i := 1; i < len(candidates); i++ {
 		candidate := &candidates[i]
 		if candidate.Strategy == nil || !candidate.Estimate.Feasible ||
-			!balanceTopologyCompatible(base, candidate.Strategy) ||
+			!sameBalanceWorkload(base, candidate.Strategy) ||
 			!materialTopologyChange(base, candidate.Strategy) {
+			continue
+		}
+		extraCPU := max(0, candidate.Strategy.NCPUMoE-base.NCPUMoE)
+		if extraCPU*perLayerMB > base.ResourceLedger.Host.SlackMB {
 			continue
 		}
 		candidate.Estimate.ActionableGain = true
@@ -790,7 +978,9 @@ type DeviceBalanceSignal struct {
 }
 
 // AnalyzeDeviceBalance derives a typed signal from active-workload samples.
-// Missing samples and single-device placements fail closed.
+// For MoE, only ordinary-layer owners participate: an idle expert-storage GPU
+// is expected when the router did not select its experts and is not by itself a
+// defective topology. Missing samples and single-owner placements fail closed.
 func AnalyzeDeviceBalance(s *Strategy, samples []GPUUtilSample) DeviceBalanceSignal {
 	signal := DeviceBalanceSignal{BusyGPU: -1, IdleGPU: -1}
 	if s == nil || len(samples) == 0 {
@@ -799,7 +989,7 @@ func AnalyzeDeviceBalance(s *Strategy, samples []GPUUtilSample) DeviceBalanceSig
 	maxSM, minSM := -1, 101
 	activeDevices := 0
 	for _, sample := range samples {
-		if !deviceHoldsWork(s, sample.GPU) {
+		if !deviceParticipatesInBalance(s, sample.GPU) {
 			continue
 		}
 		activeDevices++
@@ -823,7 +1013,6 @@ func AnalyzeDeviceBalance(s *Strategy, samples []GPUUtilSample) DeviceBalanceSig
 }
 
 // DeviceBalanceBottleneck turns per-device SM samples into a topology signal.
-// A card that holds weights but does no compute is storage, not a speed plan.
 // Missing samples fail closed: no observation is not evidence of balance.
 func DeviceBalanceBottleneck(s *Strategy, samples []GPUUtilSample) string {
 	signal := AnalyzeDeviceBalance(s, samples)
@@ -851,12 +1040,26 @@ func SelectDeviceBalanceFinalist(candidates []CalibrationCandidate, signal Devic
 	}
 	baseIdle := deviceModelFraction(base, signal.IdleGPU)
 	baseIdleBackbone := deviceBackboneFraction(base, signal.IdleGPU)
+	baseCost := candidates[0].Estimate.AgentCost
 	bestIndex := -1
-	bestScore := 0.0
+	bestCost := math.Inf(1)
+	bestRelief := 0.0
 	for i := 1; i < len(candidates); i++ {
 		candidate := candidates[i]
 		if candidate.Strategy == nil || !candidate.Estimate.Feasible ||
 			!balanceTopologyCompatible(base, candidate.Strategy) {
+			continue
+		}
+		candidateCost := candidate.Estimate.AgentCost
+		if candidateCost <= 0 || math.IsNaN(candidateCost) || math.IsInf(candidateCost, 1) {
+			continue
+		}
+		// Utilization identifies why the baseline is worth challenging; it does
+		// not make an otherwise slower topology useful. In particular, a fastest
+		// sole backbone owner being busy while expert-storage cards wait is the
+		// expected optimum, not a reason to move attention onto a slower GPU.
+		if baseCost > 0 && !math.IsNaN(baseCost) && !math.IsInf(baseCost, 1) &&
+			candidateCost >= baseCost*0.98 {
 			continue
 		}
 		busy := deviceModelFraction(candidate.Strategy, signal.BusyGPU)
@@ -875,14 +1078,15 @@ func SelectDeviceBalanceFinalist(candidates []CalibrationCandidate, signal Devic
 		}
 		idleGain := deviceModelFraction(candidate.Strategy, signal.IdleGPU) - baseIdle
 		idleBackboneGain := deviceBackboneFraction(candidate.Strategy, signal.IdleGPU) - baseIdleBackbone
-		score := math.Max(0, modelRelief) + 0.25*math.Max(0, idleGain)
+		relief := math.Max(0, modelRelief) + 0.25*math.Max(0, idleGain)
 		if base.Type == MoEOffload {
-			score += 2*math.Max(0, backboneRelief) + 0.5*math.Max(0, idleBackboneGain)
+			relief += 2*math.Max(0, backboneRelief) + 0.5*math.Max(0, idleBackboneGain)
 		}
-		if bestIndex < 0 || score > bestScore+1e-9 ||
-			(math.Abs(score-bestScore) <= 1e-9 && candidate.Estimate.AgentCost < candidates[bestIndex].Estimate.AgentCost) {
+		if bestIndex < 0 || candidateCost < bestCost-1e-9 ||
+			(math.Abs(candidateCost-bestCost) <= 1e-9 && relief > bestRelief+1e-9) {
 			bestIndex = i
-			bestScore = score
+			bestCost = candidateCost
+			bestRelief = relief
 		}
 	}
 	if bestIndex < 0 {
@@ -927,6 +1131,23 @@ func deviceBackboneFraction(s *Strategy, gpu int) float64 {
 }
 
 func balanceTopologyCompatible(base, candidate *Strategy) bool {
+	if !sameBalanceWorkload(base, candidate) {
+		return false
+	}
+	if base.Type == MoEOffload {
+		if candidate.NCPUMoE <= base.NCPUMoE {
+			return true
+		}
+		// Only the roomy performance lane may trade a little more host expert
+		// work for a much faster backbone owner. The candidate's complete ledger
+		// and later exact admission remain the memory authorities.
+		return base.Residency == ResidencyRoomy && candidate.ResourceLedger != nil &&
+			candidate.ResourceLedger.Fits && !candidate.MMapRequired
+	}
+	return true
+}
+
+func sameBalanceWorkload(base, candidate *Strategy) bool {
 	if base == nil || candidate == nil || candidate.Type == CPUOnly || candidate.Type == DenseCPUOffload {
 		return false
 	}
@@ -938,7 +1159,7 @@ func balanceTopologyCompatible(base, candidate *Strategy) bool {
 		return false
 	}
 	if base.Type == MoEOffload {
-		return candidate.Type == MoEOffload && candidate.NCPUMoE <= base.NCPUMoE
+		return candidate.Type == MoEOffload
 	}
 	return candidate.Type == base.Type || candidate.Type == SingleGPU || candidate.Type == MultiGPUDense
 }
@@ -987,6 +1208,13 @@ func deviceHoldsWork(s *Strategy, gpu int) bool {
 		return s.TensorSplit[gpu] > 0
 	}
 	return false
+}
+
+func deviceParticipatesInBalance(s *Strategy, gpu int) bool {
+	if s != nil && s.Type == MoEOffload {
+		return deviceBackboneFraction(s, gpu) > 0
+	}
+	return deviceHoldsWork(s, gpu)
 }
 
 // SummarizeCandidateFrontier records the complete calculated search boundary,

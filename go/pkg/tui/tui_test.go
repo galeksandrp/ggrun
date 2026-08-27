@@ -1625,6 +1625,35 @@ func TestBuildLaunchRequestCarriesConfiguredKVQuality(t *testing.T) {
 	}
 }
 
+func TestLoadingScreenShowsUntilStartupReady(t *testing.T) {
+	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "config"))
+	t.Setenv("LLM_APP_HOME", t.TempDir())
+	m := loadingModel()
+	if m.screen != ScreenLoading {
+		t.Fatalf("startup screen=%v, want loading", m.screen)
+	}
+	cmd := m.Init()
+	if cmd == nil {
+		t.Fatal("loading screen did not start the spinner and hardware scan")
+	}
+	view := m.View()
+	if !strings.Contains(view, "ggrun") || !strings.Contains(view, "Starting up") {
+		t.Fatalf("loading view missing animation copy: %q", view)
+	}
+	got, _ := m.Update(startupReadyMsg{
+		models: []ModelItem{{Name: "model.gguf", Path: "/models/model.gguf"}},
+	})
+	ready, ok := got.(Model)
+	if !ok || ready.screen != ScreenMain || len(ready.models) != 1 {
+		t.Fatalf("startup did not enter the main list: screen=%v models=%d ok=%t", ready.screen, len(ready.models), ok)
+	}
+	empty, _ := loadingModel().Update(startupReadyMsg{})
+	firstRun, ok := empty.(Model)
+	if !ok || firstRun.screen != ScreenFirstRun {
+		t.Fatalf("empty catalog did not open first-run: %+v ok=%t", firstRun.screen, ok)
+	}
+}
+
 func TestInitialModelDefaultsKVQualityToAuto(t *testing.T) {
 	t.Setenv("LLM_CONFIG", filepath.Join(t.TempDir(), "config"))
 	t.Setenv("LLM_APP_HOME", t.TempDir())

@@ -733,7 +733,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			curP = nil
 		}
 		candidateTimeout := boundedCalibrationTimeout(timeout, remaining)
-		cp, measuredStrategy, measuredArgs, serr := startLaunchWithCUDAOOMRecoveryState(req, cfg, model, cand.Strategy, be, caps, candArgs, candidateTimeout, memoryRecovery)
+		cp, measuredStrategy, measuredArgs, serr := startLaunchExactAdmission(req, cfg, model, cand.Strategy, be, caps, candArgs, candidateTimeout, memoryRecovery)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s failed to start (%v); skipping\n", cand.Name, serr)
 			failures++

@@ -83,6 +83,20 @@ func TestAutomaticCalibrationSelectsOneMeasuredFinalist(t *testing.T) {
 	}
 }
 
+func TestAutomaticCalibrationUsesRankedCostNotCandidateName(t *testing.T) {
+	base := &placement.Strategy{Type: placement.MoEOffload, BatchSize: 128, UBatchSize: 64}
+	giant := &placement.Strategy{Type: placement.MoEOffload, BatchSize: 8192, UBatchSize: 8192}
+	owner := &placement.Strategy{Type: placement.MoEOffload, BatchSize: 128, UBatchSize: 64, MainGPU: 1}
+	got := selectAutomaticCalibrationFinalist([]placement.CalibrationCandidate{
+		{Name: "default", Strategy: base, Estimate: placement.CandidateEstimate{Feasible: true, AgentCost: 1.0}},
+		{Name: "batch-8192-ubatch-8192", Strategy: giant, Estimate: placement.CandidateEstimate{Feasible: true, AgentCost: 0.4}},
+		{Name: "moe-owner-1", Strategy: owner, Estimate: placement.CandidateEstimate{Feasible: true, AgentCost: 0.9}},
+	}, func(strategy *placement.Strategy) bool { return strategy == giant })
+	if len(got) != 2 || got[1].Name != "batch-8192-ubatch-8192" {
+		t.Fatalf("auto plan ignored ranked cost/exact evidence because of a candidate name: %+v", got)
+	}
+}
+
 func TestCalibrationCandidateFilterKeepsBaselineAndDropsRejectedArgv(t *testing.T) {
 	base := &placement.Strategy{BatchSize: 128}
 	rejected := &placement.Strategy{BatchSize: 256}

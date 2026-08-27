@@ -94,6 +94,28 @@ func TestParseSizesTensorsByDiskSpan(t *testing.T) {
 	}
 }
 
+func TestParseCountsPerLayerTokenEmbdAsHostResident(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ple.gguf")
+	writeGGUFFixture(t, path, []fixtureTensor{
+		{name: "token_embd.weight", elems: 64, ttype: 39, offset: 0},
+		{name: "per_layer_token_embd.weight", elems: 64, ttype: 39, offset: 96},
+		{name: "blk.0.ffn_gate_exps.weight", elems: 64, ttype: 39, offset: 192},
+		{name: "output.weight", elems: 64, ttype: 39, offset: 226},
+	}, 32, 226+34)
+
+	info, err := Parse(path)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if info.PerLayerTokenEmbdBytes != 96 {
+		t.Fatalf("PLE bytes = %d, want 96", info.PerLayerTokenEmbdBytes)
+	}
+	if info.TokenEmbdBytes != 96+96 {
+		t.Fatalf("host embeddings = %d, want token_embd+PLE 192", info.TokenEmbdBytes)
+	}
+}
+
 func TestParseReportsPerLayerExpertTransferBytes(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "layer-bytes.gguf")
@@ -158,10 +180,10 @@ func TestFindParseScriptPrefersAppHomeSourceCheckout(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(installedParser), 0755); err != nil {
 		t.Fatalf("mkdir installed parser dir: %v", err)
 	}
-	if err := os.WriteFile(sourceParser, []byte("#!/usr/bin/env python3\n"), 0755); err != nil {
+	if err := os.WriteFile(sourceParser, []byte("#!/usr/bin/env python3\nr['tensor_accounting_schema'] = 2\n"), 0755); err != nil {
 		t.Fatalf("write source parser: %v", err)
 	}
-	if err := os.WriteFile(installedParser, []byte("#!/usr/bin/env python3\n"), 0755); err != nil {
+	if err := os.WriteFile(installedParser, []byte("#!/usr/bin/env python3\nr['tensor_accounting_schema'] = 2\n"), 0755); err != nil {
 		t.Fatalf("write installed parser: %v", err)
 	}
 
@@ -173,6 +195,73 @@ func TestFindParseScriptPrefersAppHomeSourceCheckout(t *testing.T) {
 	want, _ := filepath.Abs(sourceParser)
 	if got != want {
 		t.Fatalf("expected app-home source parser %s, got %s", want, got)
+	}
+}
+
+func TestFindParseScriptSkipsStaleParserMissingHostPLE(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "stale", "parse_gguf.py")
+	current := filepath.Join(dir, "current", "parse_gguf.py")
+	if err := os.MkdirAll(filepath.Dir(stale), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(current), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("#!/usr/bin/env python3\nprint('old')\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(current, []byte("#!/usr/bin/env python3\nr['tensor_accounting_schema'] = 2\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("LLM_SCRIPT_DIR", filepath.Dir(stale))
+	t.Setenv("LLM_SERVER_HOME", "")
+	t.Setenv("LLM_APP_HOME", filepath.Dir(current))
+
+	got := findParseScript()
+	want, _ := filepath.Abs(current)
+	if got != want {
+		t.Fatalf("stale PATH parser won: got %s, want %s", got, want)
+	}
+}
+
+func TestValidateParserOutputRejectsQwen4ExpStaleTensorAccounting(t *testing.T) {
+	info := &Info{
+		Architecture:   "qwen4exp",
+		TokenEmbdBytes: 675430400,
+		NonExpertBytes: 33900597760,
+	}
+	err := validateParserOutput("/old/parse_gguf.py", "/models/Qwen3.8-Flash-Next.gguf", info)
+	if err == nil {
+		t.Fatal("expected stale parser output to fail")
+	}
+	if !strings.Contains(err.Error(), "tensor accounting schema 2") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateParserOutputAcceptsQwen4ExpWithoutPLE(t *testing.T) {
+	info := &Info{
+		TensorAccountingSchema: 2,
+		Architecture:           "qwen4exp",
+		TokenEmbdBytes:         675430400,
+		NonExpertBytes:         5100000000,
+	}
+	if err := validateParserOutput("/current/parse_gguf.py", "/models/no-ple.gguf", info); err != nil {
+		t.Fatalf("valid no-PLE qwen4exp was rejected: %v", err)
+	}
+}
+
+func TestValidateParserOutputRejectsPresentButUnaccountedPLE(t *testing.T) {
+	info := &Info{
+		TensorAccountingSchema: 2,
+		Architecture:           "qwen4exp",
+		HasPerLayerTokenEmbd:   1,
+	}
+	err := validateParserOutput("/broken/parse_gguf.py", "/models/ple.gguf", info)
+	if err == nil || !strings.Contains(err.Error(), "did not account") {
+		t.Fatalf("inconsistent PLE accounting error = %v", err)
 	}
 }
 

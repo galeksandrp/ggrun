@@ -372,6 +372,19 @@ func reconcileGuardedDevices(parsed []preflightDevice, summary memprobe.Summary)
 			devices[idx].UnaccountedMB += unexplained
 		}
 	}
+	// CUDA guard events and the cgroup peak are two halves of the same exact
+	// allocation proof. Preserve an unlabelled host peak in the returned device
+	// rows as well as the persisted memprobe plan, because these rows are fed
+	// into placement immediately during this launch.
+	if peakMB := bytesToMiBCeil(summary.Host.CgroupPeakBytes); peakMB > 0 {
+		if idx, ok := byName["Host"]; ok {
+			if unexplained := peakMB - devices[idx].TotalMB(); unexplained > 0 {
+				devices[idx].UnaccountedMB += unexplained
+			}
+		} else {
+			devices = append(devices, preflightDevice{Name: "Host", UnaccountedMB: peakMB})
+		}
+	}
 	return devices
 }
 
@@ -397,6 +410,15 @@ func guardedPlanDevices(devices []preflightDevice, summary memprobe.Summary) ([]
 		entry.ComputeBytes = uint64(maxPreflightInt(device.ComputeMB, 0)) * 1024 * 1024
 		entry.UnaccountedBytes = uint64(maxPreflightInt(device.UnaccountedMB, 0)) * 1024 * 1024
 		measured[idx] = entry
+	}
+	// cgroup peak is the exact resident host footprint of the contained process.
+	// Backends do not consistently label host model buffers (qwen4exp PLE is one
+	// example), so retain every peak byte not explained by parsed model/context/
+	// compute rows as unaccounted instead of silently reducing a 60+ GiB process
+	// to its small host compute buffer.
+	accountedHost := host.ModelBytes + host.ContextBytes + host.ComputeBytes + host.UnaccountedBytes
+	if host.CgroupPeakBytes > accountedHost {
+		host.UnaccountedBytes += host.CgroupPeakBytes - accountedHost
 	}
 	ordered := memprobe.Summary{Devices: measured}.DeviceSlice()
 	return ordered, host
@@ -1290,10 +1312,11 @@ func preflightPlacement(req *launchRequest, be *backendInfo, cfg *configForPrefl
 	if model != nil && strategy != nil {
 		computeByGPU := map[int]int{}
 		allocation := placement.MeasuredAllocation{
-			Evidence:         string(outcome.Evidence.Level),
-			ContextByGPU:     map[int]int{},
-			ModelByGPU:       map[int]int{},
-			UnaccountedByGPU: map[int]int{},
+			Evidence:          string(outcome.Evidence.Level),
+			PlacementIdentity: placement.AllocationPlacementIdentity(strategy),
+			ContextByGPU:      map[int]int{},
+			ModelByGPU:        map[int]int{},
+			UnaccountedByGPU:  map[int]int{},
 		}
 		for _, d := range targetDevs {
 			if idx, ok := cudaDeviceIndex(d.Name); ok {

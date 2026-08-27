@@ -1,6 +1,7 @@
 package gguf
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 // Info holds parsed GGUF metadata.
 type Info struct {
+	TensorAccountingSchema    int     `json:"tensor_accounting_schema"`
 	Architecture              string  `json:"arch"`
 	Name                      string  `json:"name"`
 	Basename                  string  `json:"basename"`
@@ -30,10 +32,12 @@ type Info struct {
 	TokenizerHash             string  `json:"tokenizer_hash"`
 	ExpertBytes               int64   `json:"expert_bytes"`
 	NonExpertBytes            int64   `json:"non_expert_bytes"`
-	TokenEmbdBytes            int64   `json:"token_embd_bytes"` // input embeddings; stay in host RAM
-	OutputBytes               int64   `json:"output_bytes"`     // output head; lands whole on the last split device
-	ShexpBytes                int64   `json:"shexp_bytes"`      // shared experts; stay on the layer's device even when routed experts offload to CPU
-	ExpertAuxBytes            int64   `json:"expert_aux_bytes"` // routing tensors moved by whole expert-layer overrides
+	TokenEmbdBytes            int64   `json:"token_embd_bytes"`           // host-resident embeddings: token_embd + per_layer_token_embd
+	PerLayerTokenEmbdBytes    int64   `json:"per_layer_token_embd_bytes"` // PLE/n-gram table; subset of TokenEmbdBytes
+	HasPerLayerTokenEmbd      int     `json:"has_per_layer_token_embd"`   // tensor-table presence; distinguishes no-PLE models from stale parsers
+	OutputBytes               int64   `json:"output_bytes"`               // output head; lands whole on the last split device
+	ShexpBytes                int64   `json:"shexp_bytes"`                // shared experts; stay on the layer's device even when routed experts offload to CPU
+	ExpertAuxBytes            int64   `json:"expert_aux_bytes"`           // routing tensors moved by whole expert-layer overrides
 	ExpertLayerBytes          []int64 `json:"expert_layer_bytes,omitempty"`
 	RoutedExpertLayerBytes    []int64 `json:"routed_expert_layer_bytes,omitempty"`
 	ShexpLayerBytes           []int64 `json:"shexp_layer_bytes,omitempty"`
@@ -181,13 +185,31 @@ func findParseScript() string {
 		filepath.Join(home, "ggrun", "tools", "gguf", "parse_gguf.py"),
 		filepath.Join(home, "parse_gguf.py"),
 	)
+	var fallback string
 	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			abs, _ := filepath.Abs(p)
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		abs, _ := filepath.Abs(p)
+		if parserHasCurrentTensorAccounting(abs) {
 			return abs
 		}
+		if fallback == "" {
+			fallback = abs
+		}
 	}
-	return ""
+	return fallback
+}
+
+// parserHasCurrentTensorAccounting is true when the helper exposes a versioned
+// tensor-accounting contract. Looking only for a PLE byte field cannot tell a
+// stale parser from a valid qwen4exp file that simply has no PLE tensor.
+func parserHasCurrentTensorAccounting(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte("tensor_accounting_schema"))
 }
 
 func validateParserOutput(script, modelPath string, info *Info) error {
@@ -202,6 +224,22 @@ func validateParserOutput(script, modelPath string, info *Info) error {
 		if info.TokenEmbdBytes <= 0 || info.OutputBytes <= 0 || info.ShexpBytes <= 0 {
 			return fmt.Errorf(
 				"parse_gguf.py at %s is missing required DeepSeek4 byte splits for %s; reinstall ggrun or set LLM_SCRIPT_DIR to the repo tools/gguf directory",
+				script, filepath.Base(modelPath))
+		}
+	}
+	// qwen4exp may legitimately omit the optional n-gram PLE table. Require a
+	// parser contract new enough to report tensor presence separately, then
+	// reject only an internally inconsistent result. This still catches the
+	// dangerous stale-helper case without rejecting valid no-PLE fixtures.
+	if strings.EqualFold(info.Architecture, "qwen4exp") {
+		if info.TensorAccountingSchema < 2 {
+			return fmt.Errorf(
+				"parse_gguf.py at %s lacks tensor accounting schema 2 for %s; reinstall ggrun or set LLM_SCRIPT_DIR to the repo tools/gguf directory",
+				script, filepath.Base(modelPath))
+		}
+		if info.HasPerLayerTokenEmbd != 0 && info.PerLayerTokenEmbdBytes <= 0 {
+			return fmt.Errorf(
+				"parse_gguf.py at %s reports per_layer_token_embd in %s but did not account its host-resident bytes",
 				script, filepath.Base(modelPath))
 		}
 	}

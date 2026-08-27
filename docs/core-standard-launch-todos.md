@@ -6,15 +6,24 @@
 
 Status: active implementation, 2026-08-27.
 
+The theory, evidence schema, implementation map, known risks, and exact resume
+sequence are preserved in [optimizer-theory.md](optimizer-theory.md). Treat it
+as the handoff document for this tracker.
+
 ## Implementation snapshot
 
-The 2026-08-27 working tree contains the first core implementation and its
-synthetic regressions. The repo-local candidate is rebuilt and passes 1,367 Go
-tests, the full race run, vet, formatting, shell/Python regressions, ShellCheck,
-and the Linux arm64, Darwin arm64, and Windows amd64 cross-builds. Checkboxes
-below remain open under the tracking rule at the end of this document until the
-work is committed and claims that depend on real hardware have preserved live
-evidence.
+The 2026-08-27 working tree contains the first core implementation plus a
+correction that restores the fit-first baseline, removes topology-name
+priority, and separates backbone, GPU-expert, CPU-expert, and activation costs.
+It also binds complete guarded peaks to an exact placement identity, preserves
+unlabelled cgroup/device bytes, and versions qwen4exp tensor accounting so a
+large host-only PLE table is neither charged to GPU backbone nor required when
+the GGUF legitimately omits it. The focused four-package run passes 889 tests;
+the full repository and race runs each pass 1,400 tests, with build, vet,
+formatting, shell/Python suites, ShellCheck, and three supported cross-builds
+clean. The canonical binary has been rebuilt from this tree. Checkboxes below
+remain open under the tracking rule at the end of this document until claims
+that depend on real hardware have preserved live evidence.
 
 | Work | Implementation state | Remaining acceptance |
 |---|---|---|
@@ -25,19 +34,57 @@ evidence.
 | PERF-2, PERF-6, PERF-7 | Implemented as baseline plus one calculated finalist, with a measured prefill pilot, identical budget-scaled cold+append scenarios, two samples, concurrent generation, mixed foreground traffic, lifecycle gates, delayed promotion, and a reusable baseline-won result | Add longer branch/replay and long-context hardware acceptance; quantify noise on public hardware |
 | PERF-10 | Automatic 1/2/4 slot neighbors are implemented with useful per-slot context and full re-placement | Add capability-specific unified/partitioned KV A/B |
 | PERF-4, PERF-8, PERF-12, UX-2 | Not complete | Implement measured headroom continuation, broader optional knobs, and bounded control UX |
-| PERF-11 | Partially implemented in the rebuilt candidate: MoE topology candidates now include each feasible sole-backbone owner, every candidate is a full placement recompute, and sustained device imbalance can redirect the one live finalist by compute role | Run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
+| PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
 | ROOMY-1, ROOMY-2, ROOMY-3, ROOMY-4, ROOMY-6 | Implemented in source: exact residual slack classifies roomy; tight live-tests only the proven shape; topology ranking prefers a fitting fastest single GPU; batch/ubatch/slots are full recomputes; winner/baseline-won/boundary persist | Commit plus live roomy dense/MoE/recurrent proof |
-| ROOMY-5 | Partially implemented in the rebuilt candidate: PCI-keyed SM sampling spans the complete agent trial; sustained idle devices become a typed bottleneck and can select one fully recomputed MoE backbone-owner finalist | Capture a matched live DeepSeek-class baseline/finalist comparison, then add process CPU, peer/host traffic, and queue telemetry only where it changes finalist selection |
-| Exact-argv admission and long-load UX | Implemented and rebuilt: a recomputed argv must receive its own allocation evidence, lateral MoE split churn retains the exact proven placement, and 64+ GiB models warn before loading | Install for a future launch, then repeat the live MoE case after the current server is intentionally stopped |
+| ROOMY-5 | Partially implemented in the working tree: PCI-keyed SM sampling spans the complete agent trial; only imbalance between ordinary-layer owners is actionable, and telemetry cannot select a predicted-slower topology | Capture a matched live DeepSeek-class baseline/finalist comparison, then add process CPU, peer/host traffic, and queue telemetry only where it changes finalist selection |
+| Exact-argv admission and long-load UX | Implemented in the working tree: a recomputed argv must receive its own allocation evidence, guarded peaks carry a placement identity, known challenger rewrite/recovery paths fail closed, lateral MoE split churn retains the exact proven placement, and 64+ GiB models warn before loading | Commit, then repeat the live MoE case after the current server is intentionally stopped |
 | MMAP-1, MMAP-2, MMAP-4 | Implemented: production/preflight/recovery/daemon share capability-aware reclaim policy; unknown/anonymous loaders fail closed; mmap remains last-resort and consent-gated | Commit plus live resident/mmap/anonymous cases |
 | MMAP-3 | Host ledger now separates exact reclaimable expert bytes from non-reclaimable runtime, KV, embeddings, and checkpoint reserve | Audit remaining backend-reported buffers/page tables/companions against live cgroup data |
 | MMAP-5 through MMAP-7 | Not complete | Requires the storage/workload and real too-large-model acceptance window |
 | PIN/P3 | Deliberately not started | Blocked on appropriate hardware/model artifacts as specified below |
 
-## Live evidence: the same model in two different residency classes
+## Live evidence: stable serving versus proven optimization
 
-### Current ~217 GB host: roomy/performance evidence, 2026-08-26
+### Active Qwen3.8 Flash Next run: safe baseline, optimization unresolved
+
+The active qwen4exp launch uses 262,144 total context, one explicitly requested
+slot, Q8 K/V, batch/ubatch `2048/256`, 21 GPU expert layers and 27 CPU-expert
+layers, no mmap, a `0.29/0.61/0.10` layer split, 13,312 MiB CRAM, and 16
+checkpoints. A separate 4B reviewer occupies about 4.25 GiB on the RTX 3060;
+that card's apparent lack of free VRAM is therefore not all main-model state.
+
+The server is healthy. At the latest sample it had processed 222,917 uncached
+prompt tokens in 1,898.06 seconds (117.44 tok/s aggregate) and generated 28,234
+tokens in 2,542.08 seconds (11.11 tok/s aggregate), with a maximum observed
+sequence of 110,587 tokens. One completed 104k-context turn prefetched 12,129
+tokens at 101.44 tok/s and decoded 17,626 tokens at 10.61 tok/s; the following
+long-context turn was decoding around 9.9 tok/s. During its prompt phase the RTX
+4070 reached about 79% SM while the 3090 Ti and 3060 were much lighter. During
+decode all three fluctuate at low-to-moderate utilization. This is
+phase-dependent sparse/CPU-offload behavior, not proof that parallel 2 or an
+even split is faster.
+
+The schema-15 optimizer record is not an optimality proof. It classified the
+baseline as tight from an estimated ledger with GPU0 at -92 MiB, named
+`ubatch-2048` as the sole finalist with low confidence, could not admit that
+candidate, and restored the baseline. The guarded probe actually contained
+exact aggregate peaks, but the backend labelled model bytes as
+`unaccounted`; the old distribution matcher therefore reported zero exact
+candidates. The source fix records a hash of every allocation-affecting
+placement coordinate and trusts a matching guarded aggregate even when the
+backend cannot label its model rows. It also carries the cgroup peak into the
+same-launch host ledger and prevents a later KV-only observation from erasing
+that proof. Calibration schema 16 retires the old settled claim.
+
+Therefore the current answer is: **stable and reasonable, but not yet the
+fastest validated setting**. Because parallel 1 was explicit, the optimizer
+correctly did not test parallel 2. The active process remains untouched; the
+next intentional relaunch with the rebuilt binary will record the new exact
+identity, reclassify residual headroom, and admit at most one newly ranked live
+finalist.
+
+### Earlier ~217 GB host DeepSeek-class run: roomy/performance evidence, 2026-08-26
 
 The current 146 GiB-class Q3 XL launch is **not** representative tight-fit
 evidence. The same checkpoint fits this server comfortably: its guarded probe
@@ -193,8 +240,9 @@ locks only workload-hot expert ranges and leaves the cold tail mmap-backed.
   flags feed placement.
 - [x] Stable single/multi-GPU dense, MoE offload, dense CPU offload, and
   CPU-only strategies exist.
-- [x] Exact allocation preflight, bounded OOM re-planning, runtime-growth
-  evidence, functional/cache canaries, and verified-config reuse exist.
+- [x] Exact allocation preflight, placement-bound guarded peaks, bounded OOM
+  re-planning, runtime-growth evidence, functional/cache canaries, and
+  verified-config reuse exist.
 - [x] KV measurements reject known parallel and `swa-full` poisoning cases.
 - [x] The first `ctx=fit` defects were fixed: Claude mode no longer turns fit
   into model maximum, and RAM is no longer counted as unbounded GPU KV space.

@@ -69,6 +69,17 @@ Generic, agent-screen, and automatically promoted artifacts are separately
 scoped by model, exact backend build, hardware, context, slots, effective batch
 pair, explicit-intent bits, and a versioned workload profile.
 
+A complete guarded allocator/cgroup peak has a second, stricter placement
+identity covering tensor/expert ownership, batch and ubatch, KV/SWA policy,
+slots, mmap/mlock, checkpoints/CRAM, graphs, projector, and speculation. This
+allows a backend's exact aggregate to remain authoritative when it cannot label
+individual model buffers, while preventing that aggregate from becoming proof
+for a different argv shape. Sparse post-launch KV measurements merge into a
+matching complete ledger instead of replacing it. GGUF tensor accounting has
+its own parser schema: optional host-only tensors such as qwen4exp PLE report
+presence separately from bytes, so a valid no-PLE file is distinguishable from
+a stale parser.
+
 Resident optimization has two distinct controller paths. A roomy launch has
 exactly measured residual headroom and actively searches a faster resident
 configuration—first avoiding unnecessary multi-GPU overhead, then spending
@@ -81,10 +92,13 @@ the same GGUF between them.
 For a roomy sparse MoE, resident bytes and compute ownership are deliberately
 separate signals. The frontier may fully recompute each feasible GPU as the sole
 ordinary-layer/KV/output owner while the other cards remain complete-expert
-storage. Sustained per-device SM imbalance can select one such topology as the
-single live finalist, but it still passes exact allocation admission and the
-same agent-workload/lifecycle gates before promotion. A recovered argv is only
-proof of a safe allocation; it is not evidence that a roomy host is tight.
+storage. This is a performance-only challenger and never replaces the stable
+fit baseline by policy. Sustained SM imbalance between ordinary-layer owners can
+help select a predicted-faster topology as the single live finalist; an idle
+expert-storage card is expected sparse behavior, not sufficient evidence of a
+defect. The finalist still passes exact allocation admission and the same
+agent-workload/lifecycle gates before promotion. A recovered argv is only proof
+of a safe allocation; it is not evidence that a roomy host is tight.
 
 ## Development lanes
 
@@ -99,6 +113,10 @@ fastest validated configuration for real agent work. Ordinary mmap remains the
 final generic fit fallback. Selective per-expert mmap/mlock pinning is a later,
 hardware-gated last resort for supported MoEs beyond usable RAM plus VRAM; it
 is not the backend's global `--mlock` mode.
+
+The optimizer's phase model, llama.cpp control semantics, data schema, current
+evidence, known gaps, and resume checklist live in the durable
+[optimizer theory and handoff](optimizer-theory.md).
 
 The evidence-driven [Workflow capacity planner](workflow-capacity-plan.md)
 follows that single-backend core milestone. It evaluates primary slots,

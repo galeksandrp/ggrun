@@ -262,14 +262,27 @@ func TestGuardPeakAddsOnlyUnaccountedAllocatorBytes(t *testing.T) {
 	summary := memprobe.Summary{Devices: map[int]memprobe.DeviceMemory{
 		0: {ID: "CUDA0", PeakBytes: 175 * 1024 * 1024},
 		3: {ID: "CUDA3", PeakBytes: 64 * 1024 * 1024},
-	}}
+	}, Host: memprobe.HostMemory{CgroupPeakBytes: 512 * 1024 * 1024}}
 	got := reconcileGuardedDevices(parsed, summary)
 	want := []preflightDevice{
 		{Name: "CUDA0", ModelMB: 100, ContextMB: 20, ComputeMB: 30, UnaccountedMB: 25},
 		{Name: "CUDA3", UnaccountedMB: 64},
+		{Name: "Host", UnaccountedMB: 512},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("guard reconciliation = %#v, want %#v", got, want)
+	}
+}
+
+func TestGuardedPlanRetainsUnlabelledHostCgroupPeak(t *testing.T) {
+	devices := []preflightDevice{{Name: "Host", ModelMB: 1024, ContextMB: 256, ComputeMB: 128}}
+	summary := memprobe.Summary{Host: memprobe.HostMemory{CgroupPeakBytes: 4096 * 1024 * 1024}}
+	_, host := guardedPlanDevices(devices, summary)
+	if got, want := host.UnaccountedBytes, uint64(2688*1024*1024); got != want {
+		t.Fatalf("unaccounted host bytes = %d, want %d", got, want)
+	}
+	if got := host.ModelBytes + host.ContextBytes + host.ComputeBytes + host.UnaccountedBytes; got != host.CgroupPeakBytes {
+		t.Fatalf("host ledger total = %d, cgroup peak = %d", got, host.CgroupPeakBytes)
 	}
 }
 

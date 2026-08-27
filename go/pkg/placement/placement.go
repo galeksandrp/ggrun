@@ -6360,10 +6360,65 @@ func RecordPostLaunchContextAllocation(cacheDir string, model *ModelProfile, str
 	if total <= 0 {
 		return false
 	}
+	identity := AllocationPlacementIdentity(strategy)
+	allocation := MeasuredAllocation{
+		Evidence: "live-allocated", ContextTotalMB: total, PlacementIdentity: identity,
+	}
+	// A healthy launch log often exposes only KV totals. Do not let that sparse
+	// observation erase the complete guarded model/context/peak breakdown that
+	// preflight recorded for the same exact placement moments earlier.
+	if previous, ok := LoadMeasuredAllocation(cacheDir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, backendTag, gpus, strategy.Parallel); ok &&
+		previous.PlacementIdentity != "" && previous.PlacementIdentity == identity {
+		allocation.ContextByGPU = previous.ContextByGPU
+		allocation.ContextHostMB = previous.ContextHostMB
+		allocation.ModelByGPU = previous.ModelByGPU
+		allocation.ModelHostMB = previous.ModelHostMB
+		allocation.UnaccountedByGPU = previous.UnaccountedByGPU
+		allocation.UnaccountedHostMB = previous.UnaccountedHostMB
+	}
 	err := RecordMeasuredAllocation(cacheDir, model, strategy.ContextSize, strategy.UBatchSize,
 		strategy.KVQuality, strategy.KVPlacement, backendTag, gpus, strategy.Parallel,
-		MeasuredAllocation{Evidence: "live-allocated", ContextTotalMB: total})
+		allocation)
 	return err == nil
+}
+
+// AllocationPlacementIdentity hashes every strategy coordinate that can alter
+// the backend's resident allocation. Probe cache filenames intentionally share
+// some runtime coordinates so graph observations can converge; this identity
+// is the stricter gate that decides whether a complete guarded peak is exact
+// evidence for the strategy currently being priced.
+func AllocationPlacementIdentity(strategy *Strategy) string {
+	if strategy == nil {
+		return ""
+	}
+	split := make([]string, len(strategy.TensorSplit))
+	for i, value := range strategy.TensorSplit {
+		split[i] = strconv.FormatFloat(value, 'g', -1, 64)
+	}
+	parts := []string{
+		"allocation-v1", string(strategy.Type), strconv.Itoa(strategy.ContextSize),
+		strconv.Itoa(strategy.Parallel), strconv.Itoa(strategy.BatchSize), strconv.Itoa(strategy.UBatchSize),
+		strategy.KVPlacement, strategy.KVQuality, strategy.KVType, strategy.KVTypeV,
+		strconv.Itoa(strategy.GPULayers), strings.Join(split, ","), strategy.SplitMode,
+		strconv.Itoa(strategy.MainGPU), strconv.Itoa(strategy.NCPUMoE), strategy.OTString,
+		strconv.FormatBool(strategy.MMap), strconv.FormatBool(strategy.MMapRequired), strconv.FormatBool(strategy.MLock),
+		strconv.FormatBool(strategy.FlashAttention), strconv.FormatBool(strategy.SWAFull), strconv.FormatBool(strategy.UseCUDAGraphs),
+		strconv.Itoa(strategy.CRAM), strconv.Itoa(strategy.MaxCheckpoints), strconv.Itoa(strategy.CheckpointMinStep),
+		SpecCompanionIdentity(strategy.MMProjPath), strconv.Itoa(strategy.MMProjSizeMB), strategy.BackendTag,
+	}
+	if draft := strategy.Draft; draft != nil {
+		parts = append(parts,
+			string(draft.Type), draft.BackendTag, SpecCompanionIdentity(draft.Path),
+			strconv.Itoa(draft.DraftGPU), strconv.Itoa(draft.CTXSizeDraft), draft.KVTypeDraft,
+			strconv.Itoa(draft.ThreadsDraft), draft.GPULayersDraft, strconv.Itoa(draft.VRAMMB),
+			strconv.FormatBool(draft.SupportsDraftCTX), strconv.FormatBool(draft.SpecAutoTune),
+			strconv.Itoa(draft.DraftMax), strconv.Itoa(draft.DraftMin), strconv.FormatFloat(draft.PSplit, 'g', -1, 64),
+			draft.SpecType, strconv.FormatBool(draft.MTPFlag), strconv.Itoa(draft.NgramN),
+			strconv.Itoa(draft.NgramM), strconv.Itoa(draft.NgramMinHits),
+		)
+	}
+	return specHash(parts...)
 }
 
 // MeasuredAllocation is the fixed memory ledger reported by the selected
@@ -6373,6 +6428,7 @@ func RecordPostLaunchContextAllocation(cacheDir string, model *ModelProfile, str
 // package dependency cycle.
 type MeasuredAllocation struct {
 	Evidence          string
+	PlacementIdentity string
 	ContextTotalMB    int
 	ContextByGPU      map[int]int
 	ContextHostMB     int
@@ -6410,6 +6466,7 @@ func RecordMeasuredAllocation(cacheDir string, model *ModelProfile, ctxSize, uba
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement,
 		backendTag, gpus, parallel, nil, nil, nil, 0, probeMeasurements{
 			AllocationSet:      true,
+			PlacementIdentity:  allocation.PlacementIdentity,
 			ContextTotalMB:     allocation.ContextTotalMB,
 			ContextByGPU:       copyProbeIntMap(allocation.ContextByGPU),
 			ContextHostMB:      allocation.ContextHostMB,
@@ -6433,6 +6490,7 @@ func LoadMeasuredAllocation(cacheDir string, model *ModelProfile, ctxSize, ubatc
 	}
 	return MeasuredAllocation{
 		Evidence:          pc.AllocationEvidence,
+		PlacementIdentity: pc.AllocationPlacementIdentity,
 		ContextTotalMB:    pc.ContextTotalMB,
 		ContextByGPU:      copyProbeIntMap(pc.ContextByGPU),
 		ContextHostMB:     pc.ContextHostMB,
@@ -7661,6 +7719,8 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			}
 		case k == "PROBED_ALLOCATION_EVIDENCE":
 			pc.AllocationEvidence = val
+		case k == "PROBED_ALLOCATION_PLACEMENT":
+			pc.AllocationPlacementIdentity = val
 		case k == "PROBED_COMPUTE_BUF_EVIDENCE":
 			pc.ComputeBufEvidence = val
 		case strings.HasPrefix(k, "PROBED_CONTEXT_MB_CUDA"):
@@ -7905,6 +7965,10 @@ type probeCache struct {
 	// "live-allocated". It makes confidence explicit instead of flattening a
 	// dry plan and an observed allocator peak into the same boolean.
 	AllocationEvidence string
+	// AllocationPlacementIdentity binds a complete guarded/live allocation to
+	// the exact tensor, KV, batch, checkpoint, mmap, and speculation placement
+	// that produced it. Empty is a legacy record and uses distribution fallback.
+	AllocationPlacementIdentity string
 	// RuntimeGraphGrowthByGPU is VRAM a real request needed beyond the
 	// load-time graph reserve, keyed by GPU index.
 	RuntimeGraphGrowthByGPU map[int]int
@@ -8021,6 +8085,7 @@ type probeMeasurements struct {
 	UnaccountedByGPU   map[int]int
 	UnaccountedHostMB  int
 	AllocationEvidence string
+	PlacementIdentity  string
 	// ComputeBufEvidence tags the computeByGPU values this write carries, so the
 	// merge can keep an observed (guarded/live) measurement authoritative over a
 	// later fit-oracle prediction. Empty means the caller gave no tag; the merge
@@ -8150,6 +8215,7 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 			measured.ModelHostMB = previous.ModelHostMB
 			measured.UnaccountedHostMB = previous.UnaccountedHostMB
 			measured.AllocationEvidence = previous.AllocationEvidence
+			measured.PlacementIdentity = previous.AllocationPlacementIdentity
 			measured.ContextByGPU = copyProbeIntMap(previous.ContextByGPU)
 			measured.ModelByGPU = copyProbeIntMap(previous.ModelByGPU)
 			measured.UnaccountedByGPU = copyProbeIntMap(previous.UnaccountedByGPU)
@@ -8287,6 +8353,9 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 		fmt.Fprintf(&b, "PROBED_CONTEXT_TOTAL_MB=%d\n", measured.ContextTotalMB)
 		if measured.AllocationEvidence != "" {
 			fmt.Fprintf(&b, "PROBED_ALLOCATION_EVIDENCE=%s\n", measured.AllocationEvidence)
+		}
+		if measured.PlacementIdentity != "" {
+			fmt.Fprintf(&b, "PROBED_ALLOCATION_PLACEMENT=%s\n", measured.PlacementIdentity)
 		}
 		fmt.Fprintf(&b, "PROBED_CONTEXT_MB_HOST=%d\n", max(measured.ContextHostMB, 0))
 		fmt.Fprintf(&b, "PROBED_MODEL_MB_HOST=%d\n", max(measured.ModelHostMB, 0))

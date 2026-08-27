@@ -2,16 +2,54 @@
 
 ## Unreleased
 
+- **qwen4exp PLE accounting is versioned and no longer charged as GPU VRAM.**
+  A launch that cannot fit with "no GPU has free VRAM after CUDA/compute
+  overhead" was packing the ~27 GiB `per_layer_token_embd` table onto every
+  card because `~/.local/bin/parse_gguf.py` predated host-resident accounting.
+  ggrun now prefers helpers exposing tensor-accounting schema 2, records PLE
+  tensor presence separately from its byte count, and fails closed only when a
+  stale parser cannot make that distinction or reports an unaccounted present
+  tensor. Valid qwen4exp GGUFs with no optional PLE tensor remain supported.
+- **Guarded allocation evidence now survives unlabelled backend buffers without
+  leaking across placements.** Complete CUDA peaks and the host cgroup peak are
+  persisted with a hash of every allocation-affecting strategy coordinate.
+  Matching aggregates are exact even when a backend reports model weights only
+  as `unaccounted`; a changed split, batch pair, KV/mmap/checkpoint policy, or
+  speculation shape cannot reuse them. A later KV-only launch observation no
+  longer erases the complete guarded breakdown, and calibration schema 16
+  retires decisions made under the old zero-exact-candidate behavior.
+- **Unsupported architectures search open llama.cpp PRs and Hugging Face GGUF
+  cards for a supporting fork.** When no installed backend can load a GGUF
+  architecture and no reviewed recipe names it, ggrun queries the official
+  llama.cpp pull-request index and the publisher's Hugging Face model card
+  (from local `quantized_by` / name metadata, then a Hub architecture search).
+  Only official `ggml-org/llama.cpp/pull/N` links are followed. The fetched PR
+  must return the same official number/URL, mention the requested architecture
+  in its current title/body, expose a GitHub HTTPS head, and pin a hexadecimal
+  40-character commit; detail fetches are bounded. Publisher-cited PRs and
+  titles that add the architecture rank ahead of later fix PRs that merely
+  mention it. An open unmerged github.com head is offered as an isolated
+  `.src/fork-*` clone before falling back to a mainline backend update. The
+  lookup is architecture generic; a network miss fails closed to the existing
+  update prompt.
+- **Standard launch now keeps MoE fit placement separate from performance
+  hypotheses.** The stable planner still resolves the fit-first baseline; a
+  sole `--tensor-split` owner is generated only as one fully recomputed roomy
+  challenger. The frontier ranks candidates by phase-aware backbone, routed
+  GPU-expert, CPU-expert, and activation-transfer cost rather than by an
+  `moe-owner-*` name. Optimizer challengers fail closed on the first exact
+  admission miss instead of walking the fit recovery ladder.
 - **Roomy MoE optimization now distinguishes compute ownership from storage.**
   The bounded frontier fully recomputes every feasible GPU as a sole
   ordinary-layer/KV/output owner while the remaining cards store complete
   routed-expert layers. PCI-keyed SM sampling spans the complete agent trial;
-  sustained imbalance can redirect the one finalist toward a topology that
-  removes the serial backbone from the saturated card, even when that card
-  still stores sparse expert bytes. Exact allocation admission and the normal
-  live workload/lifecycle gates remain promotion authority. Recovery to a safe
-  argv no longer suppresses roomy performance measurement, while exact-ledger
-  tight launches retain their proven-shape filter.
+  sustained imbalance between ordinary-layer owners can help select one
+  predicted-faster topology. An idle expert-storage card is not itself a
+  balance defect, and utilization cannot promote a costlier owner. Exact
+  allocation admission and the normal live workload/lifecycle gates remain
+  promotion authority. Recovery to a safe argv no longer suppresses roomy
+  performance measurement, while exact-ledger tight launches retain their
+  proven-shape filter.
 - **The automatic agent screen now fits its own time budget and scores cold
   work.** A short uncached prefill pilot selects one rounded per-lane prompt
   geometry for both baseline and finalist; slow CPU-expert MoEs no longer time

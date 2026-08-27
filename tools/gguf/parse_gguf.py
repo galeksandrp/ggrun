@@ -258,11 +258,15 @@ def _account_tensors(r, tensors, header_end, file_size, align):
                 add_layer_bytes('_expert_aux_layer_bytes', layer, nbytes)
             else:
                 add_layer_bytes('_non_expert_layer_bytes', layer, nbytes)
-            if tname == 'token_embd.weight':
-                # Input embeddings stay in host memory (llama.cpp keeps the
-                # input layer on CPU), so placement must not charge them
-                # against GPU VRAM budgets.
+            if tname == 'token_embd.weight' or tname == 'per_layer_token_embd.weight':
+                # Input embeddings and qwen4exp's per-layer/n-gram PLE table stay
+                # in host memory (llama.cpp never tensor-splits them onto CUDA).
+                # Charging per_layer_token_embd (~27 GiB at Q3) as GPU backbone
+                # makes every card look over-full and the model "not fit".
                 r['token_embd_bytes'] = r.get('token_embd_bytes', 0) + nbytes
+                if tname == 'per_layer_token_embd.weight':
+                    r['has_per_layer_token_embd'] = 1
+                    r['per_layer_token_embd_bytes'] = r.get('per_layer_token_embd_bytes', 0) + nbytes
             elif tname == 'output.weight':
                 # The output head lands on the device that owns the last
                 # layer slot (llama.cpp splits n_layer+1 slots across the
@@ -277,7 +281,13 @@ def parse(path: str) -> Dict[str, Any]:
     int, strings are str. Consumers should `.get(key, default)` rather than
     index directly.
     """
-    r: Dict[str, Any] = {'fused': 0, 'expert_bytes': 0, 'non_expert_bytes': 0}
+    r: Dict[str, Any] = {
+        'tensor_accounting_schema': 2,
+        'has_per_layer_token_embd': 0,
+        'fused': 0,
+        'expert_bytes': 0,
+        'non_expert_bytes': 0,
+    }
 
     def read_shard(sp: str, meta: Dict[str, Any]) -> None:
         with open(sp, 'rb') as f:
@@ -345,6 +355,8 @@ def parse(path: str) -> Dict[str, Any]:
 
 # (metadata key, bash variable name, default-for-missing)
 SHELL_KEY_MAP = [
+    ('tensor_accounting_schema', 'TENSOR_ACCOUNTING_SCHEMA', 0),
+    ('has_per_layer_token_embd', 'HAS_PER_LAYER_TOKEN_EMBD', 0),
     ('layers',            'LAYER_COUNT',         0),
     ('experts',           'EXPERT_COUNT',        0),
     ('hkv',               'HEAD_COUNT_KV',       0),

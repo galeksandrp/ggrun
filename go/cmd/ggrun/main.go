@@ -2366,7 +2366,7 @@ func normalizeArchKVRequest(req *launchRequest, model *placement.ModelProfile) {
 func backendUnavailableReason(arch, backendPath string) string {
 	actionable := fmt.Sprintf("Update the mainline llama.cpp backend or install a fork that adds %s (ggrun backend install <recipe>).", arch)
 	if len(backends.RecipesForArch(arch)) == 0 {
-		actionable = "It requires a newer llama.cpp mainline or a fork that adds the architecture. Update the mainline backend or install a fork."
+		actionable = "It requires a newer llama.cpp mainline or a fork that adds the architecture. ggrun can search open llama.cpp PRs for a supporting fork, or update the mainline backend."
 	}
 	return fmt.Sprintf(
 		"No installed backend supports the %s architecture. The %s backend does not support it.\n  %s",
@@ -2414,6 +2414,118 @@ func offerMainlineBackendUpdateWith(req *launchRequest, model *placement.ModelPr
 		return false
 	}
 	return update() == nil
+}
+
+// searchArchForkPRs is the live GitHub + Hugging Face lookup for an
+// architecture with no reviewed recipe. Tests replace it so launch prompting
+// does not hit the network.
+var searchArchForkPRs = func(ctx context.Context, model *placement.ModelProfile) ([]backends.ArchForkPR, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	query := backends.ArchForkSearch{}
+	if model != nil {
+		query.Arch = model.ModelArch
+		query.QuantizedBy = model.QuantizedBy
+		query.Name = model.Name
+		query.Basename = model.Basename
+	}
+	return backends.SearchArchForks(ctx, query, backends.ForkSearchClient{})
+}
+
+func installDiscoveredArchFork(recipe backends.Recipe) error {
+	cmdBackendAddRecipe([]string{
+		recipe.GitURL,
+		"--tag", recipe.Tag,
+		"--checkout-name", recipe.Tag,
+		"--branch", recipe.Branch,
+		"--commit", recipe.Commit,
+		"--route-arch", recipe.RouteArch,
+	}, &recipe)
+	return nil
+}
+
+// offerDiscoveredArchFork searches the official llama.cpp PR index and the
+// GGUF publisher's Hugging Face card for a fork that adds this architecture,
+// then offers to clone/build it. Reviewed recipes stay first; this is the
+// generic path for a novel arch the catalog does not yet name. A miss or
+// decline falls through to the mainline-update offer.
+func offerDiscoveredArchFork(req *launchRequest, model *placement.ModelProfile, assumeYes bool) bool {
+	return offerDiscoveredArchForkWith(req, model, assumeYes, os.Stdin, os.Stderr, stdinIsTerminal(), searchArchForkPRs, installDiscoveredArchFork)
+}
+
+func offerDiscoveredArchForkWith(
+	req *launchRequest,
+	model *placement.ModelProfile,
+	assumeYes bool,
+	in io.Reader,
+	out io.Writer,
+	terminal bool,
+	search func(context.Context, *placement.ModelProfile) ([]backends.ArchForkPR, error),
+	install func(backends.Recipe) error,
+) bool {
+	if req == nil || model == nil || search == nil || install == nil {
+		return false
+	}
+	arch := strings.TrimSpace(model.ModelArch)
+	if arch == "" || strings.TrimSpace(req.BackendUnavailableReason) == "" {
+		return false
+	}
+	if len(backends.RecipesForArch(arch)) > 0 {
+		return false
+	}
+	prs, err := search(context.Background(), model)
+	if err != nil {
+		fmt.Fprintf(out, "[launch] could not search llama.cpp PRs for architecture %s: %v\n", arch, err)
+		return false
+	}
+	var candidate backends.ArchForkPR
+	for _, pr := range prs {
+		if pr.GitURL != "" && pr.Branch != "" && pr.Commit != "" && pr.Number > 0 && !pr.Merged {
+			candidate = pr
+			break
+		}
+	}
+	if candidate.Number == 0 {
+		return false
+	}
+	recipe := candidate.RecipeForModel(discoveredForkModelName(model))
+	source := fmt.Sprintf("Open llama.cpp PR #%d (%s)", candidate.Number, candidate.URL)
+	if candidate.Cited {
+		source = fmt.Sprintf("Hugging Face model card cites open llama.cpp PR #%d (%s)", candidate.Number, candidate.URL)
+	}
+	if !assumeYes {
+		if !terminal {
+			fmt.Fprintf(out, "[launch] %s adds %s. Install with: ggrun backend add %s --branch %s --commit %s --tag %s --checkout-name %s --route-arch %s\n",
+				source, arch, recipe.GitURL, recipe.Branch, recipe.Commit, recipe.Tag, recipe.Tag, recipe.RouteArch)
+			return false
+		}
+		fmt.Fprintf(out, "No installed backend can load architecture %s for %s. %s adds it as a separate fork named %q under .src/fork-* (mainline llama.cpp is not modified). Install that fork now? [y/N] ",
+			arch, recipe.Tag, source, recipe.Tag)
+		line, _ := bufio.NewReader(in).ReadString('\n')
+		answer := strings.ToLower(strings.TrimSpace(line))
+		if answer != "y" && answer != "yes" {
+			return false
+		}
+	}
+	fmt.Fprintf(out, "[launch] installing isolated fork %q from llama.cpp PR #%d into %s (mainline %s untouched)\n",
+		recipe.Tag, candidate.Number, backends.IsolatedForkSourceDir("", recipe.GitURL, recipe.Branch, recipe.Tag), backends.MainlineSourceDir(""))
+	return install(recipe) == nil
+}
+
+func discoveredForkModelName(model *placement.ModelProfile) string {
+	if model == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(model.Name); name != "" {
+		return name
+	}
+	if name := strings.TrimSpace(model.Basename); name != "" {
+		return name
+	}
+	return placement.CalibrationModelBasename(model.Path)
 }
 
 func backendUnavailableMessage(req *launchRequest) string {
@@ -4219,7 +4331,67 @@ func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, mode
 // load, measured promotion, calibration, restoration, and runtime recovery can
 // never forget an argv that an earlier phase disproved.
 func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
-	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, false)
+	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, false, false)
+}
+
+// startLaunchExactAdmission starts one optimizer challenger as the exact argv
+// that candidate computed. A memory miss records the rejection and returns; it
+// does not walk the fit recovery ladder (more CPU experts, derated ubatch, or
+// a different checkpoint step). The caller restores the measured baseline.
+func startLaunchExactAdmission(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
+	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, false, true)
+}
+
+// exactAdmissionClass names one rewrite the fit recovery ladder is allowed to
+// perform, and that an optimizer challenger must refuse instead.
+type exactAdmissionClass string
+
+const (
+	exactAdmissionSpec      exactAdmissionClass = "speculation"
+	exactAdmissionCompat    exactAdmissionClass = "compatibility"
+	exactAdmissionCompanion exactAdmissionClass = "companion"
+	exactAdmissionMemory    exactAdmissionClass = "memory"
+	exactAdmissionMMap      exactAdmissionClass = "mmap"
+	exactAdmissionCUDAOOM   exactAdmissionClass = "cuda-oom"
+)
+
+func exactAdmissionError(class exactAdmissionClass, detail string, cause error) error {
+	var err error
+	switch class {
+	case exactAdmissionSpec:
+		err = fmt.Errorf("exact candidate requires a speculation re-plan; refusing to change its argv")
+	case exactAdmissionCompat:
+		err = fmt.Errorf("exact candidate requires backend compatibility adjustment (%s); refusing to change its argv", detail)
+	case exactAdmissionCompanion:
+		err = fmt.Errorf("exact candidate's speculative companion was rejected; refusing a target-only argv rewrite")
+	case exactAdmissionMemory:
+		err = fmt.Errorf("exact candidate failed memory admission%s; refusing recovery ladder", detail)
+	case exactAdmissionMMap:
+		err = fmt.Errorf("exact candidate contradicted mmap pageability; refusing a resident argv rewrite")
+	case exactAdmissionCUDAOOM:
+		err = fmt.Errorf("exact candidate CUDA OOM%s; refusing recovery ladder", detail)
+	default:
+		err = fmt.Errorf("exact candidate required an argv rewrite (%s); refusing recovery ladder", class)
+	}
+	if cause != nil {
+		return fmt.Errorf("%w: %w", err, cause)
+	}
+	return err
+}
+
+// validateExactAdmissionArgv is the backstop for every challenger admission
+// path. Individual rewrite sites fail with a specific reason; this invariant
+// catches both future sites and an accidental in-place slice mutation before a
+// changed process can start under the original candidate's evidence.
+func validateExactAdmissionArgv(exact bool, expected string, actual []string) error {
+	if !exact {
+		return nil
+	}
+	got := formatCommand(actual)
+	if got != expected {
+		return fmt.Errorf("exact candidate argv changed during admission; expected %s, got %s", expected, got)
+	}
+	return nil
 }
 
 // restoreLaunchWithCUDAOOMRecoveryState re-enters the start boundary to bring
@@ -4232,7 +4404,7 @@ func startLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config,
 // Recovery rejections remain recorded and enforced everywhere the argv is chosen
 // by recovery/recompute.
 func restoreLaunchWithCUDAOOMRecoveryState(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery) (*server.Process, *placement.Strategy, []string, error) {
-	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, true)
+	return startLaunchWithCUDAOOMRecoveryStateMode(req, cfg, model, strategy, be, caps, serverArgs, timeout, memoryRecovery, true, false)
 }
 
 type tunedBatchConstraint struct {
@@ -4289,7 +4461,7 @@ func backendMeasuredRecomputeWorthVerifying(level memoryEvidenceLevel, current, 
 	return true
 }
 
-func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool) (launchProcess *server.Process, launchStrategy *placement.Strategy, launchArgs []string, launchErr error) {
+func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration, memoryRecovery *launchMemoryRecovery, restoreExempt bool, exactAdmission bool) (launchProcess *server.Process, launchStrategy *placement.Strategy, launchArgs []string, launchErr error) {
 	const maxRetries = 2
 	const maxPreflightReplans = 5
 	retries := 0
@@ -4300,6 +4472,10 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 	}
 	specDisabled := false
 	measuredProductionArgs := ""
+	exactCandidateArgs := ""
+	if exactAdmission {
+		exactCandidateArgs = formatCommand(serverArgs)
+	}
 	// A calibration winner/candidate owns an exact batch pair even when the user
 	// did not spell that pair on the command line. Backend allocation evidence
 	// can force a fresh Compute pass before the real server starts; preserve the
@@ -4338,12 +4514,18 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		}
 	}()
 	for {
+		if err := validateExactAdmissionArgv(exactAdmission, exactCandidateArgs, serverArgs); err != nil {
+			return nil, strategy, serverArgs, err
+		}
 		if !restoreExempt && memoryRecovery.isRejected(serverArgs) {
 			return nil, strategy, serverArgs, fmt.Errorf("refusing to retry a memory configuration rejected earlier in this launch lifecycle")
 		}
 		if !specDisabled && strings.EqualFold(strings.TrimSpace(req.SpecMode), "auto") && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
 			verified := strategy.Draft.VerifiedLaunchIdentity
 			if verified == "" || verified != specLaunchIdentity(serverArgs) {
+				if exactAdmission {
+					return nil, strategy, serverArgs, exactAdmissionError(exactAdmissionSpec, "", nil)
+				}
 				fmt.Fprintln(os.Stderr, "[spec] final launch flags differ from the verified profile; disabling speculation")
 				specDisabled = true
 				next, rerr := placement.Compute(caps, model, placementOpts())
@@ -4367,6 +4549,9 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		if strategy != nil {
 			preflight := preflightPlacement(req, be, &configForPreflight{CacheDir: cfg.CacheDir}, runtimeCaps, model, strategy, serverArgs)
 			if adjustment := preflight.BackendAdjustment; adjustment != nil {
+				if exactAdmission {
+					return nil, strategy, serverArgs, exactAdmissionError(exactAdmissionCompat, adjustment.Reason, nil)
+				}
 				if preflightReplans >= maxPreflightReplans {
 					return nil, strategy, serverArgs, fmt.Errorf("backend compatibility adjustment did not converge after %d retries", maxPreflightReplans)
 				}
@@ -4550,6 +4735,9 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 				fmt.Fprintf(os.Stderr, "[launch] %s; continuing on the planner's estimate\n", preflight.ProbeUnavailable)
 			}
 			if preflight.CompanionRejected {
+				if exactAdmission {
+					return nil, strategy, serverArgs, exactAdmissionError(exactAdmissionCompanion, "", nil)
+				}
 				specDisabled = true
 				opts := placementOpts()
 				opts.SkipPlacementCache = false
@@ -4568,6 +4756,9 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 			}
 			if preflight.DoesNotFit {
 				memoryRecovery.reject(serverArgs)
+				if exactAdmission {
+					return nil, strategy, serverArgs, exactAdmissionError(exactAdmissionMemory, fmt.Sprintf(" on CUDA%d (%d MiB deficit)", preflight.Device, preflight.DeficitMB), nil)
+				}
 				if preflightReplans >= maxPreflightReplans {
 					return nil, strategy, serverArgs, fmt.Errorf("memory preflight did not converge after %d re-plans; refusing a real model load", maxPreflightReplans)
 				}
@@ -4586,7 +4777,15 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 				)
 				continue
 			}
-			if preflight.Evidence.Level != memoryEvidenceNone {
+			if preflight.Evidence.Level != memoryEvidenceNone && exactAdmission {
+				// The preflight measured this exact argv. Challenger admission must
+				// consume that proof directly; feeding it back through Compute can
+				// produce a different split and turn one bounded experiment into an
+				// unrequested recovery search.
+				if preflight.Evidence.Level == memoryEvidenceAllocated {
+					measuredProductionArgs = formatCommand(serverArgs)
+				}
+			} else if preflight.Evidence.Level != memoryEvidenceNone {
 				opts := placementOpts()
 				opts.SkipPlacementCache = true
 				next, rerr := placement.Compute(caps, model, opts)
@@ -4644,11 +4843,17 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		if err := confirmRequiredMMap(req, strategy, os.Stdin, os.Stderr, stdinIsTerminal()); err != nil {
 			return nil, strategy, serverArgs, err
 		}
+		if err := validateExactAdmissionArgv(exactAdmission, exactCandidateArgs, serverArgs); err != nil {
+			return nil, strategy, serverArgs, err
+		}
 		p, err := startLaunchProcess(req, cfg, model, be, caps, serverArgs, timeout)
 		if err == nil {
 			if mmapErr := validateObservedMMapPageability(cfg, model, be, strategy, p); mmapErr != nil {
 				memoryRecovery.reject(serverArgs)
 				_ = p.Stop()
+				if exactAdmission {
+					return nil, strategy, serverArgs, exactAdmissionError(exactAdmissionMMap, "", mmapErr)
+				}
 				if preflightReplans >= maxPreflightReplans {
 					return nil, strategy, serverArgs, fmt.Errorf("mmap pageability correction did not converge: %w", mmapErr)
 				}
@@ -4703,6 +4908,9 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 			return p, strategy, serverArgs, err
 		}
 		memoryRecovery.reject(serverArgs)
+		if exactAdmission {
+			return p, strategy, serverArgs, exactAdmissionError(exactAdmissionCUDAOOM, fmt.Sprintf(" on device %d allocating %d MiB", device, allocMB), err)
+		}
 
 		// Re-plan with the failed card penalized by its overshoot: the real packer
 		// refits it with partial gate+up chunks and reclaims stranded VRAM on the
@@ -5619,11 +5827,14 @@ func cmdLaunch(args []string) {
 		be = resolveLaunchBackend(req, model, caps)
 	}
 	if be == nil {
-		// A NOVEL architecture (no reviewed recipe) cannot be fixed by a recipe
-		// install; the actionable path is advancing the mainline llama.cpp
-		// checkout to a revision that added the loader. Offer it on a terminal so
-		// the dead-end error becomes a question, but never block a scripted call.
-		if offerMainlineBackendUpdate(req, model, cfg.AssumeYes) {
+		// No reviewed recipe for this architecture. Search open llama.cpp PRs
+		// and Hugging Face GGUF cards for a head fork that adds the loader; if
+		// the user declines or nothing is found, the mainline-update offer
+		// remains. A scripted non-terminal call never blocks.
+		if offerDiscoveredArchFork(req, model, cfg.AssumeYes) {
+			be = resolveLaunchBackend(req, model, caps)
+		}
+		if be == nil && offerMainlineBackendUpdate(req, model, cfg.AssumeYes) {
 			be = resolveLaunchBackend(req, model, caps)
 		}
 		if be == nil {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -57,6 +58,7 @@ const (
 	ScreenFirstRun
 	ScreenRecommended
 	ScreenChoice
+	ScreenLoading
 )
 
 // Model is the Bubble Tea model.
@@ -195,6 +197,7 @@ type Model struct {
 	message        string
 	messageType    string // info, warning, error
 	scanningModels bool
+	spinner        spinner.Model
 }
 
 // ModelItem represents a discovered GGUF model.
@@ -234,6 +237,18 @@ func scanComputerModels(modelDir, cacheDir string) tea.Cmd {
 }
 
 func InitialModel() Model {
+	m := sessionModel()
+	m.loadHardwareAndModels()
+	return m
+}
+
+func loadingModel() Model {
+	m := sessionModel()
+	m.screen = ScreenLoading
+	return m
+}
+
+func sessionModel() Model {
 	cfg, err := config.Load()
 	configErr := err
 	if err != nil || cfg == nil {
@@ -254,6 +269,9 @@ func InitialModel() Model {
 	if cfg.Parallel > 0 {
 		parallel = strconv.Itoa(cfg.Parallel)
 	}
+	spin := spinner.New()
+	spin.Spinner = spinner.MiniDot
+	spin.Style = titleStyle
 	m := Model{
 		screen:          ScreenMain,
 		cfgMemo:         &configMemo{},
@@ -274,6 +292,7 @@ func InitialModel() Model {
 		supportOnline:   cfg.SupportOnline,
 		aituneRounds:    rounds,
 		ramLimitPercent: cfg.RAMLimitPercent,
+		spinner:         spin,
 	}
 	m.modelUsage = modelusage.Load(cfg.CacheDir)
 	if m.port <= 0 {
@@ -293,26 +312,52 @@ func InitialModel() Model {
 	m.input = textinput.New()
 	m.input.Placeholder = ""
 	m.input.Focus()
-
-	// Detect once, then reuse that result while enriching every discovered GGUF.
-	caps, _ := detect.Detect()
-	m.caps = caps
-	m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, m.caps)
-
 	m.vramHeadroomMB = config.ParseBudgetMB(cfg.VRAMHeadroom)
 	m.ramHeadroomMB = config.ParseBudgetMB(cfg.RAMHeadroom)
-	m.refreshRecommendations()
-
-	if len(m.models) == 0 {
-		m.screen = ScreenFirstRun
-	}
-
-	m.mainList = newMainList(m.models, m.modelUsage)
+	m.mainList = newMainList(nil, m.modelUsage)
 	if configErr != nil {
 		m.message = fmt.Sprintf("Warning: Configuration error: %v. Fix it with ggrun config edit or reset before launching.", configErr)
 		m.messageType = "warning"
 	}
 	return m
+}
+
+func (m *Model) loadHardwareAndModels() {
+	caps, _ := detect.Detect()
+	m.caps = caps
+	m.models = loadRecognizedModels(m.modelDir, m.cacheDir, m.backend, caps)
+	m.refreshRecommendations()
+	if len(m.models) == 0 {
+		m.screen = ScreenFirstRun
+	} else {
+		m.screen = ScreenMain
+	}
+	m.mainList = newMainList(m.models, m.modelUsage)
+}
+
+type startupReadyMsg struct {
+	caps      *detect.Capabilities
+	models    []ModelItem
+	recGroups recommend.Categories
+	recs      []recommend.Recommendation
+}
+
+func loadHardwareAndModelsCmd(modelDir, cacheDir, backend string, ramLimit, vramHeadroomMB, ramHeadroomMB int) tea.Cmd {
+	return func() tea.Msg {
+		caps, _ := detect.Detect()
+		models := loadRecognizedModels(modelDir, cacheDir, backend, caps)
+		tmp := Model{
+			caps:            caps,
+			ramLimitPercent: ramLimit,
+			vramHeadroomMB:  vramHeadroomMB,
+			ramHeadroomMB:   ramHeadroomMB,
+		}
+		tmp.refreshRecommendations()
+		return startupReadyMsg{
+			caps: caps, models: models,
+			recGroups: tmp.recommendationGroups, recs: tmp.recommendations,
+		}
+	}
 }
 
 func flattenRecommendationCategories(cats recommend.Categories) []recommend.Recommendation {
@@ -514,10 +559,50 @@ func (d mainItemDelegate) Render(w io.Writer, m list.Model, index int, listItem 
 }
 
 func (m Model) Init() tea.Cmd {
-	return nil
+	if m.screen != ScreenLoading {
+		return nil
+	}
+	return tea.Batch(
+		m.spinner.Tick,
+		loadHardwareAndModelsCmd(m.modelDir, m.cacheDir, m.backend, m.ramLimitPercent, m.vramHeadroomMB, m.ramHeadroomMB),
+	)
+}
+
+func (m Model) updateLoading(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case startupReadyMsg:
+		m.caps = msg.caps
+		m.models = msg.models
+		m.recommendationGroups = msg.recGroups
+		m.recommendations = msg.recs
+		if len(m.models) == 0 {
+			m.screen = ScreenFirstRun
+		} else {
+			m.screen = ScreenMain
+		}
+		m.rebuildMainList()
+		return m, nil
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		}
+	}
+	return m, nil
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.screen == ScreenLoading {
+		return m.updateLoading(msg)
+	}
 	switch msg := msg.(type) {
 	case modelScanFinishedMsg:
 		m.scanningModels = false
@@ -1502,6 +1587,9 @@ func (m Model) updateInputScreen(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	if m.screen == ScreenLoading {
+		return m.viewLoading()
+	}
 	if m.width == 0 {
 		return "Loading..."
 	}
@@ -1526,6 +1614,19 @@ func (m Model) View() string {
 	default:
 		return m.viewMain()
 	}
+}
+
+func (m Model) viewLoading() string {
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("═══ ggrun ═══") + "\n\n")
+	b.WriteString("  " + m.spinner.View() + "  " + subtitleStyle.Render("Starting up…") + "\n")
+	b.WriteString(mutedStyle.Render("  Detecting hardware and reading GGUF headers") + "\n")
+	b.WriteString(mutedStyle.Render("  This can take a few seconds with a large model directory") + "\n")
+	body := b.String()
+	if m.width > 0 && m.height > 0 {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+	}
+	return body
 }
 
 func (m Model) viewMain() string {
@@ -4083,14 +4184,14 @@ func runModel(initial Model) (*LaunchRequest, error) {
 }
 
 // Run starts the TUI and returns a launch request if the user chose to launch.
-// The terminal check happens before InitialModel: building the model scans every
-// discovered GGUF header, which is wasted seconds when there is no TTY to show
-// the result on.
+// The terminal check happens before any GGUF scan. Hardware detection and header
+// reads then run behind a loading screen so a large model directory is not a
+// blank wait.
 func Run() (*LaunchRequest, error) {
 	if !terminalAvailable() {
 		return nil, noTerminalError()
 	}
-	return runModel(InitialModel())
+	return runModel(loadingModel())
 }
 
 // RunAfterBackendInstall reopens the same model and settings at pre-launch

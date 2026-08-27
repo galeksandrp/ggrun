@@ -44,6 +44,26 @@ routes GGUFs with `general.architecture=laguna` to that isolated build. Mainline
 does not support Laguna until that PR lands. DFlash GGUFs are companion
 speculators rather than standalone target models and are not offered in the TUI.
 
+If no reviewed recipe exists, a launch that cannot load the GGUF architecture
+searches open `ggml-org/llama.cpp` pull requests for that architecture name and
+reads Hugging Face GGUF model cards derived from the file's `quantized_by` /
+name metadata (falling back to an architecture search on the Hub). Only
+official `ggml-org/llama.cpp/pull/N` links are followed. A publisher-cited PR
+ranks ahead of GitHub hits, and a title that adds the architecture ranks ahead
+of a later fix PR that only mentions it. An open PR with a cloneable head fork
+is offered as `ggrun backend add` (same clone/build/register path as a recipe).
+A miss or a declined prompt still offers a mainline llama.cpp update, in case
+support has already landed upstream.
+
+Discovery results are unreviewed code, not reviewed recipes. Before a result is
+offered, ggrun re-reads the official PR API response and requires the requested
+PR number and canonical `ggml-org/llama.cpp` URL, an open/unmerged state, an
+architecture mention in the current title or body, an HTTPS `github.com` head
+repository, a non-empty branch, and a hexadecimal 40-character commit. Search,
+model-card, and PR-detail fetches are bounded. Installation pins that immutable
+head commit in a separate `.src/fork-*` checkout and still runs the normal
+build/conformance path; it never modifies `.src/llama.cpp`.
+
 ## Any other fork
 
 The same workflow accepts an arbitrary fork without adding model-specific code:
