@@ -52,13 +52,17 @@ type Result struct {
 	AgentWorkloadMaxS  float64 `json:"agent_workload_max_s,omitempty"`
 	// GPUUtilization is sampled across the complete active agent trial when a
 	// sampler is installed. Empty means no observation, not a balanced topology.
-	GPUUtilization  []GPUUtilization `json:"gpu_utilization,omitempty"`
-	DraftTokens     int              `json:"draft_tokens,omitempty"`
-	DraftAccepted   int              `json:"draft_accepted,omitempty"`
-	DraftAcceptRate float64          `json:"draft_accept_rate,omitempty"`
-	PeakVRAMMB      int              `json:"peak_vram_mb,omitempty"`
-	LoadTimeS       float64          `json:"load_time_s,omitempty"`
-	Timestamp       int64            `json:"timestamp"`
+	GPUUtilization []GPUUtilization `json:"gpu_utilization,omitempty"`
+	// PhaseUtilization keeps prefill, cache-backed append, decode, and mixed
+	// traffic separate. Aggregate GPUUtilization remains for compatibility and
+	// topology ranking; phase evidence is what supports a bottleneck diagnosis.
+	PhaseUtilization []PhaseUtilization `json:"phase_utilization,omitempty"`
+	DraftTokens      int                `json:"draft_tokens,omitempty"`
+	DraftAccepted    int                `json:"draft_accepted,omitempty"`
+	DraftAcceptRate  float64            `json:"draft_accept_rate,omitempty"`
+	PeakVRAMMB       int                `json:"peak_vram_mb,omitempty"`
+	LoadTimeS        float64            `json:"load_time_s,omitempty"`
+	Timestamp        int64              `json:"timestamp"`
 }
 
 // Runner executes a benchmark against a running server.
@@ -81,6 +85,13 @@ type Runner struct {
 	// GPUUtilizationInterval controls sampling cadence. Zero uses the production
 	// default; tests may shorten it without changing global state.
 	GPUUtilizationInterval time.Duration
+	// SampleResources may add process and queue counters to the same bounded
+	// phase observation. GPU samples from SampleGPUUtilization are merged in when
+	// this callback leaves them empty, preserving existing callers.
+	SampleResources func() ResourceSnapshot
+	// ResourceSamplingInterval supersedes GPUUtilizationInterval when set. The
+	// older field remains supported for API and test compatibility.
+	ResourceSamplingInterval time.Duration
 }
 
 // GPUUtilization is one observed device during a bounded agent workload.

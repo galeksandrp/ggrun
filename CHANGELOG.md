@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- **Standard launch now diagnoses performance per agent phase.** The bounded
+  workload retains separate cold-prefill, cache-backed-append, decode, and
+  mixed-traffic GPU samples plus Linux process-tree CPU, RSS, and disk-I/O
+  deltas. A typed conservative classifier distinguishes capacity, GPU
+  compute/memory/topology, host execution, the still-ambiguous CPU-expert path,
+  storage faults, scheduler starvation, and pipeline underfill. It can
+  prioritize one matching complete finalist, but exact admission and the
+  repeated phase-regression-gated live A/B remain the only promotion authority.
+- **Core optimizer edits now have an explicit review boundary.** Root agent
+  instructions and Claude memory import a written change contract, critical
+  optimizer paths have CODEOWNERS, and a dedicated CI check runs the uncached
+  `scripts/verify-core-engine.sh` formatting, focused-test, and vet gate. The
+  contract preserves fit-before-speed,
+  complete configurations, explicit user constraints, phase safety, versioned
+  evidence, and bounded lifecycle behavior.
+- **Claude Code status line now shows decode tok/s, not only prefill.** The
+  progress monitor took its decode rate only from the `/metrics` gauge, which
+  submits a task into llama-server's scheduler and therefore timed out on the
+  monitor's 3 s budget exactly while a long decode owned the scheduler — so
+  the status line showed prefill-only during generation. The monitor now
+  parses the backend's periodic `tg_3s` windowed-rate log line (the same
+  per-task stream prefill already used), prefers it over the whole-run
+  `/metrics` average, gives that scheduler-backed endpoint one short
+  cancellable attempt with an independent two-minute backoff, and merges
+  prefill + decode rates in the passive log path.
+- **CPU-expert launches pin llama.cpp to physical cores for prefill and
+  decode.** Agent turns pay the same DRAM-bound expert GEMM on cold ingest and
+  on token generation. For CPU-expert paths, ggrun now passes `--cpu-range` /
+  `--cpu-strict` and only exactly advertised batch counterparts, using a
+  contiguous set of online physical cores allowed to the Linux process. It
+  omits affinity when topology/capability proof is incomplete, re-derives it on
+  verified-config reuse, and scopes performance evidence to the resulting host
+  policy. A host script documents the remaining Linux knobs that need root.
+- **Model start now reports overall elapsed time and ETA.** The health-wait
+  spinner already showed a phase line on a TTY; Claude Code and launch logs
+  only recorded "health check OK after 12m". ggrun now prints the model size
+  at start, keeps a live status line on a TTY, and writes a newline progress
+  snapshot about every 10 seconds (elapsed, remaining estimate from the
+  observed read rate, bytes read, phase) until the server is healthy.
 - **qwen4exp PLE accounting is versioned and no longer charged as GPU VRAM.**
   A launch that cannot fit with "no GPU has free VRAM after CUDA/compute
   overhead" was packing the ~27 GiB `per_layer_token_embd` table onto every
@@ -16,8 +55,9 @@
   Matching aggregates are exact even when a backend reports model weights only
   as `unaccounted`; a changed split, batch pair, KV/mmap/checkpoint policy, or
   speculation shape cannot reuse them. A later KV-only launch observation no
-  longer erases the complete guarded breakdown, and calibration schema 16
-  retires decisions made under the old zero-exact-candidate behavior.
+  longer erases the complete guarded breakdown. Calibration schema 17 also
+  retires baseline-only decisions that were previously marked performance
+  tuned without a measured challenger outcome.
 - **Unsupported architectures search open llama.cpp PRs and Hugging Face GGUF
   cards for a supporting fork.** When no installed backend can load a GGUF
   architecture and no reviewed recipe names it, ggrun queries the official

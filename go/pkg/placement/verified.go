@@ -43,36 +43,40 @@ type VerifiedConfig struct {
 	MainGPU        int             `json:"main_gpu,omitempty"` // SingleGPU/MultiGPUDense
 
 	// Runtime knobs that change the emitted flags (buildLaunchServerArgs)
-	ContextSize              int                     `json:"context_size"`
-	ContextAuto              bool                    `json:"context_auto,omitempty"`
-	ContextFitTier           string                  `json:"context_fit_tier,omitempty"`
-	ContextFitRejected       int                     `json:"context_fit_rejected,omitempty"`
-	ContextFitEvidence       string                  `json:"context_fit_evidence,omitempty"`
-	KVPlacement              string                  `json:"kv_placement"`
-	KVType                   string                  `json:"kv_type,omitempty"`
-	KVTypeV                  string                  `json:"kv_type_v,omitempty"`
-	BatchSize                int                     `json:"batch_size"`
-	UBatchSize               int                     `json:"ubatch_size"`
-	BatchTuned               bool                    `json:"batch_tuned,omitempty"`
-	PerformanceTuned         bool                    `json:"performance_tuned,omitempty"`
-	Parallel                 int                     `json:"parallel"`
-	Threads                  int                     `json:"threads,omitempty"`
-	ThreadsBatch             int                     `json:"threads_batch,omitempty"`
-	MMap                     bool                    `json:"mmap"`
-	MMapRequired             bool                    `json:"mmap_required,omitempty"`
-	MLock                    bool                    `json:"mlock,omitempty"`
-	CPUExpertMMapCapability  CPUExpertMMapCapability `json:"cpu_expert_mmap_capability,omitempty"`
-	CPUExpertMMapEvidence    string                  `json:"cpu_expert_mmap_evidence,omitempty"`
-	ReclaimableHostWeightsMB int                     `json:"reclaimable_host_weights_mb,omitempty"`
-	FlashAttention           bool                    `json:"flash_attention"`
-	SWAFull                  bool                    `json:"swa_full"`
-	CRAM                     int                     `json:"cram,omitempty"`
-	MaxCheckpoints           int                     `json:"max_checkpoints,omitempty"`
-	CheckpointMinStep        int                     `json:"checkpoint_min_step,omitempty"`
-	UseCUDAGraphs            bool                    `json:"use_cuda_graphs,omitempty"`
-	Host                     string                  `json:"host,omitempty"`
-	NoJinja                  bool                    `json:"no_jinja,omitempty"`
-	ReasoningOff             bool                    `json:"reasoning_off"`
+	ContextSize        int    `json:"context_size"`
+	ContextAuto        bool   `json:"context_auto,omitempty"`
+	ContextFitTier     string `json:"context_fit_tier,omitempty"`
+	ContextFitRejected int    `json:"context_fit_rejected,omitempty"`
+	ContextFitEvidence string `json:"context_fit_evidence,omitempty"`
+	KVPlacement        string `json:"kv_placement"`
+	KVType             string `json:"kv_type,omitempty"`
+	KVTypeV            string `json:"kv_type_v,omitempty"`
+	BatchSize          int    `json:"batch_size"`
+	UBatchSize         int    `json:"ubatch_size"`
+	BatchTuned         bool   `json:"batch_tuned,omitempty"`
+	PerformanceTuned   bool   `json:"performance_tuned,omitempty"`
+	// PerformanceEvidenceSchema binds PerformanceTuned to the calibration
+	// semantics that produced it. Older verified placements remain reusable for
+	// fit, but cannot suppress a newer optimizer after its evidence rules change.
+	PerformanceEvidenceSchema int                     `json:"performance_evidence_schema,omitempty"`
+	Parallel                  int                     `json:"parallel"`
+	Threads                   int                     `json:"threads,omitempty"`
+	ThreadsBatch              int                     `json:"threads_batch,omitempty"`
+	MMap                      bool                    `json:"mmap"`
+	MMapRequired              bool                    `json:"mmap_required,omitempty"`
+	MLock                     bool                    `json:"mlock,omitempty"`
+	CPUExpertMMapCapability   CPUExpertMMapCapability `json:"cpu_expert_mmap_capability,omitempty"`
+	CPUExpertMMapEvidence     string                  `json:"cpu_expert_mmap_evidence,omitempty"`
+	ReclaimableHostWeightsMB  int                     `json:"reclaimable_host_weights_mb,omitempty"`
+	FlashAttention            bool                    `json:"flash_attention"`
+	SWAFull                   bool                    `json:"swa_full"`
+	CRAM                      int                     `json:"cram,omitempty"`
+	MaxCheckpoints            int                     `json:"max_checkpoints,omitempty"`
+	CheckpointMinStep         int                     `json:"checkpoint_min_step,omitempty"`
+	UseCUDAGraphs             bool                    `json:"use_cuda_graphs,omitempty"`
+	Host                      string                  `json:"host,omitempty"`
+	NoJinja                   bool                    `json:"no_jinja,omitempty"`
+	ReasoningOff              bool                    `json:"reasoning_off"`
 	// Model semantics are runtime behavior, not merely placement diagnostics:
 	// HasSSM emits --no-context-shift and activates fair parallel-agent batching.
 	// Persist them so the direct-start path cannot erase those policies.
@@ -192,7 +196,7 @@ func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilit
 		Threads:                  vc.Threads,
 		ThreadsBatch:             vc.ThreadsBatch,
 		BatchTuned:               vc.BatchTuned,
-		PerformanceTuned:         vc.PerformanceTuned,
+		PerformanceTuned:         vc.PerformanceTuned && vc.PerformanceEvidenceSchema == CalibrationSchemaVersion,
 		MMap:                     vc.MMap,
 		MMapRequired:             vc.MMapRequired,
 		MLock:                    vc.MLock,
@@ -276,6 +280,10 @@ func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilit
 			s.ThreadsBatch = caps.CPU.Cores
 		}
 	}
+	// Affinity and exact flag support are current backend/hardware facts, not a
+	// persisted placement claim. Re-derive them so a verified-config hit emits
+	// the same safe flags as a freshly computed strategy.
+	configureCPUAffinity(s, caps, opts.BackendHelp)
 	return s
 }
 
@@ -287,26 +295,32 @@ func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilit
 // strategy that actually served, so the record captures the full decision.
 func VerifiedConfigToRecord(scopeKey, modelBasename string, s *Strategy, backendIdentity, backendPath, chatTemplate, reviewer string) VerifiedConfig {
 	vc := VerifiedConfig{
-		SchemaVersion:            VerifiedConfigSchemaVersion,
-		ScopeKey:                 scopeKey,
-		ModelBasename:            modelBasename,
-		StrategyType:             s.Type,
-		OTString:                 s.OTString,
-		NCPUMoE:                  s.NCPUMoE,
-		SplitMode:                s.SplitMode,
-		MainGPU:                  s.MainGPU,
-		ContextSize:              s.ContextSize,
-		ContextAuto:              s.ContextAuto,
-		ContextFitTier:           s.ContextFitTier,
-		ContextFitRejected:       s.ContextFitRejected,
-		ContextFitEvidence:       s.ContextFitEvidence,
-		KVPlacement:              s.KVPlacement,
-		KVType:                   s.KVType,
-		KVTypeV:                  s.KVTypeV,
-		BatchSize:                s.BatchSize,
-		UBatchSize:               s.UBatchSize,
-		BatchTuned:               s.BatchTuned,
-		PerformanceTuned:         s.PerformanceTuned,
+		SchemaVersion:      VerifiedConfigSchemaVersion,
+		ScopeKey:           scopeKey,
+		ModelBasename:      modelBasename,
+		StrategyType:       s.Type,
+		OTString:           s.OTString,
+		NCPUMoE:            s.NCPUMoE,
+		SplitMode:          s.SplitMode,
+		MainGPU:            s.MainGPU,
+		ContextSize:        s.ContextSize,
+		ContextAuto:        s.ContextAuto,
+		ContextFitTier:     s.ContextFitTier,
+		ContextFitRejected: s.ContextFitRejected,
+		ContextFitEvidence: s.ContextFitEvidence,
+		KVPlacement:        s.KVPlacement,
+		KVType:             s.KVType,
+		KVTypeV:            s.KVTypeV,
+		BatchSize:          s.BatchSize,
+		UBatchSize:         s.UBatchSize,
+		BatchTuned:         s.BatchTuned,
+		PerformanceTuned:   s.PerformanceTuned,
+		PerformanceEvidenceSchema: func() int {
+			if s.PerformanceTuned {
+				return CalibrationSchemaVersion
+			}
+			return 0
+		}(),
 		Parallel:                 s.Parallel,
 		Threads:                  s.Threads,
 		ThreadsBatch:             s.ThreadsBatch,

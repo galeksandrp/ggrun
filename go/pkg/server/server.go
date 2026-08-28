@@ -240,14 +240,17 @@ func StartWithTimeoutToOptions(args []string, port int, timeout time.Duration, t
 
 	start := time.Now()
 	logStartupEvent(logStartupEvents, safeTermErr, "[launch] health check: polling http://127.0.0.1:%d/health then /v1/models (timeout %s)", port, timeout)
-	var stopSpin chan struct{}
-	if tty {
-		stopSpin = make(chan struct{})
-		go spinUntilReady(stopSpin, logBuf, start, timeout, cmd.Process.Pid, args)
-	}
+	logStartupEvent(logStartupEvents, safeTermErr, "%s", loadingIntro(args, timeout))
+	stopSpin := make(chan struct{})
+	spinDone := make(chan struct{})
+	go func() {
+		defer close(spinDone)
+		spinUntilReady(stopSpin, logBuf, start, timeout, cmd.Process.Pid, args, tty, safeTermErr, logStartupEvents)
+	}()
 	err = p.waitReady(timeout)
+	close(stopSpin)
+	<-spinDone
 	if tty {
-		close(stopSpin)
 		fmt.Fprint(os.Stderr, "\r\033[K") // clear the spinner line
 	}
 	if err != nil {
@@ -647,27 +650,68 @@ func (g *gatedWriter) Write(p []byte) (int, error) {
 
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 
-// spinUntilReady animates a single status line on stderr while the backend loads.
-// It combines backend log phase text with /proc fd offsets, which gives useful
-// progress even when llama.cpp itself does not print a byte counter.
-func spinUntilReady(stop <-chan struct{}, log *threadSafeBuffer, start time.Time, timeout time.Duration, pid int, args []string) {
+const loadProgressLogEvery = 10 * time.Second
+
+func loadingIntro(args []string, timeout time.Duration) string {
+	path := modelPathFromArgs(args)
+	name := filepath.Base(path)
+	if name == "" || name == "." {
+		name = "model"
+	}
+	_, total := modelShardPaths(path)
+	if total > 0 {
+		return fmt.Sprintf("[launch] loading %s (%s); overall start progress below (timeout %s)",
+			name, formatGiB(total), timeout.Round(time.Second))
+	}
+	return fmt.Sprintf("[launch] loading %s; overall start progress below (timeout %s)",
+		name, timeout.Round(time.Second))
+}
+
+// spinUntilReady reports overall model-start progress until health is ready.
+// A TTY gets a single updating status line; the launch log always gets a
+// newline snapshot about every 10s plus phase changes, so Claude/file launches
+// still show elapsed time and ETA.
+func spinUntilReady(stop <-chan struct{}, log *threadSafeBuffer, start time.Time, timeout time.Duration, pid int, args []string, tty bool, logW io.Writer, logEvents bool) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	progress := newLoadProgressTracker(pid, args)
 	lastLine := ""
-	for i := 0; ; i++ {
-		select {
-		case <-stop:
-			return
-		case <-t.C:
-			logTail := log.Tail(64 * 1024)
-			line := fitStatusLine(fmt.Sprintf("%s  %s",
-				spinnerFrames[i%len(spinnerFrames)],
-				startupStatus(logTail, time.Since(start), timeout, progress.Snapshot())))
+	lastLog := time.Time{}
+	lastPhase := ""
+	i := 0
+	report := func() {
+		logTail := ""
+		if log != nil {
+			logTail = log.Tail(64 * 1024)
+		}
+		snap := progress.Snapshot()
+		status := startupStatus(logTail, time.Since(start), timeout, snap)
+		phase := startupPhase(logTail)
+		if tty {
+			line := fitStatusLine(fmt.Sprintf("%s  %s", spinnerFrames[i%len(spinnerFrames)], status))
 			if line != lastLine {
 				fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
 				lastLine = line
 			}
+		}
+		if lastLog.IsZero() || time.Since(lastLog) >= loadProgressLogEvery || phase != lastPhase {
+			if logEvents {
+				logStartupEvent(true, logW, "[launch] loading %s", status)
+			} else if !tty {
+				fmt.Fprintf(os.Stderr, "[launch] loading %s\n", status)
+			}
+			lastLog = time.Now()
+			lastPhase = phase
+		}
+		i++
+	}
+	report()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			report()
 		}
 	}
 }
@@ -723,6 +767,9 @@ func startupStatus(logText string, elapsed, timeout time.Duration, progress load
 	} else {
 		parts = append(parts, fmt.Sprintf("elapsed %s", elapsed.Round(time.Second)))
 	}
+	if eta := loadETA(elapsed, progress); eta > 0 {
+		parts = append(parts, fmt.Sprintf("eta ~%s", eta))
+	}
 	if progress.Total > 0 && progress.Done > 0 {
 		parts = append(parts, fmt.Sprintf("read %s/%s", formatGiB(progress.Done), formatGiB(progress.Total)))
 	}
@@ -730,6 +777,25 @@ func startupStatus(logText string, elapsed, timeout time.Duration, progress load
 		parts = append(parts, truncateStatus(line, 90))
 	}
 	return strings.Join(parts, " | ")
+}
+
+func loadETA(elapsed time.Duration, p loadProgress) time.Duration {
+	if p.Total <= 0 || p.Done <= 0 || p.Done >= p.Total {
+		return 0
+	}
+	sec := elapsed.Seconds()
+	if sec < 2 {
+		return 0
+	}
+	rate := float64(p.Done) / sec
+	if rate < 1024 {
+		return 0
+	}
+	remain := time.Duration(float64(p.Total-p.Done) / rate * float64(time.Second)).Round(time.Second)
+	if remain < time.Second {
+		return 0
+	}
+	return remain
 }
 
 func progressPercent(p loadProgress) int {

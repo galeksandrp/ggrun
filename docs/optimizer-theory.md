@@ -332,17 +332,18 @@ behavior.
 
 ## Implementation map and current state
 
-| Area | File / functions | 2026-08-27 state |
+| Area | File / functions | 2026-08-28 state |
 |---|---|---|
 | Stable placement | `go/pkg/placement/placement.go`: `Compute`, `buildMoEOffload`, ubatch fit ladder | Existing fit-first baseline retained. `MoESplitOwnerGPU` is calibration-only; nil does not force an owner policy. |
 | Candidate generation | `go/pkg/placement/calibrate.go`: `CalibrationCandidates`, batch/slot/topology recomputes | Bounded complete candidates exist, including one sole-backbone-owner hypothesis per feasible MoE GPU. |
 | Ledger/classification | `go/pkg/placement/optimizer.go`: `BuildResourceLedger`, `AnalyzeCandidateFrontier`, `TightLiveCandidates` | Roomy/tight/non-resident states and exact-ledger gating exist. Complete guarded GPU/host peaks carry a placement hash, so backend-unlabelled model bytes remain exact only for the argv shape that produced them. Host slack for a topology that adds CPU experts is charged explicitly. |
 | Static ranking | `EstimateStrategyCost` and MoE helper functions | Working tree prices backbone, GPU experts, CPU experts, and activation transfers separately. Owner names no longer receive priority. |
 | Utilization signal | `AnalyzeDeviceBalance`, `SelectDeviceBalanceFinalist` | Idle MoE expert storage is ignored as a false balance peer. A telemetry-directed topology must also predict at least a small cost reduction. |
-| Automatic controller | `go/cmd/ggrun/calibrate.go`: `automaticCalibrationFinalistPlan`, `runCalibration` | Baseline plus one finalist; identical bounded agent workload; measured promotion/baseline-won persistence. The old owner-name shortcut is removed. |
+| Phase evidence | `go/pkg/benchmark/resources.go`, `process_linux.go`; `go/pkg/placement/bottleneck.go` | Cold prefill, append, decode, and mixed phases retain GPU and process-tree CPU/RSS/I/O summaries. Queue fields are accepted only from an optional non-perturbing source; standard calibration does not poll scheduler-backed `/metrics` for them. A conservative typed diagnosis can prioritize one feasible complete finalist; incomplete evidence stays unknown. |
+| Automatic controller | `go/cmd/ggrun/calibrate.go`: `automaticCalibrationFinalistPlan`, `runCalibration` | Baseline plus at most three admission fallbacks and one successfully measured challenger; identical bounded agent workload; per-phase regression guard; measured promotion/baseline-won persistence. The old owner-name shortcut is removed. |
 | Exact challenger admission | `go/cmd/ggrun/main.go`: `startLaunchExactAdmission` | Working tree rejects all currently identified argv-rewrite paths rather than recovering a challenger into a different candidate. |
-| Persistence | `go/pkg/placement/calibrate.go` | Schema must be bumped whenever candidate/scoring/evidence semantics change; placement-bound aggregate evidence uses calibration schema 16. |
-| Tests | repository validation | Focused four-package run: 889 tests. Full and race runs: 1,400 tests each. Build, vet, Windows vet, formatting, ShellCheck, Python/shell suites, and Linux ARM64, Darwin ARM64, and Windows AMD64 cross-builds pass. |
+| Persistence | `go/pkg/placement/calibrate.go` | Schema must be bumped whenever candidate/scoring/evidence semantics change; placement-bound aggregate and performance evidence use calibration schema 17. Older fit proof may remain reusable, but older performance proof may not. |
+| Tests | repository validation | Focused core run: 971 tests. Full and race runs: 1,435 tests each. Build, vet, Windows vet, formatting, ShellCheck, Python/shell suites, and Linux ARM64, Darwin ARM64, and Windows AMD64 cross-builds pass. |
 
 The working tree also contains a separate Grok/user fork-discovery lane. Do not
 rewrite or discard `forksearch`, backend-selection, or TUI changes while
@@ -350,49 +351,121 @@ finishing this optimizer lane.
 
 ## Hardware evidence available now
 
-The active Qwen3.8 Flash Next qwen4exp run is a stable baseline, not a settled
-performance winner. It serves one explicit slot at ctx 262,144, batch/ubatch
-`2048/256`, Q8 K/V, 21 GPU and 27 CPU expert layers, and no mmap. Aggregate
-backend counters currently show about 117.44 prompt tok/s and 11.11 decode
-tok/s; a completed 104k-context turn decoded at 10.61 tok/s and the following
-turn was near 9.9 tok/s. Prompt work drove the RTX 4070 to about 79% SM while
-the other devices were lighter; decode samples were low-to-moderate on all
-three. That observation identifies phase imbalance but does not select a
-different topology or slot count.
+### Live Qwen3.8-Flash-Next qwen4exp cache review, 2026-08-27 22:47–23:25 UTC
 
-Its schema-15 record had zero exact frontier candidates even though guarded
-peaks existed: this backend reported its GPU model allocation inside
-`unaccounted`, while the legacy exactness gate required labelled model-share
-rows. It chose `ubatch-2048` from a low-confidence estimate, could not admit it,
-and restored `2048/256`. The working tree fixes the evidence model, preserves
-the full host cgroup peak and full guarded breakdown across later KV-only
-observations, and advances calibration schema 16. The next intentional relaunch
-must show how the corrected exact ledger classifies the launch before another
-performance claim is made.
+The afternoon qwen4exp placement failure is resolved and that launch is the
+live server: 262144 ctx, one slot, `2048/256`, K/V q5_1, split
+`0.29,0.61,0.10`, 22 GPU / 26 CPU expert layers, no mmap, CRAM 13824, 16
+checkpoints (min spacing 512), and `--kv-offload`. The live argv predates the
+new CPU-expert affinity path; the source emits only exactly advertised flags on
+a contiguous Linux CPU set allowed to the process. Reviewer Qwen3.5-2B on
+CUDA0 `:36539`. Log:
+`.logs/ggrun-claude-server-v2-8081-670015b98e88d0be37009e66.log`.
+
+Cache-behavior evidence from `/metrics`, `/slots`, and the scope log:
+
+- Cumulative prompt reuse **2,253,240 / 2,499,374 total prompt tokens =
+  91.3% cached** (23:21 sample); a 3-minute window reused 460k cached tokens
+  while processing 12.9k uncached at ~138 tok/s.
+- Live agent turn at 94.4% cache hit (61,528 of 65,193 prompt tokens cached);
+  decode tg_3s **11.9 tok/s** at ~75k live context vs 8.9 tok/s at ~140k
+  earlier — decode cost tracks live KV length on top of the fixed
+  26-CPU-expert DRAM work.
+- Checkpoint machinery active: 111 created / 68 invalidated-erased events,
+  ~112.571 MiB per checkpoint slot; strict-append restores branch points
+  without re-prefill. CRAM prompt cache retains prior prompts with
+  checkpoint sets (~342–524 MiB each observed).
+- Aggregate over the 3h window: 124.8 prompt tok/s / 9.77 decode tok/s mean.
+  GPU SM 10/19/8%, llama ~544% CPU on 14 pinned threads, host 134 GiB free.
+
+Conclusion: cache stack (q5_1 KV + kv-offload + checkpoints + CRAM) is not the
+bottleneck — 9 of 10 prompt tokens skip prefill entirely. The remaining
+wall-clock cost is the CPU-expert DRAM bound already recorded above; the
+measured challenger (more complete expert layers on the 3090 Ti) would improve
+both TTFT and decode.
+
+### Live DeepSeek-V4-Flash Q3 XL, 2026-08-27 19:16–19:33 UTC
+
+TUI launch at 18:39:52 (`ctx=fit`, explicit `parallel=2`, inherited bf16 KV,
+Claude Code, reviewer `qwen2b`). Serving started 19:16:12 on
+`llama-server-cuda-a7f612d366cdba231abe0fd9` (PATH ggrun from 18:00,
+sha256 prefix `81f2f37991a5f1dc`). Health became OK after 12m27s. Scope
+`100afe682825fc24426a7afe`, workload
+`claude-agent-parallel-v4:custom-36d10adae080c622`. Log:
+`.logs/ggrun-claude-server-v2-8081-100afe682825fc24426a7afe.log`. Probe cache
+`5404ea79f032.probe` at 19:28:40 records live-allocated compute 2177 MiB on
+CUDA0 (591/591 on CUDA1/CUDA2) and placement hash
+`31edf8edc701b1eb5813b471231529d87beb7d4d8ac3a7baf128a8e1b1ad7fa1`.
+
+Exact serving argv (0.0.0.0:8081):
+
+- model `DeepSeek-V4-Flash-0731-UD-Q3_K_XL` (284.33B params, 43 blocks)
+- `--ctx-size 987136` (`n_seq_max=2`, 493568 tokens/slot; train 1,048,576)
+- `-b 128 -ub 64`, `--cache-type-k/v bf16`, `--parallel 2`
+- `--tensor-split 0.26,0.64,0.10 --split-mode layer`
+- GPU experts: layers 0–3 → CUDA1 (3090 Ti), 4 → CUDA0 (4070), 5 → CUDA2 (3060);
+  `--n-cpu-moe 37`
+- `--no-mmap -cram 15360 --ctx-checkpoints 16 --checkpoint-min-step 512`
+- reviewer: Qwen3.5-2B Q4_K_M on CUDA0 `:43071`, ctx 65536
+
+Load ledgers from the backend (MiB), plus the 19:32 nvidia-smi sample:
+
+| device | model | KV caches | compute | nvidia-smi used |
+|---|---:|---:|---:|---:|
+| CUDA0 RTX 4070 | 4308.71 | 1552.25 | 2177.06 | 8491 (includes ~4.8 GiB reviewer) |
+| CUDA1 RTX 3090 Ti | 14977.55 | 4343.50 | 591.32 | 20554 |
+| CUDA2 RTX 3060 | 3559.56 | 612.00 | 590.57 | 7157 |
+| CUDA_Host | 99416.56 | — | 32.72 | RSS 104094056 KiB ≈ 101.7 GiB |
+
+Host 217096 MiB total, ~102976 MiB available at sample, no mmap. This is still
+a **roomy** host relative to the 97 GiB CPU-expert working set. Recovery to
+`128/64` is not proof the launch is tight.
+
+Eighteen `print_timing` pairs before teardown: 4786 prompt tokens in 292.8 s
+(**16.35 tok/s** aggregate) and 402 decode tokens in 107.8 s (**3.73 tok/s**).
+Solo ~660-token prefills ran 15.4–20.6 tok/s. A 64-token decode concurrent with
+a 663-token prefill dropped to **1.93–1.94 tok/s** while that prompt stayed
+~20.5 tok/s. Idle-slot 64-token decode was ~6.0 tok/s.
+
+Utilization while 8081 was serving: CUDA0 **100% SM** / 7% mem / 56 W; CUDA1
+**1% SM** / 0% mem / 112 W holding 20.5 GiB; CUDA2 **0% SM**. Serial
+ordinary-layer work on the 4070 plus idle expert storage on the 3090 Ti. Not
+proof that a 3090-owner topology is faster.
+
+At 19:33:16 the controller **stopped 8081** and started a contained memguard
+probe on 127.0.0.1:45867: `-b 8192 -ub 8192`, split `0.30,0.60,0.10`,
+`--n-cpu-moe 39` (four GPU expert layers), `checkpoint-min-step 8192`, limits
+`GGRUN_MEMGUARD_GPU_LIMITS_MB=10254,20104,6851`. At 19:35:30 it was still
+loading (RSS ~5.4 GiB, VRAM 4833/9578/5713). That is a search/probe, not a
+promoted winner. No DeepSeek `cal-*.json` exists yet (newest calibration file
+is the 16:01 Qwen record).
+
+This snapshot is P1 *inventory*, not P1 *acceptance*. Still missing: two
+identical agent-screen samples, an exact-admitted finalist with no recovery
+rewrite, and promote-or-baseline-won persistence under schema 17.
+
+### Earlier Qwen3.8 Flash Next qwen4exp, 2026-08-27 afternoon
+
+Stable baseline, not a settled winner: one explicit slot at ctx 262,144,
+batch/ubatch `2048/256`, Q8 K/V, 21 GPU and 27 CPU expert layers, no mmap.
+Aggregate counters were about 117.44 prompt tok/s and 11.11 decode tok/s. The
+schema-15 record had zero exact frontier candidates because the backend labelled
+GPU model bytes as `unaccounted`. Schema 17 contains that fix and the newer
+performance-evidence rules. That process is no longer the live server.
 
 The older DeepSeek-class runs answer two other questions:
-
-Two runs of the same broad model class answer different questions:
 
 - On the historical 128 GB host, the fit path was genuinely tight. The preserved
   1M-context, parallel-4 run completed one 60,020-token request plus three
   concurrent requests without OOM/restart/truncation. It measured about
   29.05 prompt tok/s and 5.88 decode tok/s. That is stability evidence.
-- On the current roughly 217 GB host, a 146 GiB-class Q3 XL configuration is
-  roomy despite a prior recovery. The observed launch used two slots, 1,048,576
-  total context, BF16 GPU KV, batch/ubatch 128/64, seven GPU expert layers,
-  36 CPU-expert layers, no mmap, and an approximately
-  `0.23/0.67/0.09` layer split.
-- During one 76,433-token cold prefill, CUDA0 (RTX 4070) repeatedly reached
-  roughly 95-100% SM while the 3090 Ti and 3060 were mostly idle. Because
-  `-ot` disables pipeline parallel, that is evidence of a serial
-  ordinary-layer phase, not proof that every idle storage GPU should receive
-  backbone work.
-- A later sample used about 8.5 CPU cores while GPU SM was roughly
-  17%/16%/0%, consistent with a different CPU-expert-limited phase.
-- A cache canary processed 6,347 cold tokens at 24.16 tok/s and restored 6,343
-  tokens on a strict append. A later branch could not restore recurrent/SWA
-  state and was correctly not promoted.
+- On this 217 GB host, a prior recovered Q3 XL launch used two slots, 1,048,576
+  total context, BF16 GPU KV, `128/64`, seven GPU expert layers, 36 CPU-expert
+  layers, no mmap, and about `0.23/0.67/0.09`. A 76,433-token cold prefill ran
+  about 20.4 tok/s while CUDA0 sat at 95–100% SM and the other cards idled. A
+  later sample used ~8.5 CPU cores with SM 17%/16%/0%. Cache canary restored
+  6,343 of 6,347 tokens on a strict append; a branch without recurrent/SWA
+  state was correctly not promoted.
 
 Not proven yet:
 
@@ -412,16 +485,20 @@ Do not turn the first utilization sample into any of those claims.
 2. Link cost currently uses negotiated PCIe ceilings when direct measurements
    are absent. It does not yet have a complete directional P2P matrix.
 3. Prefill transfer and kernel-compute terms are deliberately approximate.
-   Phase telemetry is not yet rich enough to fit a hardware-specific roofline.
-4. Device-balance sampling currently has GPU SM/memory data but not typed
-   process-CPU, host-bandwidth, peer-traffic, or queue evidence in finalist
-   selection.
+   Phase telemetry now separates GPU and process CPU/RSS/I/O behavior and has
+   an optional queue schema, but standard calibration does not yet have a
+   non-perturbing queue source or direct host DRAM/PCIe bandwidth, kernel
+   occupancy, or page-fault latency measurements sufficient for a
+   hardware-specific roofline.
+4. The typed `host_expert_path` diagnosis intentionally remains composite
+   until direct host-bandwidth, peer-traffic, and synchronization counters can
+   distinguish CPU expert GEMM from transfer and barrier costs.
 5. A complete public matrix still needs dense, sparse MoE, recurrent/SSM,
    single-GPU, heterogeneous multi-GPU, tight, roomy, and non-resident hardware.
-6. A failed sole automatic finalist currently settles the scoped baseline even
-   when the static estimate was low-confidence. Placement-bound evidence makes
-   the next selection better grounded, but admission-only fallback ordering and
-   bounded re-evaluation policy still need an explicit design.
+6. Automatic search is intentionally bounded to baseline plus at most three
+   admission fallbacks and stops after the first successfully measured
+   challenger. Broader exploration needs an explicit user-requested calibration
+   mode rather than silently lengthening a standard launch.
 
 ## Ordered next work
 
@@ -434,11 +511,20 @@ Do not turn the first utilization sample into any of those claims.
   activation transfers.
 - [x] Stop treating idle expert storage as an ordinary-layer balance defect.
 - [x] Make known challenger mutation/recovery paths fail exact admission.
-- [x] Add focused placement/controller regressions; 889 focused tests pass.
+- [x] Add focused core regressions; 971 focused tests pass.
 - [x] Bind complete guarded allocations to their exact placement and retain
   unlabelled device/cgroup peaks without transferring them to another split.
-- [x] Bump calibration schema to 16 so decisions produced by superseded
+- [x] Bump calibration schema to 17 so decisions produced by superseded
   scoring or exact-evidence behavior cannot be reused.
+- [x] Require a measured challenger outcome before persisting reusable
+  performance evidence; retain older fit proof independently.
+- [x] Retain phase-tagged GPU and process-tree CPU/RSS/I/O evidence, accept
+  optional non-perturbing queue evidence, and expose a conservative typed
+  bottleneck classifier without making it promotion authority.
+- [x] Bound progress polling with cancellation/backoff so monitoring cannot
+  leak scheduler requests or inflate queue counts.
+- [x] Add a repository core-engine contract, CODEOWNERS boundary, and focused
+  verification script for future agent edits.
 - [x] Add a generic exact-argv identity invariant and regression test.
 - [x] Add branch-level tests for each exact-admission mutation class.
 - [x] Run full Go tests, race tests, vet, formatting checks, shell/Python tests,
@@ -467,10 +553,10 @@ Run only when the hardware/model window is intentionally available:
 
 - Fit hardware-specific ubatch knees from successful exact scopes while keeping
   conservative priors for unseen public hardware.
-- Add process-CPU and host-bandwidth evidence to distinguish GPU-backbone from
-  CPU-expert bottlenecks.
-- Add queue/busy-slot evidence before allowing slot width to outrank batch or
-  topology.
+- Add direct host-bandwidth and PCIe evidence to split the composite host-expert
+  diagnosis into CPU GEMM, transfer, and synchronization causes.
+- Calibrate queue/busy-slot thresholds across real agent workloads before
+  allowing slot width to outrank batch or topology.
 - Measure P2P before generating row/tensor-parallel candidates.
 - Expand the acceptance matrix and publish anonymized evidence fixtures.
 - Finish ordinary mmap last-resort acceptance. Keep selective expert
@@ -485,9 +571,10 @@ rtk git status --short --branch
 rtk git diff --stat
 ```
 
-Then inspect this document, `docs/core-standard-launch-todos.md`, and the
-targeted diffs. Do not reset the dirty tree: it contains both the optimizer work
-and a user-owned fork lane.
+Then inspect this document, `docs/core-standard-launch-todos.md`,
+`docs/core-engine-change-contract.md`, and the targeted diffs. Core-path edits
+must satisfy `AGENTS.md`. Do not reset a dirty tree: it may contain optimizer
+work and a user-owned fork lane.
 
 Validation commands must be run separately:
 

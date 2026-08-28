@@ -16,7 +16,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 16
+const CalibrationSchemaVersion = 17
 
 var calibrationShardBasename = regexp.MustCompile(`(?i)^(.*)-00001-of-[0-9]{5}\.gguf$`)
 
@@ -1094,6 +1094,10 @@ type CalibrationScopeKey struct {
 	ParallelExplicit    bool
 	BatchSize           int
 	UBatchSize          int
+	Threads             int
+	ThreadsBatch        int
+	CPURange            string
+	CPUStrict           bool
 	BatchExplicit       bool
 	UBatchExplicit      bool
 	KVQuality           string
@@ -1127,6 +1131,10 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 	parallel := opts.Parallel
 	batchSize := opts.BatchSize
 	ubatchSize := opts.UBatchSize
+	threads := opts.Threads
+	threadsBatch := opts.Threads
+	cpuRange := ""
+	cpuStrict := false
 	kvQuality := opts.KVQuality
 	kvType := ""
 	basePlacement := ""
@@ -1144,6 +1152,14 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 		if base.UBatchSize > 0 {
 			ubatchSize = base.UBatchSize
 		}
+		if base.Threads > 0 {
+			threads = base.Threads
+		}
+		if base.ThreadsBatch > 0 {
+			threadsBatch = base.ThreadsBatch
+		}
+		cpuRange = base.CPURange
+		cpuStrict = base.CPUStrict
 		if base.KVQuality != "" {
 			kvQuality = base.KVQuality
 		}
@@ -1172,6 +1188,10 @@ func NewCalibrationScopeKey(model *ModelProfile, caps *detect.Capabilities, opts
 		ParallelExplicit:    opts.ParallelExplicit,
 		BatchSize:           batchSize,
 		UBatchSize:          ubatchSize,
+		Threads:             threads,
+		ThreadsBatch:        threadsBatch,
+		CPURange:            cpuRange,
+		CPUStrict:           cpuStrict,
 		BatchExplicit:       opts.BatchSizeExplicit,
 		UBatchExplicit:      opts.UBatchSizeExplicit,
 		KVQuality:           kvQuality,
@@ -1221,6 +1241,8 @@ func (k CalibrationScopeKey) String() string {
 		fmt.Sprintf("%d", max(1, k.WorkloadConcurrency)),
 		fmt.Sprintf("%d", k.ContextSize), fmt.Sprintf("%d", k.Parallel),
 		fmt.Sprintf("%d", k.BatchSize), fmt.Sprintf("%d", k.UBatchSize),
+		fmt.Sprintf("%d", k.Threads), fmt.Sprintf("%d", k.ThreadsBatch),
+		k.CPURange, fmt.Sprintf("%t", k.CPUStrict),
 		fmt.Sprintf("%t", k.ParallelExplicit),
 		fmt.Sprintf("%t", k.BatchExplicit), fmt.Sprintf("%t", k.UBatchExplicit),
 		k.KVQuality, k.KVQualityV, k.KVType, k.GPUSet, k.BasePlacement, k.MemoryPolicy,

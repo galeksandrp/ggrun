@@ -168,8 +168,18 @@ type Strategy struct {
 	ReclaimableHostWeightsMB int  `json:"reclaimable_host_weights_mb,omitempty"`
 	FlashAttention           bool `json:"flash_attention"`
 	Threads                  int  `json:"threads"`
-	BatchSize                int  `json:"batch_size"`
-	UBatchSize               int  `json:"ubatch_size"`
+	// CPURange / CPUStrict pin llama.cpp workers to physical cores for both
+	// decode (--threads) and agent prefill (--threads-batch). Hyperthread
+	// siblings share L1/L2 and DRAM ports; CPU-expert MoE is bandwidth-bound
+	// in both phases.
+	CPURange                      string `json:"cpu_range,omitempty"`
+	CPUStrict                     bool   `json:"cpu_strict,omitempty"`
+	BackendSupportsCPURange       bool   `json:"-"`
+	BackendSupportsCPURangeBatch  bool   `json:"-"`
+	BackendSupportsCPUStrict      bool   `json:"-"`
+	BackendSupportsCPUStrictBatch bool   `json:"-"`
+	BatchSize                     int    `json:"batch_size"`
+	UBatchSize                    int    `json:"ubatch_size"`
 	// BatchTuned marks a live, profile-scoped calibration winner. It is runtime
 	// state only: cached decisions re-derive the named candidate, while verified
 	// configs still require the matching calibration decision before bypassing
@@ -762,6 +772,55 @@ func backendFitTakesValue(help string) bool {
 	return strings.Contains(help, "--fit [on|off]") ||
 		strings.Contains(help, "--fit (on|off)") ||
 		strings.Contains(help, "--fit <on|off>")
+}
+
+// backendHelpSupportsExactFlag rejects prefix matches such as treating
+// --cpu-range-batch as proof of --cpu-range. The generic capability helper is
+// intentionally substring-based for feature names; emitted argv flags need an
+// exact token boundary.
+func backendHelpSupportsExactFlag(help, flag string) bool {
+	help = strings.ToLower(help)
+	flag = strings.ToLower(strings.TrimSpace(flag))
+	if help == "" || flag == "" {
+		return false
+	}
+	for offset := 0; offset < len(help); {
+		index := strings.Index(help[offset:], flag)
+		if index < 0 {
+			return false
+		}
+		index += offset
+		end := index + len(flag)
+		beforeOK := index == 0 || !backendFlagNameByte(help[index-1])
+		afterOK := end == len(help) || !backendFlagNameByte(help[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		offset = index + 1
+	}
+	return false
+}
+
+func backendFlagNameByte(value byte) bool {
+	return value == '-' || value == '_' || value >= '0' && value <= '9' ||
+		value >= 'a' && value <= 'z'
+}
+
+func configureCPUAffinity(strategy *Strategy, caps *detect.Capabilities, backendHelp string) {
+	if strategy == nil {
+		return
+	}
+	strategy.BackendSupportsCPURange = backendHelpSupportsExactFlag(backendHelp, "--cpu-range")
+	strategy.BackendSupportsCPURangeBatch = backendHelpSupportsExactFlag(backendHelp, "--cpu-range-batch")
+	strategy.BackendSupportsCPUStrict = backendHelpSupportsExactFlag(backendHelp, "--cpu-strict")
+	strategy.BackendSupportsCPUStrictBatch = backendHelpSupportsExactFlag(backendHelp, "--cpu-strict-batch")
+	strategy.CPURange = ""
+	strategy.CPUStrict = false
+	if caps == nil || !strategy.BackendSupportsCPURange {
+		return
+	}
+	strategy.CPURange = detect.CompactCPURange(caps.CPU.PhysicalIDs)
+	strategy.CPUStrict = strategy.CPURange != "" && strategy.BackendSupportsCPUStrict
 }
 
 func backendCheckpointMinStepFlag(help, backendTag string) string {
@@ -1407,6 +1466,7 @@ func computeResolvedStrategy(caps *detect.Capabilities, model *ModelProfile, opt
 		BackendSupportsKVOffload:     backendHelpSupports(opts.BackendHelp, "--kv-offload"),
 		BackendCheckpointMinStepFlag: backendCheckpointMinStepFlag(opts.BackendHelp, opts.BackendTag),
 	}
+	configureCPUAffinity(s, caps, opts.BackendHelp)
 
 	if s.ContextSize <= 0 {
 		s.ContextSize = defaultContextSize(model, caps)
@@ -5672,6 +5732,21 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 		"--threads", fmt.Sprintf("%d", s.Threads),
 		"--threads-batch", fmt.Sprintf("%d", s.ThreadsBatch),
 	)
+	// Affinity is a CPU-expert best estimate, not a universal dense/GPU policy.
+	// Keep other architectures on the backend/OS defaults until matched live
+	// workload evidence proves a broader rule.
+	if s.NCPUMoE > 0 && s.CPURange != "" && s.BackendSupportsCPURange {
+		args = append(args, "--cpu-range", s.CPURange)
+		if s.CPUStrict {
+			args = append(args, "--cpu-strict", "1")
+		}
+		if s.BackendSupportsCPURangeBatch {
+			args = append(args, "--cpu-range-batch", s.CPURange)
+			if s.CPUStrict && s.BackendSupportsCPUStrictBatch {
+				args = append(args, "--cpu-strict-batch", "1")
+			}
+		}
+	}
 
 	if s.KVPlacement == "cpu" {
 		args = append(args, "--no-kv-offload")

@@ -4,7 +4,7 @@
 > direct CLI. This is the GGUF/llama.cpp lane; it does not depend on FreeToken,
 > AI Tune, or multi-model orchestration.
 
-Status: active implementation, 2026-08-27.
+Status: active implementation, 2026-08-28.
 
 The theory, evidence schema, implementation map, known risks, and exact resume
 sequence are preserved in [optimizer-theory.md](optimizer-theory.md). Treat it
@@ -12,14 +12,17 @@ as the handoff document for this tracker.
 
 ## Implementation snapshot
 
-The 2026-08-27 working tree contains the first core implementation plus a
+The 2026-08-28 working tree contains the first core implementation plus a
 correction that restores the fit-first baseline, removes topology-name
 priority, and separates backbone, GPU-expert, CPU-expert, and activation costs.
 It also binds complete guarded peaks to an exact placement identity, preserves
 unlabelled cgroup/device bytes, and versions qwen4exp tensor accounting so a
 large host-only PLE table is neither charged to GPU backbone nor required when
-the GGUF legitimately omits it. The focused four-package run passes 889 tests;
-the full repository and race runs each pass 1,400 tests, with build, vet,
+the GGUF legitimately omits it. Phase-tagged GPU/process evidence and an
+optional non-perturbing queue schema now feed a conservative typed bottleneck
+diagnosis, which may prioritize one complete finalist but cannot bypass exact
+admission or the live A/B gate. The focused core run passes 971 tests; the full
+repository and race runs each pass 1,435 tests, with build, vet,
 formatting, shell/Python suites, ShellCheck, and three supported cross-builds
 clean. The canonical binary has been rebuilt from this tree. Checkboxes below
 remain open under the tracking rule at the end of this document until claims
@@ -37,7 +40,7 @@ that depend on real hardware have preserved live evidence.
 | PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
 | ROOMY-1, ROOMY-2, ROOMY-3, ROOMY-4, ROOMY-6 | Implemented in source: exact residual slack classifies roomy; tight live-tests only the proven shape; topology ranking prefers a fitting fastest single GPU; batch/ubatch/slots are full recomputes; winner/baseline-won/boundary persist | Commit plus live roomy dense/MoE/recurrent proof |
-| ROOMY-5 | Partially implemented in the working tree: PCI-keyed SM sampling spans the complete agent trial; only imbalance between ordinary-layer owners is actionable, and telemetry cannot select a predicted-slower topology | Capture a matched live DeepSeek-class baseline/finalist comparison, then add process CPU, peer/host traffic, and queue telemetry only where it changes finalist selection |
+| ROOMY-5 | Partially implemented in the working tree: PCI-keyed SM plus Linux process-tree CPU/RSS/I/O sampling spans each separate agent phase; only imbalance between ordinary-layer owners is actionable, and telemetry cannot select a predicted-slower topology | Capture a matched live DeepSeek-class baseline/finalist comparison, then add direct host/peer traffic and a non-perturbing queue source only where they change finalist selection |
 | Exact-argv admission and long-load UX | Implemented in the working tree: a recomputed argv must receive its own allocation evidence, guarded peaks carry a placement identity, known challenger rewrite/recovery paths fail closed, lateral MoE split churn retains the exact proven placement, and 64+ GiB models warn before loading | Commit, then repeat the live MoE case after the current server is intentionally stopped |
 | MMAP-1, MMAP-2, MMAP-4 | Implemented: production/preflight/recovery/daemon share capability-aware reclaim policy; unknown/anonymous loaders fail closed; mmap remains last-resort and consent-gated | Commit plus live resident/mmap/anonymous cases |
 | MMAP-3 | Host ledger now separates exact reclaimable expert bytes from non-reclaimable runtime, KV, embeddings, and checkpoint reserve | Audit remaining backend-reported buffers/page tables/companions against live cgroup data |
@@ -46,15 +49,144 @@ that depend on real hardware have preserved live evidence.
 
 ## Live evidence: stable serving versus proven optimization
 
-### Active Qwen3.8 Flash Next run: safe baseline, optimization unresolved
+### Live Qwen3.8-Flash-Next qwen4exp cache review, 2026-08-27 22:47–23:25 UTC
 
-The active qwen4exp launch uses 262,144 total context, one explicitly requested
+The qwen4exp launch that failed placement on the afternoon of 2026-08-27 is now
+the live server (after the host-resident PLE parser fix): pid 901203, started
+~20:17 UTC, up 3h+; ggrun controller pid 888290 on `127.0.0.1:33645`; scope log
+`.logs/ggrun-claude-server-v2-8081-670015b98e88d0be37009e66.log`. Serving argv
+matches the afternoon dry-run: ctx 262144, one slot, `-b 2048 -ub 256`, K/V
+`q5_1`, split `0.29,0.61,0.10`, 22 GPU expert layers (0–11 CUDA1, 12–17 CUDA0,
+18–21 CUDA2) / 26 CPU, no mmap, CRAM 13824, 16 checkpoints at min spacing 512,
+and `--kv-offload`. This already-running argv predates the new physical-core
+affinity path; subsequent CPU-expert launches emit only exactly advertised
+range/strict flags and only for a contiguous Linux CPU set allowed to the
+process. KV buffers at load: 2304 + 864 MiB (q5_1, 24 layers x
+262144 cells total across two shards of 12). A separate reviewer server
+(Qwen3.5-2B Q4_K_M, `.bin/llama-server-cuda`, `:36539`, CUDA0) shares the host.
+
+Cache review findings (server metrics + slot snapshot + log counters):
+
+- **Prompt cache reuse is the headline: 91.3% cumulative.** At 23:21 the
+  server had processed 246,134 uncached prompt tokens and reused 2,253,240
+  cached tokens. A second sample at 23:24 shows 258,996 / 2,713,300 — a
+  ~3-minute window of 12,862 prompt tokens at ~138 tok/s uncached ingest while
+  reusing 460,060 cached tokens.
+- **Current turn (task 79447): 94.4% cache hit.** Slot snapshot: 65,193 prompt
+  tokens, 61,528 cached, only 1,906 processed. The turn is a long-context
+  Claude Code agent turn (~138k) with per-step appends hitting
+  `memory_seq_rm [n, end)`.
+- **Context checkpoints are working, not free.** Log counts 111 created /
+  68 erased-invalidated checkpoint events; each checkpoint is ~112.571 MiB, so
+  16 slots cost ~1.8 GiB inside the CRAM budget. The `--kv-offload` +
+  checkpoint pattern (PR #15293 machinery) restores mid-turn branches without
+  full re-prefill; invalidated checkpoints are erased on divergence, which is
+  the expected strict-append behavior.
+- **Prompt cache (CRAM 13824 MiB) holds prior prompts** with their own
+  checkpoint sets (~342 MiB for small prompts, ~524 MiB at 6.1k tokens).
+  Multi-turn agent work keeps prior conversations restorable.
+- **Decode improved as context got shorter: tg_3s ~11.9 tok/s** on the live
+  task (vs 8.9 tok/s at ~140k context in the 22:47 sample), consistent with
+  the CPU-expert/DRAM-bandwidth diagnosis — decode cost scales with live KV
+  length, not just fixed expert work. Prefill sample: 5,720 tokens at 170.4
+  tok/s; short-turn prefill 37–50 tok/s (small n dominates latency floor).
+- **Aggregate counters**: 65,536 predicted tokens in 6,707 s (9.77 tok/s mean
+  over the whole 3h window), 246,134 prompt tokens in 1,972 s (124.8 tok/s
+  mean). GPU SM 10/19/8% (4070/3090 Ti/3060), 3090 Ti at 159 W; llama ~544%
+  CPU (~14 threads of 14 pinned), load ~7.9, host 134 GiB available.
+- The ~1 MiB `/metrics` spec_decode counters remain zero (no draft model).
+
+Cache config verdict: the q5_1 K/V + kv-offload + 16-checkpoint + CRAM stack
+is behaving as designed under Claude Code agent load — 9 in 10 prompt tokens
+never re-hit the CPU/GPU prefill path. The remaining wall-clock cost is the
+same 26-CPU-expert DRAM bottleneck recorded at 22:47; cache machinery is not
+the bottleneck.
+
+Follow-up shipped from this review: the Claude Code status line showed prefill
+tok/s but no decode rate, because the monitor took decode only from the
+`/metrics` gauge (a scheduler task that times out on the monitor's 3 s budget
+exactly while decode owns the scheduler) and had no decode log parser. The
+monitor now parses the backend's per-task `tg_3s` windowed-rate log line,
+prefers it over the whole-run `/metrics` average, fetches `/metrics`
+with one short cancellable attempt and an independent two-minute backoff, and
+merges both rates in the passive path (CHANGELOG "Unreleased"; tests cover
+decode capture, cancellation, backoff, and exact queue accounting). Installed
+PATH `ggrun` sha256 prefix `e3250c7cfa4cedd3` (2026-08-28); the live
+controller picks it up on its next launch.
+
+### Live reviewer-lane error, 2026-08-27 23:3x UTC diagnosis
+
+The live reviewer server itself (Qwen3.5-2B, `:36539`) is healthy: zero 5xx,
+zero `send_error`, five tasks served. The user-visible error — Claude Code
+permission-classifier timeouts blocking tool calls ("Stage 2 classifier
+error", "auto mode cannot determine the safety of Bash") — comes from the
+classifier lane having no dedicated slot:
+
+- With a review-only reviewer (`ServesWorkers=false`), the utility lane falls
+  through to the main model (`claudeauto.go` utilityEnabled = hasCompanion =
+  false), so ~200 KB non-stream classifier calls queue behind the single slot
+  (`--parallel 1`) while it serves 28-minute foreground streams: 45–80 s
+  latency against an ~80 s client patience. Nine client aborts recorded in
+  `.logs/ggrun-claude-requests-33645.jsonl`.
+- The two mechanisms meant to keep classification on the reviewer both leak it
+  back to main: (a) the overflow guard estimates tokens as bytes/3, which
+  under-counts code-dense/escaped bodies — 18 historical 400 overflows in
+  `ggrun-claude-reviewer-41197.log` (65,675–415,683 tokens vs 65,536 ctx);
+  (b) the strict `<block>yes|no</block>` verdict matcher rejected all four
+  real reviews today (only the engineered startup canary passed), so those
+  went to main too (no reviewer row in the requests jsonl).
+- ultra-zen fixed the same failure class on 2026-08-27 (commit `b414ea0`,
+  "dedicated small-fast tier for the permission classifier"): route the
+  cheap tier to its own model instead of the session model. The ggrun port is
+  smaller — the 2B reviewer is already seated — and is: route utility/haiku
+  requests to the reviewer backend when a separate reviewer exists and the
+  request fits its context, plus loosening the bytes/3 estimate and fixing the
+  verdict-template mismatch (prime suspect: the 2B running the
+  `qwen3.8-27b.jinja` template file). `SetCompanion("local", …)` must stay
+  review-only so Workflow worker sub-agents are not degraded to the 2B.
+- Not yet implemented in ggrun; recorded here as the accepted diagnosis.
+
+### Live DeepSeek-V4-Flash Q3 XL, 2026-08-27 19:16–19:33 UTC
+
+This is the Codex P1 inventory sample, not P1 acceptance.
+
+TUI request 18:39:52: `ctx=fit`, explicit parallel 2, inherited bf16, Claude
+Code, reviewer `qwen2b`. PATH ggrun from 18:00 (`81f2f37991a5f1dc`) started
+`llama-server-cuda` at 19:16:12. Health OK after 12m27s. Scope
+`100afe682825fc24426a7afe`. Log
+`.logs/ggrun-claude-server-v2-8081-100afe682825fc24426a7afe.log`. Live probe
+row `5404ea79f032.probe` (19:28:40) binds compute 2177/591/591 MiB to placement
+hash `31edf8edc701b1eb5813b471231529d87beb7d4d8ac3a7baf128a8e1b1ad7fa1`.
+
+Serving argv on `:8081`: ctx 987136 (two 493568-token slots), `-b 128 -ub 64`,
+bf16 KV, split `0.26,0.64,0.10`, GPU experts 0–3 on CUDA1 / 4 on CUDA0 / 5 on
+CUDA2, `--n-cpu-moe 37`, no mmap, CRAM 15360, 16 checkpoints. Reviewer 2B on
+CUDA0 `:43071`. Backend model buffers: CUDA0 4308.71, CUDA1 14977.55, CUDA2
+3559.56, host 99416.56 MiB. nvidia-smi while serving: 8491 / 20554 / 7157 MiB
+used; CUDA0 100% SM, CUDA1 1%, CUDA2 0%. RSS ≈ 101.7 GiB. Host still had ~103
+GiB available — roomy, not tight.
+
+Eighteen backend timing pairs: 4786 prompt tokens at **16.35 tok/s**, 402 decode
+tokens at **3.73 tok/s**. A 64-token decode concurrent with a 663-token prefill
+ran **1.93 tok/s**. Solo 64-token decode was ~6.0 tok/s.
+
+At 19:33:16 the controller tore down 8081 and launched a memguard probe on
+`:45867` with `-b 8192 -ub 8192`, split `0.30,0.60,0.10`, `--n-cpu-moe 39`.
+That probe was still loading at 19:35:30. It is not a promoted configuration.
+No DeepSeek calibration JSON was written.
+
+P1 still needs two identical agent-screen samples, exact-argv admission of one
+finalist, and a persisted winner or baseline-won under schema 17.
+
+### Earlier Qwen3.8 Flash Next run: safe baseline, optimization unresolved
+
+That qwen4exp launch used 262,144 total context, one explicitly requested
 slot, Q8 K/V, batch/ubatch `2048/256`, 21 GPU expert layers and 27 CPU-expert
 layers, no mmap, a `0.29/0.61/0.10` layer split, 13,312 MiB CRAM, and 16
-checkpoints. A separate 4B reviewer occupies about 4.25 GiB on the RTX 3060;
-that card's apparent lack of free VRAM is therefore not all main-model state.
+checkpoints. A separate 4B reviewer occupied about 4.25 GiB on the RTX 3060;
+that card's apparent lack of free VRAM was therefore not all main-model state.
 
-The server is healthy. At the latest sample it had processed 222,917 uncached
+The server was healthy. At the latest sample it had processed 222,917 uncached
 prompt tokens in 1,898.06 seconds (117.44 tok/s aggregate) and generated 28,234
 tokens in 2,542.08 seconds (11.11 tok/s aggregate), with a maximum observed
 sequence of 110,587 tokens. One completed 104k-context turn prefetched 12,129
@@ -75,18 +207,17 @@ candidates. The source fix records a hash of every allocation-affecting
 placement coordinate and trusts a matching guarded aggregate even when the
 backend cannot label its model rows. It also carries the cgroup peak into the
 same-launch host ledger and prevents a later KV-only observation from erasing
-that proof. Calibration schema 16 retires the old settled claim.
+that proof. Calibration schema 17 retires the old settled claim and requires a
+measured challenger outcome before performance evidence is reusable.
 
-Therefore the current answer is: **stable and reasonable, but not yet the
-fastest validated setting**. Because parallel 1 was explicit, the optimizer
-correctly did not test parallel 2. The active process remains untouched; the
-next intentional relaunch with the rebuilt binary will record the new exact
-identity, reclassify residual headroom, and admit at most one newly ranked live
-finalist.
+That Qwen answer remains: **stable and reasonable, but not yet the fastest
+validated setting**. Parallel 1 was explicit, so the optimizer correctly did
+not test parallel 2. The process is no longer live; the DeepSeek snapshot
+above is the current hardware window.
 
 ### Earlier ~217 GB host DeepSeek-class run: roomy/performance evidence, 2026-08-26
 
-The current 146 GiB-class Q3 XL launch is **not** representative tight-fit
+That earlier 146 GiB-class Q3 XL launch is **not** representative tight-fit
 evidence. The same checkpoint fits this server comfortably: its guarded probe
 peaked at about 121.3 GiB of a 196.7 GiB host limit, and the live host still has
 about 106 GiB available. Recovery to a known-safe argv does not change that
@@ -129,8 +260,9 @@ layers, that is consistent with a CPU-expert-limited phase. The calculated
 frontier already prices CPU-expert bandwidth and prefers a feasible denser GPU
 expert pack; the repeated live workflow still decides whether that, a larger
 microbatch, more useful slots, or an owner topology actually wins. The current
-source does not yet record process CPU/peer/queue telemetry as typed promotion
-evidence, so that remains part of ROOMY-5 rather than being implied by GPU SM.
+source records phase-tagged process CPU/RSS/I/O, but not direct DRAM/PCIe/peer
+traffic or a non-perturbing live queue counter. Those remain part of ROOMY-5
+rather than being implied by GPU SM.
 
 `parallel=2` is therefore not yet proven faster. It provides a second slot and
 halves guaranteed context to 524,288 tokens per agent, but the observed request

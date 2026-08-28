@@ -158,18 +158,10 @@ func (r *Runner) runAgentParallelTrial(lanes, trial int) (*Result, error) {
 	for lane := range prefillPrompts {
 		prefillPrompts[lane] = r.agentBenchmarkLongPrompt(trial, lane)
 	}
-	// Observe the complete active trial, not only the final mixed phase. Serial
-	// agent launches otherwise sampled a short decode and learned nothing about
-	// the long-prefill imbalance users actually wait for. Idle frames are still
-	// discarded by the sampler.
-	stopGPUObservation := startGPUUtilizationObservation(r)
-	observationStopped := false
-	defer func() {
-		if !observationStopped {
-			_ = stopGPUObservation()
-		}
-	}()
+	phaseUtilization := make([]PhaseUtilization, 0, 4)
+	stopPrefillObservation := startPhaseResourceObservation(r, AgentPhasePrefill)
 	prefill, prefillWall, err := r.runParallelChats(prefillPrompts, 1, 1, true, 100+trial*1000)
+	phaseUtilization = append(phaseUtilization, stopPrefillObservation())
 	if err != nil {
 		return nil, fmt.Errorf("parallel prefill: %w", err)
 	}
@@ -191,7 +183,9 @@ func (r *Runner) runAgentParallelTrial(lanes, trial int) (*Result, error) {
 	for lane := range appendPrompts {
 		appendPrompts[lane] = prefillPrompts[lane] + fmt.Sprintf("\nTool result for lane %d: tests passed. Produce the next compact engineering action list.", lane)
 	}
+	stopAppendObservation := startPhaseResourceObservation(r, AgentPhaseAppend)
 	appendResults, appendWall, err := r.runParallelChats(appendPrompts, agentBenchmarkGenTokens, agentBenchmarkGenTokens, true, 200+trial*1000)
+	phaseUtilization = append(phaseUtilization, stopAppendObservation())
 	if err != nil {
 		return nil, fmt.Errorf("cache-backed append turn: %w", err)
 	}
@@ -202,7 +196,9 @@ func (r *Runner) runAgentParallelTrial(lanes, trial int) (*Result, error) {
 	for lane := range genPrompts {
 		genPrompts[lane] = fmt.Sprintf("Lane %d: produce a compact deterministic engineering checklist. Continue until the token budget is exhausted.", lane)
 	}
+	stopDecodeObservation := startPhaseResourceObservation(r, AgentPhaseDecode)
 	generation, genWall, err := r.runParallelChats(genPrompts, agentBenchmarkGenTokens, agentBenchmarkGenTokens, false, 300+trial*1000)
+	phaseUtilization = append(phaseUtilization, stopDecodeObservation())
 	if err != nil {
 		return nil, fmt.Errorf("parallel generation: %w", err)
 	}
@@ -212,11 +208,15 @@ func (r *Runner) runAgentParallelTrial(lanes, trial int) (*Result, error) {
 		genTPS = float64(genTokens) / genWall.Seconds()
 	}
 
+	stopMixedObservation := startPhaseResourceObservation(r, AgentPhaseMixed)
 	mixedTokens, mixedWall, mixedTPS, err := r.runMixedAgentPhase(lanes, trial)
-	gpuUtilization := stopGPUObservation()
-	observationStopped = true
+	phaseUtilization = append(phaseUtilization, stopMixedObservation())
 	if err != nil {
 		return nil, fmt.Errorf("mixed agent phase: %w", err)
+	}
+	var gpuUtilization []GPUUtilization
+	for _, phase := range phaseUtilization {
+		gpuUtilization = mergeGPUUtilization(gpuUtilization, phase.GPUUtilization)
 	}
 
 	return &Result{
@@ -240,90 +240,9 @@ func (r *Runner) runAgentParallelTrial(lanes, trial int) (*Result, error) {
 		AgentCachedTokens:    cachedTokens,
 		AgentNewPromptTokens: newPromptTokens,
 		GPUUtilization:       gpuUtilization,
+		PhaseUtilization:     phaseUtilization,
 		Timestamp:            time.Now().Unix(),
 	}, nil
-}
-
-// startGPUUtilizationObservation samples throughout the complete agent trial:
-// long prefill, cached append, decode, and mixed traffic. A point sample after
-// the request completed mostly measured an idle server and could not support a
-// topology diagnosis. All-idle frames are discarded, so a missing/broken
-// sampler still fails closed instead of becoming balance proof.
-func startGPUUtilizationObservation(r *Runner) func() []GPUUtilization {
-	if r == nil || r.SampleGPUUtilization == nil {
-		return func() []GPUUtilization { return nil }
-	}
-	interval := r.GPUUtilizationInterval
-	if interval <= 0 {
-		interval = defaultGPUUtilInterval
-	}
-	type aggregate struct {
-		sm, memory, observations int
-	}
-	stop := make(chan struct{})
-	done := make(chan []GPUUtilization, 1)
-	go func() {
-		byGPU := map[int]aggregate{}
-		observe := func() {
-			samples := r.SampleGPUUtilization()
-			maxSM := 0
-			for _, sample := range samples {
-				if sample.SMPercent > maxSM {
-					maxSM = sample.SMPercent
-				}
-			}
-			if maxSM < activeGPUUtilThreshold {
-				return
-			}
-			for _, sample := range samples {
-				agg := byGPU[sample.GPU]
-				agg.sm += sample.SMPercent
-				agg.memory += sample.MemPercent
-				agg.observations++
-				byGPU[sample.GPU] = agg
-			}
-		}
-
-		// The command itself takes long enough to overlap real inference in the
-		// common case; subsequent ticks cover longer prefill/decode phases.
-		observe()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				observe()
-			case <-stop:
-				if len(byGPU) == 0 {
-					done <- nil
-					return
-				}
-				out := make([]GPUUtilization, 0, len(byGPU))
-				for gpu, agg := range byGPU {
-					if agg.observations <= 0 {
-						continue
-					}
-					out = append(out, GPUUtilization{
-						GPU: gpu, SMPercent: agg.sm / agg.observations,
-						MemPercent:   agg.memory / agg.observations,
-						Observations: agg.observations,
-					})
-				}
-				sort.Slice(out, func(i, j int) bool { return out[i].GPU < out[j].GPU })
-				done <- out
-				return
-			}
-		}
-	}()
-	var once sync.Once
-	var result []GPUUtilization
-	return func() []GPUUtilization {
-		once.Do(func() {
-			close(stop)
-			result = <-done
-		})
-		return result
-	}
 }
 
 func (r *Runner) runParallelChats(prompts []string, maxTokens, minTokens int, cachePrompt bool, seedBase int) ([]timedChatResult, time.Duration, error) {
@@ -490,6 +409,9 @@ func aggregateAgentTrials(trials []*Result) *Result {
 		if len(trial.GPUUtilization) > 0 {
 			out.GPUUtilization = mergeGPUUtilization(out.GPUUtilization, trial.GPUUtilization)
 		}
+		if len(trial.PhaseUtilization) > 0 {
+			out.PhaseUtilization = mergePhaseUtilization(out.PhaseUtilization, trial.PhaseUtilization)
+		}
 	}
 	n := float64(len(trials))
 	out.PromptTokens /= len(trials)
@@ -504,6 +426,7 @@ func aggregateAgentTrials(trials []*Result) *Result {
 	out.AgentTurnTimeS /= n
 	out.AgentScenarioTimeS /= n
 	out.AgentNewPromptTokens /= len(trials)
+	averagePhaseUtilization(out.PhaseUtilization, len(trials))
 	return out
 }
 

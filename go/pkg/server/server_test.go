@@ -449,6 +449,40 @@ func TestModelShardPathsSplitGGUF(t *testing.T) {
 	}
 }
 
+func TestStartupStatusIncludesETAFromReadRate(t *testing.T) {
+	got := startupStatus("load_tensors: loading model", 2*time.Minute, 30*time.Minute, loadProgress{
+		Done:  30 << 30,
+		Total: 120 << 30,
+	})
+	if !strings.Contains(got, "elapsed 2m0s (limit 30m0s)") {
+		t.Fatalf("elapsed/limit missing: %q", got)
+	}
+	if !strings.Contains(got, "eta ~6m0s") {
+		t.Fatalf("overall remaining time missing: %q", got)
+	}
+}
+
+func TestLoadETARequiresAStableReadRate(t *testing.T) {
+	if got := loadETA(time.Second, loadProgress{Done: 1 << 30, Total: 10 << 30}); got != 0 {
+		t.Fatalf("eta in first two seconds = %s, want 0", got)
+	}
+	if got := loadETA(2*time.Minute, loadProgress{Done: 10 << 30, Total: 10 << 30}); got != 0 {
+		t.Fatalf("eta after weights are read = %s, want 0", got)
+	}
+}
+
+func TestLoadingIntroNamesModelAndSize(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Model.gguf")
+	if err := os.WriteFile(path, make([]byte, 2<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := loadingIntro([]string{"llama-server", "-m", path}, 30*time.Minute)
+	if !strings.Contains(got, "[launch] loading Model.gguf") || !strings.Contains(got, "timeout 30m0s") {
+		t.Fatalf("intro = %q", got)
+	}
+}
+
 func TestStartupStatusIncludesProgressAndLatestLine(t *testing.T) {
 	logText := "main: loading model\nload_tensors: loading model tensors, this can take a while...\n"
 	got := startupStatus(logText, 90*time.Second, 30*time.Minute, loadProgress{

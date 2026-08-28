@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -374,5 +375,170 @@ func TestClaudeProgressMonitorPublishesAndCleansState(t *testing.T) {
 	stop()
 	if _, err := os.Stat(claudeProgressStatePath(port)); !os.IsNotExist(err) {
 		t.Fatalf("progress state was not cleaned up: %v", err)
+	}
+}
+
+func TestParseClaudeLogSnapshotDecodesFromLog(t *testing.T) {
+	log := `
+slot launch_slot_: id  0 | task 96151 | processing task, is_child = 0
+slot print_timing: id  0 | task 96151 | prompt processing, n_tokens = 61528, progress = 0.94, t = 444.66 s / 138.41 tokens per second
+slot print_timing: id  0 | task 96151 | n_gen =    230, tg =   9.94 t/s, tg_3s =  10.78 t/s
+slot print_timing: id  0 | task 96151 | n_gen =    296, tg =  10.04 t/s, tg_3s =  10.78 t/s
+`
+	snapshot := parseClaudeLogSnapshot(log)
+	req, ok := snapshot.Active[96151]
+	if !ok {
+		t.Fatalf("decode task missing from snapshot: %+v", snapshot)
+	}
+	if req.Stage != "generating" || req.Generated != 296 {
+		t.Fatalf("unexpected decode state: %+v", req)
+	}
+	if req.DecodeTPS != 10.78 {
+		t.Fatalf("decode rate = %v, want windowed tg_3s 10.78", req.DecodeTPS)
+	}
+	// The prefill rate observed earlier in the same tail must survive the
+	// merge so the status can show both rates.
+	if req.PrefillTPS != 138.41 {
+		t.Fatalf("prefill rate = %v, want 138.41 retained across decode merge", req.PrefillTPS)
+	}
+}
+
+func TestParseDecodeLogProgressKeepsLatestPerTask(t *testing.T) {
+	log := `
+slot print_timing: id  0 | task 100 | n_gen =    100, tg =  10.69 t/s, tg_3s =  10.80 t/s
+slot print_timing: id  1 | task 101 | n_gen =    152, tg =   8.10 t/s, tg_3s =   8.35 t/s
+slot print_timing: id  0 | task 100 | n_gen =    296, tg =  10.04 t/s, tg_3s =  10.78 t/s
+`
+	items := parseDecodeLogProgress(log)
+	if len(items) != 2 {
+		t.Fatalf("got %d tasks, want 2: %+v", len(items), items)
+	}
+	var main decodeLogProgress
+	for _, item := range items {
+		if item.Task == 100 {
+			main = item
+		}
+	}
+	if main.Decoded != 296 || main.WindowRate != 10.78 {
+		t.Fatalf("latest decode progress not retained: %+v", main)
+	}
+}
+
+func TestPollClaudeProgressPrefersWindowedDecodeRate(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slots", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[
+  {"id":0,"id_task":9,"is_processing":true,"n_ctx":262144,"n_prompt_tokens":65193,"n_prompt_tokens_processed":61528,"next_token":{"has_next_token":true,"n_remain":30241,"n_decoded":1759}}
+]`))
+	})
+	// /metrics either fails (the scheduler-busy case) or returns a stale
+	// whole-run average; either way the log's windowed tg_3s must win.
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	mux.HandleFunc("/ggrun/router", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"active":1,"queued":0,"limit":1}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := testProgressLog("slot print_timing: id  0 | task 9 | prompt processing, n_tokens = 61528, progress = 0.94, t = 444.66 s / 138.41 tokens per second\nslot print_timing: id  0 | task 9 | n_gen =    296, tg =  10.04 t/s, tg_3s =  10.78 t/s\n")
+	state := pollClaudeProgress(srv.Client(), u.Hostname(), port, log)
+	if state.Active != 1 || len(state.Requests) != 1 {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+	req := state.Requests[0]
+	if req.Stage != "generating" {
+		t.Fatalf("stage = %q, want generating", req.Stage)
+	}
+	if req.DecodeTPS != 10.78 {
+		t.Fatalf("decode tps = %v, want 10.78 from tg_3s log line", req.DecodeTPS)
+	}
+	if req.PrefillTPS != 138.41 {
+		t.Fatalf("prefill tps = %v, want 138.41 retained", req.PrefillTPS)
+	}
+	got := formatClaudeProgress(state)
+	if !strings.Contains(got, "prefill 138.4 tok/s") || !strings.Contains(got, "decode 10.8 tok/s") {
+		t.Fatalf("status %q missing split rates", got)
+	}
+}
+
+func TestPollClaudeProgressCancelsSlowMetricsAndCountsRouterOnce(t *testing.T) {
+	var active atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slots", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[{"id":0,"is_processing":false}]`))
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		active.Add(1)
+		defer active.Add(-1)
+		<-r.Context().Done()
+	})
+	mux.HandleFunc("/ggrun/router", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"queued":3}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	state := pollClaudeProgress(srv.Client(), u.Hostname(), port, nil)
+	if elapsed := time.Since(started); elapsed > claudeProgressMetricsGrace+time.Second {
+		t.Fatalf("slow metrics request was not bounded: %s", elapsed)
+	}
+	if !state.metricsAttempted || state.metricsOK {
+		t.Fatalf("metrics backoff signal=%+v", state)
+	}
+	if state.Queued != 3 {
+		t.Fatalf("router queue was counted %d times, want exactly 3", state.Queued)
+	}
+	deadline := time.Now().Add(time.Second)
+	for active.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if active.Load() != 0 {
+		t.Fatal("cancelled metrics request remained active")
+	}
+}
+
+func TestPollClaudeProgressMetricsBackoffSkipsEndpoint(t *testing.T) {
+	var metricsCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slots", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`[]`))
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+		metricsCalls.Add(1)
+		_, _ = w.Write([]byte("llamacpp:requests_deferred 99\n"))
+	})
+	mux.HandleFunc("/ggrun/router", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"queued":2}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := pollClaudeProgressWithMetrics(srv.Client(), u.Hostname(), port, nil, false)
+	if metricsCalls.Load() != 0 || state.metricsAttempted || state.Queued != 2 {
+		t.Fatalf("metrics backoff was not isolated: calls=%d state=%+v", metricsCalls.Load(), state)
 	}
 }

@@ -262,6 +262,30 @@ func TestCalibrationScopeIncludesFullCorePolicy(t *testing.T) {
 	}
 }
 
+func TestCalibrationScopeSeparatesHostExecutionPolicy(t *testing.T) {
+	model := &ModelProfile{Path: "m.gguf", SizeBytes: 1234}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "gpu", VRAMTotalMB: 24576}}}
+	base := &Strategy{
+		ContextSize: 32768, Parallel: 2, BatchSize: 2048, UBatchSize: 512,
+		Threads: 14, ThreadsBatch: 14, CPURange: "0-13", CPUStrict: true,
+	}
+	baseline := NewCalibrationScopeKey(model, caps, Options{}, base).String()
+	variants := []*Strategy{}
+	for i := 0; i < 4; i++ {
+		copyBase := *base
+		variants = append(variants, &copyBase)
+	}
+	variants[0].Threads = 12
+	variants[1].ThreadsBatch = 12
+	variants[2].CPURange = ""
+	variants[3].CPUStrict = false
+	for i, variant := range variants {
+		if got := NewCalibrationScopeKey(model, caps, Options{}, variant).String(); got == baseline {
+			t.Fatalf("host execution variant %d shared calibration evidence", i)
+		}
+	}
+}
+
 func TestCalibrationCandidatesGeneralDenseSearchesBatchAndSlots(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{{Index: 0, Name: "gpu", VRAMTotalMB: 24576, BandwidthMBps: 32000}},

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -25,6 +26,11 @@ const (
 	// monitoring tasks into llama-server every second during slow multi-slot decode.
 	claudeProgressPollInterval = 2 * time.Second
 	claudeProgressStaleAfter   = 10 * time.Second
+	// /metrics gets this long to answer before the poll publishes without it. A
+	// missed metrics task does
+	// not blank the status: the backend's windowed tg_3s log line fills in the
+	// decode rate on the same cadence.
+	claudeProgressMetricsGrace = 1500 * time.Millisecond
 	// A timed-out /slots request is itself queued in llama-server's scheduler. Do
 	// not immediately submit another one while a long prefill owns the scheduler;
 	// passive log progress remains available during this backoff.
@@ -79,6 +85,10 @@ type claudeProgressState struct {
 	Event         string                  `json:"event,omitempty"`
 	StatusDelayed bool                    `json:"status_delayed,omitempty"`
 	Error         string                  `json:"error,omitempty"`
+	// metricsAttempted/metricsOK are monitor-local backoff signals. They are
+	// intentionally not serialized into the status file.
+	metricsAttempted bool
+	metricsOK        bool
 }
 
 type claudeProgressTracker struct {
@@ -97,7 +107,18 @@ type promptLogProgress struct {
 	Rate      float64
 }
 
+type decodeLogProgress struct {
+	Slot    int
+	Task    int
+	Decoded int
+	// WindowRate is the backend's tg_3s, a windowed decode rate that reacts to
+	// current conditions; the run-average tg is intentionally not kept.
+	WindowRate float64
+}
+
 var promptProgressRE = regexp.MustCompile(`slot print_timing: id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+prompt processing, n_tokens =\s*(\d+), progress =\s*([0-9.]+), t =\s*[0-9.]+\s*s /\s*([0-9.]+) tokens per second`)
+
+var decodeProgressRE = regexp.MustCompile(`slot print_timing: id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+n_gen =\s*(\d+), tg =\s*[0-9.]+ t/s, tg_3s =\s*([0-9.]+) t/s`)
 
 var slotLaunchRE = regexp.MustCompile(`slot launch_slot_:\s+id\s+(\d+)\s+\|\s+task\s+(\d+)\s+\|\s+processing task`)
 
@@ -249,13 +270,22 @@ func startClaudeProgressMonitor(host string, port int, log claudeProgressLog, te
 		defer ticker.Stop()
 		var previous claudeProgressState
 		var structuredRetryAt time.Time
+		var metricsRetryAt time.Time
 		for {
 			tryStructured := !time.Now().Before(structuredRetryAt)
-			state, structuredOK := pollClaudeProgressResilient(client, host, port, log, previous, tryStructured)
+			tryMetrics := !time.Now().Before(metricsRetryAt)
+			state, structuredOK := pollClaudeProgressResilientWithMetrics(client, host, port, log, previous, tryStructured, tryMetrics)
 			if structuredOK {
 				structuredRetryAt = time.Time{}
 			} else if state.StatusDelayed && tryStructured {
 				structuredRetryAt = time.Now().Add(claudeProgressBusyBackoff)
+			}
+			if state.metricsAttempted {
+				if state.metricsOK {
+					metricsRetryAt = time.Time{}
+				} else {
+					metricsRetryAt = time.Now().Add(claudeProgressBusyBackoff)
+				}
 			}
 			tracker.enrich(&state)
 			_ = writeClaudeProgressState(port, state)
@@ -279,8 +309,12 @@ func startClaudeProgressMonitor(host string, port int, log claudeProgressLog, te
 // request and advance it from passive server logs rather than reporting a dead
 // backend or continuously injecting more monitoring tasks.
 func pollClaudeProgressResilient(client *http.Client, host string, port int, log claudeProgressLog, previous claudeProgressState, tryStructured bool) (claudeProgressState, bool) {
+	return pollClaudeProgressResilientWithMetrics(client, host, port, log, previous, tryStructured, true)
+}
+
+func pollClaudeProgressResilientWithMetrics(client *http.Client, host string, port int, log claudeProgressLog, previous claudeProgressState, tryStructured, tryMetrics bool) (claudeProgressState, bool) {
 	if tryStructured {
-		state := pollClaudeProgress(client, host, port, log)
+		state := pollClaudeProgressWithMetrics(client, host, port, log, tryMetrics)
 		if state.Error == "" {
 			return state, true
 		}
@@ -377,11 +411,42 @@ func parseClaudeLogSnapshot(text string) claudeLogSnapshot {
 				if fraction > 0 {
 					total = int(float64(processed)/fraction + 0.5)
 				}
-				snapshot.Active[task] = claudeRequestProgress{
+				req := claudeRequestProgress{
 					Slot: slot, Task: task, Stage: "prefill", PromptProcessed: processed,
 					PromptTotal: total, PromptFraction: fraction, TokensPerSecond: rate,
 					PrefillTPS: rate,
 				}
+				// A decode line earlier in the tail for this same task means the
+				// request re-entered prefill after generating; keep that rate.
+				if active, ok := snapshot.Active[task]; ok && active.DecodeTPS > 0 {
+					req.DecodeTPS = active.DecodeTPS
+				}
+				snapshot.Active[task] = req
+				if slot+1 > snapshot.TotalSlots {
+					snapshot.TotalSlots = slot + 1
+				}
+			}
+			continue
+		}
+		if match := decodeProgressRE.FindStringSubmatch(line); len(match) == 5 {
+			slot, errSlot := strconv.Atoi(match[1])
+			task, errTask := strconv.Atoi(match[2])
+			decoded, errDecoded := strconv.Atoi(match[3])
+			rate, errRate := strconv.ParseFloat(match[4], 64)
+			if errSlot == nil && errTask == nil && errDecoded == nil && errRate == nil {
+				req := claudeRequestProgress{
+					Slot: slot, Task: task, Stage: "generating", Generated: decoded,
+					DecodeTPS: rate,
+				}
+				// Merge with any prefill state observed for this task so both
+				// rates survive in the passive path.
+				if active, ok := snapshot.Active[task]; ok {
+					req.PromptProcessed = active.PromptProcessed
+					req.PromptTotal = active.PromptTotal
+					req.PromptFraction = active.PromptFraction
+					req.PrefillTPS = active.PrefillTPS
+				}
+				snapshot.Active[task] = req
 				if slot+1 > snapshot.TotalSlots {
 					snapshot.TotalSlots = slot + 1
 				}
@@ -447,6 +512,10 @@ func (t *claudeProgressTracker) enrich(state *claudeProgressState) {
 }
 
 func pollClaudeProgress(client *http.Client, host string, port int, log claudeProgressLog) claudeProgressState {
+	return pollClaudeProgressWithMetrics(client, host, port, log, true)
+}
+
+func pollClaudeProgressWithMetrics(client *http.Client, host string, port int, log claudeProgressLog, tryMetrics bool) claudeProgressState {
 	state := claudeProgressState{UpdatedAt: time.Now()}
 	baseURL := "http://" + net.JoinHostPort(normalizeClaudeProgressHost(host), strconv.Itoa(port))
 	resp, err := client.Get(baseURL + "/slots")
@@ -472,7 +541,17 @@ func pollClaudeProgress(client *http.Client, host string, port int, log claudePr
 			logged[item.Task] = item
 		}
 	}
-	promptRate, generationRate, queued := pollClaudeMetrics(client, baseURL)
+	decoded := map[int]decodeLogProgress{}
+	if log != nil {
+		for _, item := range parseDecodeLogProgress(log.Tail(256 << 10)) {
+			decoded[item.Task] = item
+		}
+	}
+	promptRate, generationRate, queued := 0.0, 0.0, 0
+	if tryMetrics {
+		state.metricsAttempted = true
+		promptRate, generationRate, queued, state.metricsOK = pollClaudeMetrics(client, baseURL)
+	}
 	state.Queued = queued + pollClaudeRouterQueued(client, baseURL)
 	for _, slot := range slots {
 		if !slot.IsProcessing {
@@ -499,6 +578,13 @@ func pollClaudeProgress(client *http.Client, host string, port int, log claudePr
 			req.Stage = "generating"
 			req.DecodeTPS = generationRate
 			req.TokensPerSecond = generationRate
+			// The /metrics decode gauge is a whole-run average and can time out
+			// while decode owns the scheduler. The backend's periodic tg_3s log
+			// line is the windowed rate; prefer it when the task reported one.
+			if item, ok := decoded[slot.IDTask]; ok && item.WindowRate > 0 {
+				req.Generated = item.Decoded
+				req.DecodeTPS = item.WindowRate
+			}
 			// Retain the last known prefill rate so a mid-decode status can show
 			// both prompt and generation throughput over the sample window.
 			if item, ok := logged[slot.IDTask]; ok && item.Rate > 0 {
@@ -555,18 +641,50 @@ func parsePromptLogProgress(text string) []promptLogProgress {
 	return out
 }
 
-func pollClaudeMetrics(client *http.Client, baseURL string) (promptRate, generationRate float64, queued int) {
-	resp, err := client.Get(baseURL + "/metrics")
+func parseDecodeLogProgress(text string) []decodeLogProgress {
+	latest := map[int]decodeLogProgress{}
+	for _, match := range decodeProgressRE.FindAllStringSubmatch(text, -1) {
+		if len(match) != 5 {
+			continue
+		}
+		slot, errSlot := strconv.Atoi(match[1])
+		task, errTask := strconv.Atoi(match[2])
+		decoded, errDecoded := strconv.Atoi(match[3])
+		rate, errRate := strconv.ParseFloat(match[4], 64)
+		if errSlot != nil || errTask != nil || errDecoded != nil || errRate != nil {
+			continue
+		}
+		latest[task] = decodeLogProgress{Slot: slot, Task: task, Decoded: decoded, WindowRate: rate}
+	}
+	out := make([]decodeLogProgress, 0, len(latest))
+	for _, item := range latest {
+		out = append(out, item)
+	}
+	return out
+}
+
+// pollClaudeMetrics gives the scheduler-backed endpoint one short, cancellable
+// chance to answer. A miss triggers the monitor's long metrics-only backoff;
+// passive tg_3s/prompt log lines keep the visible rates current without stacking
+// abandoned metrics tasks behind active inference.
+func pollClaudeMetrics(client *http.Client, baseURL string) (promptRate, generationRate float64, queued int, ok bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), claudeProgressMetricsGrace)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/metrics", nil)
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, 0, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return 0, 0, 0
+		return 0, 0, 0, false
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, false
 	}
 	for _, match := range metricLineRE.FindAllStringSubmatch(string(data), -1) {
 		value, err := strconv.ParseFloat(match[2], 64)
@@ -582,7 +700,7 @@ func pollClaudeMetrics(client *http.Client, baseURL string) (promptRate, generat
 			generationRate = value
 		}
 	}
-	return promptRate, generationRate, queued
+	return promptRate, generationRate, queued, true
 }
 
 func writeClaudeProgressState(port int, state claudeProgressState) error {

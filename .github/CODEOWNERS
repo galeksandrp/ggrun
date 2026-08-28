@@ -1,0 +1,22 @@
+# The standard-launch optimizer is a coupled safety/performance controller.
+# GitHub branch protection should require this owner for changes to its core.
+/go/pkg/placement/                   @raketenkater
+/go/pkg/benchmark/                   @raketenkater
+/go/cmd/ggrun/calibrate.go           @raketenkater
+/go/cmd/ggrun/calibrate_test.go      @raketenkater
+/go/cmd/ggrun/main.go                @raketenkater
+/go/cmd/ggrun/main_test.go           @raketenkater
+/go/cmd/ggrun/preflight*.go          @raketenkater
+/go/cmd/ggrun/memory_probe_cmd.go    @raketenkater
+/go/cmd/ggrun/claude_progress*.go    @raketenkater
+/go/pkg/detect/                      @raketenkater
+/go/pkg/recovery/                    @raketenkater
+/go/pkg/server/                      @raketenkater
+/docs/core-engine-change-contract.md @raketenkater
+/docs/optimizer-theory.md            @raketenkater
+/docs/core-standard-launch-todos.md  @raketenkater
+/scripts/verify-core-engine.sh       @raketenkater
+/.github/workflows/ci.yml            @raketenkater
+/.github/CODEOWNERS                  @raketenkater
+/AGENTS.md                           @raketenkater
+/CLAUDE.md                           @raketenkater

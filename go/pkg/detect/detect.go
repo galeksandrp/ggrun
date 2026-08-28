@@ -60,6 +60,10 @@ type CPUInfo struct {
 	Cores   int    `json:"cores"`
 	Threads int    `json:"threads"`
 	Flags   string `json:"flags,omitempty"`
+	// PhysicalIDs are the lowest logical CPU of each physical core. Prefill and
+	// decode GEMM on CPU experts are DRAM-bandwidth bound; pinning llama.cpp to
+	// these IDs keeps both agent phases off hyperthread siblings.
+	PhysicalIDs []int `json:"physical_ids,omitempty"`
 }
 
 // Backend represents a discovered inference backend binary.
@@ -560,12 +564,49 @@ func detectCPU() CPUInfo {
 		model = strings.TrimSpace(string(out))
 	}
 
-	return CPUInfo{
-		Model:   model,
-		Cores:   cores,
-		Threads: threads,
-		Flags:   flags,
+	ids := detectPhysicalCPUList()
+	if len(ids) > 0 {
+		// The sysfs list is filtered through this process's allowed CPU set, so it
+		// is a better worker count than the host-wide /proc topology in containers
+		// and cpuset-constrained services.
+		cores = len(ids)
 	}
+	return CPUInfo{
+		Model:       model,
+		Cores:       cores,
+		Threads:     threads,
+		Flags:       flags,
+		PhysicalIDs: ids,
+	}
+}
+
+// CompactCPURange formats physical CPU IDs as a llama.cpp --cpu-range value
+// when they form one contiguous block (the common 0..N-1 case). An empty
+// string means the caller should omit the flag or use a mask instead.
+func CompactCPURange(ids []int) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	seen := map[int]bool{}
+	uniq := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id < 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		uniq = append(uniq, id)
+	}
+	if len(uniq) == 0 {
+		return ""
+	}
+	sort.Ints(uniq)
+	if uniq[len(uniq)-1]-uniq[0]+1 != len(uniq) {
+		return ""
+	}
+	if len(uniq) == 1 {
+		return strconv.Itoa(uniq[0])
+	}
+	return strconv.Itoa(uniq[0]) + "-" + strconv.Itoa(uniq[len(uniq)-1])
 }
 
 func detectBackends() []Backend {

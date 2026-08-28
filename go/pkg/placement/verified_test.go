@@ -71,7 +71,7 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 	}
 	if !loaded.MMapRequired || loaded.CPUExpertMMapCapability != CPUExpertMMapFileBacked ||
 		loaded.CPUExpertMMapEvidence != "live exact-build proof" || loaded.ReclaimableHostWeightsMB != 81920 ||
-		!loaded.BatchTuned || !loaded.PerformanceTuned {
+		!loaded.BatchTuned || !loaded.PerformanceTuned || loaded.PerformanceEvidenceSchema != CalibrationSchemaVersion {
 		t.Fatalf("optimizer/mmap evidence lost: %+v", loaded)
 	}
 	// The file lives under the verified-configs namespace with a hashed name.
@@ -81,6 +81,35 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 	}
 	if !strings.HasPrefix(filepath.Base(p), "verified-") || !strings.HasSuffix(filepath.Base(p), ".json") {
 		t.Fatalf("unexpected verified filename %q", filepath.Base(p))
+	}
+}
+
+func TestVerifiedConfigRequiresCurrentPerformanceEvidence(t *testing.T) {
+	vc := &VerifiedConfig{
+		StrategyType: SingleGPU, ContextSize: 8192, BatchSize: 2048, UBatchSize: 512,
+		Parallel: 1, PerformanceTuned: true,
+	}
+	legacy := VerifiedToStrategy(vc, Options{}, nil)
+	if legacy.PerformanceTuned {
+		t.Fatal("a verified placement without current calibration evidence suppressed the optimizer")
+	}
+	vc.PerformanceEvidenceSchema = CalibrationSchemaVersion
+	current := VerifiedToStrategy(vc, Options{}, nil)
+	if !current.PerformanceTuned {
+		t.Fatal("current performance evidence was not restored")
+	}
+}
+
+func TestVerifiedConfigRecomputesCurrentCPUAffinityCapabilities(t *testing.T) {
+	vc := &VerifiedConfig{
+		StrategyType: MoEOffload, ContextSize: 8192, BatchSize: 512, UBatchSize: 256,
+		Parallel: 1, NCPUMoE: 8,
+	}
+	caps := &detect.Capabilities{CPU: detect.CPUInfo{Cores: 4, PhysicalIDs: []int{0, 1, 2, 3}}}
+	s := VerifiedToStrategy(vc, Options{BackendHelp: "--cpu-range lo-hi\n--cpu-strict 0|1\n"}, caps)
+	args := strings.Join(s.Args("m.gguf", 8081), " ")
+	if !strings.Contains(args, "--cpu-range 0-3") || !strings.Contains(args, "--cpu-strict 1") {
+		t.Fatalf("verified-config reuse lost current affinity capability: %s", args)
 	}
 }
 

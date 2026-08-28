@@ -32,6 +32,10 @@ func detectPhysicalCores() int {
 	return n
 }
 
+func detectPhysicalCPUList() []int {
+	return nil
+}
+
 // detectRAMFreeMB returns available RAM on Windows.
 func detectRAMFreeMB() int {
 	ram := detectRAMWindows()

@@ -89,6 +89,14 @@ func TestRunAgentParallelExercisesConcurrentLongPromptAndMixedDecode(t *testing.
 		result.GPUUtilization[0].Observations < 2 || result.GPUUtilization[1].GPU != 2 {
 		t.Fatalf("mixed-phase GPU observation was not retained deterministically: %+v", result.GPUUtilization)
 	}
+	if len(result.PhaseUtilization) != 4 {
+		t.Fatalf("agent phases were not retained separately: %+v", result.PhaseUtilization)
+	}
+	for i, phase := range []AgentPhase{AgentPhasePrefill, AgentPhaseAppend, AgentPhaseDecode, AgentPhaseMixed} {
+		if result.PhaseUtilization[i].Phase != phase || len(result.PhaseUtilization[i].GPUUtilization) != 2 {
+			t.Fatalf("phase %d evidence=%+v", i, result.PhaseUtilization[i])
+		}
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if maxActive < 2 {

@@ -27,15 +27,23 @@ import (
 // indistinguishable at micro-probe precision and the estimated default stands.
 const calibrationMinImprovementPct = 3.0
 
+// A faster aggregate agent turn is not a valid core winner if it achieves that
+// result by materially sacrificing either prompt ingestion or generation.
+// Five percent is above the micro-screen noise floor while still permitting
+// small phase trade-offs whose end-to-end workflow improvement is repeatable.
+const calibrationMaxPhaseRegressionPct = 5.0
+
 const (
-	// Standard launch measures the already-running baseline plus one finalist
-	// selected from the calculated candidate set. A wider live sweep belongs to
-	// explicit maintenance mode; ordinary TUI/CLI launch must not reload a large
-	// model once per feasible neighbor.
-	calibrationAutoMaxCandidates   = 2
+	// Standard launch measures the already-running baseline plus at most one
+	// successfully admitted challenger. It may walk a short ranked admission
+	// ladder when an optimistic finalist cannot start exactly; this avoids
+	// declaring the baseline tuned merely because the first estimate missed its
+	// memory boundary. A wider successful live sweep still belongs to explicit
+	// maintenance mode.
+	calibrationAutoMaxCandidates   = 4
 	calibrationForcedMaxCandidates = 9
-	calibrationAutoFailureBudget   = 1
-	calibrationForcedFailureBudget = 2
+	calibrationAutoFailureBudget   = 3
+	calibrationForcedFailureBudget = 4
 	calibrationAutoMaxElapsed      = 20 * time.Minute
 	calibrationForcedMaxElapsed    = 60 * time.Minute
 	calibrationAdvisorTiePct       = 3.0
@@ -206,10 +214,37 @@ func automaticCalibrationFinalistPlan(req *launchRequest, cfg *config.Config, mo
 	}
 	// An estimated miss is not a product gate on a roomy launch. Contained
 	// admission remains the fail-closed proof.
-	return selectAutomaticCalibrationFinalist(ranked, func(strategy *placement.Strategy) bool {
+	return selectAutomaticCalibrationAdmissionPlan(ranked, func(strategy *placement.Strategy) bool {
 		return strategy != nil && strategy.ResourceLedger != nil &&
 			strategy.ResourceLedger.Exact && strategy.ResourceLedger.Fits
-	})
+	}, calibrationAutoMaxCandidates)
+}
+
+// selectAutomaticCalibrationAdmissionPlan keeps one calculated primary plus a
+// short sequence of already-ranked fallbacks. runCalibration stops after the
+// first challenger that both starts exactly and completes its measurement, so
+// these extra entries increase admission robustness without turning ordinary
+// launch into a successful-candidate sweep.
+func selectAutomaticCalibrationAdmissionPlan(candidates []placement.CalibrationCandidate, hasExactAllocation func(*placement.Strategy) bool, limit int) []placement.CalibrationCandidate {
+	if len(candidates) < 2 || limit < 2 {
+		return candidates
+	}
+	primary := selectAutomaticCalibrationFinalist(candidates, hasExactAllocation)
+	if len(primary) < 2 {
+		return primary
+	}
+	out := make([]placement.CalibrationCandidate, 0, min(limit, len(candidates)))
+	out = append(out, candidates[0], primary[1])
+	for _, candidate := range candidates[1:] {
+		if candidate.Name == primary[1].Name {
+			continue
+		}
+		out = append(out, candidate)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 func selectAutomaticCalibrationFinalist(candidates []placement.CalibrationCandidate, hasExactAllocation func(*placement.Strategy) bool) []placement.CalibrationCandidate {
@@ -448,7 +483,14 @@ func automaticCalibrationEvidenceValid(decision *placement.CalibrationDecision) 
 	if decision == nil {
 		return false
 	}
-	return decision.DefaultAgentSamples >= 2 && decision.WinnerAgentSamples >= 2 &&
+	// A baseline copied into the winner fields after every challenger failed is
+	// useful stability evidence, but it is not comparative performance evidence.
+	// Require an actually measured challenger before automatic launch may call
+	// either that challenger or the baseline a workflow winner.
+	challengerMeasured := decision.Finalist != "" &&
+		(decision.FinalistOutcome == "promoted" || decision.FinalistOutcome == "baseline-won")
+	return challengerMeasured &&
+		decision.DefaultAgentSamples >= 2 && decision.WinnerAgentSamples >= 2 &&
 		decision.DefaultTurnTimeS > 0 && decision.WinnerTurnTimeS > 0 &&
 		decision.DefaultTurnMaxS > 0 && decision.WinnerTurnMaxS > 0 &&
 		decision.AgentPromptBytes > 0 &&
@@ -525,6 +567,18 @@ func calibrationCandidateBetter(candidate, current calibrationMeasurement) bool 
 	if candidate.Score <= current.Score*(1+calibrationMinImprovementPct/100) {
 		return false
 	}
+	if candidate.Result != nil && current.Result != nil {
+		floor := 1 - calibrationMaxPhaseRegressionPct/100
+		for _, phase := range [][2]float64{
+			{candidate.Result.PromptTPS, current.Result.PromptTPS},
+			{candidate.Result.GenTPS, current.Result.GenTPS},
+			{candidate.Result.MixedGenTPS, current.Result.MixedGenTPS},
+		} {
+			if phase[1] > 0 && phase[0] < phase[1]*floor {
+				return false
+			}
+		}
+	}
 	if candidate.Result != nil && current.Result != nil && candidate.Result.AgentSamples > 0 {
 		// The mean must win beyond the noise floor and the slower confirmation
 		// sample must not regress. This prevents one lucky append from winning.
@@ -565,7 +619,8 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	scopeKey := calibrationScopeKey(req, model, be, caps, strategy)
 	startedAt := time.Now()
 	if mode == calibrateAuto {
-		fmt.Printf("[optimize] measuring the live baseline plus one calculated finalist (elapsed budget=%s)\n", budget.MaxElapsed)
+		fmt.Printf("[optimize] measuring the live baseline plus one successful calculated challenger (up to %d contained admissions, elapsed budget=%s)\n",
+			max(1, len(candidates)-1), budget.MaxElapsed)
 		printOptimizationSummary("optimize", candidates[0].Strategy, false)
 		finalist := candidates[1]
 		relative := 0.0
@@ -623,7 +678,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 				probe.PromptTPS, agentPromptBytes, approxTokens)
 		}
 	}
-	bench := func(active *placement.Strategy) (*benchmark.Result, error) {
+	bench := func(active *placement.Strategy, activeProcess *server.Process) (*benchmark.Result, error) {
 		remaining := budget.MaxElapsed - time.Since(startedAt)
 		if remaining <= 3*time.Second {
 			return nil, fmt.Errorf("calibration elapsed-time budget exhausted")
@@ -638,6 +693,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		runner := &benchmark.Runner{
 			BaseURL: baseURL, Model: model.Basename, Timeout: requestTimeout,
 			WorkloadID: scopeKey, AgentPromptBytes: agentPromptBytes,
+			SampleResources: calibrationProcessResourceSampler(activeProcess),
 			SampleGPUUtilization: func() []benchmark.GPUUtilization {
 				return sampleLaunchGPUUtilization(utilizationCaps)
 			},
@@ -664,7 +720,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	}
 
 	// The default is already running: measure it in place.
-	defaultResult, err := bench(strategy)
+	defaultResult, err := bench(strategy, p)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[calibrate] baseline measurement failed (%v); serving default placement\n", err)
 		return p, strategy, serverArgs, nil
@@ -675,6 +731,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	}}
 	fmt.Printf("[calibrate] default: workload makespan %.2fs, decode %.1f tok/s, prefill %.1f tok/s\n",
 		calibrationTurnTime(defaultResult), defaultResult.GenTPS, defaultResult.PromptTPS)
+	baselineDiagnosis := recordAgentBottleneckDiagnosis("default", caps, model, strategy, defaultResult)
 	if bottleneck := deviceBalanceBottleneckFromResult(strategy, defaultResult); bottleneck != "" {
 		fmt.Printf("[optimize] device balance: %s\n", bottleneck)
 		if strategy != nil && (strategy.OptimizationBottleneck == "" || strings.Contains(strategy.OptimizationBottleneck, "layer service")) {
@@ -698,7 +755,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 					fmt.Printf("[optimize] replacing calculated finalist %s with telemetry-directed %s to move work off saturated GPU %d\n",
 						candidates[1].Name, finalist.Name, signal.BusyGPU)
 				}
-				candidates = []placement.CalibrationCandidate{candidates[0], finalist}
+				candidates = prioritizeCalibrationFinalist(candidates, finalist)
 			} else {
 				fmt.Printf("[optimize] measured device imbalance, but no non-rejected same-workload topology can relieve GPU %d; keeping calculated finalist %s\n",
 					signal.BusyGPU, candidates[1].Name)
@@ -706,6 +763,13 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			if measuredBottleneck != "" {
 				strategy.OptimizationBottleneck = measuredBottleneck
 			}
+		}
+		if finalist, ok := bottleneckDirectedCalibrationFinalist(req, cfg, model, be, caps, strategy, baselineDiagnosis, memoryRecovery); ok {
+			if candidates[1].Name != finalist.Name {
+				fmt.Printf("[optimize] replacing calculated finalist %s with phase-directed %s for %s/%s\n",
+					candidates[1].Name, finalist.Name, baselineDiagnosis.PrimaryPhase, baselineDiagnosis.Primary)
+			}
+			candidates = prioritizeCalibrationFinalist(candidates, finalist)
 		}
 	}
 
@@ -760,7 +824,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			}
 			continue
 		}
-		result, berr := bench(measuredStrategy)
+		result, berr := bench(measuredStrategy, cp)
 		if berr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s measurement failed (%v); skipping\n", cand.Name, berr)
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after failed measurement", resourceBaseline, 30*time.Second) {
@@ -777,6 +841,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		score := calibrationScore(result, defaultResult)
 		fmt.Printf("[calibrate] %s: workload makespan %.2fs, decode %.1f tok/s, prefill %.1f tok/s, relative %.3f\n",
 			cand.Name, calibrationTurnTime(result), result.GenTPS, result.PromptTPS, score)
+		recordAgentBottleneckDiagnosis(cand.Name, caps, model, measuredStrategy, result)
 		if result.AgentSamples > 0 {
 			fmt.Printf("[calibrate] %s agent evidence: %d active lanes for %d-agent target, %d samples, %d bytes/lane, reuse >=%d tokens/lane, slowest workflow %.2fs, mixed foreground %.1f tok/s\n",
 				cand.Name, result.Parallel, result.AgentWorkloadLanes, result.AgentSamples, result.AgentPromptBytes,
@@ -789,6 +854,11 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		if !stopCalibrationProcessAndWait(cp, "measured candidate "+cand.Name, resourceBaseline, 30*time.Second) {
 			req.CalibrationScreened = true
 			return cp, measuredStrategy, measuredArgs, nil
+		}
+		if mode == calibrateAuto {
+			// The extra candidates are admission fallbacks, not permission to make
+			// ordinary launch reload a large model for a broad successful sweep.
+			break
 		}
 	}
 
@@ -918,7 +988,20 @@ func annotateOptimizationDecision(decision *placement.CalibrationDecision, candi
 	decision.BaselineBottleneck = baseline.OptimizationBottleneck
 	decision.ExploredBoundary = baseline.OptimizationBoundary
 
+	// If the primary estimate failed admission but a fallback completed, record
+	// the candidate that was actually compared. With no measured challenger the
+	// primary remains visible as unavailable and cannot pass the automatic
+	// evidence gate.
 	finalist := candidates[1]
+	for _, measured := range measurements[1:] {
+		for _, candidate := range candidates[1:] {
+			if candidate.Name == measured.Name {
+				finalist = candidate
+				break
+			}
+		}
+		break
+	}
 	decision.Finalist = finalist.Name
 	decision.FinalistEstimatedCost = finalist.Estimate.AgentCost
 	decision.FinalistConfidence = finalist.Estimate.Confidence
@@ -934,6 +1017,21 @@ func annotateOptimizationDecision(decision *placement.CalibrationDecision, candi
 		}
 		return
 	}
+}
+
+func prioritizeCalibrationFinalist(candidates []placement.CalibrationCandidate, finalist placement.CalibrationCandidate) []placement.CalibrationCandidate {
+	if len(candidates) < 2 || finalist.Name == "" {
+		return candidates
+	}
+	out := make([]placement.CalibrationCandidate, 0, len(candidates))
+	out = append(out, candidates[0], finalist)
+	for _, candidate := range candidates[1:] {
+		if candidate.Name == finalist.Name {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
 }
 
 func stopCalibrationProcess(process *server.Process, label string) bool {
@@ -992,6 +1090,37 @@ func sampleLaunchGPUUtilization(caps *detect.Capabilities) []benchmark.GPUUtiliz
 	return out
 }
 
+func calibrationProcessResourceSampler(p *server.Process) func() benchmark.ResourceSnapshot {
+	if p == nil || p.Cmd == nil || p.Cmd.Process == nil || p.Cmd.Process.Pid <= 0 {
+		return nil
+	}
+	return benchmark.NewProcessTreeResourceSampler(p.Cmd.Process.Pid)
+}
+
+func recordAgentBottleneckDiagnosis(label string, caps *detect.Capabilities, model *placement.ModelProfile, strategy *placement.Strategy, result *benchmark.Result) placement.WorkloadBottleneck {
+	diagnosis := placement.DiagnoseAgentBottleneck(caps, model, strategy, result)
+	if diagnosis.Primary == placement.BottleneckUnknown {
+		fmt.Printf("[optimize] %s bottleneck: unknown (%s)\n", label, diagnosis.Summary)
+		return diagnosis
+	}
+	fmt.Printf("[optimize] %s bottleneck [%s/%s]: %s\n",
+		label, diagnosis.Primary, diagnosis.Confidence, diagnosis.Summary)
+	for _, phase := range diagnosis.Phases {
+		if phase.Kind == placement.BottleneckUnknown {
+			continue
+		}
+		fmt.Printf("[optimize] %s phase %s [%s/%s]: %s\n",
+			label, phase.Phase, phase.Kind, phase.Confidence, phase.Summary)
+	}
+	if len(diagnosis.Levers) > 0 {
+		fmt.Printf("[optimize] %s safe levers: %s\n", label, strings.Join(diagnosis.Levers, "; "))
+	}
+	if strategy != nil {
+		strategy.OptimizationBottleneck = diagnosis.Summary
+	}
+	return diagnosis
+}
+
 func deviceBalanceBottleneckFromResult(strategy *placement.Strategy, result *benchmark.Result) string {
 	return placement.DeviceBalanceBottleneck(strategy, gpuUtilSamplesFromResult(result))
 }
@@ -1020,6 +1149,21 @@ func telemetryDirectedCalibrationFinalist(req *launchRequest, cfg *config.Config
 	if strategy == nil || strategy.Residency != placement.ResidencyRoomy {
 		return placement.CalibrationCandidate{}, false
 	}
+	frontier := analyzedMeasuredCalibrationFrontier(req, cfg, model, be, caps, strategy, memoryRecovery)
+	return placement.SelectDeviceBalanceFinalist(frontier, signal)
+}
+
+func bottleneckDirectedCalibrationFinalist(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, diagnosis placement.WorkloadBottleneck, memoryRecovery *launchMemoryRecovery) (placement.CalibrationCandidate, bool) {
+	if strategy == nil || strategy.Residency != placement.ResidencyRoomy ||
+		diagnosis.Primary == placement.BottleneckUnknown ||
+		diagnosis.Primary == placement.BottleneckCapacity {
+		return placement.CalibrationCandidate{}, false
+	}
+	frontier := analyzedMeasuredCalibrationFrontier(req, cfg, model, be, caps, strategy, memoryRecovery)
+	return placement.SelectBottleneckFinalist(frontier, diagnosis)
+}
+
+func analyzedMeasuredCalibrationFrontier(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, strategy *placement.Strategy, memoryRecovery *launchMemoryRecovery) []placement.CalibrationCandidate {
 	frontier := calibrationCandidates(req, cfg, model, be, caps, strategy)
 	if memoryRecovery != nil && memoryRecovery.hasRejections() {
 		frontier = filterCalibrationCandidates(frontier, func(candidate *placement.Strategy) bool {
@@ -1032,8 +1176,7 @@ func telemetryDirectedCalibrationFinalist(req *launchRequest, cfg *config.Config
 		cacheDir = cfg.CacheDir
 	}
 	opts := placementOptionsFromRequest(req, model, be, cacheDir)
-	frontier = placement.AnalyzeCandidateFrontier(caps, model, opts, frontier)
-	return placement.SelectDeviceBalanceFinalist(frontier, signal)
+	return placement.AnalyzeCandidateFrontier(caps, model, opts, frontier)
 }
 
 func cmdStatus(args []string) {

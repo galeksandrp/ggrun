@@ -54,11 +54,36 @@ func TestCalibrationPlanForcedOnIgnoresSizeGate(t *testing.T) {
 func TestCalibrationBudgetsAreFinite(t *testing.T) {
 	auto := calibrationBudgetFor(calibrateAuto)
 	forced := calibrationBudgetFor(calibrateOn)
-	if auto.MaxCandidates != 2 || auto.MaxFailures != 1 || auto.MaxElapsed != 20*time.Minute {
+	if auto.MaxCandidates != 4 || auto.MaxFailures != 3 || auto.MaxElapsed != 20*time.Minute {
 		t.Fatalf("unexpected automatic budget: %#v", auto)
 	}
 	if forced.MaxCandidates < auto.MaxCandidates || forced.MaxFailures < auto.MaxFailures || forced.MaxElapsed <= auto.MaxElapsed {
 		t.Fatalf("forced budget must remain finite but larger: auto=%#v forced=%#v", auto, forced)
+	}
+}
+
+func TestAutomaticAdmissionPlanKeepsRankedFallbacks(t *testing.T) {
+	base := &placement.Strategy{BatchSize: 128, UBatchSize: 128}
+	first := &placement.Strategy{BatchSize: 2048, UBatchSize: 2048}
+	exact := &placement.Strategy{BatchSize: 1024, UBatchSize: 1024}
+	last := &placement.Strategy{BatchSize: 512, UBatchSize: 512}
+	candidates := []placement.CalibrationCandidate{
+		{Name: "default", Strategy: base},
+		{Name: "ubatch-2048", Strategy: first, Estimate: placement.CandidateEstimate{AgentCost: 0.5}},
+		{Name: "ubatch-1024", Strategy: exact, Estimate: placement.CandidateEstimate{AgentCost: 0.51}},
+		{Name: "ubatch-512", Strategy: last, Estimate: placement.CandidateEstimate{AgentCost: 0.6}},
+	}
+	got := selectAutomaticCalibrationAdmissionPlan(candidates, func(strategy *placement.Strategy) bool {
+		return strategy == exact
+	}, 4)
+	want := []string{"default", "ubatch-1024", "ubatch-2048", "ubatch-512"}
+	if len(got) != len(want) {
+		t.Fatalf("admission plan length=%d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i].Name != want[i] {
+			t.Fatalf("admission plan[%d]=%q, want %q: %+v", i, got[i].Name, want[i], got)
+		}
 	}
 }
 
@@ -153,8 +178,21 @@ func TestDefaultWonDecisionRetainsCompleteAgentEvidence(t *testing.T) {
 	decision := newCalibrationDecision("scope", &placement.ModelProfile{Path: "/models/test.gguf"}, result,
 		calibrationMeasurement{Name: "default", Result: result, Score: 1})
 	if decision == nil || decision.Winner != "default" || decision.ModelBasename != "test.gguf" ||
-		decision.DefaultTurnTimeS != decision.WinnerTurnTimeS || !automaticCalibrationEvidenceValid(decision) {
+		decision.DefaultTurnTimeS != decision.WinnerTurnTimeS {
 		t.Fatalf("default-won evidence is incomplete: %+v", decision)
+	}
+	if automaticCalibrationEvidenceValid(decision) {
+		t.Fatal("a default result without a measured challenger became automatic evidence")
+	}
+	annotateOptimizationDecision(decision, []placement.CalibrationCandidate{
+		{Name: "default", Strategy: &placement.Strategy{}},
+		{Name: "ubatch-512", Strategy: &placement.Strategy{}},
+	}, []calibrationMeasurement{
+		{Name: "default", Result: result, Score: 1},
+		{Name: "ubatch-512", Result: result, Score: 1},
+	})
+	if !automaticCalibrationEvidenceValid(decision) {
+		t.Fatalf("measured default-won comparison was rejected: %+v", decision)
 	}
 }
 
@@ -205,6 +243,19 @@ func TestCalibrationScoreUsesSerialRequestWallTime(t *testing.T) {
 	fasterTurn := &benchmark.Result{GenTPS: 9, PromptTPS: 80, GenTokens: 256, PromptTokens: 100, GenTimeS: 8}
 	if got := calibrationScore(fasterTurn, baseline); math.Abs(got-1.25) > 1e-9 {
 		t.Fatalf("turn-time score = %v, want 1.25", got)
+	}
+	if calibrationCandidateBetter(
+		calibrationMeasurement{Result: fasterTurn, Score: 1.25},
+		calibrationMeasurement{Result: baseline, Score: 1},
+	) {
+		t.Fatal("faster aggregate turn with material prefill/decode regressions was accepted")
+	}
+	balanced := &benchmark.Result{GenTPS: 10.5, PromptTPS: 98, GenTokens: 256, PromptTokens: 100, GenTimeS: 9}
+	if !calibrationCandidateBetter(
+		calibrationMeasurement{Result: balanced, Score: 10.0 / 9.0},
+		calibrationMeasurement{Result: baseline, Score: 1},
+	) {
+		t.Fatal("balanced phase-safe workflow improvement was rejected")
 	}
 	invalid := &benchmark.Result{GenTPS: 100, PromptTPS: 0, GenTokens: 256, PromptTokens: 100, GenTimeS: 1}
 	if got := calibrationScore(invalid, baseline); got != 0 {
@@ -387,6 +438,7 @@ func TestOptimizationDecisionRecordsFinalistOutcomeAndBoundary(t *testing.T) {
 
 func TestAutomaticCalibrationPromotionRequiresCompleteAgentEvidence(t *testing.T) {
 	complete := &placement.CalibrationDecision{
+		Finalist: "ubatch-512", FinalistOutcome: "baseline-won",
 		DefaultAgentSamples: 2, WinnerAgentSamples: 2,
 		DefaultTurnTimeS: 10, WinnerTurnTimeS: 9,
 		DefaultTurnMaxS: 11, WinnerTurnMaxS: 10,
@@ -407,6 +459,11 @@ func TestAutomaticCalibrationPromotionRequiresCompleteAgentEvidence(t *testing.T
 	oneSample.DefaultAgentSamples = 1
 	if automaticCalibrationEvidenceValid(&oneSample) {
 		t.Fatal("one noisy baseline sample became automatic-eligible")
+	}
+	unavailable := *complete
+	unavailable.FinalistOutcome = "unavailable"
+	if automaticCalibrationEvidenceValid(&unavailable) {
+		t.Fatal("baseline-only evidence became automatic-eligible after challenger admission failed")
 	}
 }
 

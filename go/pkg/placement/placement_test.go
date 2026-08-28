@@ -4397,6 +4397,104 @@ func TestThreadsOptionOverridesPhysicalCoreDefault(t *testing.T) {
 	}
 }
 
+func TestArgsPinsPhysicalCoresForPrefillAndDecode(t *testing.T) {
+	s := &Strategy{
+		ContextSize: 8192, BatchSize: 512, UBatchSize: 256,
+		KVType: "q8_0", KVPlacement: "gpu", Threads: 14, ThreadsBatch: 14, NCPUMoE: 8,
+		CPURange: "0-13", CPUStrict: true,
+		BackendSupportsCPURange:       true,
+		BackendSupportsCPURangeBatch:  true,
+		BackendSupportsCPUStrict:      true,
+		BackendSupportsCPUStrictBatch: true,
+	}
+	args := strings.Join(s.Args("m.gguf", 8081), " ")
+	for _, want := range []string{
+		"--cpu-range 0-13", "--cpu-strict 1",
+		"--cpu-range-batch 0-13", "--cpu-strict-batch 1",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("args missing %q: %s", want, args)
+		}
+	}
+}
+
+func TestArgsDoesNotApplyCPUExpertAffinityToGPUOnlyStrategy(t *testing.T) {
+	s := &Strategy{
+		ContextSize: 8192, BatchSize: 512, UBatchSize: 256,
+		KVType: "q8_0", KVPlacement: "gpu", Threads: 14, ThreadsBatch: 14,
+		CPURange: "0-13", CPUStrict: true, BackendSupportsCPURange: true,
+	}
+	if args := strings.Join(s.Args("m.gguf", 8081), " "); strings.Contains(args, "--cpu-range") {
+		t.Fatalf("unmeasured CPU-expert affinity leaked into a GPU-only strategy: %s", args)
+	}
+}
+
+func TestArgsRequiresExactStrictBatchCapability(t *testing.T) {
+	s := &Strategy{
+		ContextSize: 8192, BatchSize: 512, UBatchSize: 256, NCPUMoE: 8,
+		KVType: "q8_0", KVPlacement: "gpu", Threads: 14, ThreadsBatch: 14,
+		CPURange: "0-13", CPUStrict: true,
+		BackendSupportsCPURange: true, BackendSupportsCPURangeBatch: true,
+		BackendSupportsCPUStrict: true,
+	}
+	args := strings.Join(s.Args("m.gguf", 8081), " ")
+	if !strings.Contains(args, "--cpu-range-batch 0-13") || strings.Contains(args, "--cpu-strict-batch") {
+		t.Fatalf("unsupported strict-batch flag emission: %s", args)
+	}
+}
+
+func TestCPUAffinityCapabilityUsesExactFlagTokens(t *testing.T) {
+	s := &Strategy{}
+	caps := &detect.Capabilities{CPU: detect.CPUInfo{PhysicalIDs: []int{0, 1, 2, 3}}}
+	configureCPUAffinity(s, caps, "--cpu-range-batch lo-hi\n--cpu-strict-batch 0|1")
+	if s.BackendSupportsCPURange || s.BackendSupportsCPUStrict || s.CPURange != "" {
+		t.Fatalf("batch-only flags became proof of main affinity support: %+v", s)
+	}
+}
+
+func TestComputeSetsCPURangeFromPhysicalIDs(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},
+		RAM:  detect.RAMInfo{TotalMB: 65536, FreeMB: 40000},
+		CPU:  detect.CPUInfo{Cores: 14, Threads: 28, PhysicalIDs: []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}},
+	}
+	model := &ModelProfile{
+		Path: "model.gguf", SizeBytes: 15 * 1024 * 1024 * 1024,
+		NumLayers: 64, NumParams: 32_000_000_000, ContextSize: 32768, HiddenSize: 4096,
+	}
+	s, err := Compute(caps, model, Options{BackendHelp: "--cpu-range lo-hi\n--cpu-strict\n--cpu-range-batch lo-hi\n--cpu-strict-batch\n"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CPURange != "0-13" || !s.CPUStrict {
+		t.Fatalf("cpu affinity = range %q strict %v, want 0-13/true", s.CPURange, s.CPUStrict)
+	}
+	s.NCPUMoE = 1
+	joined := strings.Join(s.Args("m.gguf", 8081), " ")
+	if !strings.Contains(joined, "--cpu-range 0-13") || !strings.Contains(joined, "--cpu-range-batch 0-13") {
+		t.Fatalf("emitted args missing prefill+decode pin: %s", joined)
+	}
+}
+
+func TestComputeOmitsCPURangeWithoutBackendSupport(t *testing.T) {
+	caps := &detect.Capabilities{
+		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},
+		RAM:  detect.RAMInfo{TotalMB: 65536, FreeMB: 40000},
+		CPU:  detect.CPUInfo{Cores: 8, PhysicalIDs: []int{0, 1, 2, 3, 4, 5, 6, 7}},
+	}
+	model := &ModelProfile{
+		Path: "model.gguf", SizeBytes: 15 * 1024 * 1024 * 1024,
+		NumLayers: 64, NumParams: 32_000_000_000, ContextSize: 32768, HiddenSize: 4096,
+	}
+	s, err := Compute(caps, model, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CPURange != "" {
+		t.Fatalf("cpu-range leaked without backend help: %q", s.CPURange)
+	}
+}
+
 func TestCacheRAMOverrideBeatsDerivedBudget(t *testing.T) {
 	caps := &detect.Capabilities{
 		GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}},

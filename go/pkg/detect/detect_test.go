@@ -4,6 +4,18 @@ import (
 	"testing"
 )
 
+func TestCompactCPURange(t *testing.T) {
+	if got := CompactCPURange([]int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}); got != "0-13" {
+		t.Fatalf("contiguous = %q, want 0-13", got)
+	}
+	if got := CompactCPURange([]int{13, 0, 1}); got != "" {
+		t.Fatalf("gapped IDs should not emit a single range: %q", got)
+	}
+	if got := CompactCPURange(nil); got != "" {
+		t.Fatalf("empty = %q", got)
+	}
+}
+
 func TestDetect(t *testing.T) {
 	caps, err := Detect()
 	if err != nil {

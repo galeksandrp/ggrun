@@ -256,14 +256,22 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 		return err
 	}
 
-	stopProgress := func() {}
-	if startupLog != nil {
-		stop := make(chan struct{})
-		go spinStartupProgress(stop, startupLog, time.Now(), l.HealthTimeout, cmd.Process.Pid, l.Args)
-		stopProgress = func() {
+	stop := make(chan struct{})
+	ttyProgress := startupLog != nil
+	progressDone := make(chan struct{})
+	go func() {
+		defer close(progressDone)
+		spinStartupProgress(stop, startupLog, time.Now(), l.HealthTimeout, cmd.Process.Pid, l.Args, ttyProgress, logFile)
+	}()
+	var stopOnce sync.Once
+	stopProgress := func() {
+		stopOnce.Do(func() {
 			close(stop)
-			fmt.Fprint(os.Stderr, "\r\033[K")
-		}
+			<-progressDone
+			if ttyProgress {
+				fmt.Fprint(os.Stderr, "\r\033[K")
+			}
+		})
 	}
 	defer stopProgress()
 
@@ -436,23 +444,50 @@ func (w startupStreamWriter) Write(p []byte) (int, error) {
 
 var startupSpinnerFrames = []string{"|", "/", "-", "\\"}
 
-func spinStartupProgress(stop <-chan struct{}, log *startupLogCapture, start time.Time, timeout time.Duration, pid int, args []string) {
+const startupProgressLogEvery = 10 * time.Second
+
+func spinStartupProgress(stop <-chan struct{}, log *startupLogCapture, start time.Time, timeout time.Duration, pid int, args []string, tty bool, logFile io.Writer) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	progress := newStartupProgressTracker(pid, args)
 	lastLine := ""
-	for i := 0; ; i++ {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
+	lastLog := time.Time{}
+	lastPhase := ""
+	i := 0
+	report := func() {
+		logTail := ""
+		if log != nil {
+			logTail = log.tail(64 * 1024)
+		}
+		snap := progress.snapshot()
+		status := startupProgressStatus(logTail, time.Since(start), timeout, snap)
+		phase := startupPhase(logTail)
+		if tty {
 			line := fitStartupStatusLine(fmt.Sprintf("%s  %s",
-				startupSpinnerFrames[i%len(startupSpinnerFrames)],
-				startupProgressStatus(log.tail(64*1024), time.Since(start), timeout, progress.snapshot())))
+				startupSpinnerFrames[i%len(startupSpinnerFrames)], status))
 			if line != lastLine {
 				fmt.Fprintf(os.Stderr, "\r\033[K%s", line)
 				lastLine = line
 			}
+		}
+		if lastLog.IsZero() || time.Since(lastLog) >= startupProgressLogEvery || phase != lastPhase {
+			if logFile != nil {
+				fmt.Fprintf(logFile, "[launch] loading %s\n", status)
+			} else if !tty {
+				fmt.Fprintf(os.Stderr, "[launch] loading %s\n", status)
+			}
+			lastLog = time.Now()
+			lastPhase = phase
+		}
+		i++
+	}
+	report()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			report()
 		}
 	}
 }
@@ -508,6 +543,9 @@ func startupProgressStatus(logText string, elapsed, timeout time.Duration, progr
 	} else {
 		parts = append(parts, fmt.Sprintf("elapsed %s", elapsed.Round(time.Second)))
 	}
+	if eta := startupLoadETA(elapsed, progress); eta > 0 {
+		parts = append(parts, fmt.Sprintf("eta ~%s", eta))
+	}
 	if progress.total > 0 && progress.done > 0 {
 		parts = append(parts, fmt.Sprintf("read %s/%s", formatGiB(progress.done), formatGiB(progress.total)))
 	}
@@ -531,6 +569,25 @@ func startupPhase(logText string) string {
 	default:
 		return "starting backend"
 	}
+}
+
+func startupLoadETA(elapsed time.Duration, p startupProgress) time.Duration {
+	if p.total <= 0 || p.done <= 0 || p.done >= p.total {
+		return 0
+	}
+	sec := elapsed.Seconds()
+	if sec < 2 {
+		return 0
+	}
+	rate := float64(p.done) / sec
+	if rate < 1024 {
+		return 0
+	}
+	remain := time.Duration(float64(p.total-p.done) / rate * float64(time.Second)).Round(time.Second)
+	if remain < time.Second {
+		return 0
+	}
+	return remain
 }
 
 func startupProgressPercent(p startupProgress) int {
