@@ -11,6 +11,11 @@ The theory, evidence schema, implementation map, known risks, and exact resume
 sequence are preserved in [optimizer-theory.md](optimizer-theory.md). Treat it
 as the handoff document for this tracker.
 
+The current parallel-2 Qwen3.8 mixed-workload measurements are preserved in
+[live-evidence-2026-08-29-qwen38-p2.md](live-evidence-2026-08-29-qwen38-p2.md).
+They show that allocated slots and simultaneously active compute lanes must be
+separate scheduler decisions.
+
 ## Implementation snapshot
 
 The preserved 2026-08-28 checkpoint contains the first core implementation plus a
@@ -42,7 +47,7 @@ evidence.
 | KVFIT-9 | Boundary evidence is persisted and verified-config reuse is scoped | Capture load, cache, agent, and adjacent-rejection evidence on real hardware |
 | PERF-1, PERF-3, PERF-5, PERF-9, UX-3 | Implemented: standard launch owns bounded search; candidates are complete placements; scope includes policy/capabilities; batch pairs preserve explicit intent | Commit and multi-hardware proof |
 | PERF-2, PERF-6, PERF-7 | Implemented as baseline plus one calculated finalist, with a measured prefill pilot, identical budget-scaled cold+append scenarios, two samples, concurrent generation, mixed foreground traffic, lifecycle gates, delayed promotion, and a reusable baseline-won result | Add longer branch/replay and long-context hardware acceptance; quantify noise on public hardware |
-| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve | Complete the live p1/p2 workflow A/B and add capability-specific unified/partitioned KV A/B |
+| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve. The 2026-08-29 live p2 run proves allocated slots cannot imply two active compute lanes on a mixed, offloaded MoE workload | Implement phase-aware active-lane admission, reviewer isolation, and real-deadline evidence; then complete controlled p1/p2 decode+decode, cold-prefill+decode, and cache-hot A/Bs plus capability-specific unified/partitioned KV A/B |
 | PERF-4, PERF-8, PERF-12, UX-2 | Not complete | Implement measured headroom continuation, broader optional knobs, and bounded control UX |
 | PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
