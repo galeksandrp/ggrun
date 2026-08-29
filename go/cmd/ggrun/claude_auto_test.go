@@ -108,7 +108,7 @@ func TestClaudeReviewerGPUCandidatesKeepSparsePhysicalSelection(t *testing.T) {
 
 func TestClaudeReviewerArgsUsesIsolatedDeviceAsLocalMain(t *testing.T) {
 	args := claudeReviewerArgs("server", "reviewer.gguf", 1234, "CUDA7", "--reasoning ARG --cache-type-k TYPE --cache-type-v TYPE")
-	for _, want := range []string{"--device", "CUDA7", "-mg", "0", "--reasoning", "off", "--ctx-size", "65536", "--cache-type-k", "q8_0", "--cache-type-v"} {
+	for _, want := range []string{"--device", "CUDA7", "-mg", "0", "--reasoning", "off", "--ctx-size", "131072", "--cache-type-k", "q8_0", "--cache-type-v"} {
 		if !hasArg(args, want) {
 			t.Fatalf("missing %q in %v", want, args)
 		}
@@ -117,6 +117,31 @@ func TestClaudeReviewerArgsUsesIsolatedDeviceAsLocalMain(t *testing.T) {
 		if !hasArgValue(args, flag, "q8_0") {
 			t.Fatalf("expected %s q8_0 in %v", flag, args)
 		}
+	}
+}
+
+func TestReviewerProfilesScopeCapacityToTheirContext(t *testing.T) {
+	qwen := resolveClaudeCompanionProfile(&launchRequest{
+		AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerQwen,
+	}, t.TempDir())
+	if qwen.ContextTokens != 131072 || qwen.ReservationVRAMMB != claudeReviewerReservationVRAMMB ||
+		!strings.Contains(qwen.companionMeasurementKey(), "ctx131072") {
+		t.Fatalf("Qwen4B reviewer capacity is not context-scoped: %+v", qwen)
+	}
+
+	small := resolveClaudeCompanionProfile(&launchRequest{
+		AppHome: t.TempDir(), ClaudeReviewerOverride: claudeReviewerQwen2B,
+	}, t.TempDir())
+	if small.ContextTokens != 262144 || small.ReservationVRAMMB != claudeSmallReviewerReservationVRAMMB ||
+		!strings.Contains(small.companionMeasurementKey(), "ctx262144") {
+		t.Fatalf("Qwen2B review-only capacity is not full-context scoped: %+v", small)
+	}
+	args := claudeReviewerArgsWithContextAndKV(
+		"server", "reviewer.gguf", 1234, "CUDA0",
+		"--cache-type-k TYPE --cache-type-v TYPE", "q8_0", "", small.ContextTokens,
+	)
+	if !hasArgValue(args, "--ctx-size", "262144") {
+		t.Fatalf("small reviewer did not receive its planned context: %v", args)
 	}
 }
 
@@ -494,6 +519,36 @@ func TestImplicitParallelKeepsHostOffloadSerialized(t *testing.T) {
 	strategy := &placement.Strategy{Type: placement.MoEOffload, Parallel: 4}
 	if got := claudeMainMaxActive(req, strategy); got != 1 {
 		t.Fatalf("max active=%d, want the conservative default of 1", got)
+	}
+}
+
+func TestMeasuredHostOffloadAdmitsOnlyValidatedWorkloadDemand(t *testing.T) {
+	req := &launchRequest{ClaudeCode: true, Parallel: 1}
+	strategy := &placement.Strategy{Type: placement.MoEOffload, Parallel: 4, PerformanceTuned: true}
+	if got := claudeMainMaxActive(req, strategy); got != 2 {
+		t.Fatalf("measured four-slot strategy admitted %d requests, want the validated two-agent workload", got)
+	}
+}
+
+func TestPendingWorkflowEvidenceAppliesMeasuredAdmissionBeforePersistence(t *testing.T) {
+	req := &launchRequest{ClaudeCode: true, Parallel: 1}
+	strategy := &placement.Strategy{Type: placement.MoEOffload, Parallel: 2}
+	decision := &placement.CalibrationDecision{
+		Finalist: "parallel-2", FinalistOutcome: "promoted",
+		DefaultAgentSamples: 2, WinnerAgentSamples: 2,
+		DefaultTurnTimeS: 10, WinnerTurnTimeS: 8,
+		DefaultTurnMaxS: 11, WinnerTurnMaxS: 9,
+		AgentPromptBytes:    4096,
+		DefaultCachedTokens: 100, WinnerCachedTokens: 100,
+		DefaultNewPromptTokens: 10, WinnerNewPromptTokens: 10,
+		DefaultMixedTPS: 1, WinnerMixedTPS: 1,
+	}
+	if got := claudeMainMaxActive(req, strategy, decision); got != 2 {
+		t.Fatalf("pending measured p2 admitted %d requests, want 2", got)
+	}
+	decision.FinalistOutcome = "unavailable"
+	if got := claudeMainMaxActive(req, strategy, decision); got != 1 {
+		t.Fatalf("admission-only evidence admitted %d requests, want conservative p1", got)
 	}
 }
 

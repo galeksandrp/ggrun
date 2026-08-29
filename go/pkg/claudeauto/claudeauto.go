@@ -559,6 +559,12 @@ type Router struct {
 	// reviewerFailNotice covers the runtime case: a seated reviewer that could
 	// not answer. Announced once rather than per tool call, like the others.
 	reviewerFailNotice sync.Once
+	// utilityReviewerNotice announces the review-only-reviewer utility lane
+	// once; the route decision itself is per request.
+	utilityReviewerNotice sync.Once
+	// utilityFailNotice announces that a preferred companion failed and the
+	// request was preserved by retrying it on the main model.
+	utilityFailNotice sync.Once
 	// msgDelimiters are the chat role markers read from the backend's own
 	// startup output. They are injected into main-route requests that carry
 	// none, because a sliding-window model can only reuse a prefix from a
@@ -600,12 +606,16 @@ func (r *Router) SetReviewerContext(tokens int) {
 }
 
 // estimatedPromptTokens conservatively estimates how many context tokens a
-// routed request consumes from its JSON body size. The underestimate must err
-// on the high side so an oversized prompt is caught rather than silently sent
-// into an overflow: ~3 bytes per token is denser than most model vocabularies,
-// so this never under-counts a real prompt.
+// routed request consumes from its JSON body size. The estimate must err on the
+// high side so an oversized prompt is caught rather than silently sent into an
+// overflow: ~2 bytes per token. The previous ~3-byte divisor under-counted
+// code-dense and escaped-JSON prompts — real reviews of 65,675 tokens arrived
+// in bodies the estimate scored below the 65,536 window and overflowed the
+// reviewer with a 400. The conservative false-positive case is harmless: a
+// prompt that would actually fit is sent to the main model early instead of
+// risking a reviewer overflow.
 func estimatedPromptTokens(body []byte) int {
-	return (len(body) + 2) / 3
+	return (len(body) + 1) / 2
 }
 
 // utilityEnabled reports whether cheap-tier requests have somewhere to go.
@@ -732,11 +742,31 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 		// local-fast back to the actual main alias before forwarding.
 		if IsUtilityRequest(body) {
 			if router.utilityEnabled() {
-				body = utilityBody(body, router.companionAlias)
-				r.Body = io.NopCloser(bodyReader(body))
-				r.ContentLength = int64(len(body))
-				router.serve(w, r, reviewerProxy, routeUtility, body)
-				return
+				companionBody := utilityBody(body, router.companionAlias)
+				if router.tryReviewerUtility(w, r, reviewerProxy, companionBody) {
+					return
+				}
+				router.utilityFailNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] the local companion could not answer cheap-tier work; retrying it on the main model\n")
+				})
+			}
+			// No worker-serving companion. A seated review-only reviewer is
+			// still a real second backend: cheap-tier calls (the permission
+			// classifier, haiku-tier background work) on the main model queue
+			// behind long foreground streams on a single slot and time out, so
+			// prefer the reviewer whenever the prompt fits its context. Too
+			// large for the reviewer falls through to the main model as before.
+			if !router.utilityEnabled() && router.separateReviewer && (router.reviewerContext <= 0 || estimatedPromptTokens(body) <= router.reviewerContext) {
+				router.utilityReviewerNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] no worker companion; cheap-tier calls (classifier, background) go to the seated reviewer instead of queueing behind main-model work\n")
+				})
+				reviewerBody := utilityBody(body, MainAlias)
+				if router.tryReviewerUtility(w, r, reviewerProxy, reviewerBody) {
+					return
+				}
+				router.utilityFailNotice.Do(func() {
+					fmt.Fprintf(os.Stderr, "[claude-code] the seated reviewer could not answer cheap-tier work; retrying it on the main model\n")
+				})
 			}
 			body = utilityBody(body, MainAlias)
 			r.Body = io.NopCloser(bodyReader(body))

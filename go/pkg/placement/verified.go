@@ -13,7 +13,7 @@ import (
 // VerifiedConfigSchemaVersion bumps whenever the record shape or its semantics
 // change, so a record saved under older semantics is never applied to a launch
 // the new code would have planned differently.
-const VerifiedConfigSchemaVersion = 6
+const VerifiedConfigSchemaVersion = 7
 
 // VerifiedConfig is a sibling of CacheEntry that stores the *whole* serving
 // decision — placement identity, runtime knobs, and non-flag provenance — so
@@ -72,6 +72,7 @@ type VerifiedConfig struct {
 	SWAFull                   bool                    `json:"swa_full"`
 	CRAM                      int                     `json:"cram,omitempty"`
 	MaxCheckpoints            int                     `json:"max_checkpoints,omitempty"`
+	MeasuredCheckpointMB      float64                 `json:"measured_checkpoint_mb,omitempty"`
 	CheckpointMinStep         int                     `json:"checkpoint_min_step,omitempty"`
 	UseCUDAGraphs             bool                    `json:"use_cuda_graphs,omitempty"`
 	Host                      string                  `json:"host,omitempty"`
@@ -207,6 +208,7 @@ func VerifiedToStrategy(vc *VerifiedConfig, opts Options, caps *detect.Capabilit
 		SWAFull:                  vc.SWAFull,
 		CRAM:                     vc.CRAM,
 		MaxCheckpoints:           vc.MaxCheckpoints,
+		MeasuredCheckpointMB:     vc.MeasuredCheckpointMB,
 		CheckpointMinStep:        vc.CheckpointMinStep,
 		UseCUDAGraphs:            vc.UseCUDAGraphs,
 		Host:                     vc.Host,
@@ -334,6 +336,7 @@ func VerifiedConfigToRecord(scopeKey, modelBasename string, s *Strategy, backend
 		SWAFull:                  s.SWAFull,
 		CRAM:                     s.CRAM,
 		MaxCheckpoints:           s.MaxCheckpoints,
+		MeasuredCheckpointMB:     s.MeasuredCheckpointMB,
 		CheckpointMinStep:        s.CheckpointMinStep,
 		UseCUDAGraphs:            s.UseCUDAGraphs,
 		Host:                     s.Host,

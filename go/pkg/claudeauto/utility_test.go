@@ -57,8 +57,10 @@ func TestRetargetModelRewritesOnlyTheModelField(t *testing.T) {
 	}
 }
 
-// With no companion backend the alias must fall back to the main model, or
-// cheap-tier work would be routed into a lane that loops to the same server.
+// With no companion backend AND no separate reviewer, the alias must fall back
+// to the main model: the only lane left loops to the same server. When a
+// separate reviewer is seated, the cheap tier goes there instead (see
+// TestUtilityFallsThroughToSeatedReviewerWithoutCompanion).
 func TestUtilityLaneDisabledWithoutACompanion(t *testing.T) {
 	var gotMain, gotCompanion int
 	var mainModel string
@@ -80,11 +82,11 @@ func TestUtilityLaneDisabledWithoutACompanion(t *testing.T) {
 
 	body := `{"model":"` + UtilityAlias + `","messages":[{"role":"user","content":"hi"}]}`
 
-	off, err := StartRouter(main.URL, companion.URL, true, 1)
+	off, err := StartRouter(main.URL, main.URL, true, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	off.SetCompanion("local", false) // no separate companion
+	off.SetCompanion("local", false) // no separate companion, no separate reviewer
 	if err := postErr(off, body); err != nil {
 		t.Fatal(err)
 	}

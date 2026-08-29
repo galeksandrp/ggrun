@@ -45,6 +45,7 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 		FlashAttention:           true,
 		SWAFull:                  true,
 		CRAM:                     4096,
+		MeasuredCheckpointMB:     871.690,
 		MaxCheckpoints:           8,
 		BackendTag:               "llama",
 		ModelBasename:            "V4.gguf",
@@ -68,6 +69,9 @@ func TestVerifiedConfigRoundTrip(t *testing.T) {
 	}
 	if !loaded.HasSSM || !loaded.IsMoE {
 		t.Fatalf("model semantics lost: %+v", loaded)
+	}
+	if loaded.MeasuredCheckpointMB != s.MeasuredCheckpointMB {
+		t.Fatalf("checkpoint measurement lost: got %.3f want %.3f", loaded.MeasuredCheckpointMB, s.MeasuredCheckpointMB)
 	}
 	if !loaded.MMapRequired || loaded.CPUExpertMMapCapability != CPUExpertMMapFileBacked ||
 		loaded.CPUExpertMMapEvidence != "live exact-build proof" || loaded.ReclaimableHostWeightsMB != 81920 ||

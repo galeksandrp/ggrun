@@ -4,7 +4,8 @@
 > direct CLI. This is the GGUF/llama.cpp lane; it does not depend on FreeToken,
 > AI Tune, or multi-model orchestration.
 
-Status: active implementation, 2026-08-28.
+Status: core hardening verified and installed, 2026-08-29; live hardware
+acceptance remains active.
 
 The theory, evidence schema, implementation map, known risks, and exact resume
 sequence are preserved in [optimizer-theory.md](optimizer-theory.md). Treat it
@@ -12,7 +13,7 @@ as the handoff document for this tracker.
 
 ## Implementation snapshot
 
-The 2026-08-28 working tree contains the first core implementation plus a
+The preserved 2026-08-28 checkpoint contains the first core implementation plus a
 correction that restores the fit-first baseline, removes topology-name
 priority, and separates backbone, GPU-expert, CPU-expert, and activation costs.
 It also binds complete guarded peaks to an exact placement identity, preserves
@@ -21,12 +22,17 @@ large host-only PLE table is neither charged to GPU backbone nor required when
 the GGUF legitimately omits it. Phase-tagged GPU/process evidence and an
 optional non-perturbing queue schema now feed a conservative typed bottleneck
 diagnosis, which may prioritize one complete finalist but cannot bypass exact
-admission or the live A/B gate. The focused core run passes 971 tests; the full
-repository and race runs each pass 1,435 tests, with build, vet,
-formatting, shell/Python suites, ShellCheck, and three supported cross-builds
-clean. The canonical binary has been rebuilt from this tree. Checkboxes below
-remain open under the tracking rule at the end of this document until claims
-that depend on real hardware have preserved live evidence.
+admission or the live A/B gate. That checkpoint passed 971 focused tests and
+1,435 full/race tests, with build, vet, formatting, shell/Python suites,
+ShellCheck, and three supported cross-builds clean. The 2026-08-29 hardening
+described below passed the protected core-engine gate plus the full normal and
+race-enabled Go suites. Its canonical binary is installed at
+`/home/mik/go/bin/ggrun` (also reached by `/home/mik/.local/bin/ggrun`) with
+SHA-256 `51046b13a2e7e17500fdcb50f192595772c82f43ec36f10322643d8fab98f93c`.
+An already-running controller retains its older mapped executable until an
+intentional relaunch. Checkboxes remain open under the tracking rule at the end
+of this document until claims that depend on real hardware have preserved live
+evidence.
 
 | Work | Implementation state | Remaining acceptance |
 |---|---|---|
@@ -35,7 +41,7 @@ that depend on real hardware have preserved live evidence.
 | KVFIT-9 | Boundary evidence is persisted and verified-config reuse is scoped | Capture load, cache, agent, and adjacent-rejection evidence on real hardware |
 | PERF-1, PERF-3, PERF-5, PERF-9, UX-3 | Implemented: standard launch owns bounded search; candidates are complete placements; scope includes policy/capabilities; batch pairs preserve explicit intent | Commit and multi-hardware proof |
 | PERF-2, PERF-6, PERF-7 | Implemented as baseline plus one calculated finalist, with a measured prefill pilot, identical budget-scaled cold+append scenarios, two samples, concurrent generation, mixed foreground traffic, lifecycle gates, delayed promotion, and a reusable baseline-won result | Add longer branch/replay and long-context hardware acceptance; quantify noise on public hardware |
-| PERF-10 | Automatic 1/2/4 slot neighbors are implemented with useful per-slot context and full re-placement | Add capability-specific unified/partitioned KV A/B |
+| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve | Complete the live p1/p2 workflow A/B and add capability-specific unified/partitioned KV A/B |
 | PERF-4, PERF-8, PERF-12, UX-2 | Not complete | Implement measured headroom continuation, broader optional knobs, and bounded control UX |
 | PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
@@ -45,7 +51,35 @@ that depend on real hardware have preserved live evidence.
 | MMAP-1, MMAP-2, MMAP-4 | Implemented: production/preflight/recovery/daemon share capability-aware reclaim policy; unknown/anonymous loaders fail closed; mmap remains last-resort and consent-gated | Commit plus live resident/mmap/anonymous cases |
 | MMAP-3 | Host ledger now separates exact reclaimable expert bytes from non-reclaimable runtime, KV, embeddings, and checkpoint reserve | Audit remaining backend-reported buffers/page tables/companions against live cgroup data |
 | MMAP-5 through MMAP-7 | Not complete | Requires the storage/workload and real too-large-model acceptance window |
+| HOT-1 through HOT-6 | Planned, backend-gated resident-MoE performance lane. A 2026-08-28 draft llama.cpp implementation is measured on Qwen3.8-Flash-Next but is not upstream-ready | Isolated fork audit, exact VRAM accounting, correctness and same-workload A/B on this three-GPU Q3 launch; then architecture matrix |
 | PIN/P3 | Deliberately not started | Blocked on appropriate hardware/model artifacts as specified below |
+
+### 2026-08-29 hardening update
+
+- Automatic calibration evidence is schema 18. Only typed deterministic exact
+  admission failures may suppress the identical calculated retry; timeouts,
+  incomplete benchmarks, and generic health failures remain retryable.
+- Memory recovery is deficit-aware. It first targets the failed device, skips
+  disproven ubatch rungs, and may reduce an automatic context only after the
+  non-context levers are exhausted. Every context change re-enters the complete
+  placement engine and rebuilds the full argv; explicit context stays fixed.
+- Recurrent checkpoint memory is reserved per checkpoint and per slot even
+  without SWA geometry. The first canary's backend-reported checkpoint size is
+  charged before cgroup tightening, and a host cgroup OOM invalidates placement,
+  calibration, lifecycle, and verified-config evidence as a typed failure.
+- Reviewer profiles now carry model-appropriate contexts and exact measurement
+  keys. Cheap-tier and safety calls use the seated review-only model rather than
+  queueing behind main-model work.
+- Parallel policy now separates capacity from demand. The agent-parallel
+  workload represents at least two runnable turns even when the inherited
+  server default is p1. Static context/memory/wave math removes impossible or
+  dominated widths; p2 still needs one identical-workload A/B before a
+  host-offloaded live router admits two requests. A measured/cached winner is
+  scoped by model, backend, hardware, context, workload, and all coupled knobs.
+- Hot-expert research now has two separate products: a dynamic VRAM expert
+  cache for the common resident CPU-expert decode bottleneck, and selective
+  mmap/mlock pinning for models beyond usable RAM. The former is described in
+  HOT below; neither is silently enabled from a theory-only estimate.
 
 ## Live evidence: stable serving versus proven optimization
 
@@ -144,7 +178,43 @@ classifier lane having no dedicated slot:
   verdict-template mismatch (prime suspect: the 2B running the
   `qwen3.8-27b.jinja` template file). `SetCompanion("local", …)` must stay
   review-only so Workflow worker sub-agents are not degraded to the 2B.
-- Not yet implemented in ggrun; recorded here as the accepted diagnosis.
+
+**Fix shipped 2026-08-28** (binary `4ae4df310c73f324`, symlinked at PATH):
+direct probes of the live reviewer reproduced the verdict contract cleanly in
+every shape tried (non-stream, stream, with tools: `<block>yes|no</block>` in
+~50 ms at 0 temp), so the 20:21 rejections remain intermittent — likely
+template/reasoning state on those specific prompts; the new
+`reviewer-rejected/invalid-verdict` metrics rows will expose it on the next
+run instead of guessing. Implemented now:
+
+1. Utility lane → seated reviewer: cheap-tier (`local-fast`) requests route to
+   the reviewer's own backend whenever a separate reviewer is seated and the
+   prompt fits `claudeReviewerContextTokens`; overflow still falls back to
+   main with the notice-once contract. The classifier lane keeps its existing
+   reviewer-first behavior.
+2. `estimatedPromptTokens` now errs high (bytes/2): the bytes/3 divisor
+   demonstrably under-counted (65,675-token reviews scored under the 65,536
+   window and 400'd 18 times historically).
+3. Rejected verdicts are recorded (`reviewer-rejected/invalid-verdict` vs
+   `reviewer-rejected/unusable-response`) so a verdict-format mismatch is
+   visible in the request log instead of looking like reviewer downtime.
+
+Evidence that the reviewer lane works when used: on 2026-08-28 09:12/09:15
+two real 131 KB reviews went `route:reviewer`, 200, verdict accepted, ~1 s —
+while same-conversation attempts routed to main aborted at 63–80 s. Full
+`go test ./...` green; `TestUtilityLaneDisabledWithoutACompanion` and the
+fallback tests updated to the new routing/rejection contract. The running
+controller keeps its old binary until the next launch; Workflow-fan-out and
+classifier timeouts should disappear from the next live session, and the
+request log should show classifier traffic on `route:reviewer`.
+
+**2026-08-29 follow-up:** the currently running reviewer and router are healthy,
+but the controller was mapped from the older binary. Its request log still
+shows utility/classifier calls on `route:main`, including repeated 60–70 s
+client aborts behind the p1 foreground slot. That is old routing behavior, not
+reviewer downtime. The source correction requires a newly installed binary and
+an intentional controller relaunch; the active server must not be interrupted
+merely to update this evidence.
 
 ### Live DeepSeek-V4-Flash Q3 XL, 2026-08-27 19:16–19:33 UTC
 
@@ -525,6 +595,56 @@ again without a scope change, reset, or maintenance request.
 Exit: the promoted standard config beats the stable baseline outside noise on
 agent wall time, preserves foreground/cache gates, survives relaunch, and is
 reused without re-searching.
+
+## HOT — dynamic VRAM expert cache for resident CPU-offloaded MoEs
+
+This is a performance lane for the common case where the model and every expert
+fit in VRAM+RAM, but some routed experts execute from host memory. It is not a
+fit fallback and it is not static tensor placement. CPU decode repeatedly
+streams routed expert weights through host DRAM; a backend-capable cache keeps
+temporally reused expert slices in spare VRAM and computes cache hits on GPU.
+
+The current reference is draft
+[llama.cpp PR #27861](https://github.com/ggml-org/llama.cpp/pull/27861),
+opened 2026-08-28. It is unusually relevant because it measured
+Qwen3.8-Flash-Next itself: a static top-32 list learned on half of a 54k-record
+mixed corpus covered only about 10% of the other half, while per-layer temporal
+LRU-64 simulated about 67% hits. Its decode-only cache measured 18.4 to 24.2
+tok/s (+31%) with 48 slots per host-expert layer and about 4.1 GiB VRAM. Those
+numbers establish a candidate, not a ggrun default: the PR is draft, currently
+wires only a separate gate/up SiLU layout, and bypasses multi-token decode and
+prefill.
+
+- [ ] **HOT-1 — isolated capability.** Audit and pin a reviewed upstream commit
+  in a separate backend fork. Detect the exact cache flags, CUDA/model layout,
+  decode shape, and disabled-path identity. Unsupported models/backends produce
+  no candidate.
+- [ ] **HOT-2 — exact cache ledger.** Derive bytes per expert slot and per
+  host-expert layer from GGUF/backend evidence. Reserve KV, graphs, checkpoints,
+  prompt cache, companions, allocator growth, and device headroom before
+  calculating any slot count; never copy the reference value 48 into policy.
+- [ ] **HOT-3 — temporal evidence.** Record per-layer cache hits, misses,
+  uploads, evictions, warmup, and drift separately for prefill/decode and p1/p2.
+  Do not persist or promote a global static hot list merely because one corpus
+  was skewed.
+- [ ] **HOT-4 — one bounded A/B.** Compare cache-off with one calculated slot
+  budget on identical cold-prefill, cached append, decode, mixed foreground,
+  and workflow makespan. Require coherent output, no missing/double-counted
+  expert contribution, clean relaunch, and material decode plus end-to-end gain
+  without a prefill/cache regression.
+- [ ] **HOT-5 — self-disable.** Cache allocation failure, unsupported graph,
+  low hit rate, upload/synchronization regression, OOM, multi-token/speculative
+  incompatibility, or correctness drift falls back to the exact stock argv.
+  Failed evidence is scoped and finite.
+- [ ] **HOT-6 — public generalization.** Validate this three-GPU
+  Qwen3.8-Flash-Next Q3 case first, then separate gate/up, fused gate-up,
+  heterogeneous CUDA, single GPU, p2, and at least one non-Qwen architecture.
+  Keep the feature opt-in until the matrix proves safe automatic eligibility.
+
+Exit: on an eligible resident CPU-expert MoE, ggrun either promotes a
+profile-scoped cache that improves real agent workflow time outside noise or
+records cache-off as the winner. Prefill remains on its separately optimized
+batch/placement path until a backend exposes a proven prefill mechanism.
 
 ## P2 — harden ordinary mmap as final generic fit fallback
 

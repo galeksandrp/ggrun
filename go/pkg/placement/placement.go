@@ -38,9 +38,9 @@ const (
 	// one rolling checkpoint is erased before a branch older than the newest
 	// boundary can restore it. Reserve conservatively per checkpoint and slot,
 	// then bound the controller-owned policy to a useful 4..16 range.
-	hybridCheckpointReservePerSlotMB = 128
-	hybridCheckpointMinimum          = 4
-	hybridCheckpointMaximum          = 16
+	hybridCheckpointReservePerCheckpointMB = 128
+	hybridCheckpointMinimum                = 4
+	hybridCheckpointMaximum                = 16
 	// Cards below this fraction of the fastest PCIe link are too slow to own
 	// regular layer slots in MoE layer-split mode, but can still be useful as
 	// expert-only VRAM when one or more whole expert layers fit.
@@ -245,7 +245,12 @@ type Strategy struct {
 	// from the backend rather than derived. It is preferred over the per-token
 	// cost because it needs no assumption about how long a typical turn is.
 	MeasuredPromptCacheEntryMB float64 `json:"measured_prompt_cache_entry_mb,omitempty"`
-	MaxCheckpoints             int     `json:"max_checkpoints,omitempty"`
+	// MeasuredCheckpointMB is one live context-checkpoint allocation reported
+	// by the exact backend. Recurrent models do not expose enough GGUF geometry
+	// to derive this value, so the first launch uses a conservative floor and
+	// subsequent plans consume the backend measurement.
+	MeasuredCheckpointMB float64 `json:"measured_checkpoint_mb,omitempty"`
+	MaxCheckpoints       int     `json:"max_checkpoints,omitempty"`
 	// PlannedHostFootprintMB is the host RAM this plan has already spoken for:
 	// CPU-resident expert weights, token embeddings, any CPU-side KV, and the
 	// runtime overhead — the same quantity the mmap decision is made against.
@@ -488,10 +493,12 @@ const checkpointMinStepFloor = 512
 // (16) is reserved — a plan that survives 16 checkpoints survives any smaller
 // cap. Bounded so a pathological geometry cannot over-reserve.
 //
-// Returns 0 when the model has no sliding window (no checkpoint machinery in
-// this backend path).
-func checkpointFootprintMB(model *ModelProfile, maxCheckpoints, slots, kvTotalMB, ctxSize int) int {
-	if model == nil || model.SlidingWindow <= 0 || kvTotalMB <= 0 || ctxSize <= 0 {
+// Recurrent/hybrid models without a sliding-window geometry still allocate
+// checkpoints. Their GGUF metadata cannot derive the state size, so a cold
+// launch uses hybridCheckpointReservePerCheckpointMB and a later exact backend
+// measurement replaces that floor.
+func checkpointFootprintMB(model *ModelProfile, maxCheckpoints, slots, kvTotalMB, ctxSize int, measuredCheckpointMB ...float64) int {
+	if model == nil || (model.SlidingWindow <= 0 && !isRecurrentOrHybrid(model)) {
 		return 0
 	}
 	if maxCheckpoints <= 0 {
@@ -503,15 +510,32 @@ func checkpointFootprintMB(model *ModelProfile, maxCheckpoints, slots, kvTotalMB
 	if slots < 1 {
 		slots = 1
 	}
-	perCheckpoint := kvTotalMB * (2 * model.SlidingWindow) / ctxSize
-	if perCheckpoint < 20 {
-		perCheckpoint = 20
+	perCheckpoint := 0
+	if model.SlidingWindow > 0 && kvTotalMB > 0 && ctxSize > 0 {
+		perCheckpoint = kvTotalMB * (2 * model.SlidingWindow) / ctxSize
+		if perCheckpoint < 20 {
+			perCheckpoint = 20
+		}
 	}
-	reserve := maxCheckpoints * slots * perCheckpoint
-	if reserve > 16*1024 {
-		reserve = 16 * 1024
+	if isRecurrentOrHybrid(model) && perCheckpoint < hybridCheckpointReservePerCheckpointMB {
+		perCheckpoint = hybridCheckpointReservePerCheckpointMB
 	}
-	return reserve
+	if len(measuredCheckpointMB) > 0 && measuredCheckpointMB[0] > 0 {
+		measured := int(math.Ceil(measuredCheckpointMB[0]))
+		if measured > perCheckpoint {
+			perCheckpoint = measured
+		}
+	}
+	if perCheckpoint <= 0 {
+		return 0
+	}
+	// Bound one slot, not the whole server. --ctx-checkpoints is per slot; a
+	// global 16 GiB cap silently under-reserved p2/p4 recurrent workloads.
+	perSlotReserve := maxCheckpoints * perCheckpoint
+	if perSlotReserve > 16*1024 {
+		perSlotReserve = 16 * 1024
+	}
+	return perSlotReserve * slots
 }
 
 // CompanionReservation reserves VRAM on one GPU for a co-launched helper model
@@ -1690,6 +1714,13 @@ func computeResolvedStrategy(caps *detect.Capabilities, model *ModelProfile, opt
 	// The stale-plan guard and support output describe the exact post-companion
 	// inventory the target placement is about to consume.
 	s.PlanFreeVRAM = snapshotPlanFreeVRAM(caps)
+	// Prompt-cache evidence also carries the exact per-checkpoint allocation.
+	// Load it before any strategy builder derives PlannedHostFootprintMB; loading
+	// it only after placement meant CRAM saw the measurement while the cgroup
+	// floor still omitted the active checkpoint copies.
+	if !opts.SkipCachedConfig {
+		LoadMeasuredPromptCache(opts.CacheDir, model, s, backendCacheTag(opts), caps.GPUs)
+	}
 
 	// Persist/reuse this exact placement under a key that includes kv placement,
 	// ctx, ubatch, backend, and the GPU set — computed from the now-resolved
@@ -2289,7 +2320,7 @@ func buildSingleGPU(s *Strategy, caps *detect.Capabilities, model *ModelProfile,
 			// bare CRAM (the Qwen3.8 27B crash: server OOM'd against its own ~11 GB
 			// scope). Set it so computeCRAM and the post-launch resize see the real
 			// resident host cost.
-			s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, 0, s.MaxCheckpoints, s.Parallel, s.ContextSize)
+			s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, 0, s.MaxCheckpoints, s.Parallel, s.ContextSize, s.MeasuredCheckpointMB)
 			return s, nil
 		}
 	}
@@ -2427,7 +2458,7 @@ func buildMultiGPUDense(s *Strategy, caps *detect.Capabilities, model *ModelProf
 	if s.KVPlacement == "cpu" {
 		cpuKVMB = kvTotalMB
 	}
-	s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, cpuKVMB, s.MaxCheckpoints, s.Parallel, s.ContextSize)
+	s.PlannedHostFootprintMB = residentHostFootprintMB(model, s.UBatchSize, totalSizeMB, cpuKVMB, s.MaxCheckpoints, s.Parallel, s.ContextSize, s.MeasuredCheckpointMB)
 	if os.Getenv("GGRUN_TRACE_PLACEMENT") != "" {
 		fmt.Fprintf(os.Stderr, "[trace] host footprint=%d (runtime overhead + embeddings + cpuKV=%d + checkpoints) freeRAM=%d\n",
 			s.PlannedHostFootprintMB, cpuKVMB, caps.RAM.FreeMB)
@@ -2722,13 +2753,13 @@ func hostFootprintForCache(residentMB, workingSetMB int, mmap bool, opts Options
 // dense-plan counterpart to buildMoEOffload's ramNeeded. Sized host-memory side
 // only — VRAM-resident weights cost the host nothing. MMap page cache is
 // excluded as reclaimable. Returns 0 when the model profile is not usable.
-func residentHostFootprintMB(model *ModelProfile, uBatch, totalSizeMB, cpuKVMB, maxCheckpoints, slots, ctxSize int) int {
+func residentHostFootprintMB(model *ModelProfile, uBatch, totalSizeMB, cpuKVMB, maxCheckpoints, slots, ctxSize int, measuredCheckpointMB float64) int {
 	if model == nil {
 		return 0
 	}
 	overheadMB := ramRuntimeOverheadMB(model, uBatch, totalSizeMB)
 	embdMB := bytesToMiBCeil(model.TokenEmbdBytes)
-	checkpointReserve := checkpointFootprintMB(model, maxCheckpoints, slots, cpuKVMB, ctxSize)
+	checkpointReserve := checkpointFootprintMB(model, maxCheckpoints, slots, cpuKVMB, ctxSize, measuredCheckpointMB)
 	if cpuKVMB < 0 {
 		cpuKVMB = 0
 	}
@@ -2757,7 +2788,7 @@ func cachedMoEHostMemoryFits(caps *detect.Capabilities, model *ModelProfile, s *
 	}
 	runtimeMB := plannedRAMRuntimeOverheadMB(caps, model, cache.UBatchSize, totalSizeMB, opts)
 	tokenEmbdMB := bytesToMiBCeil(model.TokenEmbdBytes)
-	checkpointReserveMB := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
+	checkpointReserveMB := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize, s.MeasuredCheckpointMB)
 	residentMB := cpuExpertMB + cpuKVMB + runtimeMB + tokenEmbdMB + checkpointReserveMB
 	residentFits := residentMB <= caps.RAM.FreeMB
 	s.ReclaimableHostWeightsMB = cpuExpertMB
@@ -3303,7 +3334,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	// Checkpoint snapshots and token embeddings are anonymous/fixed host state,
 	// just like CPU KV and runtime buffers. Omitting them from this floor let an
 	// mmap plan pass only to OOM when a long agent session populated checkpoints.
-	checkpointReserve := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize)
+	checkpointReserve := checkpointFootprintMB(model, 0, s.Parallel, kvTotalMB, s.ContextSize, s.MeasuredCheckpointMB)
 	preWorkingSetFloor := ramOverheadPreMB + cpuKVRAMMB + tokenEmbdMB + checkpointReserve
 	mmapReclaimable := mmapCanPageCPUExperts(opts)
 	maxCPULayersMMap := 0
@@ -3919,40 +3950,89 @@ func CurrentUBatch(args []string) int {
 // currentUBatch reads the launch args' current -ub/--ubatch-size value, or 0
 // if unset/unparseable.
 func currentUBatch(args []string) int {
-	idx := argIndex(args, "-ub", "--ubatch-size")
-	if idx < 0 || idx+1 >= len(args) {
-		return 0
+	value := 0
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "-ub" && args[i] != "--ubatch-size" {
+			continue
+		}
+		if parsed, err := strconv.Atoi(args[i+1]); err == nil {
+			value = parsed
+		}
+		i++
 	}
-	v, _ := strconv.Atoi(args[idx+1])
-	return v
+	return value
 }
 
-// nextUBatchDown returns the next smaller rung on the same fit ladder
-// maximizeMoEGPUFitByUBatch uses at placement time, or ok=false if current is
-// already at or below the ladder's floor.
-func nextUBatchDown(current int) (int, bool) {
+// recoveryMarginMB is allocator jitter added to the exact measured deficit.
+// The deficit already includes ggrun's normal device guard. Sixty-four MiB
+// protects small failures; ten percent keeps a multi-GiB correction from
+// landing exactly on the same allocator cliff.
+func recoveryMarginMB(deficitMB int) int {
+	margin := ceilDivInt(max(deficitMB, 1), 10)
+	if margin < 64 {
+		margin = 64
+	}
+	return margin
+}
+
+// nextUBatchForDeficit chooses the largest lower fit rung whose optimistic
+// linear reclaim can cover the measured deficit plus allocator jitter. Compute
+// graphs also have fixed terms, so this is an upper bound: if even it cannot
+// cover the failure, intermediate rungs are disproved without another load.
+func nextUBatchForDeficit(current, allocMB, deficitMB int) (int, bool) {
+	var lower []int
 	for _, rung := range UBatchFitLadder {
 		if rung < current {
+			lower = append(lower, rung)
+		}
+	}
+	if len(lower) == 0 {
+		return 0, false
+	}
+	if allocMB <= 0 || deficitMB <= 0 {
+		return lower[0], true
+	}
+	required := deficitMB + recoveryMarginMB(deficitMB)
+	for _, rung := range lower {
+		if allocMB*(current-rung)/current >= required {
 			return rung, true
 		}
 	}
-	return 0, false
+	return lower[len(lower)-1], true
 }
 
-// DerateCUDAOOMArgs recovers from a cudaMalloc load failure. isComputeBuffer
-// distinguishes the two failure classes the caller can observe in the
-// backend log: a graph_reserve/gallocr (compute-buffer) OOM scales with
-// ubatch, not expert-layer placement, so shrinking ubatch one rung down the
-// same ladder used at placement time is tried first; a model-weight
-// allocation failure (isComputeBuffer=false) goes straight to moving expert
-// layers from the failed device back to CPU, since ubatch has no bearing on
-// weight tensor size.
+// DerateCUDAOOMArgs preserves the historical API for callers that only have an
+// allocation size. New recovery code should call DerateCUDAOOMArgsForDeficit so
+// allocation and deficit cannot be conflated. When the allocation exceeds the
+// current free-memory reading, that difference is usable deficit evidence;
+// otherwise the wrapper makes the smallest monotonic correction.
 func DerateCUDAOOMArgs(args []string, model *ModelProfile, caps *detect.Capabilities, device, allocMB int, isComputeBuffer bool) ([]string, *CacheEntry, bool) {
+	deficitMB := 1
+	if caps != nil {
+		for _, g := range caps.GPUs {
+			if g.Index == device && allocMB > g.VRAMFreeMB() {
+				deficitMB = allocMB - g.VRAMFreeMB()
+				break
+			}
+		}
+	}
+	return DerateCUDAOOMArgsForDeficit(args, model, caps, device, allocMB, deficitMB, isComputeBuffer)
+}
+
+// DerateCUDAOOMArgsForDeficit recovers from one typed cudaMalloc failure.
+// allocMB is the measured failed component; deficitMB is how far it exceeded
+// the guarded device budget. Compute recovery skips ubatch rungs disproved by
+// the measurement. Weight recovery removes enough experts from the exact
+// failed device to cover the deficit and jitter margin.
+func DerateCUDAOOMArgsForDeficit(args []string, model *ModelProfile, caps *detect.Capabilities, device, allocMB, deficitMB int, isComputeBuffer bool) ([]string, *CacheEntry, bool) {
 	if model == nil || model.NumLayers <= 0 || allocMB <= 0 {
 		return nil, nil, false
 	}
+	if deficitMB <= 0 {
+		deficitMB = 1
+	}
 	if isComputeBuffer {
-		if next, ok := nextUBatchDown(currentUBatch(args)); ok {
+		if next, ok := nextUBatchForDeficit(currentUBatch(args), allocMB, deficitMB); ok {
 			newArgs := append([]string(nil), args...)
 			setOrAppendArg(&newArgs, "-ub", strconv.Itoa(next))
 			// Keep the in-memory Strategy's UBatchSize in sync with serverArgs —
@@ -3967,16 +4047,7 @@ func DerateCUDAOOMArgs(args []string, model *ModelProfile, caps *detect.Capabili
 	if expertPerLayerMB <= 0 {
 		return nil, nil, false
 	}
-	overshootMB := allocMB
-	if caps != nil {
-		for _, g := range caps.GPUs {
-			if g.Index == device && allocMB > g.VRAMFreeMB() {
-				overshootMB = allocMB - g.VRAMFreeMB()
-				break
-			}
-		}
-	}
-	dropLayers := ceilDivInt(overshootMB, expertPerLayerMB)
+	dropLayers := ceilDivInt(deficitMB+recoveryMarginMB(deficitMB), expertPerLayerMB)
 	if dropLayers <= 0 {
 		dropLayers = 1
 	}
@@ -4016,6 +4087,30 @@ func DerateCUDAOOMArgs(args []string, model *ModelProfile, caps *detect.Capabili
 
 	entry := cacheEntryFromArgs(newArgs, assignments)
 	return newArgs, entry, true
+}
+
+// CurrentGPUExpertLayers reports how many whole routed-expert layers the
+// effective override places on one logical backend device. Launch recovery uses
+// it to prove that a re-pack relieves the failed device rather than only changing
+// an unrelated dimension such as context.
+func CurrentGPUExpertLayers(args []string, device int) int {
+	idx := -1
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "-ot" || args[i] == "--override-tensor" {
+			idx = i
+			i++
+		}
+	}
+	if idx < 0 || idx+1 >= len(args) {
+		return 0
+	}
+	total := 0
+	for _, assignment := range parseOTAssignments(args[idx+1]) {
+		if assignment.CUDAIndex == device && assignment.Count > 0 {
+			total += assignment.Count
+		}
+	}
+	return total
 }
 
 func moeLayerRange(model *ModelProfile) (int, int) {
@@ -5311,7 +5406,7 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 		if checkpointHeadroom < 0 {
 			checkpointHeadroom = 0
 		}
-		capacity := checkpointHeadroom / (slots * hybridCheckpointReservePerSlotMB)
+		capacity := checkpointHeadroom / (slots * hybridCheckpointReservePerCheckpointMB)
 		if capacity >= hybridCheckpointMinimum {
 			if capacity > hybridCheckpointMaximum {
 				capacity = hybridCheckpointMaximum
@@ -7776,6 +7871,10 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
 				pc.PromptCacheEntryMB = v
 			}
+		case k == "PROBED_CHECKPOINT_MB":
+			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
+				pc.CheckpointMB = v
+			}
 		case k == "PROBED_CONTEXT_TOTAL_MB":
 			if v, err := strconv.Atoi(val); err == nil && v > 0 {
 				pc.ContextTotalMB = v
@@ -7879,7 +7978,8 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 	// pre-schema-7 file outright, so that repair became unreachable and was
 	// removed rather than left to imply a guarantee it no longer provides.
 	if pc.ComputeBufMB > 0 || len(pc.ComputeBufByGPU) > 0 || len(pc.RuntimeGraphGrowthByGPU) > 0 ||
-		pc.KVPerLayerMB > 0 || pc.ContextTotalMB > 0 || pc.PromptCacheBytesPerToken > 0 || pc.PromptCacheEntryMB > 0 {
+		pc.KVPerLayerMB > 0 || pc.ContextTotalMB > 0 || pc.PromptCacheBytesPerToken > 0 ||
+		pc.PromptCacheEntryMB > 0 || pc.CheckpointMB > 0 {
 		return pc
 	}
 	return nil
@@ -8078,6 +8178,9 @@ type probeCache struct {
 	// arrives without raising verbosity. It only appears once the cache is
 	// already under pressure, which is exactly when the budget is wrong.
 	PromptCacheEntryMB float64
+	// CheckpointMB is one active context-checkpoint allocation reported by the
+	// exact backend for this runtime signature.
+	CheckpointMB float64
 	// FreeVRAMAtProbe is the free VRAM each GPU showed when these numbers were
 	// measured. Every value above is conditional on it: a backend boxed into a
 	// degenerate placement by a busy card reserves a completely different graph
@@ -8151,6 +8254,7 @@ func probeMeasuredUnderDuress(freeAtProbe map[int]int, gpus []detect.GPU) bool {
 type probeMeasurements struct {
 	BytesPerToken      float64
 	EntryMB            float64
+	CheckpointMB       float64
 	AllocationSet      bool
 	ContextTotalMB     int
 	ContextByGPU       map[int]int
@@ -8283,6 +8387,9 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 		}
 		if measured.EntryMB <= 0 {
 			measured.EntryMB = previous.PromptCacheEntryMB
+		}
+		if previous.CheckpointMB > measured.CheckpointMB {
+			measured.CheckpointMB = previous.CheckpointMB
 		}
 		if !measured.AllocationSet {
 			measured.ContextTotalMB = previous.ContextTotalMB
@@ -8423,6 +8530,9 @@ func writeProbeCacheForModel(cacheDir string, model *ModelProfile, ctxSize, ubat
 	}
 	if measured.EntryMB > 0 {
 		fmt.Fprintf(&b, "PROBED_PROMPT_CACHE_ENTRY_MB=%.1f\n", measured.EntryMB)
+	}
+	if measured.CheckpointMB > 0 {
+		fmt.Fprintf(&b, "PROBED_CHECKPOINT_MB=%.3f\n", measured.CheckpointMB)
 	}
 	if measured.ContextTotalMB > 0 {
 		fmt.Fprintf(&b, "PROBED_CONTEXT_TOTAL_MB=%d\n", measured.ContextTotalMB)

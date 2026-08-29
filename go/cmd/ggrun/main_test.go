@@ -625,6 +625,8 @@ func TestWorkloadConcurrencyFollowsAgentDemandNotOnlyServerSlots(t *testing.T) {
 		{"interactive_default", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileInteractive, Parallel: 4}, 1},
 		{"interactive_explicit", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileInteractive, Parallel: 4, ParallelSet: true}, 4},
 		{"parallel_default", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel}, 2},
+		{"parallel_inherited_serial_default", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, Parallel: 1}, 2},
+		{"parallel_configured_demand", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, Parallel: 4}, 4},
 		{"parallel_declared_demand", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, Parallel: 2, ClaudeMaxActive: 4}, 4},
 		{"bounded", &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, ClaudeMaxActive: 32}, 8},
 	}
@@ -984,6 +986,18 @@ func TestStartupLogCUDAOOM(t *testing.T) {
 	device, allocMB, ok := startupLogCUDAOOM(log)
 	if !ok || device != 0 || allocMB != 2207 {
 		t.Fatalf("cuda oom parse = device %d alloc %d ok %v", device, allocMB, ok)
+	}
+}
+
+func TestClassifyRuntimeCgroupOOM(t *testing.T) {
+	if peakMB, ok := classifyRuntimeCgroupOOM(0, 73568*1024*1024); ok || peakMB != 0 {
+		t.Fatalf("ordinary exit classified as cgroup OOM: peak=%d ok=%v", peakMB, ok)
+	}
+	if peakMB, ok := classifyRuntimeCgroupOOM(1, 73568*1024*1024); !ok || peakMB != 73568 {
+		t.Fatalf("cgroup OOM classification = peak %d ok=%v, want 73568/true", peakMB, ok)
+	}
+	if peakMB, ok := classifyRuntimeCgroupOOM(2, 1024*1024+1); !ok || peakMB != 2 {
+		t.Fatalf("cgroup OOM peak must round up: peak=%d ok=%v", peakMB, ok)
 	}
 }
 
@@ -3073,6 +3087,12 @@ func TestExactAdmissionErrorCoversEveryRewriteClass(t *testing.T) {
 		if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 			t.Fatalf("%s did not wrap cause: %v", tc.class, err)
 		}
+		if !isStableExactAdmissionFailure(err) {
+			t.Fatalf("%s was not classified as deterministic admission evidence: %v", tc.class, err)
+		}
+	}
+	if isStableExactAdmissionFailure(errors.New("health timeout")) {
+		t.Fatal("a transient start error became persistent negative admission evidence")
 	}
 }
 
@@ -3763,6 +3783,15 @@ func TestLaunchProfileScopeSeparatesClaudeCompanionIdentity(t *testing.T) {
 	nano.ReviewerProfile.KVType = "q4_0"
 	if launchProfileScope(nano, model, backend, caps) == launchProfileScope(&nanoQ8, model, backend, caps) {
 		t.Fatal("Q4 and Q8 companion profiles reused one lifecycle scope")
+	}
+	nanoLargerContext := *nano
+	nanoLargerContext.ReviewerProfile = &claudeCompanionProfile{
+		Name: claudeNanoCompanionName, ModelPath: "/models/nano.gguf", BackendPath: "/bin/nanbeige",
+		KVType: "q4_0", ContextTokens: 262144,
+	}
+	nano.ReviewerProfile.ContextTokens = 131072
+	if launchProfileScope(nano, model, backend, caps) == launchProfileScope(&nanoLargerContext, model, backend, caps) {
+		t.Fatal("different companion context capacities reused one lifecycle scope")
 	}
 	nano.ClaudeReviewerDisabled = true
 	if launchProfileScope(qwen, model, backend, caps) == launchProfileScope(nano, model, backend, caps) {

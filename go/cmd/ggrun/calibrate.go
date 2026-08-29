@@ -109,7 +109,9 @@ func calibrationPlan(req *launchRequest, cfg *config.Config, model *placement.Mo
 	if len(candidates) < 2 {
 		return nil
 	}
+	var cachedDecision *placement.CalibrationDecision
 	if decision, err := placement.LoadCalibrationDecision(cfg.CacheDir, scopeKey); err == nil {
+		cachedDecision = decision
 		// A reusable recorded decision (including "default won") makes the
 		// controller finite. A merely screened explicit result is intentionally
 		// not reusable by auto mode and therefore must not suppress the core
@@ -131,14 +133,59 @@ func calibrationPlan(req *launchRequest, cfg *config.Config, model *placement.Mo
 	budget := calibrationBudgetFor(mode)
 	if mode == calibrateAuto {
 		candidates = automaticCalibrationFinalistPlan(req, cfg, model, be, caps, candidates)
+	} else {
+		// Explicit maintenance is the scientific sweep. Batch search can emit
+		// dozens of coordinates before slot count is appended; without family
+		// ordering the nine-load budget never reached p1/p2/p4 at all.
+		candidates = prioritizeParallelCalibrationCurve(candidates)
 	}
 	if len(candidates) < 2 {
+		return nil
+	}
+	// Compare negative admission evidence with the finalist that automatic mode
+	// will actually load, not the first raw candidate. The finalist planner can
+	// reorder the calculated set, and comparing before that step caused the same
+	// failed argv to be retried on every launch.
+	if mode == calibrateAuto && cachedDecision != nil &&
+		cachedDecision.SuppressesAutomaticAdmissionRetry(candidates[1].Name) {
 		return nil
 	}
 	if len(candidates) > budget.MaxCandidates {
 		candidates = candidates[:budget.MaxCandidates]
 	}
 	return candidates
+}
+
+// prioritizeParallelCalibrationCurve guarantees the bounded maintenance plan
+// observes the useful power-of-two scheduler curve before spending the rest of
+// its load budget on dense batch coordinates. Every candidate remains in the
+// result; this changes experiment order, not feasibility or promotion policy.
+func prioritizeParallelCalibrationCurve(candidates []placement.CalibrationCandidate) []placement.CalibrationCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	out := make([]placement.CalibrationCandidate, 0, len(candidates))
+	out = append(out, candidates[0])
+	used := make([]bool, len(candidates))
+	used[0] = true
+	for _, want := range []int{1, 2, 4, 8} {
+		for i := 1; i < len(candidates); i++ {
+			candidate := candidates[i]
+			if used[i] || !strings.HasPrefix(candidate.Name, "parallel-") ||
+				candidate.Strategy == nil || candidate.Strategy.Parallel != want {
+				continue
+			}
+			out = append(out, candidate)
+			used[i] = true
+			break
+		}
+	}
+	for i := 1; i < len(candidates); i++ {
+		if !used[i] {
+			out = append(out, candidates[i])
+		}
+	}
+	return out
 }
 
 // filterCalibrationCandidates removes only challengers. Candidate zero is the
@@ -167,6 +214,10 @@ func filterCalibrationCandidates(candidates []placement.CalibrationCandidate, re
 // evidence wins ties because it can skip an otherwise speculative admission;
 // the live agent benchmark remains the only authority that can promote a win.
 func automaticCalibrationFinalistPlan(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, candidates []placement.CalibrationCandidate) []placement.CalibrationCandidate {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	candidates = automaticWorkloadCandidateSet(req, candidates)
 	if len(candidates) < 2 {
 		return candidates
 	}
@@ -220,6 +271,33 @@ func automaticCalibrationFinalistPlan(req *launchRequest, cfg *config.Config, mo
 	}, calibrationAutoMaxCandidates)
 }
 
+// automaticWorkloadCandidateSet removes slot-width experiments that cannot
+// serve another runnable request in the declared workload. An idle llama.cpp
+// slot does not speed an active sequence; it only consumes sequence state and
+// divides the guaranteed context window. Keep the serving baseline and every
+// non-slot coordinate so a configured wider baseline can still be compared
+// with the useful p1/p2 curve. Explicit maintenance retains the full p1..p8
+// experiment set through its separate path.
+func automaticWorkloadCandidateSet(req *launchRequest, candidates []placement.CalibrationCandidate) []placement.CalibrationCandidate {
+	if len(candidates) < 2 || candidates[0].Strategy == nil {
+		return candidates
+	}
+	demand := max(1, requestWorkloadConcurrency(req))
+	baselineParallel := max(1, candidates[0].Strategy.Parallel)
+	out := make([]placement.CalibrationCandidate, 0, len(candidates))
+	out = append(out, candidates[0])
+	for _, candidate := range candidates[1:] {
+		if candidate.Strategy != nil {
+			parallel := max(1, candidate.Strategy.Parallel)
+			if parallel != baselineParallel && parallel > demand {
+				continue
+			}
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
+
 // selectAutomaticCalibrationAdmissionPlan keeps one calculated primary plus a
 // short sequence of already-ranked fallbacks. runCalibration stops after the
 // first challenger that both starts exactly and completes its measurement, so
@@ -235,14 +313,33 @@ func selectAutomaticCalibrationAdmissionPlan(candidates []placement.CalibrationC
 	}
 	out := make([]placement.CalibrationCandidate, 0, min(limit, len(candidates)))
 	out = append(out, candidates[0], primary[1])
-	for _, candidate := range candidates[1:] {
-		if candidate.Name == primary[1].Name {
-			continue
+	// If the predicted primary is a batch/topology coordinate, keep one legal
+	// slot-count fallback in the bounded admission ladder. This is especially
+	// important after a high-ubatch candidate fails: retrying two more members
+	// of the same family teaches nothing about aggregate agent throughput.
+	if !strings.HasPrefix(primary[1].Name, "parallel-") && len(out) < limit {
+		for _, candidate := range candidates[1:] {
+			if strings.HasPrefix(candidate.Name, "parallel-") {
+				out = append(out, candidate)
+				break
+			}
 		}
-		out = append(out, candidate)
+	}
+	for _, candidate := range candidates[1:] {
 		if len(out) >= limit {
 			break
 		}
+		duplicate := false
+		for _, selected := range out[1:] {
+			if candidate.Name == selected.Name {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		out = append(out, candidate)
 	}
 	return out
 }
@@ -497,6 +594,18 @@ func automaticCalibrationEvidenceValid(decision *placement.CalibrationDecision) 
 		decision.DefaultCachedTokens > 0 && decision.WinnerCachedTokens > 0 &&
 		decision.DefaultNewPromptTokens > 0 && decision.WinnerNewPromptTokens > 0 &&
 		decision.DefaultMixedTPS > 0 && decision.WinnerMixedTPS > 0
+}
+
+func automaticCalibrationAdmissionEvidenceValid(decision *placement.CalibrationDecision) bool {
+	if decision == nil {
+		return false
+	}
+	// This state records only an exact admission failure. A benchmark timeout,
+	// malformed response, incomplete workload, or untested estimate must retry
+	// later rather than becoming a permanent negative result.
+	return decision.Winner == "default" &&
+		decision.Finalist != "" &&
+		decision.FinalistOutcome == "unavailable"
 }
 
 func calibrationTurnTime(result *benchmark.Result) float64 {
@@ -775,10 +884,14 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 
 	curP := p
 	failures := 0
+	stableAdmissionFailed := false
+	admissionInconclusive := false
+	exactCandidateStarted := false
 	for _, cand := range candidates[1:] {
 		remaining := budget.MaxElapsed - time.Since(startedAt)
 		if remaining <= 3*time.Second {
 			fmt.Fprintln(os.Stderr, "[calibrate] elapsed-time budget reached; stopping candidate search")
+			admissionInconclusive = true
 			break
 		}
 		candArgs := buildLaunchServerArgs(req, cfg, be, caps, model, cand.Strategy)
@@ -787,6 +900,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		}
 		if memoryRecovery.isRejected(candArgs) {
 			fmt.Printf("[calibrate] skipping %s: its exact argv already failed memory admission in this launch\n", cand.Name)
+			stableAdmissionFailed = true
 			continue
 		}
 		fmt.Printf("[calibrate] measuring %s...\n", cand.Name)
@@ -800,6 +914,11 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		cp, measuredStrategy, measuredArgs, serr := startLaunchExactAdmission(req, cfg, model, cand.Strategy, be, caps, candArgs, candidateTimeout, memoryRecovery)
 		if serr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s failed to start (%v); skipping\n", cand.Name, serr)
+			if isStableExactAdmissionFailure(serr) {
+				stableAdmissionFailed = true
+			} else {
+				admissionInconclusive = true
+			}
 			failures++
 			if failures >= budget.MaxFailures {
 				fmt.Fprintln(os.Stderr, "[calibrate] failure budget reached; stopping candidate search")
@@ -813,6 +932,7 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		// candidate name would replay an unverified shape on the next launch.
 		if !exactCalibrationCandidate(candArgs, measuredArgs) {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s needed memory recovery; skipping the altered candidate\n", cand.Name)
+			stableAdmissionFailed = true
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after memory recovery", resourceBaseline, 30*time.Second) {
 				req.CalibrationScreened = true
 				return cp, measuredStrategy, measuredArgs, nil
@@ -824,9 +944,11 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			}
 			continue
 		}
+		exactCandidateStarted = true
 		result, berr := bench(measuredStrategy, cp)
 		if berr != nil {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s measurement failed (%v); skipping\n", cand.Name, berr)
+			admissionInconclusive = true
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after failed measurement", resourceBaseline, 30*time.Second) {
 				req.CalibrationScreened = true
 				return cp, measuredStrategy, measuredArgs, nil
@@ -873,6 +995,12 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		}
 		if curP == nil {
 			return nil, strategy, serverArgs, nil
+		}
+		// Only exact admission failures are stable negative evidence. A candidate
+		// that started but whose benchmark timed out or returned incomplete data
+		// must remain retryable on the next launch.
+		if !stableAdmissionFailed || admissionInconclusive || exactCandidateStarted {
+			return curP, strategy, serverArgs, nil
 		}
 		pending := newCalibrationDecision(scopeKey, model, defaultResult, measurements[0])
 		annotateOptimizationDecision(pending, candidates, measurements)

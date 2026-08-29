@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/raketenkater/ggrun/pkg/config"
@@ -126,9 +127,28 @@ func recoverPreflightOOM(
 		)
 	}
 
+	var candidateArgs []string
+	if candidate != nil {
+		candidateArgs = buildLaunchServerArgs(req, cfg, be, caps, model, candidate)
+	}
 	nextStrategy, nextArgs, method, changed := applyMemoryRecoverySelection(
-		req, strategy, serverArgs, candidate, model, runtimeCaps, outcome,
+		req, strategy, serverArgs, candidate, model, runtimeCaps, outcome, candidateArgs,
 	)
+	if !changed {
+		// Context is the last automatic compute-memory lever. It cannot be an
+		// argv patch: context changes KV, graph, CRAM, checkpoint, placement-cache,
+		// and host-ledger state together. Recompute the complete configuration at
+		// one deficit-sized target, then let the normal exact preflight prove it.
+		contextCandidate, contextArgs, contextErr := recomputeAutomaticContextRecovery(
+			req, cfg, model, be, caps, strategy, serverArgs, outcome,
+		)
+		if contextErr != nil {
+			return nil, nil, "", contextErr
+		}
+		if contextCandidate != nil {
+			return contextCandidate, contextArgs, "context-derate", nil
+		}
+	}
 	if !changed {
 		detail := ""
 		if replanErr != nil {
@@ -142,10 +162,11 @@ func recoverPreflightOOM(
 	return nextStrategy, nextArgs, method, nil
 }
 
-// applyMemoryRecoverySelection is the only place that turns a selected memory
-// recovery action into the next Strategy+argv pair. Both preflight failures and
-// real allocator OOMs use it, so policy ordering and state mutation cannot
-// drift between the two loops again.
+// applyMemoryRecoverySelection turns a selected non-context memory recovery
+// action into the next Strategy+argv pair. Production callers pass the complete
+// candidate argv rebuilt from its Strategy; the optional form keeps the pure
+// selector testable. Context recovery is deliberately outside this function
+// because it must re-enter placement.Compute before any argv is emitted.
 func applyMemoryRecoverySelection(
 	req *launchRequest,
 	current *placement.Strategy,
@@ -154,6 +175,7 @@ func applyMemoryRecoverySelection(
 	model *placement.ModelProfile,
 	caps *detect.Capabilities,
 	outcome preflightOutcome,
+	completeCandidateArgs ...[]string,
 ) (*placement.Strategy, []string, string, bool) {
 	// Withdraw a ggrun-generated --swa-full before shedding any weights.
 	//
@@ -177,8 +199,27 @@ func applyMemoryRecoverySelection(
 			return current, withdrawn, "swa-full-withdrawn", true
 		}
 	}
-	nextArgs, entry, method, changed := selectChangedPreflightRecovery(
-		currentArgs, candidate, model, caps, outcome,
+	// Context changes need a complete placement recompute. Reject any
+	// contradictory partial candidate here; an explicit context is immutable,
+	// while the automatic path below derives one deficit-sized target and sends
+	// it back through Compute.
+	if candidate != nil && current != nil && candidate.ContextSize > 0 &&
+		candidate.ContextSize != current.ContextSize {
+		// Even an automatically-selected context cannot be a partial candidate
+		// argv. The caller will derive one deficit-sized target and fully recompute
+		// it after the non-context levers are exhausted.
+		candidate = nil
+	}
+	var candidateArgs []string
+	if candidate != nil {
+		if len(completeCandidateArgs) > 0 {
+			candidateArgs = completeCandidateArgs[0]
+		} else {
+			candidateArgs = patchPlacementArgs(currentArgs, candidate)
+		}
+	}
+	nextArgs, entry, method, changed := selectChangedPreflightRecoveryWithArgs(
+		currentArgs, candidate, candidateArgs, model, caps, outcome,
 	)
 	if !changed {
 		return nil, nil, "", false
@@ -208,6 +249,21 @@ func selectChangedPreflightRecovery(
 	caps *detect.Capabilities,
 	outcome preflightOutcome,
 ) ([]string, *placement.CacheEntry, string, bool) {
+	var candidateArgs []string
+	if candidate != nil {
+		candidateArgs = patchPlacementArgs(currentArgs, candidate)
+	}
+	return selectChangedPreflightRecoveryWithArgs(currentArgs, candidate, candidateArgs, model, caps, outcome)
+}
+
+func selectChangedPreflightRecoveryWithArgs(
+	currentArgs []string,
+	candidate *placement.Strategy,
+	candidateArgs []string,
+	model *placement.ModelProfile,
+	caps *detect.Capabilities,
+	outcome preflightOutcome,
+) ([]string, *placement.CacheEntry, string, bool) {
 	currentFingerprint := effectiveMemoryArgsFingerprint(currentArgs)
 	candidateLowersUBatch := false
 	if candidate != nil {
@@ -216,54 +272,267 @@ func selectChangedPreflightRecovery(
 			switch {
 			case candidate.UBatchSize > currentUB:
 				candidate = nil
+				candidateArgs = nil
 			case candidate.UBatchSize > 0 && candidate.UBatchSize < currentUB:
 				candidateLowersUBatch = true
 			}
 		}
 	}
-	var candidateArgs []string
 	if candidate != nil {
-		candidateArgs = patchPlacementArgs(currentArgs, candidate)
+		candidateArgs = append([]string(nil), candidateArgs...)
 		if effectiveMemoryArgsFingerprint(candidateArgs) == currentFingerprint {
 			candidateArgs = nil
 		}
 	}
-	// A same-ubatch re-pack that moves weights is preferable to a blind layer
-	// drop. A candidate whose only way forward is a smaller ubatch waits until
-	// the failed device has first lost one routed expert layer.
-	if candidateArgs != nil && !candidateLowersUBatch {
+	// A same-ubatch re-pack wins early only when it actually relieves the failed
+	// device. Context is part of the memory fingerprint, so the old generic
+	// changed-fingerprint test accepted GLM's 1,024-token nudges (4-5 MiB each)
+	// against a 2.5 GiB deficit until the retry budget expired.
+	candidateRelievesTopology := candidateArgs != nil && candidateRelievesFailedDevice(currentArgs, candidateArgs, outcome.Device)
+	candidateUBatchCovers := candidateArgs != nil && candidateLowersUBatch && ubatchCandidateCoversDeficit(currentArgs, candidateArgs, outcome)
+	if candidateArgs != nil && !candidateLowersUBatch && candidateRelievesTopology {
 		return candidateArgs, nil, "replanned", true
 	}
 
 	// The exact deficit is the minimum memory that must be reclaimed from the
 	// loaded state. Passing the full allocation here could drop many expert
 	// layers even when the guard was exceeded by only a few MiB.
-	derateMB := maxPreflightInt(outcome.DeficitMB, 1)
 	if outcome.IsComputeBuffer {
 		// The failed device is stronger evidence than a generic compute-buffer
 		// classification. Move one routed expert layer off that exact GPU before
 		// reducing global compute throughput via ubatch.
-		nextArgs, entry, ok := placement.DerateCUDAOOMArgs(
-			currentArgs, model, caps, outcome.Device, derateMB, false,
+		nextArgs, entry, ok := placement.DerateCUDAOOMArgsForDeficit(
+			currentArgs, model, caps, outcome.Device,
+			maxPreflightInt(outcome.AllocMB, 1), maxPreflightInt(outcome.DeficitMB, 1), false,
 		)
 		if ok && effectiveMemoryArgsFingerprint(nextArgs) != currentFingerprint {
 			return nextArgs, entry, "expert-derate", true
 		}
 	}
-	if candidateArgs != nil {
+	if candidateArgs != nil && (candidateRelievesTopology || candidateUBatchCovers) {
 		return candidateArgs, nil, "replanned", true
 	}
-	nextArgs, entry, ok := placement.DerateCUDAOOMArgs(
-		currentArgs, model, caps, outcome.Device, derateMB, outcome.IsComputeBuffer,
+	nextArgs, entry, ok := placement.DerateCUDAOOMArgsForDeficit(
+		currentArgs, model, caps, outcome.Device,
+		maxPreflightInt(outcome.AllocMB, 1), maxPreflightInt(outcome.DeficitMB, 1), outcome.IsComputeBuffer,
 	)
-	if !ok || effectiveMemoryArgsFingerprint(nextArgs) == currentFingerprint {
-		return nil, nil, "", false
+	if ok && effectiveMemoryArgsFingerprint(nextArgs) != currentFingerprint {
+		method := "expert-derate"
+		if outcome.IsComputeBuffer && entry != nil && entry.UBatchSize > 0 {
+			method = "ubatch-derate"
+		}
+		return nextArgs, entry, method, true
 	}
-	method := "expert-derate"
-	if outcome.IsComputeBuffer && entry != nil && entry.UBatchSize > 0 {
-		method = "ubatch-derate"
+	return nil, nil, "", false
+}
+
+func recoveryRequiredMB(deficitMB int) int {
+	deficitMB = maxPreflightInt(deficitMB, 1)
+	margin := (deficitMB + 9) / 10
+	if margin < 64 {
+		margin = 64
 	}
-	return nextArgs, entry, method, true
+	return deficitMB + margin
+}
+
+func effectiveMemoryArgValues(args []string) map[string]string {
+	values := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		canonical, ok := memoryArgCanonical[args[i]]
+		if !ok || i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
+			continue
+		}
+		values[canonical] = args[i+1]
+		i++
+	}
+	for _, flag := range []string{"--no-kv-offload", "--no-mmap", "--mmap"} {
+		if hasArg(args, flag) {
+			values[flag] = "true"
+		}
+	}
+	return values
+}
+
+func memoryValueInt(values map[string]string, key string) int {
+	v, _ := strconv.Atoi(values[key])
+	return v
+}
+
+func tensorSplitShare(values map[string]string, device int) float64 {
+	parts := strings.Split(values["tensor-split"], ",")
+	if device < 0 || device >= len(parts) {
+		return 0
+	}
+	shares := make([]float64, len(parts))
+	total := 0.0
+	for i, part := range parts {
+		share, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil || share < 0 {
+			return 0
+		}
+		shares[i] = share
+		total += share
+	}
+	if total <= 0 {
+		return 0
+	}
+	return shares[device] / total
+}
+
+// candidateRelievesFailedDevice proves a topology candidate reduces pressure on
+// the device that failed. A generic changed argv is not enough: lateral split
+// churn and context-only changes do not address a device-local allocation.
+func candidateRelievesFailedDevice(currentArgs, candidateArgs []string, device int) bool {
+	currentLayers := placement.CurrentGPUExpertLayers(currentArgs, device)
+	candidateLayers := placement.CurrentGPUExpertLayers(candidateArgs, device)
+	if currentLayers > 0 && candidateLayers < currentLayers {
+		return true
+	}
+	current := effectiveMemoryArgValues(currentArgs)
+	candidate := effectiveMemoryArgValues(candidateArgs)
+	if currentLayers > 0 && memoryValueInt(candidate, "n-cpu-moe") > memoryValueInt(current, "n-cpu-moe") {
+		return true
+	}
+	currentShare := tensorSplitShare(current, device)
+	candidateShare := tensorSplitShare(candidate, device)
+	if currentShare > 0 && candidateShare >= 0 && candidateShare < currentShare {
+		return true
+	}
+	currentLayersGeneric := memoryValueInt(current, "gpu-layers")
+	candidateLayersGeneric := memoryValueInt(candidate, "gpu-layers")
+	return currentLayersGeneric > 0 && candidateLayersGeneric >= 0 && candidateLayersGeneric < currentLayersGeneric
+}
+
+func ubatchCandidateCoversDeficit(currentArgs, candidateArgs []string, outcome preflightOutcome) bool {
+	current := memoryValueInt(effectiveMemoryArgValues(currentArgs), "ubatch")
+	next := memoryValueInt(effectiveMemoryArgValues(candidateArgs), "ubatch")
+	if current <= 0 || next <= 0 || next >= current {
+		return false
+	}
+	if !outcome.AllocMBMeasured || outcome.AllocMB <= 0 {
+		return true
+	}
+	return outcome.AllocMB*(current-next)/current >= recoveryRequiredMB(outcome.DeficitMB)
+}
+
+func contextCandidateCoversDeficit(currentArgs, candidateArgs []string, model *placement.ModelProfile, outcome preflightOutcome) bool {
+	if !outcome.IsComputeBuffer || !outcome.AllocMBMeasured || outcome.AllocMB <= 0 {
+		return false
+	}
+	currentValues := effectiveMemoryArgValues(currentArgs)
+	candidateValues := effectiveMemoryArgValues(candidateArgs)
+	currentCtx := memoryValueInt(currentValues, "ctx")
+	nextCtx := memoryValueInt(candidateValues, "ctx")
+	if currentCtx <= 0 || nextCtx <= 0 || nextCtx >= currentCtx {
+		return false
+	}
+	// Allocation scaling plus total KV reduction is an optimistic upper bound
+	// for one device. If even that bound misses the deficit, the candidate is
+	// disproved. If it passes, exact preflight remains authoritative.
+	reclaim := outcome.AllocMB * (currentCtx - nextCtx) / currentCtx
+	kvType := currentValues["cache-k"]
+	if kvType == "" {
+		kvType = "q8_0"
+	}
+	currentKV := placement.EstimateKVCacheMB(model, currentCtx, kvType, hasArg(currentArgs, "--swa-full"))
+	nextKV := placement.EstimateKVCacheMB(model, nextCtx, kvType, hasArg(candidateArgs, "--swa-full"))
+	if currentKV > nextKV {
+		reclaim += currentKV - nextKV
+	}
+	return reclaim >= recoveryRequiredMB(outcome.DeficitMB)
+}
+
+func automaticContextRecoveryTarget(req *launchRequest, current *placement.Strategy, currentArgs []string, outcome preflightOutcome) (int, bool) {
+	if req == nil || current == nil || !current.ContextAuto || !outcome.IsComputeBuffer ||
+		!outcome.AllocMBMeasured || outcome.AllocMB <= 0 {
+		return 0, false
+	}
+	if !automaticContextRequest(req) {
+		return 0, false
+	}
+	currentCtx := memoryValueInt(effectiveMemoryArgValues(currentArgs), "ctx")
+	if currentCtx <= 0 {
+		currentCtx = current.ContextSize
+	}
+	minimum := 32768
+	if req.ClaudeCode {
+		slots := maxPreflightInt(current.Parallel, 1)
+		minimum = maxPreflightInt(minimum, slots*claudeSlotMin)
+	}
+	if currentCtx <= minimum {
+		return 0, false
+	}
+	required := recoveryRequiredMB(outcome.DeficitMB)
+	target := minimum
+	if required < outcome.AllocMB {
+		target = currentCtx * (outcome.AllocMB - required) / outcome.AllocMB
+	}
+	target = target / 1024 * 1024
+	if target < minimum {
+		target = minimum
+	}
+	if target >= currentCtx {
+		target = (currentCtx - 1024) / 1024 * 1024
+	}
+	if target < minimum || target >= currentCtx {
+		return 0, false
+	}
+	return target, true
+}
+
+// recomputeAutomaticContextRecovery turns the measured target into one complete
+// placement. A context change is never applied to the current Strategy in
+// place: all context-derived memory and cache state must come from Compute.
+func recomputeAutomaticContextRecovery(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities, current *placement.Strategy, currentArgs []string, outcome preflightOutcome) (*placement.Strategy, []string, error) {
+	target, ok := automaticContextRecoveryTarget(req, current, currentArgs, outcome)
+	if !ok || cfg == nil || model == nil || be == nil || caps == nil {
+		return nil, nil, nil
+	}
+	opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
+	opts.ContextSize = target
+	opts.AutoContextMax = 0
+	opts.Parallel = maxPreflightInt(current.Parallel, 1)
+	opts.AutoParallel = false
+	opts.BatchSize = current.BatchSize
+	opts.UBatchSize = current.UBatchSize
+	opts.SkipPlacementCache = true
+	opts.CacheFile = ""
+	opts.VerifiedConfigScopeKey = ""
+	next, err := placement.Compute(caps, model, opts)
+	if err != nil {
+		return nil, nil, fmt.Errorf("full context-recovery re-plan at %d tokens: %w", target, err)
+	}
+	if next == nil || next.ContextSize != target {
+		return nil, nil, fmt.Errorf("full context-recovery re-plan did not preserve target %d", target)
+	}
+	next.ContextAuto = true
+	next.ContextFitRejected = current.ContextSize
+	next.ContextFitTier = current.ContextFitTier
+	if next.ContextFitTier == "" {
+		next.ContextFitTier = "recovered"
+	}
+	next.ContextFitEvidence = fmt.Sprintf("exact CUDA%d compute allocation missed guard by %d MiB", outcome.Device, outcome.DeficitMB)
+	next.PerformanceTuned = false
+	nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
+	if effectiveMemoryArgsFingerprint(nextArgs) == effectiveMemoryArgsFingerprint(currentArgs) {
+		return nil, nil, fmt.Errorf("full context-recovery re-plan at %d tokens did not change effective memory arguments", target)
+	}
+	if !contextCandidateCoversDeficit(currentArgs, nextArgs, model, outcome) {
+		return nil, nil, fmt.Errorf("full context-recovery re-plan at %d tokens cannot cover the measured %d MiB deficit", target, outcome.DeficitMB)
+	}
+	return next, nextArgs, nil
+}
+
+func automaticContextRequest(req *launchRequest) bool {
+	if req == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(req.CtxFlag)) {
+	case "", "fit", "auto":
+		return true
+	default:
+		return false
+	}
 }
 
 var memoryArgCanonical = map[string]string{
@@ -288,20 +557,7 @@ var memoryArgCanonical = map[string]string{
 // behavior. This catches retries where ggrun changed an earlier generated flag
 // but a later user override kept the effective placement identical.
 func effectiveMemoryArgsFingerprint(args []string) string {
-	values := map[string]string{}
-	for i := 0; i < len(args); i++ {
-		canonical, ok := memoryArgCanonical[args[i]]
-		if !ok || i+1 >= len(args) || strings.HasPrefix(args[i+1], "-") {
-			continue
-		}
-		values[canonical] = args[i+1]
-		i++
-	}
-	for _, flag := range []string{"--no-kv-offload", "--no-mmap", "--mmap"} {
-		if hasArg(args, flag) {
-			values[flag] = "true"
-		}
-	}
+	values := effectiveMemoryArgValues(args)
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

@@ -26,6 +26,61 @@ slot create_check: id  0 | task 97 | created context checkpoint 4 of 16 (pos_min
 	if obs.Evicted != 0 || obs.Skipped != 0 {
 		t.Fatalf("save-only observation counted pressure: evicted=%d skipped=%d", obs.Evicted, obs.Skipped)
 	}
+	if math.Abs(obs.LargestCheckpointMB-871.690) > 0.001 {
+		t.Fatalf("LargestCheckpointMB = %.3f, want 871.690", obs.LargestCheckpointMB)
+	}
+}
+
+func TestRecurrentCheckpointFootprintUsesColdFloorMeasurementAndSlots(t *testing.T) {
+	model := &ModelProfile{HasSSM: 1}
+	if got := checkpointFootprintMB(model, 16, 1, 0, 262144); got != 2048 {
+		t.Fatalf("cold recurrent reserve = %d MiB, want 2048", got)
+	}
+	if got := checkpointFootprintMB(model, 16, 4, 0, 262144); got != 8192 {
+		t.Fatalf("four-slot recurrent reserve = %d MiB, want 8192", got)
+	}
+	if got := checkpointFootprintMB(model, 16, 1, 0, 262144, 871.690); got != 13952 {
+		t.Fatalf("measured recurrent reserve = %d MiB, want 13952", got)
+	}
+	if got := checkpointFootprintMB(&ModelProfile{}, 16, 1, 0, 262144); got != 0 {
+		t.Fatalf("non-recurrent model without SWA reserved %d MiB", got)
+	}
+}
+
+func TestApplyMeasuredCheckpointObservationRaisesHostPlan(t *testing.T) {
+	model := &ModelProfile{HasSSM: 1}
+	strategy := &Strategy{
+		ContextSize: 262144, Parallel: 1, MaxCheckpoints: 16,
+		PlannedHostFootprintMB: 60000,
+	}
+	before, after, changed := ApplyMeasuredCheckpointObservation(model, strategy, PromptCacheObservation{LargestCheckpointMB: 871.690})
+	if !changed || before != 2048 || after != 13952 {
+		t.Fatalf("checkpoint adjustment = %d -> %d changed=%v, want 2048 -> 13952", before, after, changed)
+	}
+	if strategy.PlannedHostFootprintMB != 71904 || math.Abs(strategy.MeasuredCheckpointMB-871.690) > 0.001 {
+		t.Fatalf("adjusted strategy = %+v", strategy)
+	}
+}
+
+func TestCheckpointObservationRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	model := &ModelProfile{Path: "recurrent.gguf", Basename: "recurrent.gguf", SizeBytes: 1234, HasSSM: 1}
+	gpus := []detect.GPU{{Index: 0, Name: "gpu", VRAMTotalMB: 24576}}
+	const (
+		ctx      = 32768
+		ubatch   = 256
+		parallel = 2
+		tag      = "llama-test"
+	)
+	obs := PromptCacheObservation{LargestCheckpointMB: 871.690}
+	if err := RecordPromptCacheObservation(dir, model, ctx, ubatch, "mid", "gpu", tag, gpus, parallel, obs); err != nil {
+		t.Fatal(err)
+	}
+	strategy := &Strategy{ContextSize: ctx, UBatchSize: ubatch, KVQuality: "mid", KVPlacement: "gpu", Parallel: parallel}
+	LoadMeasuredPromptCache(dir, model, strategy, tag, gpus)
+	if math.Abs(strategy.MeasuredCheckpointMB-871.690) > 0.001 {
+		t.Fatalf("checkpoint round trip = %.3f, want 871.690", strategy.MeasuredCheckpointMB)
+	}
 }
 
 func TestObservePromptCacheDoesNotUndercutBackendFullEntryMeasurement(t *testing.T) {

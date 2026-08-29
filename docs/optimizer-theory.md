@@ -5,8 +5,8 @@
 > fork discovery, replicas, and specialist-model orchestration are separate
 > development lanes.
 
-Status: source correction committed and canonical binary rebuilt, 2026-08-27.
-Live performance acceptance still requires the next intentional model window.
+Status: core hardening verified and installed, 2026-08-29. Live performance
+acceptance still requires the next intentional model window.
 
 ## The contract in one sentence
 
@@ -110,6 +110,7 @@ on one card does not make a globally constrained launch roomy.
 | `--tensor-split` with `--split-mode layer` | Assigns consecutive layer ranges to devices. Those layer ranges form a serial model path; it is not generic data parallelism. | Putting ordinary layers on every GPU can add slow-device and boundary costs. A device that merely stores routed experts is a different role from an ordinary-layer owner. |
 | `--split-mode row` | Tensor-parallel row splitting where supported. | Do not generate it until the backend/device topology proves support and peer behavior. It needs a separate cost/admission model from layer split. |
 | `-ot` tensor overrides | Places selected tensors (for ggrun, commonly routed experts) on named devices/CPU. | Expert storage is also expert execution placement. Current llama.cpp disables pipeline parallel when tensor overrides exist, so an MoE `-ot` plan must not be priced as an overlapped pipeline. |
+| backend expert cache (experimental) | Keeps recently reused slices of CPU-resident expert tensors in VRAM and splits decode work between GPU cache hits and CPU misses. | This attacks host-DRAM-bound decode, not model fit or cold prefill. Generate it only for an exact advertised backend/model layout, size it from the complete VRAM ledger, and require a same-workload A/B. |
 | `--mmap` / `--no-mmap` | File-backed mapping versus resident loading behavior, subject to backend implementation. | mmap is a fit/reclaim policy, not a normal speed lever. Exact pageability observation must agree with the planned host ledger. |
 | `--mlock` | Requests locking mapped pages in RAM. | Global mlock is not a solution for a model larger than usable RAM. Selective hot-expert pinning would require backend capability and remains a later last-resort experiment. |
 
@@ -216,6 +217,21 @@ Relevant MoE systems work includes
 prefetch/cache, and [PowerInfer](https://arxiv.org/abs/2312.12456) for hot/cold
 residency. They are design references, not features ggrun can claim from
 llama.cpp today.
+
+Two different ideas must not share the name “hot experts”:
+
+- **Resident decode cache:** all experts already fit in host RAM, but repeated
+  CPU expert reads are DRAM-bound. A temporal per-layer VRAM cache can turn
+  repeated decode hits into GPU work. Static global popularity is not a safe
+  prior: the Qwen3.8-Flash-Next measurements in
+  [llama.cpp PR #27861](https://github.com/ggml-org/llama.cpp/pull/27861)
+  found weak cross-corpus static coverage but strong short-term LRU locality.
+- **Selective mmap/mlock pinning:** the model exceeds usable resident RAM and
+  only a working set stays memory-resident while the cold tail remains on disk.
+  This is a last-resort fit experiment with page-fault and storage risk.
+
+The first is a core roomy/tight performance candidate. The second remains
+outside automatic best until its separate hardware acceptance passes.
 
 ## Candidate and promotion rules
 
@@ -342,7 +358,7 @@ behavior.
 | Phase evidence | `go/pkg/benchmark/resources.go`, `process_linux.go`; `go/pkg/placement/bottleneck.go` | Cold prefill, append, decode, and mixed phases retain GPU and process-tree CPU/RSS/I/O summaries. Queue fields are accepted only from an optional non-perturbing source; standard calibration does not poll scheduler-backed `/metrics` for them. A conservative typed diagnosis can prioritize one feasible complete finalist; incomplete evidence stays unknown. |
 | Automatic controller | `go/cmd/ggrun/calibrate.go`: `automaticCalibrationFinalistPlan`, `runCalibration` | Baseline plus at most three admission fallbacks and one successfully measured challenger; identical bounded agent workload; per-phase regression guard; measured promotion/baseline-won persistence. The old owner-name shortcut is removed. |
 | Exact challenger admission | `go/cmd/ggrun/main.go`: `startLaunchExactAdmission` | Working tree rejects all currently identified argv-rewrite paths rather than recovering a challenger into a different candidate. |
-| Persistence | `go/pkg/placement/calibrate.go` | Schema must be bumped whenever candidate/scoring/evidence semantics change; placement-bound aggregate and performance evidence use calibration schema 17. Older fit proof may remain reusable, but older performance proof may not. |
+| Persistence | `go/pkg/placement/calibrate.go` | Schema must be bumped whenever candidate/scoring/evidence semantics change; placement-bound aggregate and performance evidence use calibration schema 18. Older fit proof may remain reusable, but older performance proof may not. |
 | Tests | repository validation | Focused core run: 971 tests. Full and race runs: 1,435 tests each. Build, vet, Windows vet, formatting, ShellCheck, Python/shell suites, and Linux ARM64, Darwin ARM64, and Windows AMD64 cross-builds pass. |
 
 The working tree also contains a separate Grok/user fork-discovery lane. Do not
@@ -475,6 +491,9 @@ Not proven yet:
 - moving more/fewer experts to GPU wins after accounting for host bandwidth;
 - the current working-tree finalist survives exact allocation and beats the
   baseline on identical agent work.
+- a draft temporal expert cache preserves correctness and improves the current
+  three-GPU Q3 launch; published Qwen3.8 evidence makes it a high-confidence
+  experiment, not transferable proof.
 
 Do not turn the first utilization sample into any of those claims.
 
@@ -499,6 +518,10 @@ Do not turn the first utilization sample into any of those claims.
    admission fallbacks and stops after the first successfully measured
    challenger. Broader exploration needs an explicit user-requested calibration
    mode rather than silently lengthening a standard launch.
+7. Expert-cache implementations are draft backend forks. Decode-only layout
+   support, cache ownership, asynchronous publication, speculative/multi-token
+   bypass, and heterogeneous-device accounting all need exact capability and
+   correctness gates before ggrun can generate a candidate.
 
 ## Ordered next work
 
@@ -555,12 +578,17 @@ Run only when the hardware/model window is intentionally available:
   conservative priors for unseen public hardware.
 - Add direct host-bandwidth and PCIe evidence to split the composite host-expert
   diagnosis into CPU GEMM, transfer, and synchronization causes.
+- Evaluate the pinned draft temporal expert cache as one exact
+  host-expert/decode candidate. Size it from residual VRAM and expert geometry,
+  and keep static hot lists out of policy unless workload-scoped evidence proves
+  them.
 - Calibrate queue/busy-slot thresholds across real agent workloads before
   allowing slot width to outrank batch or topology.
 - Measure P2P before generating row/tensor-parallel candidates.
 - Expand the acceptance matrix and publish anonymized evidence fixtures.
 - Finish ordinary mmap last-resort acceptance. Keep selective expert
-  mmap/mlock parked until a supported backend and too-large-model window exist.
+  mmap/mlock parked until a supported backend and too-large-model window exists;
+  do not conflate it with the resident decode cache.
 
 ## Resume checklist
 

@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+- **Agent-parallel optimization now measures the concurrency it intends to
+  serve.** The inherited single-slot server default no longer collapses the
+  `agent-parallel` workload to one runnable turn. Automatic launch models at
+  least two independent agent lanes, removes slot-width challengers above the
+  declared demand, and still measures p1 versus p2 before changing a
+  host-offloaded model's live admission. A validated winner admits only the
+  number of lanes represented by its workload evidence; cold and
+  admission-only launches remain serialized, while explicit `--parallel` and
+  `--claude-max-active` continue to win.
+- **Automatic optimization no longer reloads a known-unavailable finalist on
+  every identical launch.** A bounded challenger ladder that fails only typed
+  exact-admission checks is cached as scoped admission evidence after the
+  restored baseline passes its lifecycle gates. That evidence suppresses the
+  same destructive retry without claiming that the baseline is fastest;
+  timeouts and incomplete benchmarks remain retryable.
+- **Recurrent context checkpoints are charged before host cgroups are
+  tightened.** Hybrid/recurrent launches reserve checkpoint RAM per checkpoint
+  and per slot even when GGUF metadata exposes no sliding-window geometry. The
+  first functional canary's exact backend-reported checkpoint size is persisted,
+  applied to the live host footprint, and carried by verified configs. A later
+  cgroup OOM is now a typed runtime failure that revokes unsafe placement,
+  calibration, lifecycle, and verified-config evidence instead of appearing as
+  an unexplained server exit.
+- **Cheap-tier and classifier calls use the seated reviewer instead of
+  queueing behind main-model work.** With a review-only reviewer (no worker
+  companion) the router previously sent `local-fast` traffic — Claude Code's
+  permission classifier and haiku-tier background calls — to the main model,
+  where 45–80 s behind a single slot's long foreground streams timed out tool
+  calls and blocked Workflow fan-out agents. The cheap tier now routes to the
+  seated reviewer whenever the prompt fits its context, keeping the same
+  visible-notice and overflow-fallback contracts as the classifier lane.
+- **The routed prompt token estimate errs high.** `estimatedPromptTokens`
+  divided body bytes by 3 and could score code-dense or escaped-JSON prompts
+  below the reviewer's real window: reviews of 65,675 tokens arrived past a
+  65,536-token estimate and overflowed the reviewer with a 400. A 2-byte
+  divisor replaces the 3-byte one; a conservative false positive merely falls
+  back to the main model before the reviewer is overrun.
+- **Rejected reviewer verdicts are recorded.** A reviewer answer whose text
+  fails the `<block>` verdict contract now writes a
+  `reviewer-rejected/invalid-verdict` metrics row next to the main-model retry,
+  instead of leaving a template or format mismatch indistinguishable from
+  reviewer unavailability in the request log.
 - **Standard launch now diagnoses performance per agent phase.** The bounded
   workload retains separate cold-prefill, cache-backed-append, decode, and
   mixed-traffic GPU samples plus Linux process-tree CPU, RSS, and disk-I/O

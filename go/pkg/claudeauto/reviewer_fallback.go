@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"strings"
 	"time"
 )
@@ -18,11 +20,9 @@ var errReviewerUnusable = errors.New("reviewer backend returned an unusable resp
 
 type reviewerAttemptKey struct{}
 
-// reviewerAttempt tracks one review sent to the separate reviewer. It is carried
-// on the request context so the shared reviewer proxy's ModifyResponse and
-// ErrorHandler can report a failure without writing anything to the client --
-// only classifier traffic installs one, so utility traffic keeps its old
-// behaviour of surfacing the error directly.
+// reviewerAttempt tracks one buffered request sent to the separate reviewer.
+// It is carried on the request context so the shared proxy's ModifyResponse and
+// ErrorHandler can report a failure without writing anything to the client.
 type reviewerAttempt struct{ failed bool }
 
 func reviewerAttemptFrom(ctx context.Context) *reviewerAttempt {
@@ -209,9 +209,77 @@ func (r *Router) tryReviewer(w http.ResponseWriter, req *http.Request, proxy *ht
 	metered := &meteredWriter{ResponseWriter: deferred, start: start}
 	proxy.ServeHTTP(metered, req)
 	if attempt.failed || !reviewerResponseUsable(deferred.status, deferred.hdr, deferred.buf.Bytes()) {
+		// Record the rejected attempt so the metrics log distinguishes "the
+		// reviewer answered but its verdict did not parse" from "the reviewer
+		// never saw the request" — otherwise a template or format mismatch
+		// looks identical to reviewer unavailability and silently leaks every
+		// review to the main model.
+		reason := "unusable-response"
+		if !attempt.failed {
+			reason = "invalid-verdict"
+			// The first invalid verdicts looked like every other rejection in
+			// the metrics log; showing the actual answer turns a mystery into a
+			// one-line diagnosis (a thinking wrapper, a template mismatch...).
+			if snippet := reviewerVerdictSnippet(deferred.buf.Bytes()); snippet != "" {
+				fmt.Fprintf(os.Stderr, "[claude-code] reviewer verdict did not parse; answer was: %s\n", snippet)
+			}
+		}
+		r.recordReviewerReject(body, start, metered, reason)
 		return false
 	}
 	deferred.flush()
 	r.record(routeReviewer, body, start, 0, metered)
 	return true
+}
+
+// tryReviewerUtility gives cheap-tier traffic the same transport/status safety
+// as classifier traffic without imposing the classifier's <block> verdict
+// contract. A companion is an optimization, not a single point of failure: a
+// non-2xx or empty response is withheld and the caller can retry on main.
+func (r *Router) tryReviewerUtility(w http.ResponseWriter, req *http.Request, proxy *httputil.ReverseProxy, body []byte) bool {
+	attempt := &reviewerAttempt{}
+	req = req.WithContext(context.WithValue(req.Context(), reviewerAttemptKey{}, attempt))
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+
+	start := time.Now()
+	deferred := newDeferredWriter(w)
+	metered := &meteredWriter{ResponseWriter: deferred, start: start}
+	proxy.ServeHTTP(metered, req)
+	usable := deferred.status >= 200 && deferred.status < 300 && len(bytes.TrimSpace(deferred.buf.Bytes())) > 0
+	if attempt.failed || !usable {
+		reason := "unusable-response"
+		if attempt.failed {
+			reason = "upstream-failure"
+		}
+		r.record("utility-rejected/"+reason, body, start, 0, metered)
+		return false
+	}
+	deferred.flush()
+	r.record(routeUtility, body, start, 0, metered)
+	return true
+}
+
+// recordReviewerReject writes a metrics row for a reviewer answer the router
+// chose not to forward. route "reviewer-rejected" keeps it visible next to the
+// served routes without disturbing the served/reviewer accounting.
+func (r *Router) recordReviewerReject(body []byte, start time.Time, metered *meteredWriter, reason string) {
+	if r == nil {
+		return
+	}
+	r.record("reviewer-rejected/"+reason, body, start, 0, metered)
+}
+
+// reviewerVerdictSnippet extracts the reviewer's joined text, trimmed to one
+// diagnostic line, for the invalid-verdict stderr notice.
+func reviewerVerdictSnippet(body []byte) string {
+	text := reviewerJSONText(body)
+	if text == "" {
+		text = reviewerSSEText(body)
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 200 {
+		text = text[:200] + "…"
+	}
+	return text
 }

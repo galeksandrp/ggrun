@@ -240,6 +240,26 @@ func TestCalibrationStatusIgnoresStaleSchemaDecisions(t *testing.T) {
 	}
 }
 
+func TestAdmissionDecisionSuppressesOnlyItsExactAutomaticRetry(t *testing.T) {
+	decision := &CalibrationDecision{
+		Winner: "default", ValidationLevel: CalibrationValidationAdmission,
+		Finalist: "ubatch-2048", FinalistOutcome: "unavailable",
+	}
+	if decision.AutomaticEligible() {
+		t.Fatal("admission-only evidence became automatic performance evidence")
+	}
+	if !decision.SuppressesAutomaticAdmissionRetry("ubatch-2048") {
+		t.Fatal("exact unavailable finalist was not suppressed")
+	}
+	if decision.SuppressesAutomaticAdmissionRetry("parallel-2") {
+		t.Fatal("one failed finalist suppressed a different candidate")
+	}
+	decision.ValidationLevel = CalibrationValidationWorkflow
+	if decision.SuppressesAutomaticAdmissionRetry("ubatch-2048") {
+		t.Fatal("workflow result was treated as admission-only evidence")
+	}
+}
+
 func TestCalibrationScopeIncludesFullCorePolicy(t *testing.T) {
 	model := &ModelProfile{Path: "m.gguf", SizeBytes: 1234}
 	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, Name: "gpu", VRAMTotalMB: 24576}}}

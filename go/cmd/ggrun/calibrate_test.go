@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -164,6 +165,93 @@ func TestAutomaticCalibrationKeepsNonResidentLastResortStable(t *testing.T) {
 	})
 	if len(got) != 1 || got[0].Name != "default" || got[0].Strategy.Residency != placement.ResidencyNonResident {
 		t.Fatalf("standard launch challenged a non-resident last-resort plan: %+v", got)
+	}
+}
+
+func TestCalibrationPlanKeepsPowerOfTwoParallelCurveInsideBoundedBudget(t *testing.T) {
+	base := &placement.Strategy{Parallel: 3}
+	candidates := []placement.CalibrationCandidate{{Name: "default", Strategy: base}}
+	for i := 0; i < 12; i++ {
+		candidates = append(candidates, placement.CalibrationCandidate{
+			Name:     fmt.Sprintf("batch-%d-ubatch-64", 128+i*64),
+			Strategy: &placement.Strategy{Parallel: 3, BatchSize: 128 + i*64, UBatchSize: 64},
+		})
+	}
+	for _, parallel := range []int{3, 8, 4, 2, 1} {
+		candidates = append(candidates, placement.CalibrationCandidate{
+			Name: fmt.Sprintf("parallel-%d", parallel), Strategy: &placement.Strategy{Parallel: parallel},
+		})
+	}
+
+	got := prioritizeParallelCalibrationCurve(candidates)
+	if len(got) != len(candidates) || got[0].Name != "default" {
+		t.Fatalf("parallel diversification lost candidates or baseline: %+v", got)
+	}
+	want := []string{"parallel-1", "parallel-2", "parallel-4", "parallel-8"}
+	for i, name := range want {
+		if got[i+1].Name != name {
+			t.Fatalf("parallel curve position %d = %q, want %q; plan=%+v", i, got[i+1].Name, name, got)
+		}
+	}
+	// The forced nine-candidate budget now contains baseline + the full p1/p2/p4
+	// curve even when batch search generated many coordinates first.
+	for _, name := range want[:3] {
+		found := false
+		for _, candidate := range got[:calibrationForcedMaxCandidates] {
+			if candidate.Name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("bounded plan omitted %s: %+v", name, got[:calibrationForcedMaxCandidates])
+		}
+	}
+}
+
+func TestAutomaticAdmissionFallbackIncludesParallelFamily(t *testing.T) {
+	strategy := func(parallel int) *placement.Strategy { return &placement.Strategy{Parallel: parallel} }
+	candidates := []placement.CalibrationCandidate{
+		{Name: "default", Strategy: strategy(1)},
+		{Name: "ubatch-2048", Strategy: strategy(1)},
+		{Name: "batch-2048-ubatch-1024", Strategy: strategy(1)},
+		{Name: "parallel-2", Strategy: strategy(2)},
+		{Name: "parallel-4", Strategy: strategy(4)},
+	}
+	got := selectAutomaticCalibrationAdmissionPlan(candidates, nil, calibrationAutoMaxCandidates)
+	foundParallel := false
+	for _, candidate := range got[2:] {
+		if strings.HasPrefix(candidate.Name, "parallel-") {
+			foundParallel = true
+			break
+		}
+	}
+	if !foundParallel {
+		t.Fatalf("automatic admission fallbacks were all from one coordinate family: %+v", got)
+	}
+}
+
+func TestAutomaticWorkloadCandidateSetCapsSlotExperimentsAtDemand(t *testing.T) {
+	strategy := func(parallel int) *placement.Strategy {
+		return &placement.Strategy{Parallel: parallel}
+	}
+	req := &launchRequest{ClaudeCode: true, ClaudeProfile: claudeProfileParallel, Parallel: 1}
+	candidates := []placement.CalibrationCandidate{
+		{Name: "default", Strategy: strategy(4)},
+		{Name: "parallel-3", Strategy: strategy(3)},
+		{Name: "parallel-2", Strategy: strategy(2)},
+		{Name: "parallel-1", Strategy: strategy(1)},
+		{Name: "batch-256-ubatch-128", Strategy: strategy(4)},
+	}
+	got := automaticWorkloadCandidateSet(req, candidates)
+	want := []string{"default", "parallel-2", "parallel-1", "batch-256-ubatch-128"}
+	if len(got) != len(want) {
+		t.Fatalf("candidate count=%d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i].Name != want[i] {
+			t.Fatalf("candidate[%d]=%q, want %q: %+v", i, got[i].Name, want[i], got)
+		}
 	}
 }
 
@@ -464,6 +552,44 @@ func TestAutomaticCalibrationPromotionRequiresCompleteAgentEvidence(t *testing.T
 	unavailable.FinalistOutcome = "unavailable"
 	if automaticCalibrationEvidenceValid(&unavailable) {
 		t.Fatal("baseline-only evidence became automatic-eligible after challenger admission failed")
+	}
+	if !automaticCalibrationAdmissionEvidenceValid(&placement.CalibrationDecision{
+		Winner: "default", Finalist: "ubatch-512", FinalistOutcome: "unavailable",
+	}) {
+		t.Fatal("exact unavailable finalist was not recognized as admission-only evidence")
+	}
+	if automaticCalibrationAdmissionEvidenceValid(complete) {
+		t.Fatal("a measured comparison was mislabeled admission-only")
+	}
+}
+
+func TestCalibrationPlanCachesUnavailableAdmissionWithoutPerformancePromotion(t *testing.T) {
+	req, cfg, model, be, caps := calibrateTestSetup(60 * 1024)
+	cfg.CacheDir = t.TempDir()
+	strategy := &placement.Strategy{
+		Type: placement.MoEOffload, KVPlacement: "cpu", KVQuality: "mid",
+		ContextSize: 32768, Parallel: 1, BatchSize: 2048, UBatchSize: 512,
+		NCPUMoE: 40,
+	}
+	first := calibrationPlan(req, cfg, model, be, caps, strategy)
+	if len(first) < 2 {
+		t.Fatalf("test setup produced no automatic finalist: %+v", first)
+	}
+	scope := calibrationScopeKey(req, model, be, caps, strategy)
+	decision := placement.CalibrationDecision{
+		ScopeKey: scope, ModelBasename: model.Path,
+		Winner: "default", ValidationLevel: placement.CalibrationValidationAdmission,
+		Finalist: first[1].Name, FinalistOutcome: "unavailable",
+	}
+	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, decision); err != nil {
+		t.Fatal(err)
+	}
+	if got := calibrationPlan(req, cfg, model, be, caps, strategy); len(got) != 0 {
+		t.Fatalf("identical failed admission was scheduled again: %+v", got)
+	}
+	applied := applyCalibrationDecision(req, cfg, model, be, caps, strategy)
+	if applied != strategy || applied.PerformanceTuned || req.AppliedCalibration != nil {
+		t.Fatalf("admission-only evidence became a performance winner: strategy=%+v request=%+v", applied, req)
 	}
 }
 

@@ -82,13 +82,17 @@ const claudeNanoCompanionName = "claude-worker-nanbeige42"
 const claudeSmallReviewerCompanionName = "claude-auto-small-reviewer"
 
 type claudeCompanionProfile struct {
-	Name              string
-	DisplayName       string
-	ModelPath         string
-	BackendPath       string
-	ModelMarker       string
-	MeasurementKey    string
-	KVType            string
+	Name           string
+	DisplayName    string
+	ModelPath      string
+	BackendPath    string
+	ModelMarker    string
+	MeasurementKey string
+	KVType         string
+	// ContextTokens and ReservationVRAMMB are one indivisible capacity
+	// contract. The measurement key includes both context and KV type so a 64k
+	// sample can never under-reserve a later 128k/256k reviewer.
+	ContextTokens     int
 	ReservationVRAMMB int
 	NanoBeige         bool
 	// ServesWorkers authorizes ordinary local-fast traffic in addition to
@@ -124,24 +128,36 @@ func (p *claudeCompanionProfile) companionMeasurementKey() string {
 	return p.Name
 }
 
-// claudeReviewerReservationVRAMMB is the reviewer's on-device footprint reserved
-// in the placement ledger: ~2.6 GB Q4_K_M weights (Qwen3.5-4B, 2740937888 bytes)
-// + 64k Q8 KV + CUDA context and compute. This is a conservative bound — after a
-// real launch the reviewer's actual usage is visible in the normal probe paths,
-// and the seat is re-planned on every launch anyway.
-const claudeReviewerReservationVRAMMB = 4600
+func (p *claudeCompanionProfile) reviewerContextTokens() int {
+	if p != nil && p.ContextTokens > 0 {
+		return p.ContextTokens
+	}
+	return claudeReviewerContextTokens
+}
 
-// claudeSmallReviewerReservationVRAMMB is the small/light Qwen3.5-2B review-only
-// footprint reserved in the placement ledger. The 2B Q4_K_M weights are
-// 1331 MiB (1396198496 bytes); the historical reservation for the 2B was 2600 MB
-// (measured ~2096 MiB resident) — roughly half of the 4B's 4600 MB seat.
-const claudeSmallReviewerReservationVRAMMB = 2600
+// The Qwen3.5-4B worker/reviewer runs at 128k. Its measured/derived Q8 KV is
+// 1088 MiB per 64k (8 attention layers, 4 KV heads, 256-wide K/V), so doubling
+// the old 64k profile adds ~1088 MiB. Six GiB covers weights, KV, graph, and
+// allocator jitter until the context-scoped live measurement supersedes it.
+const claudeReviewerReservationVRAMMB = 6144
+
+// The 2B review-only model can afford its full native 262k context. The live
+// 64k process occupies ~2050 MiB and its measured Q8 KV is 408 MiB; scaling KV
+// to 262k predicts ~3274 MiB total. Four GiB keeps the complete control plane
+// independent of the busy main model with conservative allocator headroom.
+const claudeSmallReviewerReservationVRAMMB = 4096
 
 // claudeNanoReservationVRAMMB covers the measured 8843 MiB peak for the real
 // 64k/Q8 worker profile on the RTX 3090 Ti, rounded up before per-host samples
 // replace it. Nanbeige's 44 logical KV layers make it materially larger than
 // its 2.4 GiB weight file; reserving only the weights would corrupt placement.
-const claudeNanoReservationVRAMMB = 9216
+const claudeNanoReservationVRAMMB = 11264
+
+const (
+	claudeReviewerContextTokens      = 131072
+	claudeSmallReviewerContextTokens = 262144
+	claudeNanoReviewerContextTokens  = 131072
+)
 
 var (
 	claudeNanoArtifactReady = func(path string) bool {
@@ -201,8 +217,9 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			profile = &claudeCompanionProfile{
 				Name: claudeNanoCompanionName, DisplayName: "Nanbeige4.2-3B",
 				ModelPath: modelPath, BackendPath: backendPath, ModelMarker: modelPath,
-				MeasurementKey:    claudeNanoCompanionName + "-ctx65536-kv-q4_0",
+				MeasurementKey:    claudeNanoCompanionName + "-ctx131072-kv-q4_0",
 				KVType:            "q4_0",
+				ContextTokens:     claudeNanoReviewerContextTokens,
 				ReservationVRAMMB: claudeNanoReservationVRAMMB, NanoBeige: true,
 				ServesWorkers: true,
 			}
@@ -215,8 +232,9 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			ModelPath: modelPath, ModelMarker: modelPath,
 			// The 2B profile owns its own measurement key so it never collides with
 			// the 4B footprint or the stale legacy-name measurement.
-			MeasurementKey:    "claude-reviewer-qwen35-2b-q4-k-m",
+			MeasurementKey:    "claude-reviewer-qwen35-2b-q4-k-m-ctx262144-kv-q8_0",
 			KVType:            "q8_0",
+			ContextTokens:     claudeSmallReviewerContextTokens,
 			ReservationVRAMMB: claudeSmallReviewerReservationVRAMMB,
 			ServesWorkers:     false,
 			Artifact:          claudeauto.SmallReviewerSpec(),
@@ -233,8 +251,9 @@ func resolveClaudeCompanionProfile(req *launchRequest, cacheDir string) *claudeC
 			ModelPath: modelPath, ModelMarker: modelPath,
 			// The Qwen3.5-4B profile owns its own measurement key so it never
 			// inherits the stale 2B footprint stored under the legacy name.
-			MeasurementKey:    "claude-reviewer-qwen35-4b-q4-k-m",
+			MeasurementKey:    "claude-reviewer-qwen35-4b-q4-k-m-ctx131072-kv-q8_0",
 			KVType:            "q8_0",
+			ContextTokens:     claudeReviewerContextTokens,
 			ReservationVRAMMB: claudeReviewerReservationVRAMMB,
 			ServesWorkers:     !modelOverride,
 			Artifact:          claudeauto.DefaultReviewerSpec(),
@@ -444,10 +463,10 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		// tensors live on the selected device (observed: +262 MiB on the main
 		// CUDA0 during a DeepSeek-V4 run). Ask the backend for the device name it
 		// exposes after isolation instead of assuming every fork uses CUDA0.
-		args := claudeReviewerArgsWithKV(be.Path, modelPath, port, device, be.Help, profile.KVType, cacheDir)
+		args := claudeReviewerArgsWithContextAndKV(be.Path, modelPath, port, device, be.Help, profile.KVType, cacheDir, profile.reviewerContextTokens())
 		p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, env)
 		if err == nil {
-			fmt.Printf("[claude-code] Auto worker/reviewer ready on GPU %d (PID %d, %s, ctx 64k)\n", gpu, p.Cmd.Process.Pid, profile.DisplayName)
+			fmt.Printf("[claude-code] Auto worker/reviewer ready on GPU %d (PID %d, %s, ctx %dk)\n", gpu, p.Cmd.Process.Pid, profile.DisplayName, profile.reviewerContextTokens()/1024)
 			recordReviewerVRAM(cfg, p, profile)
 			return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: gpu, companion: profile}, nil
 		}
@@ -466,7 +485,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 
 	// CPU is slower, but it preserves autonomous/fail-closed behavior on systems
 	// whose GPUs are already full. It is also the normal path on CPU-only hosts.
-	args := claudeReviewerArgsWithKV(be.Path, modelPath, port, "", be.Help, profile.KVType, cacheDir)
+	args := claudeReviewerArgsWithContextAndKV(be.Path, modelPath, port, "", be.Help, profile.KVType, cacheDir, profile.reviewerContextTokens())
 	p, err := server.StartWithTimeoutToEnv(args, port, 5*time.Minute, logWriter, logWriter, claudeReviewerBackendEnv(be.Path, claudeReviewerCPUEnv()))
 	if err != nil {
 		if logCloser != nil {
@@ -477,7 +496,7 @@ func startClaudeAutoReviewer(req *launchRequest, cfg *config.Config, caps *detec
 		}
 		return nil, fmt.Errorf("start local Auto reviewer: %w", err)
 	}
-	fmt.Printf("[claude-code] Auto worker/reviewer ready on CPU (PID %d, %s, ctx 64k)\n", p.Cmd.Process.Pid, profile.DisplayName)
+	fmt.Printf("[claude-code] Auto worker/reviewer ready on CPU (PID %d, %s, ctx %dk)\n", p.Cmd.Process.Pid, profile.DisplayName, profile.reviewerContextTokens()/1024)
 	return &claudeAutoRuntime{reviewer: p, reviewerLog: logCloser, reviewerPort: port, reviewerGPU: -1, companion: profile}, nil
 }
 
@@ -533,18 +552,21 @@ func reviewerArchFromName(basename string) string {
 	}
 }
 
-// claudeReviewerContextTokens is the context window every separate reviewer
-// backend is launched with (see claudeReviewerArgsWithKV). The router uses it as
-// the overflow threshold: a classifier prompt estimated to exceed this window is
-// routed to the main model (self-classify) with a visible notice instead of
-// being sent into an oversized context the reviewer cannot accept.
-const claudeReviewerContextTokens = 65536
-
 func claudeReviewerArgsWithKV(binary, modelPath string, port int, device, help, kvType string, cacheDir string) []string {
+	return claudeReviewerArgsWithContextAndKV(binary, modelPath, port, device, help, kvType, cacheDir, claudeReviewerContextTokens)
+}
+
+// claudeReviewerArgsWithContextAndKV emits the exact capacity contract that
+// placement reserved. Keeping context in this builder prevents the router,
+// reservation, and backend from describing three different reviewer windows.
+func claudeReviewerArgsWithContextAndKV(binary, modelPath string, port int, device, help, kvType string, cacheDir string, contextTokens int) []string {
+	if contextTokens <= 0 {
+		contextTokens = claudeReviewerContextTokens
+	}
 	args := []string{
 		binary, "-m", modelPath,
 		"--host", "127.0.0.1", "--port", strconv.Itoa(port),
-		"--ctx-size", strconv.Itoa(claudeReviewerContextTokens), "--parallel", "1",
+		"--ctx-size", strconv.Itoa(contextTokens), "--parallel", "1",
 		"--alias", "local",
 		"--temp", "0", "--presence-penalty", "0", "--repeat-penalty", "1",
 	}
@@ -812,11 +834,14 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	// perfectly valid separate safety reviewer, but local-fast falls through to
 	// the main model because that profile is review-only.
 	router.SetCompanion("local", r.workerRouteEnabled())
-	// The separate reviewer always runs with claudeReviewerContextTokens of
-	// context (see claudeReviewerArgsWithKV). Tell the router that window so a
-	// classifier prompt too large for the reviewer falls back to the main model
-	// (self-classify) with a visible notice instead of failing.
-	router.SetReviewerContext(claudeReviewerContextTokens)
+	// Tell the router the exact context that was reserved and launched for this
+	// profile. A fixed 64k threshold made the healthy 2B reviewer reject real
+	// 65k+ Claude control prompts and queue them behind a busy p1 main model.
+	reviewerContext := claudeReviewerContextTokens
+	if r.companion != nil {
+		reviewerContext = r.companion.reviewerContextTokens()
+	}
+	router.SetReviewerContext(reviewerContext)
 	// The pass-cost decomposition needs to know how many tokens a prefill pass
 	// carried, which is the micro-batch the backend was launched with.
 	router.SetUBatch(argIntValue(serverArgs, "-ub", "--ubatch-size"))
@@ -866,11 +891,11 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 // --ctx-size is split across slots either way. Observed live -- `--parallel 2`
 // produced two slots of 131072, one of them permanently idle, at the same
 // throughput a single 262144 slot had delivered.
-func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
+func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy, pending ...*placement.CalibrationDecision) int {
 	if req == nil || !req.ClaudeCode || strategy == nil {
 		return 0
 	}
-	limit := defaultClaudeMainMaxActive(req, strategy)
+	limit := defaultClaudeMainMaxActive(req, strategy, pending...)
 	if req.ClaudeMaxActiveSet {
 		limit = req.ClaudeMaxActive
 	}
@@ -886,7 +911,7 @@ func claudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
 	return limit
 }
 
-func defaultClaudeMainMaxActive(req *launchRequest, strategy *placement.Strategy) int {
+func defaultClaudeMainMaxActive(req *launchRequest, strategy *placement.Strategy, pending ...*placement.CalibrationDecision) int {
 	// An explicit --parallel is an instruction, not a hint. Every slot costs
 	// context whether or not it is ever used, so honouring the flag by allocating
 	// slots while refusing to admit into them is the one outcome nobody asked
@@ -896,6 +921,20 @@ func defaultClaudeMainMaxActive(req *launchRequest, strategy *placement.Strategy
 		return strategy.Parallel
 	}
 	if strategy.Type == placement.MoEOffload || strategy.Type == placement.DenseCPUOffload {
+		// Host-offloaded concurrency is hardware/model dependent, so the cold
+		// default remains serialized. Once the exact agent workload has compared
+		// a challenger (including a baseline win), admit only the number of lanes
+		// that comparison actually represented. The optional pending decision is
+		// the first-launch bridge: it lets the selected process pass its router
+		// lifecycle gates under the same concurrency that was benchmarked without
+		// prematurely marking it reusable performance evidence.
+		measured := strategy.PerformanceTuned
+		if len(pending) > 0 && automaticCalibrationEvidenceValid(pending[0]) {
+			measured = true
+		}
+		if measured {
+			return min(max(1, strategy.Parallel), max(1, requestWorkloadConcurrency(req)))
+		}
 		return 1
 	}
 	// A single slot can only serve one request, but the limit still matters:

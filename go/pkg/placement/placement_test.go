@@ -2840,6 +2840,25 @@ func TestDerateCUDAOOMArgsShrinksUBatchForComputeBufferOOM(t *testing.T) {
 	}
 }
 
+func TestDerateCUDAOOMArgsForDeficitJumpsPastInsufficientRung(t *testing.T) {
+	model := &ModelProfile{NumLayers: 32}
+	args := []string{"llama-server", "-b", "2048", "-ub", "256"}
+	newArgs, entry, ok := DerateCUDAOOMArgsForDeficit(args, model, nil, 0, 17495, 12666, true)
+	if !ok || entry == nil {
+		t.Fatalf("measured compute deficit did not produce a ubatch recovery: entry=%+v ok=%v", entry, ok)
+	}
+	if got := currentUBatch(newArgs); got != 64 || entry.UBatchSize != 64 {
+		t.Fatalf("17,495 MiB allocation / 12,666 MiB deficit selected ubatch %d, want 64: %v", got, newArgs)
+	}
+}
+
+func TestCurrentUBatchMatchesBackendLastValueWins(t *testing.T) {
+	args := []string{"llama-server", "-ub", "512", "--ubatch-size", "64"}
+	if got := CurrentUBatch(args); got != 64 {
+		t.Fatalf("effective ubatch = %d, want final override 64", got)
+	}
+}
+
 func TestArgsFull(t *testing.T) {
 	s := &Strategy{
 		ContextSize:    4096,

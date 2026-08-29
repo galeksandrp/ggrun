@@ -16,7 +16,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 17
+const CalibrationSchemaVersion = 18
 
 var calibrationShardBasename = regexp.MustCompile(`(?i)^(.*)-00001-of-[0-9]{5}\.gguf$`)
 
@@ -42,6 +42,13 @@ const (
 	// gates. Longer hardware acceptance belongs to the release matrix and does
 	// not make one cold standard launch unbounded.
 	CalibrationValidationWorkflow = "agent-workflow-v1"
+	// CalibrationValidationAdmission means the baseline passed its full launch
+	// lifecycle, but every bounded challenger failed exact admission before a
+	// comparative workload could run. It is negative feasibility evidence, not
+	// performance evidence: automatic launch may use it to avoid repeating the
+	// same destructive stop/reload loop, but it must never advertise the default
+	// as a measured fastest configuration.
+	CalibrationValidationAdmission = "admission-only-v1"
 )
 
 // CalibrationDecision records which candidate won a measured placement screen
@@ -140,6 +147,21 @@ func SaveCalibrationDecision(cacheDir string, d CalibrationDecision) (string, er
 // opt in.
 func (d *CalibrationDecision) AutomaticEligible() bool {
 	return d != nil && d.ValidationLevel == CalibrationValidationWorkflow
+}
+
+// SuppressesAutomaticAdmissionRetry reports whether this decision proves that
+// the exact deterministic finalist could not be admitted. It deliberately does
+// not make the decision AutomaticEligible: no challenger workload completed,
+// so there is no performance winner to apply. The calibration scope and schema
+// bind the negative result to the same model/backend/hardware/workload policy;
+// either changing retires it automatically.
+func (d *CalibrationDecision) SuppressesAutomaticAdmissionRetry(finalist string) bool {
+	return d != nil &&
+		d.ValidationLevel == CalibrationValidationAdmission &&
+		d.Winner == "default" &&
+		d.FinalistOutcome == "unavailable" &&
+		d.Finalist != "" &&
+		d.Finalist == finalist
 }
 
 // LoadCalibrationDecision reads a prior calibration for the scope, rejecting

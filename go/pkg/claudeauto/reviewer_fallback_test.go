@@ -184,9 +184,13 @@ func TestReviewerFailureFallsBackToMainModel(t *testing.T) {
 	if mainHits.Load() != 1 {
 		t.Errorf("main hits = %d, want 1 (the fallback)", mainHits.Load())
 	}
-	records := waitForRecords(t, path, 1)
-	if records[0].Route != routeMain {
-		t.Errorf("route = %q, want %q for a fallback", records[0].Route, routeMain)
+	records := waitForRecords(t, path, 2)
+	last := records[len(records)-1]
+	if last.Route != routeMain {
+		t.Errorf("final route = %q, want %q for a fallback", last.Route, routeMain)
+	}
+	if records[0].Route != "reviewer-rejected/unusable-response" {
+		t.Errorf("first route = %q, want the rejected reviewer attempt recorded", records[0].Route)
 	}
 }
 
@@ -274,9 +278,9 @@ func TestReviewerUnusableHTTP200FallsBackToMainModel(t *testing.T) {
 			if reviewerHits.Load() != 1 || mainHits.Load() != 1 {
 				t.Fatalf("reviewer=%d main=%d; want one unusable attempt and one fallback", reviewerHits.Load(), mainHits.Load())
 			}
-			records := waitForRecords(t, path, 1)
-			if records[0].Route != routeMain {
-				t.Fatalf("route = %q, want %q after fallback", records[0].Route, routeMain)
+			records := waitForRecords(t, path, 2)
+			if records[len(records)-1].Route != routeMain {
+				t.Fatalf("final route = %q, want %q after fallback", records[len(records)-1].Route, routeMain)
 			}
 		})
 	}
@@ -338,10 +342,11 @@ func TestHealthyReviewerStillAnswersItself(t *testing.T) {
 	}
 }
 
-// Cheap-tier traffic shares the reviewer's backend but not this fallback: it
-// installs no attempt on its context, so a failure still surfaces directly
-// rather than being silently re-run on the expensive main model.
-func TestUtilityTrafficDoesNotTakeTheReviewerFallback(t *testing.T) {
+// Cheap-tier work should prefer the companion, but companion failure must not
+// fail the agent turn. Buffer the failed response and retry on main just like a
+// classifier review, using the utility response contract rather than requiring
+// a <block> verdict.
+func TestUtilityTrafficFallsBackWhenReviewerFails(t *testing.T) {
 	var mainHits atomic.Int64
 	mainBackend := countingBackend(t, &mainHits)
 	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -360,10 +365,109 @@ func TestUtilityTrafficDoesNotTakeTheReviewerFallback(t *testing.T) {
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("status = %d, want the 500 passed through for utility traffic", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want the successful main-model fallback", resp.StatusCode)
 	}
-	if got := mainHits.Load(); got != 0 {
-		t.Errorf("a utility failure was retried on the main model %d time(s); want 0", got)
+	if got := mainHits.Load(); got != 1 {
+		t.Errorf("utility failure reached the main model %d time(s); want 1", got)
+	}
+}
+
+// A review-only reviewer is still a second backend. With no worker-serving
+// companion, cheap-tier traffic must use it rather than queue behind long
+// main-model streams on a single slot — that queueing is what timed out the
+// permission classifier and blocked tool calls on the live 262k-ctx MoE.
+func TestUtilityFallsThroughToSeatedReviewerWithoutCompanion(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := countingBackend(t, &reviewerHits)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	router.SetReviewerContext(65536)
+	// No SetCompanion call: the profile is review-only, exactly like the live
+	// Qwen3.5-2B reviewer deployment.
+	post(t, router, `{"model":"local-fast","messages":[{"role":"user","content":"summarize"}]}`)
+
+	records := waitForRecords(t, path, 1)
+	if records[0].Route != routeUtility {
+		t.Errorf("route = %q, want %q (seated reviewer serves the cheap tier)", records[0].Route, routeUtility)
+	}
+	if reviewerHits.Load() != 1 || mainHits.Load() != 0 {
+		t.Errorf("reviewer hits = %d, main hits = %d; want 1 and 0",
+			reviewerHits.Load(), mainHits.Load())
+	}
+}
+
+// The utility lane keeps the same context-overflow guard as the classifier
+// lane: a prompt too large for the reviewer cannot be made to fit by routing
+// it there anyway, so it still goes to the main model.
+func TestUtilityOverflowStillGoesToMainWithoutCompanion(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := countingBackend(t, &reviewerHits)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	router.SetReviewerContext(64)
+	post(t, router, `{"model":"local-fast","messages":[{"role":"user","content":"`+strings.Repeat("x", 4096)+`"}]}`)
+
+	records := waitForRecords(t, path, 1)
+	if records[0].Route != routeMain {
+		t.Errorf("route = %q, want %q (utility prompt overflows the reviewer)", records[0].Route, routeMain)
+	}
+	if mainHits.Load() != 1 || reviewerHits.Load() != 0 {
+		t.Errorf("main hits = %d, reviewer hits = %d; want 1 and 0",
+			mainHits.Load(), reviewerHits.Load())
+	}
+}
+
+// A reviewer answer that does not carry a parseable verdict is recorded so the
+// metrics log shows why the review leaked to the main model instead of leaving
+// a template or format mismatch indistinguishable from reviewer unavailability.
+func TestRejectedReviewerVerdictIsRecorded(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	// Answers, but with prose instead of the <block> contract.
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"message","role":"assistant","content":[{"type":"text","text":"I think this looks fine to me."}]}`))
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	router.SetReviewerContext(65536)
+	post(t, router, classifierBody(64))
+
+	records := waitForRecords(t, path, 2)
+	if records[0].Route != routeMain && records[1].Route != routeMain {
+		t.Errorf("neither record shows the main-model retry: %+v", records)
+	}
+	found := false
+	for _, rec := range records {
+		if strings.HasPrefix(rec.Route, "reviewer-rejected/") {
+			found = true
+			if !strings.HasSuffix(rec.Route, "invalid-verdict") {
+				t.Errorf("rejection reason = %q, want invalid-verdict (the reviewer answered)", rec.Route)
+			}
+			if rec.Status != http.StatusOK {
+				t.Errorf("rejected record status = %d, want the reviewer's 200", rec.Status)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("no reviewer-rejected record among: %+v", records)
+	}
+}
+
+// The token estimate must err high: a 65,675-token review arrived in a body
+// that the previous bytes/3 divisor scored below a 65,536 window and overflowed
+// the reviewer with a 400. bytes/2 catches dense prompts at the cost of
+// over-admitting mostly-ASCII prose, which the reviewer serves fine.
+func TestEstimatedPromptTokensErrsHigh(t *testing.T) {
+	if got := estimatedPromptTokens([]byte(strings.Repeat("a", 65536*2))); got < 65536 {
+		t.Errorf("a %d-byte body estimated at %d tokens, want >= 65536", 65536*2, got)
+	}
+	if got := estimatedPromptTokens(nil); got != 0 {
+		t.Errorf("empty body estimated at %d tokens, want 0", got)
 	}
 }

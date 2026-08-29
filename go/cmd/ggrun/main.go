@@ -1493,7 +1493,14 @@ func requestWorkloadConcurrency(req *launchRequest) int {
 			return min(8, req.ClaudeMaxActive)
 		}
 		if req.Parallel > 0 {
-			return min(8, req.Parallel)
+			// LLM_PARALLEL is also the ordinary server default, which is one on a
+			// fresh install. The agent-parallel profile itself declares at least
+			// two independently runnable turns; treating that inherited one as the
+			// workload demand made both the cost model and live A/B measure p1 and
+			// therefore incapable of learning whether p2 reduced workflow time.
+			// Larger configured values remain useful declared demand, while the
+			// automatic slot count is still only a capacity ceiling.
+			return min(8, max(2, req.Parallel))
 		}
 		return 2
 	}
@@ -4261,6 +4268,33 @@ func recordMeasuredLaunchProbes(req *launchRequest, cfg *config.Config, model *p
 	return computeByGPU
 }
 
+// recordLiveCheckpointEvidence consumes the first real checkpoint allocation
+// produced by the functional canary. Startup probes stop at health and cannot
+// see this host-RAM state, while waiting until the next launch is too late: the
+// caller is about to tighten this process's cgroup memory.max. Persist the exact
+// observation for future planning and raise this live strategy's host floor
+// before that resize happens.
+func recordLiveCheckpointEvidence(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverLog string) bool {
+	if cfg == nil || model == nil || strategy == nil || be == nil || caps == nil || serverLog == "" {
+		return false
+	}
+	obs := placement.ObservePromptCache(serverLog)
+	if obs.LargestCheckpointMB <= 0 {
+		return false
+	}
+	tag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
+	if err := placement.RecordPromptCacheObservation(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize,
+		strategy.KVQuality, strategy.KVPlacement, tag, caps.GPUs, strategy.Parallel, obs); err != nil {
+		fmt.Fprintf(os.Stderr, "[launch] checkpoint measurement cache write failed (launch remains conservatively bounded): %v\n", err)
+	}
+	beforeMB, afterMB, changed := placement.ApplyMeasuredCheckpointObservation(model, strategy, obs)
+	if changed {
+		fmt.Fprintf(os.Stderr, "[launch] measured %.3f MiB per context checkpoint; raised the active host reserve from %d to %d MiB before cgroup re-size\n",
+			obs.LargestCheckpointMB, beforeMB, afterMB)
+	}
+	return changed
+}
+
 func measuredPromotionOptions(req *launchRequest, model *placement.ModelProfile, be *backendInfo, cacheDir string) placement.Options {
 	opts := placementOptionsFromRequest(req, model, be, cacheDir)
 	opts.SkipPlacementCache = true
@@ -4355,28 +4389,57 @@ const (
 	exactAdmissionCUDAOOM   exactAdmissionClass = "cuda-oom"
 )
 
+// exactAdmissionFailure distinguishes a deterministic refusal to run the
+// candidate's exact argv from an ordinary start error such as a health timeout,
+// interrupted load, or transient backend failure. Only this typed class may be
+// persisted as negative automatic-calibration evidence.
+type exactAdmissionFailure struct {
+	class   exactAdmissionClass
+	message string
+	cause   error
+}
+
+func (e *exactAdmissionFailure) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.cause != nil {
+		return e.message + ": " + e.cause.Error()
+	}
+	return e.message
+}
+
+func (e *exactAdmissionFailure) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isStableExactAdmissionFailure(err error) bool {
+	var failure *exactAdmissionFailure
+	return errors.As(err, &failure)
+}
+
 func exactAdmissionError(class exactAdmissionClass, detail string, cause error) error {
-	var err error
+	message := ""
 	switch class {
 	case exactAdmissionSpec:
-		err = fmt.Errorf("exact candidate requires a speculation re-plan; refusing to change its argv")
+		message = "exact candidate requires a speculation re-plan; refusing to change its argv"
 	case exactAdmissionCompat:
-		err = fmt.Errorf("exact candidate requires backend compatibility adjustment (%s); refusing to change its argv", detail)
+		message = fmt.Sprintf("exact candidate requires backend compatibility adjustment (%s); refusing to change its argv", detail)
 	case exactAdmissionCompanion:
-		err = fmt.Errorf("exact candidate's speculative companion was rejected; refusing a target-only argv rewrite")
+		message = "exact candidate's speculative companion was rejected; refusing a target-only argv rewrite"
 	case exactAdmissionMemory:
-		err = fmt.Errorf("exact candidate failed memory admission%s; refusing recovery ladder", detail)
+		message = fmt.Sprintf("exact candidate failed memory admission%s; refusing recovery ladder", detail)
 	case exactAdmissionMMap:
-		err = fmt.Errorf("exact candidate contradicted mmap pageability; refusing a resident argv rewrite")
+		message = "exact candidate contradicted mmap pageability; refusing a resident argv rewrite"
 	case exactAdmissionCUDAOOM:
-		err = fmt.Errorf("exact candidate CUDA OOM%s; refusing recovery ladder", detail)
+		message = fmt.Sprintf("exact candidate CUDA OOM%s; refusing recovery ladder", detail)
 	default:
-		err = fmt.Errorf("exact candidate required an argv rewrite (%s); refusing recovery ladder", class)
+		message = fmt.Sprintf("exact candidate required an argv rewrite (%s); refusing recovery ladder", class)
 	}
-	if cause != nil {
-		return fmt.Errorf("%w: %w", err, cause)
-	}
-	return err
+	return &exactAdmissionFailure{class: class, message: message, cause: cause}
 }
 
 // validateExactAdmissionArgv is the backstop for every challenger admission
@@ -4772,8 +4835,8 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 				}
 				strategy, serverArgs = next, nextArgs
 				fmt.Fprintf(os.Stderr,
-					"[launch] preflight %s after CUDA%d allocation %d MiB (deficit %d MiB, n-cpu-moe=%d, ubatch=%d)\n",
-					method, preflight.Device, preflight.AllocMB, preflight.DeficitMB, strategy.NCPUMoE, strategy.UBatchSize,
+					"[launch] preflight %s after CUDA%d allocation %d MiB (deficit %d MiB, ctx=%d, n-cpu-moe=%d, ubatch=%d)\n",
+					method, preflight.Device, preflight.AllocMB, preflight.DeficitMB, strategy.ContextSize, strategy.NCPUMoE, strategy.UBatchSize,
 				)
 				continue
 			}
@@ -4950,9 +5013,14 @@ func startLaunchWithCUDAOOMRecoveryStateMode(req *launchRequest, cfg *config.Con
 		// smaller ubatch is not adopted until the failed GPU has first lost one
 		// routed expert layer. For a real allocator OOM the exact overshoot is not
 		// known, so one layer is the smallest useful black-box experiment.
+		var recoveryCandidateArgs []string
+		if s != nil {
+			recoveryCandidateArgs = buildLaunchServerArgs(req, cfg, be, caps, model, s)
+		}
 		nextStrategy, nextArgs, method, changed := applyMemoryRecoverySelection(
 			req, strategy, serverArgs, s, model, runtimeCaps,
 			preflightOutcome{Device: device, AllocMB: allocMB, AllocMBMeasured: allocMB > 0, DeficitMB: 1, IsComputeBuffer: isComputeBuffer},
+			recoveryCandidateArgs,
 		)
 		if !changed {
 			return p, strategy, serverArgs, err
@@ -5165,6 +5233,63 @@ func recordRuntimeOOMLog(req *launchRequest, cfg *config.Config, model *placemen
 	return device, reserveMB, estimated, changed, true, nil
 }
 
+func classifyRuntimeCgroupOOM(oomKills, peakBytes uint64) (peakMB int, ok bool) {
+	if oomKills == 0 {
+		return 0, false
+	}
+	const mib = uint64(1024 * 1024)
+	if peakBytes > 0 {
+		peakMB = int((peakBytes + mib - 1) / mib)
+	}
+	return peakMB, true
+}
+
+func runtimeCgroupOOM(p *server.Process) (peakMB int, ok bool) {
+	if p == nil {
+		return 0, false
+	}
+	oomKills, err := p.MemoryOOMKillCount()
+	if err != nil || oomKills == 0 {
+		return 0, false
+	}
+	peakBytes, _ := p.MemoryPeakBytes()
+	return classifyRuntimeCgroupOOM(oomKills, peakBytes)
+}
+
+// recordRuntimeHostCgroupOOM is the host-memory counterpart to
+// recordRuntimeOOMLog. A cgroup kill has no CUDA allocation line, so treating it
+// as an unrecognized crash leaves an unsafe active/verified profile behind.
+// Revoke that profile and persist any prompt/checkpoint evidence from the log;
+// the next launch then derives a fresh host plan instead of replaying the one
+// the kernel disproved. markerPath makes the Claude health watcher and client
+// exit path idempotent.
+func recordRuntimeHostCgroupOOM(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, p *server.Process, logData, markerPath string) (peakMB int, hostOOM, recorded bool, err error) {
+	peakMB, hostOOM = runtimeCgroupOOM(p)
+	if !hostOOM {
+		return 0, false, false, nil
+	}
+	fingerprint := oomLogFingerprint(logData)
+	if markerPath != "" {
+		if data, readErr := os.ReadFile(markerPath); readErr == nil && strings.TrimSpace(string(data)) == fingerprint {
+			return peakMB, true, false, nil
+		}
+	}
+	reason := fmt.Sprintf("host cgroup OOM after health verification (peak %d MiB)", peakMB)
+	if err = invalidateRuntimeOOMLaunch(req, cfg, model, be, caps, strategy, serverArgs, reason); err != nil {
+		return peakMB, true, false, err
+	}
+	// Avoid mutating the serving strategy from the Claude health goroutine. The
+	// process is already dead; only the exact probe evidence is needed now.
+	evidenceStrategy := *strategy
+	recordPreviousClaudePromptCache(req, cfg, model, &evidenceStrategy, be, caps, logData)
+	if markerPath != "" {
+		if err = os.WriteFile(markerPath, []byte(fingerprint+"\n"), 0600); err != nil {
+			return peakMB, true, false, err
+		}
+	}
+	return peakMB, true, true, nil
+}
+
 func previousClaudeLogMatches(logData string, model *placement.ModelProfile, strategy *placement.Strategy, scope string) bool {
 	if model == nil || strategy == nil || strategy.Parallel < 1 || strategy.ContextSize < 1 {
 		return false
@@ -5210,7 +5335,7 @@ func recordPreviousClaudePromptCache(req *launchRequest, cfg *config.Config, mod
 		return false
 	}
 	obs := placement.ObservePromptCache(logData)
-	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 {
+	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 && obs.LargestCheckpointMB <= 0 {
 		return false
 	}
 	tag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
@@ -5218,8 +5343,9 @@ func recordPreviousClaudePromptCache(req *launchRequest, cfg *config.Config, mod
 		strategy.KVQuality, strategy.KVPlacement, tag, caps.GPUs, strategy.Parallel, obs); err != nil {
 		return false
 	}
-	grew := obs.LargestEntryMB > strategy.MeasuredPromptCacheEntryMB ||
+	promptCacheGrew := obs.LargestEntryMB > strategy.MeasuredPromptCacheEntryMB ||
 		obs.BytesPerToken > strategy.MeasuredPromptCacheBPT
+	checkpointBefore, checkpointAfter, checkpointGrew := placement.ApplyMeasuredCheckpointObservation(model, strategy, obs)
 	switch {
 	case obs.Skipped > 0:
 		fmt.Printf("[launch] prompt cache: %d prompt(s) exceeded the whole budget last run, largest %.0f MiB; sizing from the measurement\n",
@@ -5228,7 +5354,11 @@ func recordPreviousClaudePromptCache(req *launchRequest, cfg *config.Config, mod
 		fmt.Printf("[launch] prompt cache: %d eviction(s) last run, largest entry %.0f MiB; sizing from the measurement\n",
 			obs.Evicted, obs.LargestEntryMB)
 	}
-	return grew
+	if checkpointGrew {
+		fmt.Printf("[launch] context checkpoints: measured %.3f MiB each; host reserve grew from %d to %d MiB\n",
+			obs.LargestCheckpointMB, checkpointBefore, checkpointAfter)
+	}
+	return promptCacheGrew || checkpointGrew
 }
 
 func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string) (*placement.Strategy, error) {
@@ -5257,6 +5387,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 		// reaches the launch rather than waiting for the run after next.
 		opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
 		opts.SkipPlacementCache = true
+		opts.VerifiedConfigScopeKey = ""
 		next, err := placement.Compute(caps, model, opts)
 		if err != nil {
 			return nil, err
@@ -5273,6 +5404,7 @@ func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, mod
 	}
 	opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
 	opts.SkipPlacementCache = true
+	opts.VerifiedConfigScopeKey = ""
 	next, err := placement.Compute(caps, model, opts)
 	if err != nil {
 		return nil, err
@@ -5646,7 +5778,7 @@ func saveVerifiedConfigForLaunch(cfg *config.Config, req *launchRequest, model *
 // bandwidth-aware dense splits, VRAM-budgeted context fit, and granular context
 // maximisation all changed what a good plan looks like, and records written
 // before them would otherwise replay the old answer indefinitely.
-const planLogicVersion = "4"
+const planLogicVersion = "5"
 
 func verifiedConfigScopeKey(req *launchRequest, model *placement.ModelProfile, be *backendInfo, caps *detect.Capabilities) string {
 	if req == nil || model == nil || be == nil {
@@ -5748,8 +5880,14 @@ func launchProfileScope(req *launchRequest, model *placement.ModelProfile, be *b
 			policy = requestedLaunchPolicyIdentity(req, model)
 		}
 	}
+	// Lifecycle canaries are evidence for the planner semantics that interpreted
+	// the argv, not just for its current spelling. Reusing an older active record
+	// after checkpoint accounting changed would skip the very canary that creates
+	// the first exact checkpoint measurement. Keep this version aligned with the
+	// full verified-config scope so each planner revision revalidates once.
 	return controller.ScopeKey(launchModelFamilyIdentity(model), launchBackendFamilyIdentity(be),
-		launchHardwareIdentity(caps), policy, claudeCompanionLifecycleIdentity(req))
+		launchHardwareIdentity(caps), policy, claudeCompanionLifecycleIdentity(req),
+		"plan-logic="+planLogicVersion)
 }
 
 func claudeCompanionLifecycleIdentity(req *launchRequest) string {
@@ -5763,7 +5901,8 @@ func claudeCompanionLifecycleIdentity(req *launchRequest) string {
 		return "companion-unresolved"
 	}
 	p := req.ReviewerProfile
-	return controller.ScopeKey("separate-companion", p.Name, p.ModelPath, p.BackendPath, p.KVType)
+	return controller.ScopeKey("separate-companion", p.Name, p.ModelPath, p.BackendPath, p.KVType,
+		strconv.Itoa(p.reviewerContextTokens()), p.companionMeasurementKey())
 }
 
 func cmdLaunch(args []string) {
@@ -6116,7 +6255,7 @@ func cmdLaunch(args []string) {
 	// delimiter transforms, so lifecycle activation can canary /v1/messages.
 	claudeRouterURL := ""
 	if req.ClaudeCode && claudeAuto != nil {
-		if err := claudeAuto.startRouter(cfg, req.Host, req.Port, hasArg(serverArgs, "--mmproj"), claudeMainMaxActive(req, strategy), serverArgs); err != nil {
+		if err := claudeAuto.startRouter(cfg, req.Host, req.Port, hasArg(serverArgs, "--mmproj"), claudeMainMaxActive(req, strategy, pendingCalibration), serverArgs); err != nil {
 			_ = p.Stop()
 			claudeAuto.stop()
 			fmt.Fprintf(os.Stderr, "Error starting Claude Auto router: %v\n", err)
@@ -6138,6 +6277,17 @@ func cmdLaunch(args []string) {
 		fmt.Fprintf(os.Stderr, "Error verifying server profile: %v\n", err)
 		os.Exit(1)
 	}
+	checkpointPlanChanged := false
+	if p.LogBuf != nil {
+		checkpointPlanChanged = recordLiveCheckpointEvidence(req, cfg, model, strategy, be, runtimeCaps, p.LogBuf.String())
+	}
+	if checkpointPlanChanged {
+		// verifyAndActivateLaunch persists ordinary profiles at StateActive. The
+		// canary measurement above is newer than that write, so refresh the record
+		// before this process tightens its cgroup. Pending calibration profiles are
+		// intentionally withheld here and saved by the promotion block below.
+		saveVerifiedConfigForLaunch(cfg, req, model, be, runtimeCaps, strategy)
+	}
 	// The functional canary is the first real request: it grows the graph and
 	// allocates the first context checkpoints, so this is the earliest honest
 	// measurement of the backend's resident footprint. Re-size the scope to
@@ -6150,33 +6300,45 @@ func cmdLaunch(args []string) {
 		mode := effectiveCalibrationMode(req)
 		if !active {
 			fmt.Fprintf(os.Stderr, "[calibrate] screened winner did not reach an active profile; decision not cached\n")
-		} else if mode == calibrateAuto && !automaticCalibrationEvidenceValid(pendingCalibration) {
-			fmt.Fprintf(os.Stderr, "[optimize] winner reached active state but agent-workflow evidence was incomplete; decision not promoted\n")
 		} else {
-			if mode == calibrateAuto {
-				pendingCalibration.ValidationLevel = placement.CalibrationValidationWorkflow
-			}
-			path, saveErr := placement.SaveCalibrationDecision(cfg.CacheDir, *pendingCalibration)
-			if saveErr != nil {
-				fmt.Fprintf(os.Stderr, "[optimize] active winner cache failed: %v\n", saveErr)
-			} else if mode == calibrateAuto {
-				// Only now does the winner become reusable core state. The earlier
-				// StateActive transition deliberately skipped verified/place writes
-				// while this decision was pending, so a decision-cache failure can
-				// never strand a falsely tuned verified config.
-				strategy.PerformanceTuned = true
+			performanceEvidence := mode != calibrateAuto || automaticCalibrationEvidenceValid(pendingCalibration)
+			admissionEvidence := mode == calibrateAuto && automaticCalibrationAdmissionEvidenceValid(pendingCalibration)
+			if !performanceEvidence && !admissionEvidence {
+				fmt.Fprintf(os.Stderr, "[optimize] winner reached active state but agent-workflow evidence was incomplete; decision not promoted\n")
 				req.CalibrationPending = false
-				saveVerifiedConfigForLaunch(cfg, req, model, be, runtimeCaps, strategy)
-				if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
-					if placeErr := placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy)); placeErr != nil {
-						fmt.Fprintf(os.Stderr, "[optimize] verified placement cache write failed (launch unaffected): %v\n", placeErr)
-					}
-				}
-				fmt.Printf("[optimize] workflow winner %s passed clean relaunch, agent, cache, and lifecycle gates; cached at %s\n",
-					pendingCalibration.Winner, path)
 			} else {
-				fmt.Printf("[calibrate] screened winner %s passed launch canaries and was cached for explicit reuse at %s; it is not automatic-eligible without the full workflow gate\n",
-					pendingCalibration.Winner, path)
+				if mode == calibrateAuto && performanceEvidence {
+					pendingCalibration.ValidationLevel = placement.CalibrationValidationWorkflow
+				} else if admissionEvidence {
+					pendingCalibration.ValidationLevel = placement.CalibrationValidationAdmission
+				}
+				path, saveErr := placement.SaveCalibrationDecision(cfg.CacheDir, *pendingCalibration)
+				if saveErr != nil {
+					fmt.Fprintf(os.Stderr, "[optimize] active winner cache failed: %v\n", saveErr)
+				} else if mode == calibrateAuto {
+					// Only now does the winner become reusable core state. The earlier
+					// StateActive transition deliberately skipped verified/place writes
+					// while this decision was pending, so a decision-cache failure can
+					// never strand a falsely tuned verified config.
+					strategy.PerformanceTuned = performanceEvidence
+					req.CalibrationPending = false
+					saveVerifiedConfigForLaunch(cfg, req, model, be, runtimeCaps, strategy)
+					if strategy.Type == placement.MoEOffload && strategy.PlacementCachePath != "" {
+						if placeErr := placement.SavePlacementCache(strategy.PlacementCachePath, placement.StrategyToCacheEntry(strategy)); placeErr != nil {
+							fmt.Fprintf(os.Stderr, "[optimize] verified placement cache write failed (launch unaffected): %v\n", placeErr)
+						}
+					}
+					if performanceEvidence {
+						fmt.Printf("[optimize] workflow winner %s passed clean relaunch, agent, cache, and lifecycle gates; cached at %s\n",
+							pendingCalibration.Winner, path)
+					} else {
+						fmt.Printf("[optimize] exact finalist %s was unavailable; cached admission-only evidence so identical launches keep the verified baseline without another reload (%s)\n",
+							pendingCalibration.Finalist, path)
+					}
+				} else {
+					fmt.Printf("[calibrate] screened winner %s passed launch canaries and was cached for explicit reuse at %s; it is not automatic-eligible without the full workflow gate\n",
+						pendingCalibration.Winner, path)
+				}
 			}
 		}
 		req.CalibrationPending = false
@@ -6228,9 +6390,20 @@ func cmdLaunch(args []string) {
 				}
 				if !isServerRunning(req.Host, req.Port) {
 					fmt.Fprintf(os.Stderr, "[launch] backend died mid-session — recording OOM for next launch\n")
+					logData := ""
 					if p.LogBuf != nil {
-						markerPath := claudeOOMMarkerPath(cfg, req, model, be, serverArgs)
-						device, reserveMB, estimated, _, ok, recordErr := recordRuntimeOOMLog(req, cfg, model, strategy, be, caps, p.LogBuf.String(), markerPath)
+						logData = p.LogBuf.String()
+					}
+					markerPath := claudeOOMMarkerPath(cfg, req, model, be, serverArgs)
+					peakMB, hostOOM, recorded, hostErr := recordRuntimeHostCgroupOOM(req, cfg, model, strategy, be, runtimeCaps, serverArgs, p, logData, markerPath)
+					if hostErr != nil {
+						fmt.Fprintf(os.Stderr, "[launch] could not record host cgroup OOM from health monitor: %v\n", hostErr)
+					} else if hostOOM {
+						if recorded {
+							fmt.Fprintf(os.Stderr, "[launch] health monitor recorded host cgroup OOM at %d MiB; revoked the profile and cached host-state evidence for the next launch\n", peakMB)
+						}
+					} else if p.LogBuf != nil {
+						device, reserveMB, estimated, _, ok, recordErr := recordRuntimeOOMLog(req, cfg, model, strategy, be, caps, logData, markerPath)
 						if recordErr != nil {
 							fmt.Fprintf(os.Stderr, "[launch] could not record backend OOM from health monitor: %v\n", recordErr)
 						} else if ok && estimated {
@@ -6287,8 +6460,15 @@ func cmdLaunch(args []string) {
 			// deficit instead of repeating the same crash blind.
 			if !p.IsRunning() && p.LogBuf != nil {
 				markerPath := claudeOOMMarkerPath(cfg, req, model, be, serverArgs)
-				device, reserveMB, estimated, _, ok, recordErr := recordRuntimeOOMLog(req, cfg, model, strategy, be, caps, p.LogBuf.String(), markerPath)
-				if recordErr != nil {
+				logData := p.LogBuf.String()
+				peakMB, hostOOM, recorded, hostErr := recordRuntimeHostCgroupOOM(req, cfg, model, strategy, be, runtimeCaps, serverArgs, p, logData, markerPath)
+				if hostErr != nil {
+					fmt.Fprintf(os.Stderr, "[launch] could not record host cgroup OOM: %v\n", hostErr)
+				} else if hostOOM {
+					if recorded {
+						fmt.Fprintf(os.Stderr, "[launch] backend crashed during this session (host cgroup OOM at %d MiB) — profile revoked and host-state evidence recorded for the next launch.\n", peakMB)
+					}
+				} else if device, reserveMB, estimated, _, ok, recordErr := recordRuntimeOOMLog(req, cfg, model, strategy, be, caps, logData, markerPath); recordErr != nil {
 					fmt.Fprintf(os.Stderr, "[launch] could not record backend OOM: %v\n", recordErr)
 				} else if ok && estimated {
 					fmt.Fprintf(os.Stderr, "[launch] backend crashed during this session (CUDA VMM OOM on device %d; allocation size omitted) — recorded %d MiB runtime reserve for the next launch.\n", device, reserveMB)
@@ -6331,6 +6511,15 @@ func cmdLaunch(args []string) {
 		logData := ""
 		if p.LogBuf != nil {
 			logData = p.LogBuf.String()
+		}
+		if peakMB, hostOOM, _, hostErr := recordRuntimeHostCgroupOOM(req, cfg, model, strategy, be, runtimeCaps, serverArgs, p, logData, ""); hostOOM {
+			claudeAuto.stop()
+			if hostErr != nil {
+				fmt.Fprintf(os.Stderr, "[launch] server was killed by its host-memory cgroup at %d MiB, but profile invalidation failed: %v\n", peakMB, hostErr)
+			} else {
+				fmt.Fprintf(os.Stderr, "[launch] server was killed by its host-memory cgroup at %d MiB. The failed profile was revoked and prompt/checkpoint evidence was cached; the next launch will derive a fresh host plan.\n", peakMB)
+			}
+			os.Exit(1)
 		}
 		cacheBackendTag := scopedProbeBackendTagForStrategy(req, model, be, strategy)
 		prior := placement.RuntimeGraphGrowthByGPU(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, cacheBackendTag, caps.GPUs, strategy.Parallel)
@@ -6389,6 +6578,12 @@ func cmdLaunch(args []string) {
 			fmt.Fprintf(os.Stderr, "[launch] recovered placement failed lifecycle verification: %v\n", err)
 			os.Exit(1)
 		}
+		if newP.LogBuf != nil {
+			if recordLiveCheckpointEvidence(req, cfg, model, newStrategy, be, runtimeCaps, newP.LogBuf.String()) {
+				saveVerifiedConfigForLaunch(cfg, req, model, be, runtimeCaps, newStrategy)
+			}
+		}
+		resizeScopeToMeasuredFootprint(req, runtimeCaps, newStrategy, newP)
 		p, strategy, serverArgs = newP, newStrategy, newArgs
 		fmt.Printf("[launch] Server running on port %d (PID %d)\n", req.Port, p.Cmd.Process.Pid)
 		fmt.Println("[launch] Press Ctrl+C to stop")

@@ -83,6 +83,123 @@ func TestComputeRecoveryLowersUBatchWhenFailedDeviceHasNoExpert(t *testing.T) {
 	}
 }
 
+// GLM-5.3-Flash produced a 17,495 MiB CUDA0 graph allocation at ubatch 256
+// against a 12,666 MiB deficit. Walking 256 -> 128 -> 64 spent two four-minute
+// model loads even though the first measured allocation already proved that a
+// one-rung reduction could not reclaim enough memory. Recovery must use the
+// measured ratio to jump to the first rung with a plausible fit.
+func TestComputeRecoveryJumpsUBatchByMeasuredDeficit(t *testing.T) {
+	model, caps, args, _ := preflightRecoveryFixture()
+	args = replaceUBatchArg(args, 256)
+	for i := range args {
+		if args[i] == "-ot" && i+1 < len(args) {
+			// CUDA0 owns no movable expert, so graph-size recovery is the next
+			// applicable lever.
+			args[i+1] = strings.ReplaceAll(args[i+1], "CUDA0", "CUDA1")
+			break
+		}
+	}
+	next, entry, method, ok := selectChangedPreflightRecovery(args, nil, model, caps, preflightOutcome{
+		Device: 0, AllocMB: 17495, AllocMBMeasured: true, DeficitMB: 12666, IsComputeBuffer: true,
+	})
+	if !ok || method != "ubatch-derate" || entry == nil || entry.UBatchSize != 64 {
+		t.Fatalf("deficit-sized compute recovery = method %q entry=%+v ok=%v args=%v", method, entry, ok, next)
+	}
+}
+
+// At ubatch 64 the GLM preflight repeatedly changed only context by 1,024
+// tokens. Each retry reclaimed 4-5 MiB while CUDA2 was still short by ~2.5 GiB,
+// consuming the entire retry budget. The failed device owned one routed expert;
+// moving that expert is relevant and large enough, while the context nudge is
+// neither.
+func TestGLMContextNudgeCannotBeatFailedDeviceExpertRelief(t *testing.T) {
+	model := &placement.ModelProfile{
+		NumLayers: 43, LeadingDense: 1,
+		ExpertBytes: int64(42 * 3000 * 1024 * 1024),
+	}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{
+		{Index: 0, VRAMTotalMB: 24576},
+		{Index: 1, VRAMTotalMB: 24576},
+		{Index: 2, VRAMTotalMB: 12288},
+	}}
+	ot := `blk\.(1)\.ffn_((gate_up|up_gate|gate|up|down)_exps|(gate_inp|gate|up|down)_shexp).*=CUDA2,exps=CPU`
+	args := []string{
+		"llama-server", "--ctx-size", "1048576", "-b", "2048", "-ub", "64",
+		"--tensor-split", "0.29,0.61,0.10", "--split-mode", "layer",
+		"-ot", ot, "--n-cpu-moe", "41", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+	}
+	candidate := &placement.Strategy{
+		ContextSize: 1047552, BatchSize: 2048, UBatchSize: 64,
+		TensorSplit: []float64{0.29, 0.61, 0.10}, SplitMode: "layer",
+		OTString: ot, NCPUMoE: 41,
+	}
+	next, entry, method, ok := selectChangedPreflightRecovery(args, candidate, model, caps, preflightOutcome{
+		Device: 2, AllocMB: 4632, AllocMBMeasured: true, DeficitMB: 2524, IsComputeBuffer: true,
+	})
+	if !ok || method != "expert-derate" || entry == nil || entry.NCPUMoE != 42 {
+		t.Fatalf("GLM recovery = method %q entry=%+v ok=%v args=%v", method, entry, ok, next)
+	}
+	fingerprint := effectiveMemoryArgsFingerprint(next)
+	if !strings.Contains(fingerprint, "ctx=1048576") {
+		t.Fatalf("irrelevant context nudge won over failed-device relief: %v", next)
+	}
+}
+
+func TestAutomaticContextFallbackTargetIsDeficitSizedAndExplicitContextIsImmutable(t *testing.T) {
+	model := &placement.ModelProfile{NumLayers: 32, HeadCountKV: 8, KeyLength: 128, ValueLength: 128}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, VRAMTotalMB: 24576}}}
+	args := []string{
+		"llama-server", "--ctx-size", "262144", "-b", "2048", "-ub", "64",
+		"--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--parallel", "1",
+	}
+	strategy := &placement.Strategy{
+		ContextSize: 262144, ContextAuto: true, BatchSize: 2048, UBatchSize: 64,
+		KVType: "q8_0", Parallel: 1,
+	}
+	outcome := preflightOutcome{
+		Device: 0, AllocMB: 4096, AllocMBMeasured: true, DeficitMB: 2048, IsComputeBuffer: true,
+	}
+	autoReq := &launchRequest{CtxFlag: "fit"}
+	target, ok := automaticContextRecoveryTarget(autoReq, strategy, args, outcome)
+	if !ok || target >= 262144 || target < 32768 {
+		t.Fatalf("automatic context fallback target=%d ok=%v", target, ok)
+	}
+	if target%1024 != 0 {
+		t.Fatalf("context fallback target was not rounded to 1024 tokens: %d", target)
+	}
+	if _, _, _, patched := applyMemoryRecoverySelection(autoReq, strategy, args, nil, model, caps, outcome); patched {
+		t.Fatal("memory selection patched context without a full placement recompute")
+	}
+
+	explicitStrategy := &placement.Strategy{
+		ContextSize: 262144, ContextAuto: false, BatchSize: 2048, UBatchSize: 64,
+		KVType: "q8_0", Parallel: 1,
+	}
+	if _, ok := automaticContextRecoveryTarget(&launchRequest{CtxFlag: "262144"}, explicitStrategy, args, outcome); ok {
+		t.Fatal("memory recovery silently lowered an explicit context")
+	}
+	explicitCandidate := &placement.Strategy{
+		ContextSize: 65536, BatchSize: 2048, UBatchSize: 64, KVType: "q8_0", Parallel: 1,
+	}
+	if _, _, _, ok := applyMemoryRecoverySelection(
+		&launchRequest{CtxFlag: "262144"}, explicitStrategy, args, explicitCandidate, model, caps, outcome,
+	); ok {
+		t.Fatal("a re-plan candidate overrode an explicit context")
+	}
+}
+
+func TestFailedDeviceReliefNormalizesTensorSplitShares(t *testing.T) {
+	current := []string{"llama-server", "--tensor-split", "2,8", "--split-mode", "layer"}
+	equivalent := []string{"llama-server", "--tensor-split", "1,4", "--split-mode", "layer"}
+	if candidateRelievesFailedDevice(current, equivalent, 0) {
+		t.Fatal("an equivalent normalized tensor split was mistaken for failed-device relief")
+	}
+	relieved := []string{"llama-server", "--tensor-split", "1,9", "--split-mode", "layer"}
+	if !candidateRelievesFailedDevice(current, relieved, 0) {
+		t.Fatal("a real failed-device tensor-share reduction was not recognized")
+	}
+}
+
 func TestUnchangedWeightReplanMovesExpertLayer(t *testing.T) {
 	model, caps, args, unchanged := preflightRecoveryFixture()
 	next, entry, method, ok := selectChangedPreflightRecovery(args, unchanged, model, caps, preflightOutcome{
@@ -126,6 +243,26 @@ func TestSharedMemoryRecoveryAppliesLayerFirstStrategyAndArgsTogether(t *testing
 	if next.NCPUMoE != 50 || next.UBatchSize != 512 ||
 		!strings.Contains(fingerprint, "n-cpu-moe=50") || !strings.Contains(fingerprint, "ubatch=512") {
 		t.Fatalf("strategy/argv recovery drifted: strategy=%+v args=%v", next, nextArgs)
+	}
+}
+
+func TestSharedMemoryRecoveryKeepsCompleteCandidateArgs(t *testing.T) {
+	model, caps, args, current := preflightRecoveryFixture()
+	candidate := *current
+	candidate.NCPUMoE = current.NCPUMoE + 1
+	complete := patchPlacementArgs(args, &candidate)
+	complete = append(complete, "-cram", "7777", "--ctx-checkpoints", "8")
+
+	next, nextArgs, method, ok := applyMemoryRecoverySelection(
+		nil, current, args, &candidate, model, caps,
+		preflightOutcome{Device: 0, AllocMB: 2132, DeficitMB: 1, IsComputeBuffer: true},
+		complete,
+	)
+	if !ok || method != "replanned" || next != &candidate {
+		t.Fatalf("complete recovery candidate = strategy %p want %p method=%q ok=%v", next, &candidate, method, ok)
+	}
+	if argIntValue(nextArgs, "-cram") != 7777 || argIntValue(nextArgs, "--ctx-checkpoints") != 8 {
+		t.Fatalf("complete recovery argv lost context-derived flags: %v", nextArgs)
 	}
 }
 

@@ -74,6 +74,10 @@ type PromptCacheObservation struct {
 	Skipped int
 	// Evicted counts entries dropped to make room.
 	Evicted int
+	// LargestCheckpointMB is one active checkpoint's backend-reported size.
+	// It is separate from LargestEntryMB because active slot checkpoints and
+	// prompt-cache copies coexist and must be charged independently.
+	LargestCheckpointMB float64
 }
 
 // Measured reports whether the observation carries a usable per-token cost.
@@ -136,6 +140,7 @@ func ObservePromptCache(logText string) PromptCacheObservation {
 				}
 				if sizeMB > checkpointSizeMB {
 					checkpointSizeMB = sizeMB
+					obs.LargestCheckpointMB = sizeMB
 				}
 			}
 		}
@@ -221,6 +226,33 @@ func LoadMeasuredPromptCache(cacheDir string, model *ModelProfile, s *Strategy, 
 	if pc.PromptCacheBytesPerToken > 0 {
 		s.MeasuredPromptCacheBPT = pc.PromptCacheBytesPerToken
 	}
+	if pc.CheckpointMB > 0 {
+		s.MeasuredCheckpointMB = pc.CheckpointMB
+	}
+}
+
+// ApplyMeasuredCheckpointObservation raises a strategy's planned host footprint
+// when the running backend reports a checkpoint larger than the estimate used
+// at launch. This runs before the post-canary cgroup resize, so the controller
+// never tightens memory.max below the active checkpoints a long agent session
+// can still create. It returns the old and new total checkpoint reserves.
+func ApplyMeasuredCheckpointObservation(model *ModelProfile, s *Strategy, obs PromptCacheObservation) (beforeMB, afterMB int, changed bool) {
+	if model == nil || s == nil || obs.LargestCheckpointMB <= 0 {
+		return 0, 0, false
+	}
+	beforeMB = checkpointFootprintMB(model, s.MaxCheckpoints, s.Parallel, s.ContextAllocationMB, s.ContextSize, s.MeasuredCheckpointMB)
+	if obs.LargestCheckpointMB <= s.MeasuredCheckpointMB {
+		return beforeMB, beforeMB, false
+	}
+	s.MeasuredCheckpointMB = obs.LargestCheckpointMB
+	afterMB = checkpointFootprintMB(model, s.MaxCheckpoints, s.Parallel, s.ContextAllocationMB, s.ContextSize, s.MeasuredCheckpointMB)
+	if afterMB <= beforeMB {
+		return beforeMB, afterMB, false
+	}
+	if s.PlannedHostFootprintMB > 0 {
+		s.PlannedHostFootprintMB += afterMB - beforeMB
+	}
+	return beforeMB, afterMB, true
 }
 
 // RecordPromptCacheObservation stores whatever a backend log revealed about the
@@ -233,7 +265,7 @@ func RecordPromptCacheObservation(cacheDir string, model *ModelProfile, ctxSize,
 	if model == nil || ctxSize <= 0 || ubatch <= 0 {
 		return nil
 	}
-	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 {
+	if obs.LargestEntryMB <= 0 && obs.BytesPerToken <= 0 && obs.LargestCheckpointMB <= 0 {
 		return nil
 	}
 	pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel)
@@ -257,10 +289,13 @@ func RecordPromptCacheObservation(cacheDir string, model *ModelProfile, ctxSize,
 		if pc.PromptCacheEntryMB > obs.LargestEntryMB {
 			obs.LargestEntryMB = pc.PromptCacheEntryMB
 		}
+		if pc.CheckpointMB > obs.LargestCheckpointMB {
+			obs.LargestCheckpointMB = pc.CheckpointMB
+		}
 	}
 	return writeProbeCacheForModel(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, parallel,
 		compute, growth, estimated, kvPerLayerMB,
-		probeMeasurements{BytesPerToken: obs.BytesPerToken, EntryMB: obs.LargestEntryMB})
+		probeMeasurements{BytesPerToken: obs.BytesPerToken, EntryMB: obs.LargestEntryMB, CheckpointMB: obs.LargestCheckpointMB})
 }
 
 // RecordMeasuredPromptCache stores a per-token prompt-cache cost read from
