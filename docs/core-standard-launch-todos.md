@@ -27,9 +27,10 @@ admission or the live A/B gate. That checkpoint passed 971 focused tests and
 ShellCheck, and three supported cross-builds clean. The 2026-08-29 hardening
 described below passed the protected core-engine gate plus the full normal and
 race-enabled Go suites. Its canonical binary is installed at
-`/home/mik/go/bin/ggrun` (also reached by `/home/mik/.local/bin/ggrun`) with
-SHA-256 `51046b13a2e7e17500fdcb50f192595772c82f43ec36f10322643d8fab98f93c`.
-An already-running controller retains its older mapped executable until an
+`/home/mik/go/bin/ggrun` (also reached by `/home/mik/.local/bin/ggrun`). The
+install handoff verifies both paths against the just-built artifact rather than
+persisting a self-invalidating hash in this VCS-stamped source tree. An
+already-running controller retains its older mapped executable until an
 intentional relaunch. Checkboxes remain open under the tracking rule at the end
 of this document until claims that depend on real hardware have preserved live
 evidence.
