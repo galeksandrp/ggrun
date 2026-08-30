@@ -250,6 +250,28 @@ func TestGeneratedDeltaDetectionSurvivesAWriteBoundary(t *testing.T) {
 	}
 }
 
+func TestStreamingTimingUsesGeneratedDeltaNotHTTPEnvelope(t *testing.T) {
+	rec := RequestRecord{
+		Stream:        true,
+		QueueMS:       10,
+		TTFBMS:        20,
+		DecodeStartMS: 120,
+		TotalMS:       320,
+	}
+	if got := rec.PrefillMS(); got != 110 {
+		t.Errorf("prefill = %dms, want 110ms to generated delta", got)
+	}
+	if got := rec.DecodeMS(); got != 200 {
+		t.Errorf("decode = %dms, want 200ms after generated delta", got)
+	}
+	// A stream aborted after an SSE envelope but before generation has neither
+	// measured prefill completion nor decode work.
+	aborted := RequestRecord{Stream: true, TTFBMS: 20, TotalMS: 60, Aborted: true}
+	if aborted.PrefillMS() != 0 || aborted.DecodeMS() != 0 {
+		t.Errorf("envelope-only abort reported prefill/decode: %+v", aborted)
+	}
+}
+
 func TestRouterRecordsQueueWaitSeparatelyFromPrefill(t *testing.T) {
 	release := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

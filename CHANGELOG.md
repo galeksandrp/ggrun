@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Agent transport hardening now fails early and records truthful phases.**
+  Workflow calls with competing `name`, `script`, or `scriptPath` sources are
+  rejected instead of silently following tool precedence; materialized scripts
+  are read back before approval, and large protocols are kept by file reference.
+  Request telemetry retains HTTP TTFB but measures prefill/decode from the first
+  generated SSE delta. Claude Code stage-1 verdicts whose configured
+  `</block>` stop sequence is correctly stripped from response content are
+  accepted unchanged and recorded distinctly; prose,
+  conflicts, and incomplete decisions still take the safe main-model fallback.
 - **Host-offloaded agent serving now schedules active phases separately from
   allocated slots.** Multi-slot MoEs keep their requested context capacity,
   but long cold prefills serialize across the shared CPU-expert/PCIe path;
@@ -9,10 +18,13 @@
   active request emits its first generated SSE delta. Router status exposes prefill/decode
   occupancy, and cancellation telemetry identifies queue versus service plus
   recurring 60-second and 600-second client-deadline signatures.
-- **Reviewer verdicts reserve a complete local-tokenizer output budget.** Tiny
-  classifier requests could cap a reviewer at seven output tokens and truncate
-  `<block>yes</block>` to `<block>yes`, forcing an expensive main-model retry.
-  The reviewer route now raises only that output budget to 32 tokens. Opaque
+- **Reviewer verdicts honor Claude Code's stop-stripped stage-1 contract.**
+  Claude Code deliberately configures `</block>` as a stop sequence and accepts
+  the closing tag as optional; llama.cpp therefore returns `<block>yes` or
+  `<block>no` while counting the sampled delimiter tokens. ggrun previously
+  rejected those healthy answers and retried them on the slow main model. The
+  reviewer route now keeps a 32-token tokenizer-safe budget and accepts only
+  an exact, unambiguous stop-stripped verdict without rewriting it. Opaque
   named Workflow calls whose agent timeout cannot be rewritten are rejected
   before work begins with an inline/scriptPath retry instruction instead of
   silently restoring the private long-running-agent deadline.

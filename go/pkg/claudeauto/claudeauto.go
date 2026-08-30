@@ -70,8 +70,9 @@ const (
 	maxRoutedRequestBytes = 16 << 20
 
 	// Route labels recorded per request.
-	routeMain     = "main"
-	routeReviewer = "reviewer"
+	routeMain                 = "main"
+	routeReviewer             = "reviewer"
+	routeReviewerStopStripped = "reviewer/stop-stripped-verdict"
 
 	textOnlyImagePlaceholder = "[Image omitted by ggrun: this local model was launched without an mmproj. Use a text extraction/OCR tool or relaunch with --vision.]"
 )
@@ -608,8 +609,8 @@ func (r *Router) SetReviewerContext(tokens int) {
 // SetPhaseAwareAdmission enables the conservative active-lane policy for
 // host-offloaded multi-slot models. Long cold prompts serialize because their
 // CPU-expert/PCIe passes make concurrent decode collapse; small and cache-hot
-// appends may use the otherwise idle slot after the active request reaches its
-// first response byte.
+// appends may use the otherwise idle slot after the active request emits its
+// first generated SSE delta.
 func (r *Router) SetPhaseAwareAdmission(enabled bool, coldPromptTokens int) {
 	if r != nil && r.sched != nil {
 		r.sched.setPhaseAware(enabled, coldPromptTokens)
@@ -863,6 +864,7 @@ func (r *Router) record(route string, body []byte, start time.Time, queue time.D
 		rec.ResponseBytes = metered.written
 		rec.Usage = metered.usage
 		rec.TTFBMS = metered.ttfb.Milliseconds()
+		rec.DecodeStartMS = metered.decodeStart.Milliseconds()
 		rec.Aborted = metered.status == 0 && metered.written == 0
 	}
 	if rec.Aborted {

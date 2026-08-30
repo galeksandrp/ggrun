@@ -313,17 +313,97 @@ func TestReviewerValidStreamingVerdictAnswersItself(t *testing.T) {
 	}
 }
 
+func TestReviewerAcceptsStopStrippedJSONVerdict(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		// This is the real llama.cpp/Claude Code stage-1 shape: Claude supplies
+		// </block> as a stop sequence, so the delimiter is excluded from content
+		// even though all seven verdict tokens were generated.
+		_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"<block>yes"}],"stop_reason":"stop_sequence","stop_sequence":"</block>","usage":{"output_tokens":7}}`))
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if got := reviewerJSONText(payload); got != "<block>yes" {
+		t.Fatalf("client verdict = %q, want the original stop-stripped verdict", got)
+	}
+	if reviewerHits.Load() != 1 || mainHits.Load() != 0 {
+		t.Fatalf("reviewer=%d main=%d; want reviewer-only response", reviewerHits.Load(), mainHits.Load())
+	}
+	if records := waitForRecords(t, path, 1); records[0].Route != routeReviewerStopStripped {
+		t.Fatalf("route = %q, want %q", records[0].Route, routeReviewerStopStripped)
+	}
+}
+
+func TestReviewerAcceptsStopStrippedStreamingVerdict(t *testing.T) {
+	var mainHits, reviewerHits atomic.Int64
+	mainBackend := countingBackend(t, &mainHits)
+	reviewerBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reviewerHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"<block>no\"}}\n\n"))
+	}))
+	t.Cleanup(reviewerBackend.Close)
+
+	router, path := newTestRouterPair(t, mainBackend.URL, reviewerBackend.URL, 1)
+	resp, err := http.Post(router.URL()+"/v1/messages", "application/json", strings.NewReader(classifierBody(16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	payload, _ := io.ReadAll(resp.Body)
+	if got := reviewerSSEText(payload); got != "<block>no" {
+		t.Fatalf("joined SSE verdict = %q, want original stop-stripped verdict", got)
+	}
+	if reviewerHits.Load() != 1 || mainHits.Load() != 0 {
+		t.Fatalf("reviewer=%d main=%d; want reviewer-only response", reviewerHits.Load(), mainHits.Load())
+	}
+	if records := waitForRecords(t, path, 1); records[0].Route != routeReviewerStopStripped {
+		t.Fatalf("route = %q, want %q", records[0].Route, routeReviewerStopStripped)
+	}
+}
+
+func TestStopStrippedReviewerVerdictStaysUnambiguous(t *testing.T) {
+	for text, want := range map[string]bool{
+		"<block>no":           true,
+		"  <block>yes\n":      true,
+		"<block>":             false,
+		"yes":                 false,
+		"safe: <block>yes":    false,
+		"<block>no<block>yes": false,
+		"<block>no</block>":   false,
+		"<block>yes</block>":  false,
+	} {
+		if got := stopStrippedReviewerVerdict(text); got != want {
+			t.Errorf("stopStrippedReviewerVerdict(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
 func TestReviewerClassifierBodyRaisesTinyOutputBudget(t *testing.T) {
-	body := reviewerClassifierBody([]byte(`{"model":"local-fast","max_tokens":7,"messages":[]}`), "local")
+	body := reviewerClassifierBody([]byte(`{"model":"local-fast","max_tokens":7,"stop_sequences":["</block>"],"messages":[]}`), "local")
 	var got struct {
-		Model     string `json:"model"`
-		MaxTokens int    `json:"max_tokens"`
+		Model         string   `json:"model"`
+		MaxTokens     int      `json:"max_tokens"`
+		StopSequences []string `json:"stop_sequences"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.Model != "local" || got.MaxTokens < 32 {
 		t.Fatalf("reviewer request = %+v, want retargeted model and complete-verdict budget", got)
+	}
+	if len(got.StopSequences) != 1 || got.StopSequences[0] != "</block>" {
+		t.Fatalf("reviewer request lost Claude Code's verdict stop sequence: %+v", got)
 	}
 }
 

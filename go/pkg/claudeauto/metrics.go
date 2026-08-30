@@ -61,31 +61,44 @@ type RequestRecord struct {
 	CancelPhase    string `json:"cancel_phase,omitempty"`
 	DeadlineBucket string `json:"deadline_bucket,omitempty"`
 	QueueMS        int64  `json:"queue_ms"`
-	TTFBMS         int64  `json:"ttfb_ms"`
-	TotalMS        int64  `json:"total_ms"`
-	RequestBytes   int64  `json:"request_bytes"`
-	ResponseBytes  int64  `json:"response_bytes"`
-	Usage          Usage  `json:"usage"`
+	// TTFBMS is transport time to the first HTTP response byte. Anthropic SSE
+	// sends envelopes before generation, so DecodeStartMS is the authoritative
+	// model-phase boundary for streaming requests.
+	TTFBMS        int64 `json:"ttfb_ms"`
+	DecodeStartMS int64 `json:"decode_start_ms,omitempty"`
+	TotalMS       int64 `json:"total_ms"`
+	RequestBytes  int64 `json:"request_bytes"`
+	ResponseBytes int64 `json:"response_bytes"`
+	Usage         Usage `json:"usage"`
 }
 
-// PrefillMS is time to first byte minus queue wait: the backend's own prefill
-// cost, not the wait ggrun imposed.
+// PrefillMS is time to the first generated delta minus queue wait: the
+// backend's own prompt-processing cost, not the wait ggrun imposed. Legacy and
+// non-streaming records fall back to TTFB because no separate boundary exists.
 func (r RequestRecord) PrefillMS() int64 {
-	if r.TTFBMS <= r.QueueMS {
+	boundary := r.DecodeStartMS
+	if boundary <= 0 && !r.Stream {
+		boundary = r.TTFBMS
+	}
+	if boundary <= r.QueueMS {
 		return 0
 	}
-	return r.TTFBMS - r.QueueMS
+	return boundary - r.QueueMS
 }
 
-// DecodeMS is the streaming tail after the first byte.
+// DecodeMS is the generation tail after the first generated delta.
 func (r RequestRecord) DecodeMS() int64 {
 	// A request cancelled while it is queued has no response writer and therefore
 	// no first-byte timestamp. Treating total_ms - 0 as decode time made queue
 	// cancellations look like slow generation even though they produced no token.
-	if r.TTFBMS <= 0 || r.TotalMS <= r.TTFBMS {
+	boundary := r.DecodeStartMS
+	if boundary <= 0 && !r.Stream {
+		boundary = r.TTFBMS
+	}
+	if boundary <= 0 || r.TotalMS <= boundary {
 		return 0
 	}
-	return r.TotalMS - r.TTFBMS
+	return r.TotalMS - boundary
 }
 
 type metricsSink struct {
@@ -296,14 +309,15 @@ func isStreamRequest(body []byte) bool {
 // flushes would buffer the whole response.
 type meteredWriter struct {
 	http.ResponseWriter
-	start      time.Time
-	status     int
-	written    int64
-	ttfb       time.Duration
-	usage      Usage
-	carry      []byte
-	onDecode   func()
-	decodeSeen bool
+	start       time.Time
+	status      int
+	written     int64
+	ttfb        time.Duration
+	usage       Usage
+	carry       []byte
+	onDecode    func()
+	decodeSeen  bool
+	decodeStart time.Duration
 }
 
 func (w *meteredWriter) WriteHeader(status int) {
@@ -346,6 +360,7 @@ func (w *meteredWriter) scan(p []byte) {
 	// while the live slot was still thousands of tokens into a cold prefill.
 	if !w.decodeSeen && containsGeneratedDelta(buf) {
 		w.decodeSeen = true
+		w.decodeStart = time.Since(w.start)
 		if w.onDecode != nil {
 			w.onDecode()
 		}

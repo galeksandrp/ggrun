@@ -114,6 +114,18 @@ func TestClaudeWorkflowPatchInputRejectsUnresolvedName(t *testing.T) {
 	}
 }
 
+func TestClaudeWorkflowPatchInputRejectsAmbiguousSources(t *testing.T) {
+	for _, input := range []map[string]interface{}{
+		{"name": "saved", "script": `await agent("inline")`},
+		{"scriptPath": "/tmp/workflow.js", "script": `await agent("inline")`},
+		{"name": "saved", "scriptPath": "/tmp/workflow.js"},
+	} {
+		if err := claudeWorkflowPatchInput(input, ""); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+			t.Fatalf("ambiguous input %v returned %v, want an actionable rejection", input, err)
+		}
+	}
+}
+
 func TestClaudeWorkflowPatchedScriptPathIsIdempotent(t *testing.T) {
 	first := claudeWorkflowPatchedScriptPath("/w/scripts/deep-research-wf_894b.js")
 	if first != "/w/scripts/deep-research-wf_894b.ggrun.js" {

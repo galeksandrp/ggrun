@@ -58,14 +58,25 @@ func installReviewerFallbackHooks(proxy *httputil.ReverseProxy) {
 	}
 }
 
-// validReviewerVerdict mirrors the response contract in Claude Code's
-// security-monitor prompt. A thinking block, tool call, empty 200, or prose-only
-// answer is not a permission decision and must be retried on the main model.
+// validReviewerVerdict mirrors Claude Code's actual parser, not just the prose
+// prompt. Stage 1 sends "</block>" as a stop sequence and accepts the closing
+// tag as optional, so an exact "<block>yes" or "<block>no" is a complete wire
+// verdict. Keep ggrun stricter than Claude around that exception: partial tags
+// mixed with prose remain invalid, as do thinking-only, tool-only, or empty
+// responses.
 func validReviewerVerdict(text string) bool {
 	text = strings.TrimSpace(text)
+	if stopStrippedReviewerVerdict(text) {
+		return true
+	}
 	no := strings.Count(text, "<block>no</block>")
 	yes := strings.Count(text, "<block>yes</block>")
 	return no+yes == 1
+}
+
+func stopStrippedReviewerVerdict(text string) bool {
+	text = strings.TrimSpace(text)
+	return text == "<block>no" || text == "<block>yes"
 }
 
 func reviewerJSONText(body []byte) string {
@@ -140,6 +151,15 @@ func reviewerResponseUsable(status int, header http.Header, body []byte) bool {
 		return validReviewerVerdict(reviewerSSEText(body))
 	}
 	return validReviewerVerdict(reviewerJSONText(body))
+}
+
+func reviewerResponseText(header http.Header, body []byte) string {
+	contentType := strings.ToLower(header.Get("Content-Type"))
+	isSSE := strings.Contains(contentType, "text/event-stream") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("event:")) || bytes.HasPrefix(bytes.TrimSpace(body), []byte("data:"))
+	if isSSE {
+		return reviewerSSEText(body)
+	}
+	return reviewerJSONText(body)
 }
 
 // deferredWriter withholds a response until the router decides whether to keep
@@ -228,7 +248,11 @@ func (r *Router) tryReviewer(w http.ResponseWriter, req *http.Request, proxy *ht
 		return false
 	}
 	deferred.flush()
-	r.record(routeReviewer, body, start, 0, metered)
+	route := routeReviewer
+	if stopStrippedReviewerVerdict(reviewerResponseText(deferred.hdr, deferred.buf.Bytes())) {
+		route = routeReviewerStopStripped
+	}
+	r.record(route, body, start, 0, metered)
 	return true
 }
 

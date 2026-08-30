@@ -79,12 +79,12 @@ func utilityBody(body []byte, backendAlias string) []byte {
 	return retargetModel(body, backendAlias)
 }
 
-// reviewerClassifierBody reserves enough output for the complete security
-// verdict contract. Claude Code deliberately asks for a tiny answer, but some
-// local tokenizers split "<block>yes</block>" into more pieces than the hosted
-// model does. Forwarding that budget unchanged produced the observed
-// seven-token "<block>yes" response and needlessly replayed every review on the
-// expensive main model.
+// reviewerClassifierBody reserves enough output for the security verdict
+// across local tokenizers. Claude Code's stage-1 request deliberately uses
+// "</block>" as a stop sequence, so the normal wire content omits that suffix;
+// reviewer response handling recognizes that contract separately. The minimum
+// here protects versions with a genuinely tiny budget from stopping before the
+// yes/no decision itself.
 func reviewerClassifierBody(body []byte, backendAlias string) []byte {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {

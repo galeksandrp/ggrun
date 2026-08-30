@@ -47,7 +47,7 @@ evidence.
 | KVFIT-9 | Boundary evidence is persisted and verified-config reuse is scoped | Capture load, cache, agent, and adjacent-rejection evidence on real hardware |
 | PERF-1, PERF-3, PERF-5, PERF-9, UX-3 | Implemented: standard launch owns bounded search; candidates are complete placements; scope includes policy/capabilities; batch pairs preserve explicit intent | Commit and multi-hardware proof |
 | PERF-2, PERF-6, PERF-7 | Implemented as baseline plus one calculated finalist, with a measured prefill pilot, identical budget-scaled cold+append scenarios, two samples, concurrent generation, mixed foreground traffic, lifecycle gates, delayed promotion, and a reusable baseline-won result | Add longer branch/replay and long-context hardware acceptance; quantify noise on public hardware |
-| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve. Phase-aware router admission now separates allocated slots from active compute: long cold host-expert prefills serialize, while bounded small/cache-hot requests may overlap only after the first generated SSE delta. Reviewer output-budget and enforceable Workflow-timeout fixes remove the two known false fallback/deadline paths; queue/service cancellations and 60s/600s signatures are recorded. | Relaunch the new binary and complete controlled p1/p2 decode+decode, cold-prefill+decode, and cache-hot A/Bs plus capability-specific unified/partitioned KV A/B; tune the cold/append boundary only from matched public-hardware evidence. |
+| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve. Phase-aware router admission now separates allocated slots from active compute: long cold host-expert prefills serialize, while bounded small/cache-hot requests may overlap only after the first generated SSE delta. Reviewer stop-sequence-contract handling and enforceable Workflow-timeout fixes remove the observed false fallback/deadline paths; ambiguous Workflow source inputs fail early, materialized scripts are verified, and queue/service cancellations plus 60s/600s signatures are recorded. | Relaunch the new binary and complete controlled p1/p2 decode+decode, cold-prefill+decode, and cache-hot A/Bs plus capability-specific unified/partitioned KV A/B; tune the cold/append boundary only from matched public-hardware evidence. |
 | PERF-4, PERF-8, PERF-12, UX-2 | Not complete | Implement measured headroom continuation, broader optional knobs, and bounded control UX |
 | PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
@@ -72,6 +72,16 @@ evidence.
   and ~600 s deadline families. Workflow calls that cannot be rewritten with
   the maximum safe `stallMs` fail before launching work instead of silently
   running under the private deadline.
+- Workflow inputs with multiple script sources now fail before tool precedence
+  can select the wrong program; patched script files are read back before use.
+  The hook advises file references for large protocols rather than duplicating
+  them into model prompts.
+- Request JSONL keeps transport `ttfb_ms` and adds `decode_start_ms`; streaming
+  prefill/decode summaries use the first generated delta rather than the early
+  Anthropic SSE envelope. Claude Code's stage-1 request intentionally stops on
+  `</block>` and accepts an optional closing tag; the reviewer buffers and
+  accepts only those exact, unambiguous stop-stripped yes/no verdicts unchanged,
+  with a distinct `reviewer/stop-stripped-verdict` route label.
 - NVIDIA phase samples include PCIe RX/TX. A measured saturation claim requires
   at least 65% of a known link ceiling; otherwise DDR, PCIe, and synchronization
   remain a composite diagnosis.

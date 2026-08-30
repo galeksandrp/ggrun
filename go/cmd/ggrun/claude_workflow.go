@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,7 +15,7 @@ import (
 // deadline while still avoiding the immediate-failure overflow above it.
 const claudeNoTimeoutMS = 2147483647
 
-const claudeWorkflowSystemPrompt = `You are using a slow local model through ggrun. Never abort a model request or agent merely because it is quiet while processing a prompt. For every Workflow tool script, set stallMs: 2147483647 in every agent() options object. This is required even for foreground agents and retries.`
+const claudeWorkflowSystemPrompt = `You are using a slow local model through ggrun. Never abort a model request or agent merely because it is quiet while processing a prompt. For every Workflow tool script, set stallMs: 2147483647 in every agent() options object. This is required even for foreground agents and retries. Keep large protocols and source material in files and pass their paths to agents instead of embedding duplicate copies in prompts.`
 
 type claudeWorkflowHookInput struct {
 	ToolName       string                 `json:"tool_name"`
@@ -70,6 +71,19 @@ func cmdClaudeWorkflowHook(_ []string) {
 // shape Claude Code exposes. Named workflows are materialized outside the tool
 // input, so resolve a prior materialization and convert the call to scriptPath.
 func claudeWorkflowPatchInput(toolInput map[string]interface{}, transcriptPath string) error {
+	// Workflow accepts three mutually exclusive script sources. Claude Code has
+	// historically applied precedence when more than one is present, which can
+	// silently run a saved workflow instead of the inline script the model just
+	// generated. Refuse ambiguity before any agents start.
+	var sources []string
+	for _, key := range []string{"script", "scriptPath", "name"} {
+		if value, ok := toolInput[key].(string); ok && strings.TrimSpace(value) != "" {
+			sources = append(sources, key)
+		}
+	}
+	if len(sources) > 1 {
+		return fmt.Errorf("ggrun Workflow policy: script source is ambiguous (%s); provide exactly one of script, scriptPath, or name", strings.Join(sources, ", "))
+	}
 	if script, ok := toolInput["script"].(string); ok {
 		toolInput["script"] = claudeWorkflowNoTimeoutScript(script)
 		return nil
@@ -123,6 +137,16 @@ func claudeWorkflowPatchedScriptFile(path string) (string, error) {
 	patchedPath := claudeWorkflowPatchedScriptPath(path)
 	if err := os.WriteFile(patchedPath, []byte(patched), 0o600); err != nil {
 		return "", fmt.Errorf("write %s: %w", patchedPath, err)
+	}
+	// The generated file is the executable artifact handed to Workflow. Read it
+	// back before approval so a short/partial materialization cannot be accepted
+	// silently and discovered only after a long model run.
+	readback, err := os.ReadFile(patchedPath)
+	if err != nil {
+		return "", fmt.Errorf("verify %s: %w", patchedPath, err)
+	}
+	if !bytes.Equal(readback, []byte(patched)) {
+		return "", fmt.Errorf("verify %s: written script differs from patched input", patchedPath)
 	}
 	return patchedPath, nil
 }
