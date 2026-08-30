@@ -244,6 +244,7 @@ func TestAdmissionDecisionSuppressesOnlyItsExactAutomaticRetry(t *testing.T) {
 	decision := &CalibrationDecision{
 		Winner: "default", ValidationLevel: CalibrationValidationAdmission,
 		Finalist: "ubatch-2048", FinalistOutcome: "unavailable",
+		FinalistFailureClass: "cuda-oom", FinalistFailureReason: "exact candidate CUDA OOM",
 	}
 	if decision.AutomaticEligible() {
 		t.Fatal("admission-only evidence became automatic performance evidence")
@@ -253,6 +254,10 @@ func TestAdmissionDecisionSuppressesOnlyItsExactAutomaticRetry(t *testing.T) {
 	}
 	if decision.SuppressesAutomaticAdmissionRetry("parallel-2") {
 		t.Fatal("one failed finalist suppressed a different candidate")
+	}
+	decision.FinalistFailureReason = ""
+	if decision.SuppressesAutomaticAdmissionRetry("ubatch-2048") {
+		t.Fatal("unexplained admission failure suppressed a retry")
 	}
 	decision.ValidationLevel = CalibrationValidationWorkflow
 	if decision.SuppressesAutomaticAdmissionRetry("ubatch-2048") {

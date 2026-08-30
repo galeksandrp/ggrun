@@ -845,6 +845,12 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 	// The pass-cost decomposition needs to know how many tokens a prefill pass
 	// carried, which is the micro-batch the backend was launched with.
 	router.SetUBatch(argIntValue(serverArgs, "-ub", "--ubatch-size"))
+	// A host-expert MoE can allocate two slots yet perform worse when two long
+	// prefills contend for the same DDR/PCIe path. Keep the physical slots, but
+	// schedule their active phases from observable request/TTFB boundaries.
+	hostExpertLayers := argIntValue(serverArgs, "-ncmoe", "--n-cpu-moe")
+	phaseAware := maxMainActive > 1 && hostExpertLayers > 0
+	router.SetPhaseAwareAdmission(phaseAware, 8192)
 	// Poll the backend's own counters so /ggrun/router can report measured
 	// throughput rather than request wall-clock. Five seconds is well below any
 	// human-visible status refresh and negligible load on the backend.
@@ -865,7 +871,11 @@ func (r *claudeAutoRuntime) startRouter(cfg *config.Config, mainHost string, mai
 		fmt.Printf("[claude-code] agent gateway ready on %s\n", router.URL())
 	}
 	if maxMainActive > 0 {
-		fmt.Printf("[claude-code] agent admission: %d active main-model request(s); additional agents queue without timing out\n", maxMainActive)
+		if phaseAware {
+			fmt.Printf("[claude-code] agent admission: %d physical lane(s), phase-aware active scheduling (cold host-expert prefills serialize; cache-hot appends may overlap decode)\n", maxMainActive)
+		} else {
+			fmt.Printf("[claude-code] agent admission: %d active main-model request(s); queued cancellations remain client-controlled\n", maxMainActive)
+		}
 	}
 	return nil
 }

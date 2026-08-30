@@ -39,24 +39,20 @@ func cmdClaudeWorkflowHook(_ []string) {
 		return
 	}
 	if err := claudeWorkflowPatchInput(input.ToolInput, input.TranscriptPath); err != nil {
-		// Denying was too strong. The timeout policy is an optimisation for a
-		// slow local model; the tool call is legitimate either way. A built-in
-		// or saved workflow invoked by name has no materialized script under the
-		// session directory until it has already run once, so a hard deny made
-		// `Workflow({name: "deep-research"})` impossible to run at all -- and its
-		// own advice, "invoke it once as inline script", is circular for a
-		// workflow the user did not author. A restart loses the materialized
-		// copy and breaks resume-by-name the same way.
-		//
-		// So fall through unpatched: an unpatched run may stall on a slow model,
-		// a denied one certainly does nothing. claudeCodeWorkflowPromptArgs
-		// already asks the model to set stallMs itself, which is the remaining
-		// cover. An empty decision leaves normal permission handling alone.
-		fmt.Fprintf(os.Stderr,
-			"[claude-code] Workflow stall-timeout policy not applied: %v\n"+
-				"[claude-code] the run proceeds; set stallMs: %d on every agent() call if it stalls\n",
-			err, claudeNoTimeoutMS)
-		fmt.Println(`{}`)
+		// An opaque named workflow is exactly where the real 600-second aborts
+		// survived: there is no script for this hook to rewrite, so allowing it
+		// made the no-timeout promise false. Fail closed before any agents start
+		// and tell Claude how to retry in a form ggrun can make deterministic.
+		reason := fmt.Sprintf("ggrun could not enforce the local-model Workflow timeout policy: %v. Retry with an inline script or scriptPath so every agent() call can receive stallMs: %d", err, claudeNoTimeoutMS)
+		fmt.Fprintf(os.Stderr, "[claude-code] %s\n", reason)
+		output := map[string]interface{}{
+			"hookSpecificOutput": map[string]interface{}{
+				"hookEventName":            "PreToolUse",
+				"permissionDecision":       "deny",
+				"permissionDecisionReason": reason,
+			},
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(output)
 		return
 	}
 	output := map[string]interface{}{

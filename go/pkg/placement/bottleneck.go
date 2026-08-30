@@ -199,6 +199,7 @@ func sameDiagnosticWorkload(base, candidate *Strategy) bool {
 func diagnoseAgentPhase(caps *detect.Capabilities, strategy *Strategy, result *benchmark.Result, phase benchmark.PhaseUtilization) PhaseBottleneck {
 	out := PhaseBottleneck{Phase: phase.Phase, Kind: BottleneckUnknown, Confidence: "unknown"}
 	maxSM, maxMemory := phaseGPUCeilings(phase.GPUUtilization)
+	maxPCIeRX, maxPCIeTX := phasePCIeCeilings(phase.GPUUtilization)
 	cpuLoad := phaseCPUWorkerLoad(strategy, phase)
 	readMBps := 0.0
 	if phase.DurationS > 0 {
@@ -208,6 +209,11 @@ func diagnoseAgentPhase(caps *detect.Capabilities, strategy *Strategy, result *b
 		fmt.Sprintf("gpu_sm_max=%d%%", maxSM),
 		fmt.Sprintf("gpu_memory_max=%d%%", maxMemory),
 	)
+	if maxPCIeRX > 0 || maxPCIeTX > 0 {
+		out.Evidence = append(out.Evidence,
+			fmt.Sprintf("pcie_rx_max=%dMiB/s", maxPCIeRX),
+			fmt.Sprintf("pcie_tx_max=%dMiB/s", maxPCIeTX))
+	}
 	if phase.ProcessObservations > 0 {
 		out.Evidence = append(out.Evidence,
 			fmt.Sprintf("process_cpu=%.0f%%", phase.ProcessCPUPercent),
@@ -273,7 +279,15 @@ func diagnoseAgentPhase(caps *detect.Capabilities, strategy *Strategy, result *b
 	if strategy.IsMoE && strategy.NCPUMoE > 0 && phase.ProcessObservations > 0 && maxSM < 70 && cpuLoad >= 0.20 {
 		out.Kind = BottleneckHostExpertPath
 		out.Confidence = "inferred"
-		out.Summary = fmt.Sprintf("%s is limited in the CPU-expert path; current counters cannot yet separate DRAM, PCIe, and synchronization", phase.Phase)
+		out.Summary = fmt.Sprintf("%s is limited in the CPU-expert path", phase.Phase)
+		if pressure, known := phasePCIePressure(caps, phase.GPUUtilization); known && pressure >= 0.65 {
+			out.Confidence = "measured"
+			out.Summary = fmt.Sprintf("%s saturates the CPU-expert transfer path (PCIe %.0f%% of link capacity; RX/TX %d/%d MiB/s)", phase.Phase, pressure*100, maxPCIeRX, maxPCIeTX)
+		} else if maxPCIeRX > 0 || maxPCIeTX > 0 {
+			out.Summary += fmt.Sprintf("; PCIe is active at RX/TX %d/%d MiB/s but is not proven saturated, so DRAM and synchronization remain candidates", maxPCIeRX, maxPCIeTX)
+		} else {
+			out.Summary += "; transfer counters unavailable, so DRAM and synchronization remain unresolved"
+		}
 		if caps != nil && caps.HostMemoryBandwidthMBps > 0 {
 			out.Evidence = append(out.Evidence, fmt.Sprintf("measured_host_bandwidth=%dMB/s", caps.HostMemoryBandwidthMBps))
 		}
@@ -370,6 +384,44 @@ func phaseGPUCeilings(samples []benchmark.GPUUtilization) (maxSM, maxMemory int)
 		}
 	}
 	return maxSM, maxMemory
+}
+
+func phasePCIeCeilings(samples []benchmark.GPUUtilization) (maxRX, maxTX int) {
+	for _, sample := range samples {
+		if sample.PCIeRXMBps > maxRX {
+			maxRX = sample.PCIeRXMBps
+		}
+		if sample.PCIeTXMBps > maxTX {
+			maxTX = sample.PCIeTXMBps
+		}
+	}
+	return maxRX, maxTX
+}
+
+func phasePCIePressure(caps *detect.Capabilities, samples []benchmark.GPUUtilization) (float64, bool) {
+	if caps == nil {
+		return 0, false
+	}
+	bandwidth := make(map[int]int, len(caps.GPUs))
+	for _, gpu := range caps.GPUs {
+		if gpu.BandwidthMBps > 0 {
+			bandwidth[gpu.Index] = gpu.BandwidthMBps
+		}
+	}
+	maximum := 0.0
+	known := false
+	for _, sample := range samples {
+		ceiling := bandwidth[sample.GPU]
+		if ceiling <= 0 {
+			continue
+		}
+		known = true
+		pressure := float64(max(sample.PCIeRXMBps, sample.PCIeTXMBps)) / float64(ceiling)
+		if pressure > maximum {
+			maximum = pressure
+		}
+	}
+	return maximum, known
 }
 
 func benchmarkGPUUtilSamples(samples []benchmark.GPUUtilization) []GPUUtilSample {

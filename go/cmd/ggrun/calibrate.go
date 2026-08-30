@@ -605,7 +605,17 @@ func automaticCalibrationAdmissionEvidenceValid(decision *placement.CalibrationD
 	// later rather than becoming a permanent negative result.
 	return decision.Winner == "default" &&
 		decision.Finalist != "" &&
-		decision.FinalistOutcome == "unavailable"
+		decision.FinalistOutcome == "unavailable" &&
+		decision.FinalistFailureClass != "" &&
+		decision.FinalistFailureReason != ""
+}
+
+func exactAdmissionFailureEvidence(err error) (string, string) {
+	var failure *exactAdmissionFailure
+	if !errors.As(err, &failure) || failure == nil {
+		return "", ""
+	}
+	return string(failure.class), failure.Error()
 }
 
 func calibrationTurnTime(result *benchmark.Result) float64 {
@@ -885,6 +895,8 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 	curP := p
 	failures := 0
 	stableAdmissionFailed := false
+	stableFailureClass := ""
+	stableFailureReason := ""
 	admissionInconclusive := false
 	exactCandidateStarted := false
 	for _, cand := range candidates[1:] {
@@ -901,6 +913,10 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		if memoryRecovery.isRejected(candArgs) {
 			fmt.Printf("[calibrate] skipping %s: its exact argv already failed memory admission in this launch\n", cand.Name)
 			stableAdmissionFailed = true
+			if stableFailureClass == "" {
+				stableFailureClass = "cached-memory-rejection"
+				stableFailureReason = "the finalist exact argv already failed memory admission in this launch"
+			}
 			continue
 		}
 		fmt.Printf("[calibrate] measuring %s...\n", cand.Name)
@@ -916,6 +932,9 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 			fmt.Fprintf(os.Stderr, "[calibrate] %s failed to start (%v); skipping\n", cand.Name, serr)
 			if isStableExactAdmissionFailure(serr) {
 				stableAdmissionFailed = true
+				if stableFailureClass == "" {
+					stableFailureClass, stableFailureReason = exactAdmissionFailureEvidence(serr)
+				}
 			} else {
 				admissionInconclusive = true
 			}
@@ -933,6 +952,10 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		if !exactCalibrationCandidate(candArgs, measuredArgs) {
 			fmt.Fprintf(os.Stderr, "[calibrate] %s needed memory recovery; skipping the altered candidate\n", cand.Name)
 			stableAdmissionFailed = true
+			if stableFailureClass == "" {
+				stableFailureClass = "memory-recovery-rewrote-argv"
+				stableFailureReason = "the finalist started only after memory recovery changed its exact argv"
+			}
 			if !stopCalibrationProcessAndWait(cp, cand.Name+" after memory recovery", resourceBaseline, 30*time.Second) {
 				req.CalibrationScreened = true
 				return cp, measuredStrategy, measuredArgs, nil
@@ -1004,6 +1027,8 @@ func runCalibration(req *launchRequest, cfg *config.Config, model *placement.Mod
 		}
 		pending := newCalibrationDecision(scopeKey, model, defaultResult, measurements[0])
 		annotateOptimizationDecision(pending, candidates, measurements)
+		pending.FinalistFailureClass = stableFailureClass
+		pending.FinalistFailureReason = stableFailureReason
 		if mode == calibrateAuto {
 			fmt.Printf("[optimize] calculated finalist was unavailable; restored measured baseline and will record that bounded result after launch validation\n")
 		} else {
@@ -1213,6 +1238,7 @@ func sampleLaunchGPUUtilization(caps *detect.Capabilities) []benchmark.GPUUtiliz
 	for _, sample := range mapped {
 		out = append(out, benchmark.GPUUtilization{
 			GPU: sample.Index, SMPercent: sample.SMPercent, MemPercent: sample.MemPercent,
+			PCIeRXMBps: sample.PCIeRXMBps, PCIeTXMBps: sample.PCIeTXMBps,
 		})
 	}
 	return out

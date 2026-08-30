@@ -14,10 +14,13 @@ const gpuUtilizationCommandTimeout = 2 * time.Second
 // device order cannot remap it onto the wrong card. Index is filled only after
 // MapUtilizationToIndexes.
 type GPUUtilization struct {
-	Index      int    `json:"index,omitempty"`
-	PCIBusID   string `json:"pci_bus_id,omitempty"`
-	SMPercent  int    `json:"sm_percent"`
-	MemPercent int    `json:"mem_percent"`
+	Index       int    `json:"index,omitempty"`
+	NVIDIAIndex int    `json:"-"`
+	PCIBusID    string `json:"pci_bus_id,omitempty"`
+	SMPercent   int    `json:"sm_percent"`
+	MemPercent  int    `json:"mem_percent"`
+	PCIeRXMBps  int    `json:"pcie_rx_mbps,omitempty"`
+	PCIeTXMBps  int    `json:"pcie_tx_mbps,omitempty"`
 }
 
 // SampleGPUUtilization returns current SM/memory utilization, or nil when the
@@ -26,12 +29,22 @@ func SampleGPUUtilization() []GPUUtilization {
 	ctx, cancel := context.WithTimeout(context.Background(), gpuUtilizationCommandTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "nvidia-smi",
-		"--query-gpu=pci.bus_id,utilization.gpu,utilization.memory",
+		"--query-gpu=index,pci.bus_id,utilization.gpu,utilization.memory",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		return nil
 	}
-	return parseNVIDIAUtilization(string(out))
+	samples := parseNVIDIAUtilization(string(out))
+	transferOut, transferErr := exec.CommandContext(ctx, "nvidia-smi", "dmon", "-s", "t", "-c", "1").Output()
+	if transferErr == nil {
+		transfers := parseNVIDIATransfers(string(transferOut))
+		for i := range samples {
+			if pair, ok := transfers[samples[i].NVIDIAIndex]; ok {
+				samples[i].PCIeRXMBps, samples[i].PCIeTXMBps = pair[0], pair[1]
+			}
+		}
+	}
+	return samples
 }
 
 func parseNVIDIAUtilization(csv string) []GPUUtilization {
@@ -48,16 +61,44 @@ func parseNVIDIAUtilization(csv string) []GPUUtilization {
 		if len(parts) < 3 {
 			continue
 		}
-		sm, errSM := strconv.Atoi(strings.TrimSpace(parts[1]))
-		mem, errMem := strconv.Atoi(strings.TrimSpace(parts[2]))
+		offset, nvidiaIndex := 0, -1
+		if len(parts) >= 4 {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+				nvidiaIndex, offset = parsed, 1
+			}
+		}
+		sm, errSM := strconv.Atoi(strings.TrimSpace(parts[offset+1]))
+		mem, errMem := strconv.Atoi(strings.TrimSpace(parts[offset+2]))
 		if errSM != nil || errMem != nil {
 			continue
 		}
 		out = append(out, GPUUtilization{
-			PCIBusID:   strings.TrimSpace(parts[0]),
-			SMPercent:  sm,
-			MemPercent: mem,
+			NVIDIAIndex: nvidiaIndex,
+			PCIBusID:    strings.TrimSpace(parts[offset]),
+			SMPercent:   sm,
+			MemPercent:  mem,
 		})
+	}
+	return out
+}
+
+func parseNVIDIATransfers(output string) map[int][2]int {
+	out := map[int][2]int{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		index, errIndex := strconv.Atoi(fields[0])
+		rx, errRX := strconv.Atoi(fields[1])
+		tx, errTX := strconv.Atoi(fields[2])
+		if errIndex == nil && errRX == nil && errTX == nil {
+			out[index] = [2]int{rx, tx}
+		}
 	}
 	return out
 }

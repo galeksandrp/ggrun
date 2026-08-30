@@ -85,7 +85,7 @@ func startPhaseResourceObservation(r *Runner, phase AgentPhase) func() PhaseUtil
 	}
 
 	type gpuAggregate struct {
-		sm, memory, observations int
+		sm, memory, pcieRX, pcieTX, observations int
 	}
 	started := time.Now()
 	stop := make(chan struct{})
@@ -119,6 +119,8 @@ func startPhaseResourceObservation(r *Runner, phase AgentPhase) func() PhaseUtil
 					agg := byGPU[gpu.GPU]
 					agg.sm += gpu.SMPercent
 					agg.memory += gpu.MemPercent
+					agg.pcieRX += gpu.PCIeRXMBps
+					agg.pcieTX += gpu.PCIeTXMBps
 					agg.observations++
 					byGPU[gpu.GPU] = agg
 				}
@@ -173,6 +175,8 @@ func startPhaseResourceObservation(r *Runner, phase AgentPhase) func() PhaseUtil
 					out.GPUUtilization = append(out.GPUUtilization, GPUUtilization{
 						GPU: gpu, SMPercent: agg.sm / agg.observations,
 						MemPercent:   agg.memory / agg.observations,
+						PCIeRXMBps:   agg.pcieRX / agg.observations,
+						PCIeTXMBps:   agg.pcieTX / agg.observations,
 						Observations: agg.observations,
 					})
 				}

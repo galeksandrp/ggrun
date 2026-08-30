@@ -136,11 +136,10 @@ func TestClaudeWorkflowPatchedScriptPathIsIdempotent(t *testing.T) {
 	}
 }
 
-// A named workflow has no materialized script until it has already run once, so
-// denying an unpatchable call made built-in workflows impossible to start and
-// broke resume-by-name after a restart. The timeout policy is an optimisation;
-// losing it must not cost the run.
-func TestClaudeWorkflowHookAllowsAnUnpatchableNamedWorkflow(t *testing.T) {
+// An opaque named workflow cannot be rewritten, so allowing it would silently
+// restore the private Workflow deadline. Reject it before work starts and make
+// the retry shape explicit instead of losing a live run after ten minutes.
+func TestClaudeWorkflowHookRejectsAnUnpatchableNamedWorkflow(t *testing.T) {
 	inR, inW, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -170,13 +169,10 @@ func TestClaudeWorkflowHookAllowsAnUnpatchableNamedWorkflow(t *testing.T) {
 	_, _ = stderr.ReadFrom(errR)
 	os.Stdin, os.Stdout, os.Stderr = oldIn, oldOut, oldErr
 
-	if strings.Contains(out.String(), "deny") {
-		t.Fatalf("hook denied a legitimate named workflow: %s", out.String())
+	if !strings.Contains(out.String(), `"permissionDecision":"deny"`) {
+		t.Fatalf("hook allowed an unenforceable workflow: %s", out.String())
 	}
-	if strings.TrimSpace(out.String()) != "{}" {
-		t.Fatalf("hook must leave permission handling alone, got %q", out.String())
-	}
-	if !strings.Contains(stderr.String(), "stall-timeout policy not applied") {
-		t.Fatalf("dropping the policy must be reported, got %q", stderr.String())
+	if !strings.Contains(out.String(), "inline script or scriptPath") || !strings.Contains(stderr.String(), "could not enforce") {
+		t.Fatalf("denial was not actionable: out=%q stderr=%q", out.String(), stderr.String())
 	}
 }

@@ -79,6 +79,31 @@ func utilityBody(body []byte, backendAlias string) []byte {
 	return retargetModel(body, backendAlias)
 }
 
+// reviewerClassifierBody reserves enough output for the complete security
+// verdict contract. Claude Code deliberately asks for a tiny answer, but some
+// local tokenizers split "<block>yes</block>" into more pieces than the hosted
+// model does. Forwarding that budget unchanged produced the observed
+// seven-token "<block>yes" response and needlessly replayed every review on the
+// expensive main model.
+func reviewerClassifierBody(body []byte, backendAlias string) []byte {
+	var payload map[string]any
+	if json.Unmarshal(body, &payload) != nil {
+		return retargetModel(body, backendAlias)
+	}
+	if _, ok := payload["model"]; ok && backendAlias != "" {
+		payload["model"] = backendAlias
+	}
+	const minimumReviewerOutputTokens = 32
+	if value, ok := payload["max_tokens"].(float64); !ok || value < minimumReviewerOutputTokens {
+		payload["max_tokens"] = minimumReviewerOutputTokens
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return retargetModel(body, backendAlias)
+	}
+	return out
+}
+
 // bodyReader is a small helper so callers can reset a request body after the
 // model field is rewritten.
 func bodyReader(body []byte) *bytes.Reader { return bytes.NewReader(body) }

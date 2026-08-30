@@ -301,10 +301,64 @@ func TestSchedulerConcurrentLoadNeverExceedsTheLimit(t *testing.T) {
 	}
 }
 
+func TestPhaseAwareSchedulerSerializesColdPrefillButUsesAppendLane(t *testing.T) {
+	s, _ := newTestScheduler(2)
+	s.setPhaseAware(true, 1000)
+	first := s.acquireRequest(context.Background(), "cold-a", LaneBulk, 2000)
+	if first == nil {
+		t.Fatal("first cold request was not admitted")
+	}
+
+	coldReady := make(chan *admission, 1)
+	go func() { coldReady <- s.acquireRequest(context.Background(), "cold-b", LaneBulk, 2000) }()
+	waitFor(t, func() bool { _, q, _ := s.stats(); return q == 1 }, "second cold request did not queue")
+	first.markDecode()
+	if a, q, _ := s.stats(); a != 1 || q != 1 {
+		t.Fatalf("cold prefill overlapped decode: active=%d queued=%d", a, q)
+	}
+
+	smallReady := make(chan *admission, 1)
+	go func() { smallReady <- s.acquireRequest(context.Background(), "append", LaneBulk, 100) }()
+	var small *admission
+	select {
+	case small = <-smallReady:
+	case <-time.After(time.Second):
+		t.Fatal("safe append was head-of-line blocked by queued cold prefill")
+	}
+	if a, _, _ := s.stats(); a != 2 {
+		t.Fatalf("append did not use idle physical lane: active=%d", a)
+	}
+	small.release()
+	first.release()
+	select {
+	case second := <-coldReady:
+		second.release()
+	case <-time.After(time.Second):
+		t.Fatal("cold request was not admitted after the competing request completed")
+	}
+}
+
+func TestPhaseAwareSchedulerRecognizesBoundedConversationAppend(t *testing.T) {
+	s, _ := newTestScheduler(2)
+	s.setPhaseAware(true, 1000)
+	first := s.acquireRequest(context.Background(), "conversation", LaneBulk, 5000)
+	first.release()
+
+	s.mu.Lock()
+	class := s.classifyLocked("conversation", 5500)
+	cold := s.classifyLocked("conversation", 7000)
+	s.mu.Unlock()
+	if class != requestSmall || cold != requestCold {
+		t.Fatalf("classes append=%v cold-growth=%v, want small/cold", class, cold)
+	}
+}
+
 func TestPruneRecentBoundsMemoryOnLongRuns(t *testing.T) {
 	s, clock := newTestScheduler(1)
 	for i := 0; i < 400; i++ {
-		s.recent[string(rune('a'+i%26))+string(rune(i))] = clock.now()
+		key := string(rune('a'+i%26)) + string(rune(i))
+		s.recent[key] = clock.now()
+		s.promptTokens[key] = i + 1
 	}
 	clock.advance(fairShareWindow + time.Minute)
 	s.recent["fresh"] = clock.now()
@@ -314,6 +368,9 @@ func TestPruneRecentBoundsMemoryOnLongRuns(t *testing.T) {
 	s.mu.Unlock()
 	if got > 256 {
 		t.Errorf("recent map kept %d entries, want <= 256", got)
+	}
+	if len(s.promptTokens) > 256 {
+		t.Errorf("prompt history kept %d entries, want <= 256", len(s.promptTokens))
 	}
 	if _, ok := s.recent["fresh"]; !ok {
 		t.Error("pruning dropped the most recent entry")

@@ -16,7 +16,7 @@ import (
 // CalibrationSchemaVersion bumps whenever the candidate set or scoring changes,
 // so a decision measured under older semantics is never applied after an
 // upgrade changes what "fastest" means.
-const CalibrationSchemaVersion = 18
+const CalibrationSchemaVersion = 19
 
 var calibrationShardBasename = regexp.MustCompile(`(?i)^(.*)-00001-of-[0-9]{5}\.gguf$`)
 
@@ -96,6 +96,8 @@ type CalibrationDecision struct {
 	BaselineBottleneck     string                `json:"baseline_bottleneck,omitempty"`
 	Finalist               string                `json:"finalist,omitempty"`
 	FinalistOutcome        string                `json:"finalist_outcome,omitempty"`
+	FinalistFailureClass   string                `json:"finalist_failure_class,omitempty"`
+	FinalistFailureReason  string                `json:"finalist_failure_reason,omitempty"`
 	FinalistEstimatedCost  float64               `json:"finalist_estimated_agent_cost,omitempty"`
 	FinalistConfidence     string                `json:"finalist_estimate_confidence,omitempty"`
 	ExploredBoundary       *OptimizationBoundary `json:"explored_boundary,omitempty"`
@@ -160,6 +162,8 @@ func (d *CalibrationDecision) SuppressesAutomaticAdmissionRetry(finalist string)
 		d.ValidationLevel == CalibrationValidationAdmission &&
 		d.Winner == "default" &&
 		d.FinalistOutcome == "unavailable" &&
+		d.FinalistFailureClass != "" &&
+		d.FinalistFailureReason != "" &&
 		d.Finalist != "" &&
 		d.Finalist == finalist
 }

@@ -52,18 +52,20 @@ func (u Usage) PromptTokens() int64 {
 // separate: a large prefill starving active decodes is invisible in a single
 // end-to-end duration.
 type RequestRecord struct {
-	Time          string `json:"time"`
-	Route         string `json:"route"`
-	Conversation  string `json:"conversation"`
-	Status        int    `json:"status"`
-	Stream        bool   `json:"stream"`
-	Aborted       bool   `json:"aborted"`
-	QueueMS       int64  `json:"queue_ms"`
-	TTFBMS        int64  `json:"ttfb_ms"`
-	TotalMS       int64  `json:"total_ms"`
-	RequestBytes  int64  `json:"request_bytes"`
-	ResponseBytes int64  `json:"response_bytes"`
-	Usage         Usage  `json:"usage"`
+	Time           string `json:"time"`
+	Route          string `json:"route"`
+	Conversation   string `json:"conversation"`
+	Status         int    `json:"status"`
+	Stream         bool   `json:"stream"`
+	Aborted        bool   `json:"aborted"`
+	CancelPhase    string `json:"cancel_phase,omitempty"`
+	DeadlineBucket string `json:"deadline_bucket,omitempty"`
+	QueueMS        int64  `json:"queue_ms"`
+	TTFBMS         int64  `json:"ttfb_ms"`
+	TotalMS        int64  `json:"total_ms"`
+	RequestBytes   int64  `json:"request_bytes"`
+	ResponseBytes  int64  `json:"response_bytes"`
+	Usage          Usage  `json:"usage"`
 }
 
 // PrefillMS is time to first byte minus queue wait: the backend's own prefill
@@ -98,6 +100,10 @@ type metricsSink struct {
 	abortedMS        int64
 	abortedQueueMS   int64
 	abortedServiceMS int64
+	abortedQueue     int64
+	abortedService   int64
+	deadline60       int64
+	deadline600      int64
 	queueMS          int64
 	prefillMS        int64
 	decodeMS         int64
@@ -120,6 +126,17 @@ func (m *metricsSink) record(rec RequestRecord) {
 		m.abortedQueueMS += rec.QueueMS
 		if rec.TotalMS > rec.QueueMS {
 			m.abortedServiceMS += rec.TotalMS - rec.QueueMS
+		}
+		if rec.CancelPhase == "queue" {
+			m.abortedQueue++
+		} else if rec.CancelPhase == "service" {
+			m.abortedService++
+		}
+		switch rec.DeadlineBucket {
+		case "~60s":
+			m.deadline60++
+		case "~600s":
+			m.deadline600++
 		}
 	} else if rec.Status >= 200 && rec.Status < 300 {
 		m.successful++
@@ -163,6 +180,10 @@ func (m *metricsSink) summary() map[string]any {
 		"aborted_ms_total":         m.abortedMS,
 		"aborted_queue_ms_total":   m.abortedQueueMS,
 		"aborted_service_ms_total": m.abortedServiceMS,
+		"aborted_in_queue":         m.abortedQueue,
+		"aborted_in_service":       m.abortedService,
+		"deadline_60s_signature":   m.deadline60,
+		"deadline_600s_signature":  m.deadline600,
 		"queue_ms_total":           m.queueMS,
 		"prefill_ms_total":         m.prefillMS,
 		"decode_ms_total":          m.decodeMS,
@@ -275,12 +296,13 @@ func isStreamRequest(body []byte) bool {
 // flushes would buffer the whole response.
 type meteredWriter struct {
 	http.ResponseWriter
-	start   time.Time
-	status  int
-	written int64
-	ttfb    time.Duration
-	usage   Usage
-	carry   []byte
+	start       time.Time
+	status      int
+	written     int64
+	ttfb        time.Duration
+	usage       Usage
+	carry       []byte
+	onFirstByte func()
 }
 
 func (w *meteredWriter) WriteHeader(status int) {
@@ -296,6 +318,9 @@ func (w *meteredWriter) Write(p []byte) (int, error) {
 	}
 	if w.written == 0 && len(p) > 0 {
 		w.ttfb = time.Since(w.start)
+		if w.onFirstByte != nil {
+			w.onFirstByte()
+		}
 	}
 	w.written += int64(len(p))
 	w.scan(p)

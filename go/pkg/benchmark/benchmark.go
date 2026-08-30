@@ -99,6 +99,8 @@ type GPUUtilization struct {
 	GPU          int `json:"gpu"`
 	SMPercent    int `json:"sm_percent"`
 	MemPercent   int `json:"mem_percent"`
+	PCIeRXMBps   int `json:"pcie_rx_mbps,omitempty"`
+	PCIeTXMBps   int `json:"pcie_tx_mbps,omitempty"`
 	Observations int `json:"observations,omitempty"`
 }
 

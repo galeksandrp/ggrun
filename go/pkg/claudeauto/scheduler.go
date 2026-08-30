@@ -91,8 +91,31 @@ func laneOf(body []byte) Lane {
 type waiter struct {
 	conversation string
 	lane         Lane
+	promptTokens int
+	class        requestClass
 	enqueued     time.Time
 	ready        chan struct{}
+	admission    *admission
+}
+
+type requestClass int
+
+const (
+	requestSmall requestClass = iota
+	requestCold
+)
+
+// admission follows a request after it leaves the queue. The first response
+// byte is the only backend-independent boundary we can observe reliably: before
+// it the slot is prefilling, afterwards it is decoding. That is enough to avoid
+// overlapping two expensive cold prefills while still using a second slot for
+// a bounded append once the first request has begun decoding.
+type admission struct {
+	s            *scheduler
+	conversation string
+	promptTokens int
+	prefilling   bool
+	released     bool
 }
 
 // scheduler admits a bounded number of concurrent main-model requests.
@@ -100,58 +123,161 @@ type scheduler struct {
 	mu      sync.Mutex
 	limit   int
 	active  int
+	prefill int
 	waiting []*waiter
 	// recent records when a conversation last held a slot.
 	recent map[string]time.Time
-	now    func() time.Time
+	// promptTokens is the last completed request size by conversation. A small
+	// growth is a cache-hot append; a first or substantially changed long prompt
+	// is cold and must not contend with another host-expert pass.
+	promptTokens map[string]int
+	phaseAware   bool
+	coldTokens   int
+	now          func() time.Time
 }
 
 func newScheduler(limit int) *scheduler {
 	return &scheduler{
-		limit:  limit,
-		recent: map[string]time.Time{},
-		now:    time.Now,
+		limit:        limit,
+		recent:       map[string]time.Time{},
+		promptTokens: map[string]int{},
+		coldTokens:   8192,
+		now:          time.Now,
+	}
+}
+
+func (s *scheduler) setPhaseAware(enabled bool, coldTokens int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.phaseAware = enabled && s.limit > 1
+	if coldTokens > 0 {
+		s.coldTokens = coldTokens
 	}
 }
 
 // acquire blocks until the request may run. It returns false if ctx ended
 // first, in which case the caller must not call release.
 func (s *scheduler) acquire(ctx context.Context, conversation string, lane Lane) bool {
+	return s.acquireRequest(ctx, conversation, lane, 0) != nil
+}
+
+func (s *scheduler) acquireRequest(ctx context.Context, conversation string, lane Lane, promptTokens int) *admission {
 	if s == nil || s.limit <= 0 {
-		return true
+		return &admission{}
 	}
 	s.mu.Lock()
-	if s.active < s.limit && len(s.waiting) == 0 {
-		s.active++
+	class := s.classifyLocked(conversation, promptTokens)
+	w := &waiter{conversation: conversation, lane: lane, promptTokens: promptTokens, class: class, enqueued: s.now(), ready: make(chan struct{})}
+	if len(s.waiting) == 0 && s.canAdmitLocked(w) {
+		a := s.admitLocked(w)
 		s.mu.Unlock()
-		return true
-	}
-	w := &waiter{
-		conversation: conversation,
-		lane:         lane,
-		enqueued:     s.now(),
-		ready:        make(chan struct{}),
+		return a
 	}
 	s.waiting = append(s.waiting, w)
+	// Phase-aware eligibility is not FIFO: a cold waiter may be parked while a
+	// later bounded append is safe to run beside decode. Re-evaluate immediately
+	// so that append does not need an unrelated release event to wake it.
+	s.promoteLocked()
 	s.mu.Unlock()
 
 	select {
 	case <-w.ready:
-		return true
+		return w.admission
 	case <-ctx.Done():
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		for i, other := range s.waiting {
 			if other == w {
 				s.waiting = append(s.waiting[:i], s.waiting[i+1:]...)
-				return false
+				return nil
 			}
 		}
 		// Already promoted between the ctx firing and the lock: the slot is
 		// ours, so hand it straight on rather than leaking it.
-		s.active--
+		s.releaseLocked(w.admission, false)
 		s.promoteLocked()
+		return nil
+	}
+}
+
+func (s *scheduler) classifyLocked(conversation string, promptTokens int) requestClass {
+	if !s.phaseAware || promptTokens < s.coldTokens {
+		return requestSmall
+	}
+	previous, ok := s.promptTokens[conversation]
+	if ok && promptTokens >= previous && promptTokens-previous < s.coldTokens {
+		return requestSmall
+	}
+	return requestCold
+}
+
+func (s *scheduler) canAdmitLocked(w *waiter) bool {
+	if s.active >= s.limit {
 		return false
+	}
+	if !s.phaseAware {
+		return true
+	}
+	if w.class == requestCold {
+		return s.active == 0
+	}
+	return s.prefill == 0
+}
+
+func (s *scheduler) admitLocked(w *waiter) *admission {
+	a := &admission{s: s, conversation: w.conversation, promptTokens: w.promptTokens, prefilling: s.phaseAware}
+	s.active++
+	if a.prefilling {
+		s.prefill++
+	}
+	w.admission = a
+	return a
+}
+
+func (a *admission) markDecode() {
+	if a == nil || a.s == nil {
+		return
+	}
+	s := a.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a.released || !a.prefilling {
+		return
+	}
+	a.prefilling = false
+	s.prefill--
+	s.promoteLocked()
+}
+
+func (a *admission) release() {
+	if a == nil || a.s == nil {
+		return
+	}
+	s := a.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseLocked(a, true)
+	s.promoteLocked()
+}
+
+func (s *scheduler) releaseLocked(a *admission, remember bool) {
+	if a == nil || a.released {
+		return
+	}
+	a.released = true
+	if a.prefilling {
+		s.prefill--
+	}
+	s.active--
+	if remember && a.conversation != "" {
+		s.recent[a.conversation] = s.now()
+		if a.promptTokens > 0 {
+			s.promptTokens[a.conversation] = a.promptTokens
+		}
+		s.pruneRecentLocked()
 	}
 }
 
@@ -173,22 +299,27 @@ func (s *scheduler) release(conversation string) {
 // promoteLocked admits waiters while capacity allows.
 func (s *scheduler) promoteLocked() {
 	for s.active < s.limit && len(s.waiting) > 0 {
-		idx := s.bestWaiterLocked()
+		idx := s.bestAdmissibleWaiterLocked()
+		if idx < 0 {
+			return
+		}
 		w := s.waiting[idx]
 		s.waiting = append(s.waiting[:idx], s.waiting[idx+1:]...)
-		s.active++
+		s.admitLocked(w)
 		close(w.ready)
 	}
 }
 
-// bestWaiterLocked picks the next request to admit.
-func (s *scheduler) bestWaiterLocked() int {
+func (s *scheduler) bestAdmissibleWaiterLocked() int {
 	now := s.now()
-	best := 0
-	bestKey := s.sortKeyLocked(s.waiting[0], now)
-	for i := 1; i < len(s.waiting); i++ {
-		key := s.sortKeyLocked(s.waiting[i], now)
-		if key.less(bestKey) {
+	best := -1
+	var bestKey waiterKey
+	for i, w := range s.waiting {
+		if !s.canAdmitLocked(w) {
+			continue
+		}
+		key := s.sortKeyLocked(w, now)
+		if best < 0 || key.less(bestKey) {
 			best, bestKey = i, key
 		}
 	}
@@ -244,6 +375,7 @@ func (s *scheduler) pruneRecentLocked() {
 	for conv, seen := range s.recent {
 		if now.Sub(seen) > fairShareWindow {
 			delete(s.recent, conv)
+			delete(s.promptTokens, conv)
 		}
 	}
 	if len(s.recent) <= 256 {
@@ -261,6 +393,7 @@ func (s *scheduler) pruneRecentLocked() {
 	sort.Slice(entries, func(i, j int) bool { return entries[i].seen.After(entries[j].seen) })
 	for _, e := range entries[256:] {
 		delete(s.recent, e.conv)
+		delete(s.promptTokens, e.conv)
 	}
 }
 
@@ -272,4 +405,18 @@ func (s *scheduler) stats() (active, queued, limit int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.active, len(s.waiting), s.limit
+}
+
+func (s *scheduler) status() map[string]any {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return map[string]any{
+		"phase_aware":        s.phaseAware,
+		"active_prefill":     s.prefill,
+		"active_decode":      max(0, s.active-s.prefill),
+		"cold_prompt_tokens": s.coldTokens,
+	}
 }

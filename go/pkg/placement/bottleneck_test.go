@@ -62,6 +62,25 @@ func TestDiagnoseAgentBottleneckKeepsCPUExpertPathComposite(t *testing.T) {
 	}
 }
 
+func TestDiagnoseAgentBottleneckClaimsPCIeOnlyAgainstKnownCeiling(t *testing.T) {
+	strategy := &Strategy{Residency: ResidencyRoomy, Type: MoEOffload, IsMoE: true, NCPUMoE: 20, Threads: 14, ThreadsBatch: 14}
+	result := &benchmark.Result{PhaseUtilization: []benchmark.PhaseUtilization{{
+		Phase: benchmark.AgentPhaseDecode, DurationS: 4, Observations: 8,
+		ProcessCPUPercent: 500, ProcessObservations: 8,
+		GPUUtilization: []benchmark.GPUUtilization{{GPU: 0, SMPercent: 25, PCIeRXMBps: 7000}},
+	}}}
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{Index: 0, BandwidthMBps: 8000}}}
+	got := DiagnoseAgentBottleneck(caps, nil, strategy, result)
+	if got.Primary != BottleneckHostExpertPath || got.Confidence != "measured" || !strings.Contains(got.Summary, "88%") {
+		t.Fatalf("PCIe saturation diagnosis=%+v", got)
+	}
+	result.PhaseUtilization[0].GPUUtilization[0].PCIeRXMBps = 500
+	got = DiagnoseAgentBottleneck(caps, nil, strategy, result)
+	if got.Confidence != "inferred" || !strings.Contains(got.Summary, "not proven saturated") {
+		t.Fatalf("low PCIe activity was overstated: %+v", got)
+	}
+}
+
 func TestDiagnoseAgentBottleneckDetectsMixedSchedulerRegression(t *testing.T) {
 	strategy := &Strategy{Residency: ResidencyRoomy, Threads: 8, ThreadsBatch: 8}
 	result := &benchmark.Result{

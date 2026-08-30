@@ -1,6 +1,7 @@
 package claudeauto
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -309,6 +310,20 @@ func TestReviewerValidStreamingVerdictAnswersItself(t *testing.T) {
 	}
 	if records := waitForRecords(t, path, 1); records[0].Route != routeReviewer {
 		t.Fatalf("route = %q, want %q", records[0].Route, routeReviewer)
+	}
+}
+
+func TestReviewerClassifierBodyRaisesTinyOutputBudget(t *testing.T) {
+	body := reviewerClassifierBody([]byte(`{"model":"local-fast","max_tokens":7,"messages":[]}`), "local")
+	var got struct {
+		Model     string `json:"model"`
+		MaxTokens int    `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Model != "local" || got.MaxTokens < 32 {
+		t.Fatalf("reviewer request = %+v, want retargeted model and complete-verdict budget", got)
 	}
 }
 

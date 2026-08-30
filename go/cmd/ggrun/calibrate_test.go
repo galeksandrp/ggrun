@@ -555,8 +555,14 @@ func TestAutomaticCalibrationPromotionRequiresCompleteAgentEvidence(t *testing.T
 	}
 	if !automaticCalibrationAdmissionEvidenceValid(&placement.CalibrationDecision{
 		Winner: "default", Finalist: "ubatch-512", FinalistOutcome: "unavailable",
+		FinalistFailureClass: "cuda-oom", FinalistFailureReason: "exact candidate CUDA OOM",
 	}) {
 		t.Fatal("exact unavailable finalist was not recognized as admission-only evidence")
+	}
+	if automaticCalibrationAdmissionEvidenceValid(&placement.CalibrationDecision{
+		Winner: "default", Finalist: "ubatch-512", FinalistOutcome: "unavailable",
+	}) {
+		t.Fatal("unexplained unavailable finalist became persistent negative evidence")
 	}
 	if automaticCalibrationAdmissionEvidenceValid(complete) {
 		t.Fatal("a measured comparison was mislabeled admission-only")
@@ -580,6 +586,7 @@ func TestCalibrationPlanCachesUnavailableAdmissionWithoutPerformancePromotion(t 
 		ScopeKey: scope, ModelBasename: model.Path,
 		Winner: "default", ValidationLevel: placement.CalibrationValidationAdmission,
 		Finalist: first[1].Name, FinalistOutcome: "unavailable",
+		FinalistFailureClass: "memory", FinalistFailureReason: "exact candidate failed memory admission",
 	}
 	if _, err := placement.SaveCalibrationDecision(cfg.CacheDir, decision); err != nil {
 		t.Fatal(err)

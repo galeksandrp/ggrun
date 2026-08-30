@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Host-offloaded agent serving now schedules active phases separately from
+  allocated slots.** Multi-slot MoEs keep their requested context capacity,
+  but long cold prefills serialize across the shared CPU-expert/PCIe path;
+  bounded small or cache-hot appends may enter an idle slot only after the
+  active request reaches first byte. Router status exposes prefill/decode
+  occupancy, and cancellation telemetry identifies queue versus service plus
+  recurring 60-second and 600-second client-deadline signatures.
+- **Reviewer verdicts reserve a complete local-tokenizer output budget.** Tiny
+  classifier requests could cap a reviewer at seven output tokens and truncate
+  `<block>yes</block>` to `<block>yes`, forcing an expensive main-model retry.
+  The reviewer route now raises only that output budget to 32 tokens. Opaque
+  named Workflow calls whose agent timeout cannot be rewritten are rejected
+  before work begins with an inline/scriptPath retry instruction instead of
+  silently restoring the private long-running-agent deadline.
+- **Phase diagnostics now retain measured PCIe traffic.** NVIDIA sampling maps
+  per-GPU RX/TX MiB/s into cold-prefill, append, decode, and mixed evidence.
+  PCIe is called saturated only when measured traffic crosses 65% of a known
+  link ceiling; otherwise DDR, synchronization, and transfer remain explicitly
+  unresolved. Calibration schema 19 also records the exact class and reason of
+  an unavailable finalist and refuses to suppress a retry from an unexplained
+  failure.
+
 - **Agent-parallel optimization now measures the concurrency it intends to
   serve.** The inherited single-slot server default no longer collapses the
   `agent-parallel` workload to one runnable turn. Automatic launch models at

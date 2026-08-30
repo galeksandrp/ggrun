@@ -431,7 +431,7 @@ func aggregateAgentTrials(trials []*Result) *Result {
 }
 
 func mergeGPUUtilization(dst, src []GPUUtilization) []GPUUtilization {
-	type aggregate struct{ sm, memory, observations int }
+	type aggregate struct{ sm, memory, pcieRX, pcieTX, observations int }
 	byGPU := make(map[int]aggregate, len(dst)+len(src))
 	add := func(sample GPUUtilization) {
 		observations := sample.Observations
@@ -441,6 +441,8 @@ func mergeGPUUtilization(dst, src []GPUUtilization) []GPUUtilization {
 		agg := byGPU[sample.GPU]
 		agg.sm += sample.SMPercent * observations
 		agg.memory += sample.MemPercent * observations
+		agg.pcieRX += sample.PCIeRXMBps * observations
+		agg.pcieTX += sample.PCIeTXMBps * observations
 		agg.observations += observations
 		byGPU[sample.GPU] = agg
 	}
@@ -458,6 +460,8 @@ func mergeGPUUtilization(dst, src []GPUUtilization) []GPUUtilization {
 		out = append(out, GPUUtilization{
 			GPU: gpu, SMPercent: agg.sm / agg.observations,
 			MemPercent:   agg.memory / agg.observations,
+			PCIeRXMBps:   agg.pcieRX / agg.observations,
+			PCIeTXMBps:   agg.pcieTX / agg.observations,
 			Observations: agg.observations,
 		})
 	}

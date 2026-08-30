@@ -47,18 +47,37 @@ evidence.
 | KVFIT-9 | Boundary evidence is persisted and verified-config reuse is scoped | Capture load, cache, agent, and adjacent-rejection evidence on real hardware |
 | PERF-1, PERF-3, PERF-5, PERF-9, UX-3 | Implemented: standard launch owns bounded search; candidates are complete placements; scope includes policy/capabilities; batch pairs preserve explicit intent | Commit and multi-hardware proof |
 | PERF-2, PERF-6, PERF-7 | Implemented as baseline plus one calculated finalist, with a measured prefill pilot, identical budget-scaled cold+append scenarios, two samples, concurrent generation, mixed foreground traffic, lifecycle gates, delayed promotion, and a reusable baseline-won result | Add longer branch/replay and long-context hardware acceptance; quantify noise on public hardware |
-| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve. The 2026-08-29 live p2 run proves allocated slots cannot imply two active compute lanes on a mixed, offloaded MoE workload | Implement phase-aware active-lane admission, reviewer isolation, and real-deadline evidence; then complete controlled p1/p2 decode+decode, cold-prefill+decode, and cache-hot A/Bs plus capability-specific unified/partitioned KV A/B |
+| PERF-10 | Automatic legal slot neighbors use complete re-placement and useful per-agent context. Agent-parallel declares at least two runnable turns; automatic challengers wider than declared demand are dominated and skipped, while explicit maintenance orders the p1/p2/p4/p8 curve. Phase-aware router admission now separates allocated slots from active compute: long cold host-expert prefills serialize, while bounded small/cache-hot requests may overlap only after first byte. Reviewer output-budget and enforceable Workflow-timeout fixes remove the two known false fallback/deadline paths; queue/service cancellations and 60s/600s signatures are recorded. | Relaunch the new binary and complete controlled p1/p2 decode+decode, cold-prefill+decode, and cache-hot A/Bs plus capability-specific unified/partitioned KV A/B; tune the cold/append boundary only from matched public-hardware evidence. |
 | PERF-4, PERF-8, PERF-12, UX-2 | Not complete | Implement measured headroom continuation, broader optional knobs, and bounded control UX |
 | PERF-11 | Partially implemented in the working tree: MoE topology candidates include each feasible sole-backbone owner as a performance-only full recompute; ranking prices the serial backbone and routed GPU/CPU experts instead of prioritizing owner names | Finish exact-argv guard tests, run the intentional roomy hardware comparison, then add only capability-proven row/peer candidates |
 | UX-1 | Implemented for launch, dry-run, dry-run JSON, TUI config screen, and `ggrun status` | Support-expert status remains the NanoBeige controller; launch inspect is `ggrun status` |
 | ROOMY-1, ROOMY-2, ROOMY-3, ROOMY-4, ROOMY-6 | Implemented in source: exact residual slack classifies roomy; tight live-tests only the proven shape; topology ranking prefers a fitting fastest single GPU; batch/ubatch/slots are full recomputes; winner/baseline-won/boundary persist | Commit plus live roomy dense/MoE/recurrent proof |
-| ROOMY-5 | Partially implemented in the working tree: PCI-keyed SM plus Linux process-tree CPU/RSS/I/O sampling spans each separate agent phase; only imbalance between ordinary-layer owners is actionable, and telemetry cannot select a predicted-slower topology | Capture a matched live DeepSeek-class baseline/finalist comparison, then add direct host/peer traffic and a non-perturbing queue source only where they change finalist selection |
+| ROOMY-5 | Implemented in source: PCI-keyed SM plus NVIDIA PCIe RX/TX and Linux process-tree CPU/RSS/I/O sampling span each separate agent phase. Link saturation is claimed only against a known measured/detected ceiling; low traffic leaves DDR/synchronization unresolved. Only imbalance between ordinary-layer owners is actionable, and telemetry cannot select a predicted-slower topology. | Capture a matched live DeepSeek-class baseline/finalist comparison and verify phase transfer samples against the external `nvidia-smi dmon` trace; add peer counters only if they change finalist selection. |
 | Exact-argv admission and long-load UX | Implemented in the working tree: a recomputed argv must receive its own allocation evidence, guarded peaks carry a placement identity, known challenger rewrite/recovery paths fail closed, lateral MoE split churn retains the exact proven placement, and 64+ GiB models warn before loading | Commit, then repeat the live MoE case after the current server is intentionally stopped |
 | MMAP-1, MMAP-2, MMAP-4 | Implemented: production/preflight/recovery/daemon share capability-aware reclaim policy; unknown/anonymous loaders fail closed; mmap remains last-resort and consent-gated | Commit plus live resident/mmap/anonymous cases |
 | MMAP-3 | Host ledger now separates exact reclaimable expert bytes from non-reclaimable runtime, KV, embeddings, and checkpoint reserve | Audit remaining backend-reported buffers/page tables/companions against live cgroup data |
 | MMAP-5 through MMAP-7 | Not complete | Requires the storage/workload and real too-large-model acceptance window |
 | HOT-1 through HOT-6 | Planned, backend-gated resident-MoE performance lane. A 2026-08-28 draft llama.cpp implementation is measured on Qwen3.8-Flash-Next but is not upstream-ready | Isolated fork audit, exact VRAM accounting, correctness and same-workload A/B on this three-GPU Q3 launch; then architecture matrix |
 | PIN/P3 | Deliberately not started | Blocked on appropriate hardware/model artifacts as specified below |
+
+### 2026-08-30 phase-aware hardening update
+
+- Calibration evidence is schema 19. Admission-only suppression now carries a
+  non-empty typed failure class and exact reason; an unexplained unavailable
+  estimate cannot become durable negative evidence.
+- Host-offloaded multi-slot Claude serving uses first-byte phase boundaries.
+  Cold prompts above the conservative 8k-token estimate run alone; bounded
+  small/cache-hot work can use another physical slot after active prefill ends.
+- Router evidence separates queue/service cancellation and the observed ~60 s
+  and ~600 s deadline families. Workflow calls that cannot be rewritten with
+  the maximum safe `stallMs` fail before launching work instead of silently
+  running under the private deadline.
+- NVIDIA phase samples include PCIe RX/TX. A measured saturation claim requires
+  at least 65% of a known link ceiling; otherwise DDR, PCIe, and synchronization
+  remain a composite diagnosis.
+- Source and protected-core acceptance are complete. The next intentional
+  relaunch must preserve matched cold+decode, append+decode, and decode+decode
+  p1/p2 evidence before the threshold or policy is generalized further.
 
 ### 2026-08-29 hardening update
 

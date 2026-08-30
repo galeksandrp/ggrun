@@ -605,6 +605,17 @@ func (r *Router) SetReviewerContext(tokens int) {
 	}
 }
 
+// SetPhaseAwareAdmission enables the conservative active-lane policy for
+// host-offloaded multi-slot models. Long cold prompts serialize because their
+// CPU-expert/PCIe passes make concurrent decode collapse; small and cache-hot
+// appends may use the otherwise idle slot after the active request reaches its
+// first response byte.
+func (r *Router) SetPhaseAwareAdmission(enabled bool, coldPromptTokens int) {
+	if r != nil && r.sched != nil {
+		r.sched.setPhaseAware(enabled, coldPromptTokens)
+	}
+}
+
 // estimatedPromptTokens conservatively estimates how many context tokens a
 // routed request consumes from its JSON body size. The estimate must err on the
 // high side so an oversized prompt is caught rather than silently sent into an
@@ -656,6 +667,9 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 				"active": router.mainActive.Load(),
 				"queued": router.mainQueued.Load(),
 				"limit":  int64(router.maxMainActive),
+			}
+			if admission := router.sched.status(); admission != nil {
+				status["admission"] = admission
 			}
 			if summary := router.MetricsSummary(); summary != nil {
 				status["metrics"] = summary
@@ -722,7 +736,7 @@ func StartRouter(mainBaseURL, reviewerBaseURL string, supportsVision bool, maxMa
 				if router.utilityEnabled() {
 					alias = router.companionAlias
 				}
-				if router.tryReviewer(w, r, reviewerProxy, retargetModel(body, alias)) {
+				if router.tryReviewer(w, r, reviewerProxy, reviewerClassifierBody(body, alias)) {
 					return
 				}
 				router.reviewerFailNotice.Do(func() {
@@ -806,9 +820,9 @@ func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil
 	var queue time.Duration
 	if route == routeMain && r != nil && r.sched != nil {
 		r.mainQueued.Add(1)
-		admitted := r.sched.acquire(req.Context(), conversation, laneOf(body))
+		admission := r.sched.acquireRequest(req.Context(), conversation, laneOf(body), estimatedPromptTokens(body))
 		r.mainQueued.Add(-1)
-		if !admitted {
+		if admission == nil {
 			r.record(route, body, start, time.Since(start), nil)
 			return
 		}
@@ -816,8 +830,12 @@ func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil
 		r.mainActive.Add(1)
 		defer func() {
 			r.mainActive.Add(-1)
-			r.sched.release(conversation)
+			admission.release()
 		}()
+		metered := &meteredWriter{ResponseWriter: w, start: start, onFirstByte: admission.markDecode}
+		proxy.ServeHTTP(metered, req)
+		r.record(route, body, start, queue, metered)
+		return
 	}
 	metered := &meteredWriter{ResponseWriter: w, start: start}
 	proxy.ServeHTTP(metered, req)
@@ -846,6 +864,19 @@ func (r *Router) record(route string, body []byte, start time.Time, queue time.D
 		rec.Usage = metered.usage
 		rec.TTFBMS = metered.ttfb.Milliseconds()
 		rec.Aborted = metered.status == 0 && metered.written == 0
+	}
+	if rec.Aborted {
+		if metered == nil {
+			rec.CancelPhase = "queue"
+		} else {
+			rec.CancelPhase = "service"
+		}
+		switch {
+		case rec.TotalMS >= 50_000 && rec.TotalMS <= 75_000:
+			rec.DeadlineBucket = "~60s"
+		case rec.TotalMS >= 550_000 && rec.TotalMS <= 650_000:
+			rec.DeadlineBucket = "~600s"
+		}
 	}
 	r.metrics.record(rec)
 }
