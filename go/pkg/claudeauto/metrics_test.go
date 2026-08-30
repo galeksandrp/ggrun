@@ -223,6 +223,33 @@ func TestRouterForwardsFlushWhileStreaming(t *testing.T) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 }
 
+func TestMeteredWriterMarksDecodeOnlyOnGeneratedDelta(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	marked := 0
+	w := &meteredWriter{ResponseWriter: recorder, start: time.Now(), onDecode: func() { marked++ }}
+	_, _ = w.Write([]byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":0}}}\n\n"))
+	_, _ = w.Write([]byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"thinking\"}}\n\n"))
+	if marked != 0 {
+		t.Fatalf("HTTP envelope marked decode %d time(s)", marked)
+	}
+	_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"x\"}}\n\n"))
+	_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"y\"}}\n\n"))
+	if marked != 1 {
+		t.Fatalf("generated deltas marked decode %d time(s), want once", marked)
+	}
+}
+
+func TestGeneratedDeltaDetectionSurvivesAWriteBoundary(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	marked := 0
+	w := &meteredWriter{ResponseWriter: recorder, start: time.Now(), onDecode: func() { marked++ }}
+	_, _ = w.Write([]byte(`data: {"delta":{"type":"think`))
+	_, _ = w.Write([]byte(`ing_delta","thinking":"x"}}`))
+	if marked != 1 {
+		t.Fatalf("split generated delta marked decode %d time(s), want once", marked)
+	}
+}
+
 func TestRouterRecordsQueueWaitSeparatelyFromPrefill(t *testing.T) {
 	release := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

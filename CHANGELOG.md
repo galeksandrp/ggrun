@@ -6,7 +6,7 @@
   allocated slots.** Multi-slot MoEs keep their requested context capacity,
   but long cold prefills serialize across the shared CPU-expert/PCIe path;
   bounded small or cache-hot appends may enter an idle slot only after the
-  active request reaches first byte. Router status exposes prefill/decode
+  active request emits its first generated SSE delta. Router status exposes prefill/decode
   occupancy, and cancellation telemetry identifies queue versus service plus
   recurring 60-second and 600-second client-deadline signatures.
 - **Reviewer verdicts reserve a complete local-tokenizer output budget.** Tiny

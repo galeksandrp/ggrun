@@ -296,13 +296,14 @@ func isStreamRequest(body []byte) bool {
 // flushes would buffer the whole response.
 type meteredWriter struct {
 	http.ResponseWriter
-	start       time.Time
-	status      int
-	written     int64
-	ttfb        time.Duration
-	usage       Usage
-	carry       []byte
-	onFirstByte func()
+	start      time.Time
+	status     int
+	written    int64
+	ttfb       time.Duration
+	usage      Usage
+	carry      []byte
+	onDecode   func()
+	decodeSeen bool
 }
 
 func (w *meteredWriter) WriteHeader(status int) {
@@ -318,9 +319,6 @@ func (w *meteredWriter) Write(p []byte) (int, error) {
 	}
 	if w.written == 0 && len(p) > 0 {
 		w.ttfb = time.Since(w.start)
-		if w.onFirstByte != nil {
-			w.onFirstByte()
-		}
 	}
 	w.written += int64(len(p))
 	w.scan(p)
@@ -340,6 +338,17 @@ func (w *meteredWriter) scan(p []byte) {
 	buf := p
 	if len(w.carry) > 0 {
 		buf = append(append(make([]byte, 0, len(w.carry)+len(p)), w.carry...), p...)
+	}
+	// Anthropic streams message_start/content_block_start envelopes before the
+	// model has finished prompt processing. They are the first HTTP bytes, but
+	// they are not a decode boundary. Only an actual generated delta proves the
+	// backend reached generation; using the envelope admitted a second append
+	// while the live slot was still thousands of tokens into a cold prefill.
+	if !w.decodeSeen && containsGeneratedDelta(buf) {
+		w.decodeSeen = true
+		if w.onDecode != nil {
+			w.onDecode()
+		}
 	}
 	for _, k := range usageKeys {
 		from := 0
@@ -362,6 +371,19 @@ func (w *meteredWriter) scan(p []byte) {
 		return
 	}
 	w.carry = append(w.carry[:0], buf...)
+}
+
+func containsGeneratedDelta(buf []byte) bool {
+	for _, marker := range [][]byte{
+		[]byte(`"type":"text_delta"`), []byte(`"type": "text_delta"`),
+		[]byte(`"type":"thinking_delta"`), []byte(`"type": "thinking_delta"`),
+		[]byte(`"type":"input_json_delta"`), []byte(`"type": "input_json_delta"`),
+	} {
+		if bytes.Contains(buf, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseLeadingInt(b []byte) (int64, bool) {

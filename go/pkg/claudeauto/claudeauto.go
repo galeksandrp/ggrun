@@ -832,7 +832,7 @@ func (r *Router) serve(w http.ResponseWriter, req *http.Request, proxy *httputil
 			r.mainActive.Add(-1)
 			admission.release()
 		}()
-		metered := &meteredWriter{ResponseWriter: w, start: start, onFirstByte: admission.markDecode}
+		metered := &meteredWriter{ResponseWriter: w, start: start, onDecode: admission.markDecode}
 		proxy.ServeHTTP(metered, req)
 		r.record(route, body, start, queue, metered)
 		return
