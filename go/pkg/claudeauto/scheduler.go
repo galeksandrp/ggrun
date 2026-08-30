@@ -228,7 +228,10 @@ func (s *scheduler) canAdmitLocked(w *waiter) bool {
 }
 
 func (s *scheduler) admitLocked(w *waiter) *admission {
-	a := &admission{s: s, conversation: w.conversation, promptTokens: w.promptTokens, prefilling: s.phaseAware}
+	// A zero prompt size is the legacy acquire/release API used by callers which
+	// cannot provide phase metadata. Keep its original counting-semaphore
+	// semantics so release() cannot strand a synthetic prefill counter.
+	a := &admission{s: s, conversation: w.conversation, promptTokens: w.promptTokens, prefilling: s.phaseAware && w.promptTokens > 0}
 	s.active++
 	if a.prefilling {
 		s.prefill++

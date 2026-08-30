@@ -353,6 +353,21 @@ func TestPhaseAwareSchedulerRecognizesBoundedConversationAppend(t *testing.T) {
 	}
 }
 
+func TestPhaseAwareLegacyAcquireDoesNotStrandPrefill(t *testing.T) {
+	s, _ := newTestScheduler(2)
+	s.setPhaseAware(true, 1000)
+	if !s.acquire(context.Background(), "legacy", LaneBulk) {
+		t.Fatal("legacy acquire failed")
+	}
+	s.release("legacy")
+	s.mu.Lock()
+	prefill := s.prefill
+	s.mu.Unlock()
+	if prefill != 0 {
+		t.Fatalf("legacy release stranded %d active prefill(s)", prefill)
+	}
+}
+
 func TestPruneRecentBoundsMemoryOnLongRuns(t *testing.T) {
 	s, clock := newTestScheduler(1)
 	for i := 0; i < 400; i++ {
