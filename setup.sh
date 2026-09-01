@@ -5,7 +5,7 @@
 #   ./setup.sh
 #
 # Or remotely:
-#   curl -fsSL https://raw.githubusercontent.com/raketenkater/ggrun/main/setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/galeksandrp/ggrun/main/setup.sh | bash
 
 set -euo pipefail
 
@@ -16,7 +16,7 @@ if [[ ! -t 0 && ! -r /dev/tty && -z "${LLM_SETUP_NONINTERACTIVE:-}" ]]; then
     export LLM_INSTALL_NONINTERACTIVE=1
 fi
 
-REPO="raketenkater/ggrun"
+REPO="galeksandrp/ggrun"
 REF="${LLM_SETUP_REF:-main}"
 TMP_DIR=""
 

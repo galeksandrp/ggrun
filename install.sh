@@ -3,7 +3,7 @@
 # install.sh — One-command installer for ggrun.
 #
 # Usage (remote):
-#   curl -fsSL https://raw.githubusercontent.com/raketenkater/ggrun/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/galeksandrp/ggrun/main/install.sh | bash
 # Usage (local):
 #   ./install.sh                  # from a cloned repo
 #
@@ -36,8 +36,8 @@
 
 set -Eeuo pipefail
 
-REPO_URL="https://github.com/raketenkater/ggrun.git"
-GITHUB_REPO="raketenkater/ggrun"
+REPO_URL="https://github.com/galeksandrp/ggrun.git"
+GITHUB_REPO="galeksandrp/ggrun"
 SOURCE_REPO_DIR="${LLM_INSTALL_REPO_DIR:-}"
 SOURCE_REF="${LLM_INSTALL_REF:-main}"
 INSTALL_DIR="${LLM_INSTALL_PREFIX:-$HOME/.local/bin}"
@@ -994,7 +994,7 @@ build_go_binary() {
     local ldflags="-s -w"
     local ver
     ver="$(git -C "$SRC_DIR" describe --tags --exact-match 2>/dev/null || true)"
-    [[ -n "$ver" ]] && ldflags="$ldflags -X github.com/raketenkater/ggrun/pkg/update.currentVersion=$ver"
+    [[ -n "$ver" ]] && ldflags="$ldflags -X github.com/galeksandrp/ggrun/pkg/update.currentVersion=$ver"
     (cd "$SRC_DIR/go" && "$GO_CMD" build -trimpath -ldflags="$ldflags" -o "$out" ./cmd/ggrun)
 }
 

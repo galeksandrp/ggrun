@@ -34,7 +34,7 @@ echo "==> Building ggrun (Go launcher)"
 version="${GITHUB_REF_NAME:-}"
 ldflags="-s -w"
 case "$version" in
-    v*) ldflags="$ldflags -X github.com/raketenkater/ggrun/pkg/update.currentVersion=$version" ;;
+    v*) ldflags="$ldflags -X github.com/galeksandrp/ggrun/pkg/update.currentVersion=$version" ;;
     *) ;;
 esac
 ( cd "$ROOT_DIR/go" && go build -buildvcs=false -trimpath -ldflags="$ldflags" -o ggrun ./cmd/ggrun )

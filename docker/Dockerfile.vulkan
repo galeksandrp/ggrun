@@ -6,14 +6,14 @@
 #   docker run --rm --device /dev/dri -p 8081:8081 -v ~/ai_models:/models ggrun:vulkan /models/model.gguf
 #   # NVIDIA via Vulkan (needs NVIDIA Container Toolkit):
 #   docker run --rm --gpus all -e NVIDIA_DRIVER_CAPABILITIES=all -p 8081:8081 -v ~/ai_models:/models ggrun:vulkan /models/model.gguf
-ARG LLAMA_CPP_REF=d2462f8f7ac6d80070a587ffebf6cd73730f4280
+ARG LLAMA_CPP_REF=c1d0e7a004015f23bc0233470b747b596f29b264
 
 # ---- backend: build llama-server with Vulkan ----
-FROM debian:bookworm-slim AS backend
+FROM debian:trixie-slim AS backend
 ARG LLAMA_CPP_REF
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git cmake build-essential ca-certificates \
-        libvulkan-dev glslc glslang-tools \
+        libvulkan-dev glslc glslang-tools spirv-headers \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 RUN git init llama.cpp \
@@ -37,7 +37,7 @@ RUN CGO_ENABLED=0 go build -trimpath \
       -o /out/ggrun ./cmd/ggrun
 
 # ---- runtime (Vulkan loader + Mesa drivers for AMD/Intel) ----
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip ca-certificates libgomp1 curl \
         libvulkan1 mesa-vulkan-drivers vulkan-tools \
@@ -52,7 +52,7 @@ ENV LLM_APP_HOME=/opt/ggrun \
     LLM_PORT=8081 \
     PATH=/opt/ggrun/.bin:$PATH
 COPY --from=gobuild /out/ggrun            /opt/ggrun/.bin/ggrun
-COPY --from=backend /src/llama.cpp/build/bin/llama-server /opt/ggrun/.bin/llama-server
+COPY --from=backend /src/llama.cpp/build/bin/llama-server /opt/ggrun/.bin/llama-server-vulkan
 COPY tools/gguf/parse_gguf.py                  /opt/ggrun/.bin/parse_gguf.py
 COPY tools/download/download_any_gguf.py       /opt/ggrun/.bin/download_any_gguf.py
 COPY tools/models/model_index.py               /opt/ggrun/.bin/model_index.py
